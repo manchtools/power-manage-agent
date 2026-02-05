@@ -288,8 +288,6 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		newInterval := syncActionsFromServer(ctx, client, sched, firstSync, logger)
 		if newInterval > 0 {
 			syncInterval = newInterval
-			// Successful sync - reset backoff and mark first sync complete
-			currentBackoff = initialBackoff
 			firstSync = false
 		}
 
@@ -320,6 +318,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		}()
 
 		// Run the stream connection (handles heartbeats, receives server messages)
+		connStart := time.Now()
 		err := client.Run(sessionCtx, hostname, version, defaultHeartbeatInterval, h)
 
 		// Stop the goroutines
@@ -330,6 +329,11 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		if ctx.Err() != nil {
 			logger.Info("agent stopped")
 			return
+		}
+
+		// Reset backoff if the connection was stable (lasted longer than the backoff interval)
+		if time.Since(connStart) > currentBackoff {
+			currentBackoff = initialBackoff
 		}
 
 		logger.Error("connection lost, continuing with scheduled actions",
