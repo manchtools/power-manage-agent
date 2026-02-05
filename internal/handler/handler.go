@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
+	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/osquery"
@@ -17,18 +18,20 @@ import (
 
 // Handler implements the SDK StreamHandler interface.
 type Handler struct {
-	logger    *slog.Logger
-	executor  *executor.Executor
-	osquery   *osquery.Registry // nil if osquery is not installed
-	scheduler *scheduler.Scheduler
+	logger      *slog.Logger
+	executor    *executor.Executor
+	osquery     *osquery.Registry // nil if osquery is not installed
+	scheduler   *scheduler.Scheduler
+	syncTrigger chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
 }
 
 // NewHandler creates a new stream handler.
-func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.Scheduler) *Handler {
+func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.Scheduler, syncTrigger chan<- struct{}) *Handler {
 	h := &Handler{
-		logger:    logger,
-		executor:  exec,
-		scheduler: sched,
+		logger:      logger,
+		executor:    exec,
+		scheduler:   sched,
+		syncTrigger: syncTrigger,
 	}
 
 	// Initialize osquery if installed (optional)
@@ -64,8 +67,27 @@ func (h *Handler) OnAction(ctx context.Context, action *pb.Action) (*pb.ActionRe
 func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
 	h.logger.Info("received action", "action_id", action.Id.Value, "type", action.Type.String())
 
-	// Store the action for scheduled execution
-	if h.scheduler != nil {
+	// Handle SYNC instant action directly — trigger sync and return success
+	if action.Type == pb.ActionType_ACTION_TYPE_SYNC {
+		h.logger.Info("triggering immediate sync via instant action")
+		if h.syncTrigger != nil {
+			select {
+			case h.syncTrigger <- struct{}{}:
+				h.logger.Info("sync trigger sent")
+			default:
+				h.logger.Warn("sync trigger channel full, sync already pending")
+			}
+		}
+		return &pb.ActionResult{
+			ActionId:    action.Id,
+			Status:      pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
+			CompletedAt: timestamppb.Now(),
+			Output:      &pb.CommandOutput{Stdout: "Sync triggered"},
+		}, nil
+	}
+
+	// Store the action for scheduled execution (skip for instant actions — they're one-shot)
+	if h.scheduler != nil && !executor.IsInstantAction(action.Type) {
 		if err := h.scheduler.AddAction(action); err != nil {
 			h.logger.Error("failed to store action", "action_id", action.Id.Value, "error", err)
 		} else {

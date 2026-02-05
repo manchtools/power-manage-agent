@@ -180,8 +180,11 @@ func main() {
 	// Start the scheduler in a goroutine
 	go sched.Start(ctx)
 
+	// Create sync trigger channel for instant SYNC actions
+	syncTrigger := make(chan struct{}, 1)
+
 	// Create handler with scheduler integration
-	h := handler.NewHandler(logger, exec, sched)
+	h := handler.NewHandler(logger, exec, sched, syncTrigger)
 
 	// Run the agent
 	logger.Info("starting agent",
@@ -191,7 +194,7 @@ func main() {
 		"version", version,
 	)
 
-	runAgent(ctx, creds, hostname, h, sched, cfg.pendingSecurityAlert, logger)
+	runAgent(ctx, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger)
 }
 
 // register performs initial registration with the control server.
@@ -246,7 +249,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 // runAgent connects to the gateway and processes messages.
 // The agent continues to run scheduled actions even when disconnected.
 // If securityAlert is non-nil, it will be sent to the server after connection.
-func runAgent(ctx context.Context, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
+func runAgent(ctx context.Context, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
 	// Current sync interval (can be updated by server)
 	syncInterval := defaultSyncInterval
 
@@ -302,11 +305,11 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		// Create a child context for this connection session
 		sessionCtx, cancelSession := context.WithCancel(ctx)
 
-		// Start periodic sync goroutine
+		// Start periodic sync goroutine (also listens for instant sync triggers)
 		syncDone := make(chan struct{})
 		go func() {
 			defer close(syncDone)
-			periodicSync(sessionCtx, client, sched, &syncInterval, logger)
+			periodicSync(sessionCtx, client, sched, &syncInterval, syncTrigger, logger)
 		}()
 
 		// Start result sender goroutine to send scheduled execution results to server
@@ -352,11 +355,22 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 // periodicSync runs a loop that periodically syncs actions from the server.
 // The interval can be dynamically updated based on server response.
-func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Scheduler, syncInterval *time.Duration, logger *slog.Logger) {
+// Also listens on syncTrigger for instant sync requests.
+func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Scheduler, syncInterval *time.Duration, syncTrigger <-chan struct{}, logger *slog.Logger) {
 	ticker := time.NewTicker(*syncInterval)
 	defer ticker.Stop()
 
 	logger.Info("periodic sync started", "interval", syncInterval.String())
+
+	doSync := func(reason string) {
+		logger.Info("syncing actions", "reason", reason)
+		newInterval := syncActionsFromServer(ctx, client, sched, false, logger)
+		if newInterval > 0 && newInterval != *syncInterval {
+			*syncInterval = newInterval
+			ticker.Reset(*syncInterval)
+			logger.Info("sync interval updated", "new_interval", syncInterval.String())
+		}
+	}
 
 	for {
 		select {
@@ -364,13 +378,9 @@ func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Sche
 			logger.Debug("periodic sync stopped")
 			return
 		case <-ticker.C:
-			// Periodic syncs are not first syncs - only execute new actions
-			newInterval := syncActionsFromServer(ctx, client, sched, false, logger)
-			if newInterval > 0 && newInterval != *syncInterval {
-				*syncInterval = newInterval
-				ticker.Reset(*syncInterval)
-				logger.Info("sync interval updated", "new_interval", syncInterval.String())
-			}
+			doSync("periodic")
+		case <-syncTrigger:
+			doSync("instant action trigger")
 		}
 	}
 }

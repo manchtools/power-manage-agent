@@ -125,8 +125,8 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		defer cancel()
 	}
 
-	// Verify action signature before execution
-	if e.verifier != nil {
+	// Verify action signature before execution (skip for instant actions — they have no params to sign)
+	if e.verifier != nil && !isInstantAction(action.Type) {
 		actionID := ""
 		if action.Id != nil {
 			actionID = action.Id.Value
@@ -176,6 +176,8 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		output, execErr = e.executeDirectory(ctx, action.GetDirectory(), action.DesiredState)
 	case pb.ActionType_ACTION_TYPE_REPOSITORY:
 		output, execErr = e.executeRepository(ctx, action.GetRepository(), action.DesiredState)
+	case pb.ActionType_ACTION_TYPE_REBOOT:
+		output, execErr = e.executeReboot(ctx)
 	default:
 		execErr = fmt.Errorf("unsupported action type: %v", action.Type)
 	}
@@ -1781,5 +1783,28 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 	default:
 		return nil, fmt.Errorf("unknown desired state: %v", state)
 	}
+}
+
+// isInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
+func isInstantAction(t pb.ActionType) bool {
+	return t == pb.ActionType_ACTION_TYPE_REBOOT || t == pb.ActionType_ACTION_TYPE_SYNC
+}
+
+// IsInstantAction is the exported version for use by the handler.
+func IsInstantAction(t pb.ActionType) bool {
+	return isInstantAction(t)
+}
+
+// executeReboot schedules a system reboot in 5 minutes.
+func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
+	output, err := runSudoCommand(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
+	if err != nil {
+		return output, fmt.Errorf("failed to schedule reboot: %w", err)
+	}
+	if output == nil {
+		output = &pb.CommandOutput{}
+	}
+	output.Stdout = "Reboot scheduled in 5 minutes\n" + output.Stdout
+	return output, nil
 }
 
