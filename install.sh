@@ -2,11 +2,11 @@
 #
 # Power Manage Agent Installation Script
 #
-# This script sets up the power-manage-agent on a Linux system:
-# - Creates a dedicated service user (power-manage) with restricted sudo access
-# - Creates required directories with proper permissions
-# - Installs the systemd service
-# - Optionally registers the agent with a token
+# Downloads the agent binary, installs it as a systemd service, and optionally
+# registers with a control server — all in one step.
+#
+# One-liner install:
+#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN
 #
 # Usage:
 #   sudo ./install.sh [OPTIONS]
@@ -14,15 +14,19 @@
 # Options:
 #   -t, --token TOKEN       Registration token for initial setup
 #   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
+#   -v, --version VERSION   Version to install (default: latest)
 #   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
 #   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
 #   -u, --user USER         Service user name (default: power-manage)
 #   --skip-verify           Skip TLS certificate verification (development only)
+#   --skip-download         Skip downloading the binary (use existing binary at --binary path)
 #   --uninstall             Remove the agent and all configuration
 #   -h, --help              Show this help message
 #
 
 set -e
+
+GITHUB_REPO="MANCHTOOLS/power-manage-agent"
 
 # Default values
 DATA_DIR="/var/lib/power-manage"
@@ -32,6 +36,8 @@ SERVICE_NAME="power-manage-agent"
 REGISTRATION_TOKEN=""
 SERVER_URL=""
 SKIP_VERIFY=""
+SKIP_DOWNLOAD=""
+VERSION="latest"
 
 # Colors for output
 RED='\033[0;31m'
@@ -58,25 +64,30 @@ Power Manage Agent Installation Script
 Usage:
   sudo ./install.sh [OPTIONS]
 
+  One-liner:
+  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s URL -t TOKEN
+
 Options:
   -t, --token TOKEN       Registration token for initial setup
   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
+  -v, --version VERSION   Version to install (e.g., v2026.2.0; default: latest)
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
   -u, --user USER         Service user name (default: power-manage)
   --skip-verify           Skip TLS certificate verification (development only)
+  --skip-download         Skip downloading the binary (use existing binary at --binary path)
   --uninstall             Remove the agent and all configuration
   -h, --help              Show this help message
 
 Examples:
-  # Install with default settings (binary must already exist)
-  sudo ./install.sh
+  # Download, install and register (one-liner)
+  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s https://power-manage.example.com -t abc123
 
-  # Install and register with a token
-  sudo ./install.sh -s http://192.168.1.100:8080 -t abc123def456
+  # Install a specific version
+  sudo ./install.sh -v v2026.2.0 -s https://power-manage.example.com -t abc123
 
-  # Install with custom data directory
-  sudo ./install.sh -d /opt/power-manage
+  # Install with existing binary (skip download)
+  sudo ./install.sh --skip-download -s https://power-manage.example.com -t abc123
 
   # Uninstall completely
   sudo ./install.sh --uninstall
@@ -106,8 +117,16 @@ parse_args() {
                 SERVICE_USER="$2"
                 shift 2
                 ;;
+            -v|--version)
+                VERSION="$2"
+                shift 2
+                ;;
             --skip-verify)
                 SKIP_VERIFY="true"
+                shift
+                ;;
+            --skip-download)
+                SKIP_DOWNLOAD="true"
                 shift
                 ;;
             --uninstall)
@@ -134,17 +153,61 @@ check_root() {
     fi
 }
 
-check_binary() {
-    if [[ ! -f "$BINARY_PATH" ]]; then
-        log_error "Agent binary not found at $BINARY_PATH"
-        log_info "Please copy the power-manage-agent binary to $BINARY_PATH before running this script"
+detect_arch() {
+    local machine
+    machine=$(uname -m)
+    case "$machine" in
+        x86_64|amd64)  echo "amd64" ;;
+        aarch64|arm64) echo "arm64" ;;
+        *)
+            log_error "Unsupported architecture: $machine"
+            exit 1
+            ;;
+    esac
+}
+
+download_binary() {
+    if [[ -n "$SKIP_DOWNLOAD" ]]; then
+        if [[ ! -f "$BINARY_PATH" ]]; then
+            log_error "Agent binary not found at $BINARY_PATH (--skip-download was set)"
+            exit 1
+        fi
+        log_info "Using existing binary at $BINARY_PATH"
+        chmod +x "$BINARY_PATH"
+        return
+    fi
+
+    local arch
+    arch=$(detect_arch)
+    local binary_name="power-manage-agent-linux-${arch}"
+    local download_url
+
+    if [[ "$VERSION" == "latest" ]]; then
+        download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${binary_name}"
+    else
+        download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${binary_name}"
+    fi
+
+    log_info "Detected architecture: ${arch}"
+    log_info "Downloading agent from ${download_url}..."
+
+    if command -v curl &>/dev/null; then
+        if ! curl -fSL --progress-bar -o "$BINARY_PATH" "$download_url"; then
+            log_error "Download failed. Check the version and that the release exists."
+            exit 1
+        fi
+    elif command -v wget &>/dev/null; then
+        if ! wget -q --show-progress -O "$BINARY_PATH" "$download_url"; then
+            log_error "Download failed. Check the version and that the release exists."
+            exit 1
+        fi
+    else
+        log_error "Neither curl nor wget found. Please install one and try again."
         exit 1
     fi
 
-    if [[ ! -x "$BINARY_PATH" ]]; then
-        log_info "Making binary executable..."
-        chmod +x "$BINARY_PATH"
-    fi
+    chmod +x "$BINARY_PATH"
+    log_info "Binary installed to $BINARY_PATH"
 }
 
 create_user() {
@@ -370,7 +433,7 @@ show_status() {
 main() {
     parse_args "$@"
     check_root
-    check_binary
+    download_binary
 
     log_info "Starting Power Manage Agent installation..."
 

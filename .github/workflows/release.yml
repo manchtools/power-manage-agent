@@ -84,11 +84,13 @@ jobs:
             ## Installation
 
             ```bash
-            curl -LO https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${{ github.ref_name }}/power-manage-agent-linux-amd64
-            curl -LO https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${{ github.ref_name }}/install.sh
-            chmod +x install.sh power-manage-agent-linux-amd64
-            sudo mv power-manage-agent-linux-amd64 /usr/local/bin/power-manage-agent
-            sudo ./install.sh -s https://your-server.example.com -t YOUR_TOKEN
+            curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN
+            ```
+
+            Or install a specific version:
+
+            ```bash
+            curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${{ github.ref_name }}/install.sh | sudo bash -s -- -v ${{ github.ref_name }} -s https://your-server.example.com -t YOUR_TOKEN
             ```
 
             ## Binaries
