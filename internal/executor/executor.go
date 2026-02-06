@@ -176,6 +176,8 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		output, execErr = e.executeDirectory(ctx, action.GetDirectory(), action.DesiredState)
 	case pb.ActionType_ACTION_TYPE_REPOSITORY:
 		output, execErr = e.executeRepository(ctx, action.GetRepository(), action.DesiredState)
+	case pb.ActionType_ACTION_TYPE_USER:
+		output, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	default:
@@ -1949,5 +1951,367 @@ func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error)
 	}
 	output.Stdout = "Reboot scheduled in 5 minutes\n" + output.Stdout
 	return output, nil
+}
+
+// executeUser manages user accounts (create, update, disable, remove).
+func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state pb.DesiredState) (*pb.CommandOutput, error) {
+	if params == nil {
+		return nil, fmt.Errorf("user params required")
+	}
+
+	if params.Username == "" {
+		return nil, fmt.Errorf("username is required")
+	}
+
+	// Validate username format (prevent injection)
+	if !isValidUsername(params.Username) {
+		return nil, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
+	}
+
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
+	}
+
+	switch state {
+	case pb.DesiredState_DESIRED_STATE_PRESENT:
+		return e.createOrUpdateUser(ctx, params)
+	case pb.DesiredState_DESIRED_STATE_ABSENT:
+		return e.removeUser(ctx, params.Username)
+	default:
+		return nil, fmt.Errorf("unknown desired state: %v", state)
+	}
+}
+
+// isValidUsername checks if a username is valid and safe.
+func isValidUsername(username string) bool {
+	if len(username) == 0 || len(username) > 32 {
+		return false
+	}
+	// Must start with a lowercase letter
+	if username[0] < 'a' || username[0] > 'z' {
+		return false
+	}
+	// Rest can be lowercase letters, digits, underscores, or hyphens
+	for _, c := range username[1:] {
+		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
+			return false
+		}
+	}
+	return true
+}
+
+// userExists checks if a user already exists on the system.
+func userExists(username string) bool {
+	cmd := exec.Command("id", username)
+	return cmd.Run() == nil
+}
+
+// createOrUpdateUser creates a new user or updates an existing one.
+func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, error) {
+	var output strings.Builder
+	exists := userExists(params.Username)
+
+	if exists {
+		// Update existing user
+		return e.updateUser(ctx, params, &output)
+	}
+
+	// Create new user
+	return e.createUser(ctx, params, &output)
+}
+
+// createUser creates a new user account.
+func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, error) {
+	args := []string{}
+
+	// UID
+	if params.Uid > 0 {
+		args = append(args, "-u", fmt.Sprintf("%d", params.Uid))
+	}
+
+	// GID or primary group
+	if params.Gid > 0 {
+		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
+	} else if params.PrimaryGroup != "" {
+		// Ensure group exists
+		e.ensureGroupExists(ctx, params.PrimaryGroup)
+		args = append(args, "-g", params.PrimaryGroup)
+	}
+
+	// Home directory
+	if params.HomeDir != "" {
+		args = append(args, "-d", params.HomeDir)
+	}
+
+	// Shell (default to /bin/bash for normal users, /usr/sbin/nologin for disabled/system)
+	shell := params.Shell
+	if shell == "" {
+		if params.Disabled {
+			shell = "/usr/sbin/nologin"
+		} else if params.SystemUser {
+			shell = "/usr/sbin/nologin"
+		} else {
+			shell = "/bin/bash"
+		}
+	}
+	args = append(args, "-s", shell)
+
+	// System user
+	if params.SystemUser {
+		args = append(args, "-r") // Create system account
+	}
+
+	// Create home directory (default true for normal users)
+	createHome := params.CreateHome
+	if !params.SystemUser && !params.CreateHome {
+		// For normal users, default to creating home
+		createHome = true
+	}
+	if createHome {
+		args = append(args, "-m")
+	} else {
+		args = append(args, "-M")
+	}
+
+	// Comment/GECOS
+	if params.Comment != "" {
+		args = append(args, "-c", params.Comment)
+	}
+
+	// Additional groups
+	if len(params.Groups) > 0 {
+		// Validate group names
+		for _, g := range params.Groups {
+			if !isValidUsername(g) {
+				return nil, fmt.Errorf("invalid group name: %s", g)
+			}
+		}
+		args = append(args, "-G", strings.Join(params.Groups, ","))
+	}
+
+	// Add username as last argument
+	args = append(args, params.Username)
+
+	// Create the user
+	cmdOutput, err := runSudoCommand(ctx, "useradd", args...)
+	if err != nil {
+		if cmdOutput != nil {
+			output.WriteString(cmdOutput.Stderr)
+		}
+		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, fmt.Errorf("failed to create user: %w", err)
+	}
+	output.WriteString(fmt.Sprintf("created user: %s\n", params.Username))
+
+	// Handle disabled state (lock the account)
+	if params.Disabled {
+		if lockOutput, lockErr := runSudoCommand(ctx, "usermod", "-L", params.Username); lockErr != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
+			if lockOutput != nil {
+				output.WriteString(lockOutput.Stderr)
+			}
+		} else {
+			output.WriteString("account locked (disabled)\n")
+		}
+	}
+
+	// Setup SSH authorized keys if provided
+	if len(params.SshAuthorizedKeys) > 0 {
+		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+		}
+	}
+
+	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+}
+
+// updateUser modifies an existing user account.
+func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, error) {
+	output.WriteString(fmt.Sprintf("updating existing user: %s\n", params.Username))
+
+	args := []string{}
+
+	// Shell
+	if params.Shell != "" {
+		args = append(args, "-s", params.Shell)
+	} else if params.Disabled {
+		args = append(args, "-s", "/usr/sbin/nologin")
+	}
+
+	// Home directory (only if explicitly set)
+	if params.HomeDir != "" {
+		args = append(args, "-d", params.HomeDir)
+	}
+
+	// Comment
+	if params.Comment != "" {
+		args = append(args, "-c", params.Comment)
+	}
+
+	// Primary group
+	if params.Gid > 0 {
+		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
+	} else if params.PrimaryGroup != "" {
+		e.ensureGroupExists(ctx, params.PrimaryGroup)
+		args = append(args, "-g", params.PrimaryGroup)
+	}
+
+	// Additional groups (append mode)
+	if len(params.Groups) > 0 {
+		for _, g := range params.Groups {
+			if !isValidUsername(g) {
+				return nil, fmt.Errorf("invalid group name: %s", g)
+			}
+		}
+		args = append(args, "-aG", strings.Join(params.Groups, ","))
+	}
+
+	// Apply usermod if we have changes
+	if len(args) > 0 {
+		args = append(args, params.Username)
+		cmdOutput, err := runSudoCommand(ctx, "usermod", args...)
+		if err != nil {
+			if cmdOutput != nil {
+				output.WriteString(cmdOutput.Stderr)
+			}
+			return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, fmt.Errorf("failed to update user: %w", err)
+		}
+		output.WriteString("user attributes updated\n")
+	}
+
+	// Handle disabled state
+	if params.Disabled {
+		if lockOutput, err := runSudoCommand(ctx, "usermod", "-L", params.Username); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
+			if lockOutput != nil {
+				output.WriteString(lockOutput.Stderr)
+			}
+		} else {
+			output.WriteString("account locked (disabled)\n")
+		}
+	} else {
+		// Unlock the account if not disabled
+		runSudoCommand(ctx, "usermod", "-U", params.Username)
+		output.WriteString("account unlocked\n")
+	}
+
+	// Update SSH authorized keys if provided
+	if len(params.SshAuthorizedKeys) > 0 {
+		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+		}
+	}
+
+	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+}
+
+// removeUser removes a user account from the system.
+func (e *Executor) removeUser(ctx context.Context, username string) (*pb.CommandOutput, error) {
+	if !userExists(username) {
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   fmt.Sprintf("user %s does not exist, nothing to remove\n", username),
+		}, nil
+	}
+
+	// Remove user and their home directory
+	output, err := runSudoCommand(ctx, "userdel", "-r", username)
+	if err != nil {
+		// If home directory doesn't exist, userdel -r may still succeed
+		// but report an error. Check if user is actually removed.
+		if !userExists(username) {
+			return &pb.CommandOutput{
+				ExitCode: 0,
+				Stdout:   fmt.Sprintf("removed user: %s (home directory may not have existed)\n", username),
+			}, nil
+		}
+		if output != nil {
+			return &pb.CommandOutput{ExitCode: 1, Stderr: output.Stderr}, fmt.Errorf("failed to remove user: %w", err)
+		}
+		return nil, fmt.Errorf("failed to remove user: %w", err)
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   fmt.Sprintf("removed user: %s\n", username),
+	}, nil
+}
+
+// ensureGroupExists creates a group if it doesn't exist.
+func (e *Executor) ensureGroupExists(ctx context.Context, groupName string) {
+	// Check if group exists
+	cmd := exec.Command("getent", "group", groupName)
+	if cmd.Run() == nil {
+		return // Group exists
+	}
+
+	// Create the group
+	runSudoCommand(ctx, "groupadd", groupName)
+}
+
+// setupSSHKeys configures SSH authorized keys for a user.
+func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, output *strings.Builder) error {
+	// Determine home directory
+	homeDir := params.HomeDir
+	if homeDir == "" {
+		if params.SystemUser {
+			homeDir = "/"
+		} else {
+			homeDir = filepath.Join("/home", params.Username)
+		}
+	}
+
+	sshDir := filepath.Join(homeDir, ".ssh")
+	authKeysFile := filepath.Join(sshDir, "authorized_keys")
+
+	// Create .ssh directory
+	if _, err := runSudoCommand(ctx, "mkdir", "-p", sshDir); err != nil {
+		return fmt.Errorf("failed to create .ssh directory: %w", err)
+	}
+
+	// Set ownership and permissions on .ssh directory
+	if _, err := runSudoCommand(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+		return fmt.Errorf("failed to set .ssh ownership: %w", err)
+	}
+	if _, err := runSudoCommand(ctx, "chmod", "700", sshDir); err != nil {
+		return fmt.Errorf("failed to set .ssh permissions: %w", err)
+	}
+
+	// Build authorized_keys content
+	var keysContent strings.Builder
+	for _, key := range params.SshAuthorizedKeys {
+		// Basic validation - SSH keys should start with ssh-rsa, ssh-ed25519, etc.
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
+			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key (doesn't start with ssh- or ecdsa-): %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
+			continue
+		}
+		keysContent.WriteString(trimmedKey)
+		keysContent.WriteString("\n")
+	}
+
+	// Write authorized_keys file
+	cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", authKeysFile)
+	cmd.Stdin = strings.NewReader(keysContent.String())
+	if _, err := runCommand(cmd); err != nil {
+		return fmt.Errorf("failed to write authorized_keys: %w", err)
+	}
+
+	// Set ownership and permissions on authorized_keys
+	if _, err := runSudoCommand(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
+		return fmt.Errorf("failed to set authorized_keys ownership: %w", err)
+	}
+	if _, err := runSudoCommand(ctx, "chmod", "600", authKeysFile); err != nil {
+		return fmt.Errorf("failed to set authorized_keys permissions: %w", err)
+	}
+
+	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
+	return nil
 }
 

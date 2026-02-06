@@ -53,6 +53,16 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw /
 {{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw /
 
+# User management
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/useradd *
+{{.User}} ALL=(root) NOPASSWD: /sbin/useradd *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/usermod *
+{{.User}} ALL=(root) NOPASSWD: /sbin/usermod *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/userdel *
+{{.User}} ALL=(root) NOPASSWD: /sbin/userdel *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/groupadd *
+{{.User}} ALL=(root) NOPASSWD: /sbin/groupadd *
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *
