@@ -70,10 +70,13 @@ func main() {
 	// Check for subcommands before parsing flags
 	if len(os.Args) >= 2 {
 		switch os.Args[1] {
-		case "setup":
+		case "version", "--version", "-v":
+			fmt.Printf("power-manage-agent %s\n", version)
+			return
+		case "setup", "--setup", "-setup":
 			runSetup(os.Args[2:])
 			return
-		case "query":
+		case "query", "--query", "-query":
 			runQuery(os.Args[2:])
 			return
 		}
@@ -260,6 +263,9 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 	currentBackoff := initialBackoff
 
 	for {
+		// Reset handler connection state for new connection
+		h.ResetConnection()
+
 		var client *sdk.Client
 
 		// Check if using http:// (h2c mode for development) or https:// (mTLS for production)
@@ -291,9 +297,6 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 			firstSync = false
 		}
 
-		// Sync any pending results before running
-		go syncPendingResults(ctx, sched, client, logger)
-
 		// Send security alert if pending (only on first connection attempt)
 		if securityAlert != nil {
 			go sendSecurityAlert(ctx, client, securityAlert, logger)
@@ -302,6 +305,15 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 		// Create a child context for this connection session
 		sessionCtx, cancelSession := context.WithCancel(ctx)
+
+		// Sync any pending results after connection is established (wait for welcome)
+		go func() {
+			// Wait for welcome message to be received before sending results
+			if err := h.WaitConnected(sessionCtx); err != nil {
+				return // Connection cancelled
+			}
+			syncPendingResults(sessionCtx, sched, client, logger)
+		}()
 
 		// Start periodic sync goroutine (also listens for instant sync triggers)
 		syncDone := make(chan struct{})

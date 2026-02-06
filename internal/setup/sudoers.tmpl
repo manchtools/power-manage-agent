@@ -49,6 +49,10 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/ss *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/lsof *
 
+# Filesystem repair (remount read-only filesystems)
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw /
+{{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw /
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *

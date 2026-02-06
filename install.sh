@@ -430,9 +430,20 @@ show_status() {
     echo ""
 }
 
+stop_service_if_running() {
+    if systemctl is-active --quiet "$SERVICE_NAME" 2>/dev/null; then
+        log_info "Stopping running agent service for update..."
+        systemctl stop "$SERVICE_NAME"
+    fi
+}
+
 main() {
     parse_args "$@"
     check_root
+
+    # Stop the service before updating the binary to avoid in-place update issues
+    stop_service_if_running
+
     download_binary
 
     log_info "Starting Power Manage Agent installation..."

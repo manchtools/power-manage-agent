@@ -223,6 +223,14 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 		}, nil
 	}
 
+	// Repair filesystem if mounted read-only (common after kernel errors)
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
+	}
+
 	// Repair any broken package manager state before proceeding
 	e.repairPackageManager(ctx)
 
@@ -333,6 +341,14 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		return nil, fmt.Errorf("app params required")
 	}
 
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
+	}
+
 	installPath := params.InstallPath
 	if installPath == "" {
 		installPath = "/opt/appimages"
@@ -391,6 +407,14 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		return nil, fmt.Errorf("flatpak app_id is required")
 	}
 
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
+	}
+
 	// Default to flathub if no remote specified
 	remote := params.Remote
 	if remote == "" {
@@ -442,6 +466,14 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, fmt.Errorf("app params required")
 	}
 
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
+	}
+
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		// Download to temp file
@@ -477,6 +509,14 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, error) {
 	if params == nil {
 		return nil, fmt.Errorf("app params required")
+	}
+
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
 	}
 
 	switch state {
@@ -570,6 +610,16 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		return nil, fmt.Errorf("systemd params required")
 	}
 
+	// Repair filesystem if mounted read-only (only needed if writing unit content)
+	if params.UnitContent != "" {
+		if !e.repairFilesystem(ctx) {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+			}, fmt.Errorf("filesystem is read-only")
+		}
+	}
+
 	// If unit content is provided, write it using sudo tee
 	if params.UnitContent != "" {
 		unitPath := filepath.Join("/etc/systemd/system", params.UnitName)
@@ -624,6 +674,14 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, error) {
 	if params == nil {
 		return nil, fmt.Errorf("file params required")
+	}
+
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
 	}
 
 	// Resolve symlinks to prevent traversal attacks
@@ -754,6 +812,14 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 
 	if params.Path == "" {
 		return nil, fmt.Errorf("directory path is required")
+	}
+
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
 	}
 
 	// Resolve symlinks to prevent traversal attacks
@@ -1013,6 +1079,67 @@ func runSudoCommand(ctx context.Context, name string, args ...string) (*pb.Comma
 	return runCommand(cmd)
 }
 
+// repairFilesystem attempts to fix read-only filesystem issues.
+// This can happen when the kernel remounts the filesystem as read-only due to errors.
+// Returns true if the filesystem is writable, false if repair failed.
+func (e *Executor) repairFilesystem(ctx context.Context) bool {
+	// Check if root filesystem is mounted read-only
+	mounts, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		e.logger.Warn("could not read /proc/mounts", "error", err)
+		return true // Assume writable, let operations fail naturally
+	}
+
+	// Look for root filesystem mount options
+	for _, line := range strings.Split(string(mounts), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) < 4 {
+			continue
+		}
+		mountPoint := fields[1]
+		options := fields[3]
+
+		// Check root filesystem
+		if mountPoint == "/" {
+			// Check if mounted read-only
+			optionList := strings.Split(options, ",")
+			isReadOnly := false
+			for _, opt := range optionList {
+				if opt == "ro" {
+					isReadOnly = true
+					break
+				}
+			}
+
+			if !isReadOnly {
+				return true // Filesystem is already read-write
+			}
+
+			e.logger.Warn("root filesystem is mounted read-only, attempting remount")
+
+			// Try to remount as read-write
+			output, err := runSudoCommand(ctx, "mount", "-o", "remount,rw", "/")
+			if err != nil {
+				e.logger.Error("failed to remount filesystem as read-write",
+					"error", err,
+					"output", output,
+				)
+
+				// Check if there are filesystem errors that need fsck
+				e.logger.Error("filesystem may have errors - system likely needs reboot and fsck",
+					"hint", "try: sudo fsck -y / (requires reboot to single-user mode)",
+				)
+				return false
+			}
+
+			e.logger.Info("successfully remounted root filesystem as read-write")
+			return true
+		}
+	}
+
+	return true // No issues detected
+}
+
 // repairPackageManager attempts to fix common broken package manager states.
 // This handles issues like interrupted dpkg operations, broken dependencies,
 // and stale lock files that can prevent package operations from succeeding.
@@ -1122,6 +1249,14 @@ func (e *Executor) repairFlatpak(ctx context.Context) {
 func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, error) {
 	if e.pkgManager == nil {
 		return nil, fmt.Errorf("no supported package manager found")
+	}
+
+	// Repair filesystem if mounted read-only (common after kernel errors)
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
 	}
 
 	// Repair any broken package manager state first
@@ -1295,6 +1430,14 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 
 	if params.Name == "" {
 		return nil, fmt.Errorf("repository name required")
+	}
+
+	// Repair filesystem if mounted read-only
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, fmt.Errorf("filesystem is read-only")
 	}
 
 	if !validRepoName.MatchString(params.Name) {

@@ -18,11 +18,13 @@ import (
 
 // Handler implements the SDK StreamHandler interface.
 type Handler struct {
-	logger      *slog.Logger
-	executor    *executor.Executor
-	osquery     *osquery.Registry // nil if osquery is not installed
-	scheduler   *scheduler.Scheduler
-	syncTrigger chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
+	logger       *slog.Logger
+	executor     *executor.Executor
+	osquery      *osquery.Registry // nil if osquery is not installed
+	scheduler    *scheduler.Scheduler
+	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
+	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
+	connectedSet bool            // tracks if connectedCh has been closed
 }
 
 // NewHandler creates a new stream handler.
@@ -32,6 +34,7 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 		executor:    exec,
 		scheduler:   sched,
 		syncTrigger: syncTrigger,
+		connectedCh: make(chan struct{}),
 	}
 
 	// Initialize osquery if installed (optional)
@@ -53,7 +56,32 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 // OnWelcome handles the welcome message from the server.
 func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 	h.logger.Info("received welcome from server", "server_version", welcome.ServerVersion)
+	// Signal that connection is ready for sending messages
+	if !h.connectedSet {
+		close(h.connectedCh)
+		h.connectedSet = true
+	}
 	return nil
+}
+
+// WaitConnected waits for the connection to be ready (welcome received).
+// Returns immediately if already connected, or blocks until connected or context is cancelled.
+func (h *Handler) WaitConnected(ctx context.Context) error {
+	select {
+	case <-h.connectedCh:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
+// ResetConnection resets the connection state for reconnection.
+// Must be called before each new connection attempt.
+func (h *Handler) ResetConnection() {
+	if h.connectedSet {
+		h.connectedCh = make(chan struct{})
+		h.connectedSet = false
+	}
 }
 
 // OnAction handles action dispatch from the server.
