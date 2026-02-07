@@ -224,16 +224,33 @@ Install or remove RPM packages directly from URLs.
 
 ## Scheduling
 
-Actions can be configured with schedules for autonomous execution:
+Actions can be configured with schedules for autonomous execution on the agent. The scheduler operates independently and continues running actions even when disconnected from the server. Results are stored locally and synced when connection is restored.
+
+### Schedule Fields
 
 | Field | Description |
 |-------|-------------|
 | `cron` | Cron expression (e.g., `0 2 * * *` for 2 AM daily) |
-| `interval_hours` | Run every N hours (alternative to cron) |
-| `run_on_assign` | Execute immediately when assigned |
-| `skip_if_unchanged` | Skip execution if inputs haven't changed |
+| `interval_hours` | Run every N hours (alternative to cron, default: 8 hours) |
+| `run_on_assign` | Execute immediately when first assigned, then follow the schedule |
+| `skip_if_unchanged` | Skip scheduled execution if system state already matches desired state |
 
-The scheduler operates independently and continues running actions even when disconnected from the server. Results are stored locally and synced when connection is restored.
+### Run on Assign
+
+When enabled, the action executes immediately when it is first assigned to a device, rather than waiting for the first scheduled interval. After the initial execution, the action follows its normal schedule.
+
+**Use case**: You want a package installed right away when assigning the action to new devices, but also want periodic checks to ensure it stays installed.
+
+### Skip if Unchanged
+
+When enabled, the scheduler checks if the system state already matches the desired state before executing. If nothing needs to change, the execution is skipped.
+
+**Examples**:
+- Package action with `PRESENT` state: Skip if the package is already installed
+- File action with `PRESENT` state: Skip if the file already exists with correct content
+- Systemd action with `RUNNING` state: Skip if the service is already running
+
+**Use case**: Reduce unnecessary operations for idempotent actions that run frequently. Instead of reinstalling a package every 4 hours, only act when the package is missing or changed.
 
 ## Package Manager Detection
 

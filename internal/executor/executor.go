@@ -1632,17 +1632,37 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 }
 
 // repairApt fixes common apt/dpkg issues:
+// - Stale lock files from interrupted operations
 // - Interrupted dpkg operations (dpkg --configure -a)
-// - Broken dependencies (apt-get -f install)
-// - Stale lock files
+// - Broken dependencies (apt -f install)
+// - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
+	// Determine preferred apt command (apt if available, apt-get as fallback)
+	aptCmd := "apt-get"
+	if _, err := exec.LookPath("apt"); err == nil {
+		aptCmd = "apt"
+	}
+
+	// Remove stale lock files that may be left from interrupted operations
+	runSudoCommand(ctx, "rm", "-f", "/var/lib/dpkg/lock-frontend")
+	runSudoCommand(ctx, "rm", "-f", "/var/lib/dpkg/lock")
+	runSudoCommand(ctx, "rm", "-f", "/var/lib/apt/lists/lock")
+	runSudoCommand(ctx, "rm", "-f", "/var/cache/apt/archives/lock")
+
 	// Fix any interrupted dpkg operations
 	// This handles "dpkg was interrupted, you must manually run 'dpkg --configure -a'"
 	runSudoCommand(ctx, "dpkg", "--configure", "-a")
 
-	// Fix broken dependencies
-	// This handles "You have held broken packages" and similar issues
-	runSudoCommand(ctx, "apt-get", "-f", "install", "-y")
+	// Update package lists to get latest dependency info
+	// This is crucial for resolving dependency version mismatches
+	runSudoCommand(ctx, aptCmd, "update")
+
+	// Fix broken dependencies and install missing ones
+	// This handles "unmet dependencies" and "held broken packages" issues
+	runSudoCommand(ctx, aptCmd, "--fix-broken", "install", "-y")
+
+	// Remove unused packages that might be causing conflicts
+	runSudoCommand(ctx, aptCmd, "autoremove", "-y")
 }
 
 // repairDnf fixes common dnf/rpm issues:
@@ -1687,6 +1707,7 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Stale lock files
 // - Corrupted rpm database
 // - Repository metadata issues
+// - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
 	// Remove stale lock files
 	runSudoCommand(ctx, "rm", "-f", "/var/run/zypp.pid")
@@ -1696,6 +1717,9 @@ func (e *Executor) repairZypper(ctx context.Context) {
 
 	// Refresh repositories to get fresh metadata
 	runSudoCommand(ctx, "zypper", "--non-interactive", "refresh")
+
+	// Verify and fix dependency issues
+	runSudoCommand(ctx, "zypper", "--non-interactive", "verify", "--recommends")
 
 	// Rebuild rpm database if corrupted
 	if output, err := runSudoCommand(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
@@ -1969,7 +1993,9 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 // that contain the given URL and removes them along with their associated GPG keys.
 // This prevents "conflicting values set for option Signed-By" errors when the same
 // repository URL was previously configured under a different name or with different keys.
-func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url string, output *strings.Builder) {
+// The skipRepoFile and skipKeyFile parameters specify files that should NOT be deleted
+// (typically the target repository being configured).
+func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepoFile, skipKeyFile string, output *strings.Builder) {
 	sourcesDir := "/etc/apt/sources.list.d"
 	entries, err := os.ReadDir(sourcesDir)
 	if err != nil {
@@ -1986,6 +2012,16 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url string, o
 		}
 
 		filePath := filepath.Join(sourcesDir, filename)
+
+		// Skip the target repository file we're about to create/update
+		if filePath == skipRepoFile {
+			continue
+		}
+		// Also skip if it's a legacy .list version of the same repo
+		if strings.TrimSuffix(filePath, ".list")+".sources" == skipRepoFile {
+			continue
+		}
+
 		content, err := os.ReadFile(filePath)
 		if err != nil {
 			continue
@@ -2004,6 +2040,10 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url string, o
 				line = strings.TrimSpace(line)
 				if strings.HasPrefix(line, "Signed-By:") {
 					keyPath := strings.TrimSpace(strings.TrimPrefix(line, "Signed-By:"))
+					// Skip if this is our target key file
+					if keyPath == skipKeyFile {
+						continue
+					}
 					if keyPath != "" && strings.HasPrefix(keyPath, "/") {
 						output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
 						runSudoCommand(ctx, "rm", "-f", keyPath)
@@ -2018,9 +2058,14 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url string, o
 			re := regexp.MustCompile(`signed-by=([^\s\]]+)`)
 			matches := re.FindAllStringSubmatch(string(content), -1)
 			for _, match := range matches {
-				if len(match) > 1 && strings.HasPrefix(match[1], "/") {
-					output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", match[1]))
-					runSudoCommand(ctx, "rm", "-f", match[1])
+				keyPath := match[1]
+				// Skip if this is our target key file
+				if keyPath == skipKeyFile {
+					continue
+				}
+				if len(match) > 1 && strings.HasPrefix(keyPath, "/") {
+					output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
+					runSudoCommand(ctx, "rm", "-f", keyPath)
 				}
 			}
 		}
@@ -2056,7 +2101,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		// First, scan for and remove any existing repository configs that use the same URL
 		// This prevents "conflicting values set for option Signed-By" errors when the same
 		// repository was previously configured under a different name or with different keys
-		e.cleanupConflictingAptRepos(ctx, repo.Url, &output)
+		// We skip our own repo file and key file to allow the comparison logic to work
+		e.cleanupConflictingAptRepos(ctx, repo.Url, repoFile, keyFile, &output)
 
 		// Clean up any existing repository configuration to ensure clean state
 		// This handles cases where:
@@ -2072,11 +2118,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		if _, err := os.Stat(repoFile); err == nil {
 			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
 		}
-		// Remove old GPG key - will be replaced with new one if provided
-		// This ensures we don't have stale keys from previous configurations
-		if _, err := os.Stat(keyFile); err == nil {
-			runSudoCommand(ctx, "rm", "-f", keyFile)
-		}
+		// Note: We don't delete the existing GPG key here - updateGpgKeyIfNeeded
+		// will compare the existing key with the new one and only update if different.
 		// Also check for keys in the legacy trusted.gpg.d location
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
