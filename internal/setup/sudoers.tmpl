@@ -63,6 +63,12 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/groupadd *
 {{.User}} ALL=(root) NOPASSWD: /sbin/groupadd *
 
+# Shell execution (for shell actions with run_as_root)
+{{.User}} ALL=(root) NOPASSWD: /bin/bash *
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/bash *
+{{.User}} ALL=(root) NOPASSWD: /bin/sh *
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/sh *
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *
