@@ -4,61 +4,25 @@ package executor
 import (
 	"bytes"
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
 	"io"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"sync/atomic"
 	"time"
 
-	"github.com/go-cmd/cmd"
 	"google.golang.org/protobuf/types/known/timestamppb"
-
-	"log/slog"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
 )
-
-// maxOutputBytes is the maximum number of bytes captured per command output stream.
-const maxOutputBytes = 1 << 20 // 1 MiB
-
-// OutputCallback is called for each line of output during streaming execution.
-// streamType: 1 = stdout, 2 = stderr
-// line: the output line (with newline)
-// seq: sequence number for ordering
-type OutputCallback func(streamType int, line string, seq int64)
-
-// limitWriter wraps a bytes.Buffer and stops writing after limit bytes.
-// It silently discards excess data to avoid failing the underlying command.
-type limitWriter struct {
-	buf   *bytes.Buffer
-	limit int
-	n     int
-}
-
-func (lw *limitWriter) Write(p []byte) (int, error) {
-	remaining := lw.limit - lw.n
-	if remaining <= 0 {
-		return len(p), nil // discard silently
-	}
-	toWrite := p
-	if len(p) > remaining {
-		toWrite = p[:remaining]
-	}
-	n, err := lw.buf.Write(toWrite)
-	lw.n += n
-	return len(p), err // report full write to avoid cmd failure
-}
 
 // resolveAndValidatePath resolves symlinks in the parent directory of the given
 // path and returns the cleaned, resolved absolute path. This prevents symlink
@@ -288,33 +252,25 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 			if params.Version != "" {
 				installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
 				if installedVersion == params.Version {
-					// Check pin status if requested
+					// Version matches, check if we need to pin
 					if params.Pin {
-						isPinned, _ := e.pkgManager.IsPinned(pkgName)
-						if isPinned {
-							return &pb.CommandOutput{
-								ExitCode: 0,
-								Stdout:   fmt.Sprintf("package %s version %s is already installed and pinned", pkgName, params.Version),
-							}, false, nil
-						}
-						// Need to pin, fall through to pin only
-						if !e.repairFilesystem(ctx) {
-							return &pb.CommandOutput{
-								ExitCode: 1,
-								Stderr:   "filesystem is read-only",
-							}, false, fmt.Errorf("filesystem is read-only")
-						}
-						_, pinErr := e.pkgManager.Pin(pkgName).Run()
+						changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
 						if pinErr != nil {
 							return &pb.CommandOutput{
 								ExitCode: 1,
 								Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
 							}, false, pinErr
 						}
+						if changed {
+							return &pb.CommandOutput{
+								ExitCode: 0,
+								Stdout:   fmt.Sprintf("package %s version %s was already installed, pinned", pkgName, params.Version),
+							}, true, nil
+						}
 						return &pb.CommandOutput{
 							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s version %s was already installed, pinned", pkgName, params.Version),
-						}, true, nil
+							Stdout:   fmt.Sprintf("package %s version %s is already installed and pinned", pkgName, params.Version),
+						}, false, nil
 					}
 					return &pb.CommandOutput{
 						ExitCode: 0,
@@ -325,31 +281,23 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 			} else {
 				// No specific version requested, package is installed
 				if params.Pin {
-					isPinned, _ := e.pkgManager.IsPinned(pkgName)
-					if isPinned {
-						return &pb.CommandOutput{
-							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s is already installed and pinned", pkgName),
-						}, false, nil
-					}
-					// Need to pin only
-					if !e.repairFilesystem(ctx) {
-						return &pb.CommandOutput{
-							ExitCode: 1,
-							Stderr:   "filesystem is read-only",
-						}, false, fmt.Errorf("filesystem is read-only")
-					}
-					_, pinErr := e.pkgManager.Pin(pkgName).Run()
+					changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
 					if pinErr != nil {
 						return &pb.CommandOutput{
 							ExitCode: 1,
 							Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
 						}, false, pinErr
 					}
+					if changed {
+						return &pb.CommandOutput{
+							ExitCode: 0,
+							Stdout:   fmt.Sprintf("package %s was already installed, pinned", pkgName),
+						}, true, nil
+					}
 					return &pb.CommandOutput{
 						ExitCode: 0,
-						Stdout:   fmt.Sprintf("package %s was already installed, pinned", pkgName),
-					}, true, nil
+						Stdout:   fmt.Sprintf("package %s is already installed and pinned", pkgName),
+					}, false, nil
 				}
 				return &pb.CommandOutput{
 					ExitCode: 0,
@@ -389,8 +337,7 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 
 		// Pin if requested
 		if err == nil && params.Pin {
-			_, pinErr := e.pkgManager.Pin(pkgName).Run()
-			if pinErr != nil {
+			if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
 				result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
 			}
 		}
@@ -416,8 +363,8 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 		// Repair any broken package manager state before proceeding
 		e.repairPackageManager(ctx)
 
-		// Unpin first if it was pinned
-		e.pkgManager.Unpin(pkgName).Run() // Ignore errors
+		// Unpin first if it was pinned (ignore errors)
+		e.ensurePackageUnpinned(pkgName)
 		result, err = e.pkgManager.Remove(pkgName).Run()
 
 	default:
@@ -622,14 +569,14 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Install the flatpak application
-		output, err := runSudoCommand(ctx, "flatpak", "install", "-y", "--noninteractive", systemFlag, remote, params.AppId)
+		output, err := runSudoCmd(ctx, "flatpak", "install", "-y", "--noninteractive", systemFlag, remote, params.AppId)
 		if err != nil {
 			return output, false, fmt.Errorf("flatpak install failed: %w", err)
 		}
 
 		// Pin if requested (mask prevents updates)
 		if params.Pin {
-			pinOutput, pinErr := runSudoCommand(ctx, "flatpak", "mask", systemFlag, params.AppId)
+			pinOutput, pinErr := runSudoCmd(ctx, "flatpak", "mask", systemFlag, params.AppId)
 			if pinErr != nil {
 				if output != nil {
 					output.Stdout += "\nWarning: failed to pin application: " + pinErr.Error()
@@ -658,10 +605,10 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Remove pin first if it exists
-		runSudoCommand(ctx, "flatpak", "mask", "--remove", systemFlag, params.AppId)
+		runSudoCmd(ctx, "flatpak", "mask", "--remove", systemFlag, params.AppId)
 
 		// Uninstall the flatpak application
-		output, err := runSudoCommand(ctx, "flatpak", "uninstall", "-y", "--noninteractive", systemFlag, params.AppId)
+		output, err := runSudoCmd(ctx, "flatpak", "uninstall", "-y", "--noninteractive", systemFlag, params.AppId)
 		return output, true, err
 	}
 
@@ -670,8 +617,7 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 
 // isFlatpakInstalled checks if a flatpak app is installed.
 func (e *Executor) isFlatpakInstalled(appId, systemFlag string) bool {
-	cmd := exec.Command("flatpak", "info", systemFlag, appId)
-	return cmd.Run() == nil
+	return checkCmdSuccess("flatpak", "info", systemFlag, appId)
 }
 
 func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -716,10 +662,10 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Install with dpkg (requires sudo)
-		output, err := runSudoCommand(ctx, "dpkg", "-i", tmpFile.Name())
+		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
 		if err != nil {
 			// Try to fix dependencies
-			runSudoCommand(ctx, "apt-get", "-f", "install", "-y")
+			aptFixBroken(ctx)
 		}
 		return output, true, err
 
@@ -739,7 +685,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
 
-		output, err := runSudoCommand(ctx, "dpkg", "-r", pkgName)
+		output, err := runSudoCmd(ctx, "dpkg", "-r", pkgName)
 		return output, true, err
 	}
 
@@ -748,8 +694,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 
 // isDebInstalled checks if a deb package is installed.
 func (e *Executor) isDebInstalled(pkgName string) bool {
-	cmd := exec.Command("dpkg", "-s", pkgName)
-	return cmd.Run() == nil
+	return checkCmdSuccess("dpkg", "-s", pkgName)
 }
 
 func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -794,7 +739,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Install with rpm (requires sudo)
-		output, err := runSudoCommand(ctx, "rpm", "-i", tmpFile.Name())
+		output, err := runSudoCmd(ctx, "rpm", "-i", tmpFile.Name())
 		return output, true, err
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
@@ -813,7 +758,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
 
-		output, err := runSudoCommand(ctx, "rpm", "-e", pkgName)
+		output, err := runSudoCmd(ctx, "rpm", "-e", pkgName)
 		return output, true, err
 	}
 
@@ -822,8 +767,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 
 // isRpmInstalled checks if an rpm package is installed.
 func (e *Executor) isRpmInstalled(pkgName string) bool {
-	cmd := exec.Command("rpm", "-q", pkgName)
-	return cmd.Run() == nil
+	return checkCmdSuccess("rpm", "-q", pkgName)
 }
 
 func (e *Executor) executeShell(ctx context.Context, params *pb.ShellParams) (*pb.CommandOutput, error) {
@@ -863,26 +807,11 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 
 	// Use streaming execution if callback provided, otherwise fall back to standard
 	if callback != nil {
-		return runCommandStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+		return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
 	}
 
-	// Non-streaming fallback
-	var cmd *exec.Cmd
-	if params.RunAsRoot {
-		cmd = exec.CommandContext(ctx, "sudo", "-n", interpreter, "-c", params.Script)
-	} else {
-		cmd = exec.CommandContext(ctx, interpreter, "-c", params.Script)
-	}
-
-	if params.WorkingDirectory != "" {
-		cmd.Dir = params.WorkingDirectory
-	}
-
-	if len(params.Environment) > 0 {
-		cmd.Env = envVars
-	}
-
-	return runCommand(cmd)
+	// Non-streaming fallback - use runCmdStreaming with nil callback for consistent behavior
+	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, nil)
 }
 
 func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams) (*pb.CommandOutput, bool, error) {
@@ -918,16 +847,14 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 			}
 
 			// Write unit file using sudo tee
-			cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", unitPath)
-			cmd.Stdin = strings.NewReader(params.UnitContent)
-			if cmdOutput, err := runCommand(cmd); err != nil {
+			if cmdOutput, err := writeFileWithSudo(ctx, unitPath, params.UnitContent); err != nil {
 				return cmdOutput, false, fmt.Errorf("write unit file: %s", formatCmdError(err, cmdOutput))
 			}
 			output.WriteString(fmt.Sprintf("updated unit file %s\n", unitPath))
 			changed = true
 
 			// Reload systemd
-			if _, err := runSudoCommand(ctx, "systemctl", "daemon-reload"); err != nil {
+			if _, err := runSudoCmd(ctx, "systemctl", "daemon-reload"); err != nil {
 				return nil, changed, fmt.Errorf("daemon-reload failed")
 			}
 			output.WriteString("reloaded systemd daemon\n")
@@ -941,13 +868,13 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		if e.isUnitMasked(params.UnitName) {
 			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
 		}
-		if _, err := runSudoCommand(ctx, "systemctl", "enable", params.UnitName); err != nil {
+		if _, err := runSudoCmd(ctx, "systemctl", "enable", params.UnitName); err != nil {
 			return nil, changed, fmt.Errorf("enable: %v", err)
 		}
 		output.WriteString("enabled unit\n")
 		changed = true
 	} else if !params.Enable && isEnabled {
-		if _, err := runSudoCommand(ctx, "systemctl", "disable", params.UnitName); err != nil {
+		if _, err := runSudoCmd(ctx, "systemctl", "disable", params.UnitName); err != nil {
 			// Ignore errors for disable (unit might not exist)
 			output.WriteString("disable failed (unit may not exist)\n")
 		} else {
@@ -961,7 +888,7 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	switch params.DesiredState {
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STARTED:
 		if !isActive {
-			if _, err := runSudoCommand(ctx, "systemctl", "start", params.UnitName); err != nil {
+			if _, err := runSudoCmd(ctx, "systemctl", "start", params.UnitName); err != nil {
 				return nil, changed, fmt.Errorf("start: %v", err)
 			}
 			output.WriteString("started unit\n")
@@ -971,7 +898,7 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STOPPED:
 		if isActive {
-			if _, err := runSudoCommand(ctx, "systemctl", "stop", params.UnitName); err != nil {
+			if _, err := runSudoCmd(ctx, "systemctl", "stop", params.UnitName); err != nil {
 				return nil, changed, fmt.Errorf("stop: %v", err)
 			}
 			output.WriteString("stopped unit\n")
@@ -981,7 +908,7 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_RESTARTED:
 		// Restart always runs (not idempotent by design)
-		if _, err := runSudoCommand(ctx, "systemctl", "restart", params.UnitName); err != nil {
+		if _, err := runSudoCmd(ctx, "systemctl", "restart", params.UnitName); err != nil {
 			return nil, changed, fmt.Errorf("restart: %v", err)
 		}
 		output.WriteString("restarted unit\n")
@@ -998,33 +925,17 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 // isUnitEnabled checks if a systemd unit is enabled or in a state where
 // enabling is not needed (static, indirect, generated units).
 func (e *Executor) isUnitEnabled(unitName string) bool {
-	cmd := exec.Command("systemctl", "is-enabled", unitName)
-	out, _ := cmd.Output()
-	status := strings.TrimSpace(string(out))
-	switch status {
-	case "enabled", "enabled-runtime":
-		return true
-	case "static", "indirect", "generated":
-		// These units cannot or don't need to be enabled explicitly
-		return true
-	default:
-		// disabled, masked, or unknown
-		return false
-	}
+	return isUnitEnabled(unitName)
 }
 
 // isUnitMasked checks if a systemd unit is masked.
 func (e *Executor) isUnitMasked(unitName string) bool {
-	cmd := exec.Command("systemctl", "is-enabled", unitName)
-	out, _ := cmd.Output()
-	return strings.TrimSpace(string(out)) == "masked"
+	return isUnitMasked(unitName)
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
 func (e *Executor) isUnitActive(unitName string) bool {
-	cmd := exec.Command("systemctl", "is-active", unitName)
-	out, _ := cmd.Output()
-	return strings.TrimSpace(string(out)) == "active"
+	return isUnitActive(unitName)
 }
 
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -1057,8 +968,9 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// Create parent directories using sudo
-		if _, err := runSudoCommand(ctx, "mkdir", "-p", filepath.Dir(resolvedPath)); err != nil {
-			return nil, false, fmt.Errorf("create directories: %w", err)
+		parentDir := filepath.Dir(resolvedPath)
+		if _, err := createDirectory(ctx, parentDir, true); err != nil {
+			return nil, false, fmt.Errorf("create directory %s: %w", parentDir, err)
 		}
 
 		// Determine final content based on managed block mode
@@ -1066,8 +978,14 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		actionVerb := "created"
 		if params.ManagedBlock {
 			// For managed block: read existing content and append block if not present
-			existingContent, err := os.ReadFile(resolvedPath)
-			if err != nil && !os.IsNotExist(err) {
+			// Use sudo cat to read files with restrictive permissions
+			var existingContent []byte
+			if output, err := runSudoCmd(ctx, "cat", resolvedPath); err == nil {
+				existingContent = []byte(output.Stdout)
+			} else if output != nil && strings.Contains(output.Stderr, "No such file") {
+				// File doesn't exist, that's fine
+				existingContent = nil
+			} else {
 				return nil, false, fmt.Errorf("read existing file: %w", err)
 			}
 			// Ensure there's a newline before appending block if file exists and doesn't end with newline
@@ -1081,43 +999,10 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			finalContent = params.Content
 		}
 
-		// Atomic write: write to temp file, then move into place.
-		// This avoids TOCTOU race conditions where the file could be
-		// swapped between write and chmod/chown operations.
-		tmpPath := resolvedPath + ".pm-tmp"
-
-		// Write content to temp file using sudo tee
-		cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", tmpPath)
-		cmd.Stdin = strings.NewReader(finalContent)
-		if _, err := runCommand(cmd); err != nil {
-			runSudoCommand(ctx, "rm", "-f", tmpPath) // cleanup
-			return nil, false, fmt.Errorf("write file: %w", err)
-		}
-
-		// Set mode on temp file before moving
-		if params.Mode != "" {
-			if _, err := runSudoCommand(ctx, "chmod", params.Mode, tmpPath); err != nil {
-				runSudoCommand(ctx, "rm", "-f", tmpPath) // cleanup
-				return nil, false, fmt.Errorf("chmod: %w", err)
-			}
-		}
-
-		// Set owner on temp file before moving
-		if params.Owner != "" || params.Group != "" {
-			ownership := params.Owner
-			if params.Group != "" {
-				ownership += ":" + params.Group
-			}
-			if _, err := runSudoCommand(ctx, "chown", ownership, tmpPath); err != nil {
-				runSudoCommand(ctx, "rm", "-f", tmpPath) // cleanup
-				return nil, false, fmt.Errorf("chown: %w", err)
-			}
-		}
-
-		// Atomic move into place (same filesystem)
-		if _, err := runSudoCommand(ctx, "mv", "-f", tmpPath, resolvedPath); err != nil {
-			runSudoCommand(ctx, "rm", "-f", tmpPath) // cleanup
-			return nil, false, fmt.Errorf("move file into place: %w", err)
+		// Atomic write: write to temp file, set permissions, then move into place.
+		// This avoids TOCTOU race conditions.
+		if err := atomicWriteFile(ctx, resolvedPath, finalContent, params.Mode, params.Owner, params.Group); err != nil {
+			return nil, false, err
 		}
 
 		return &pb.CommandOutput{
@@ -1144,13 +1029,14 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 
 		// For managed block mode, remove only the specified content block from the file
 		if params.ManagedBlock {
-			existingContent, err := os.ReadFile(resolvedPath)
+			// Read file with restrictive permissions
+			existingContent, err := readFileWithSudo(ctx, resolvedPath)
 			if err != nil {
 				return nil, false, fmt.Errorf("read file: %w", err)
 			}
 
 			// Check if content exists in file
-			if !strings.Contains(string(existingContent), params.Content) {
+			if !strings.Contains(existingContent, params.Content) {
 				return &pb.CommandOutput{
 					ExitCode: 0,
 					Stdout:   fmt.Sprintf("content not found in %s, nothing to remove", resolvedPath),
@@ -1158,42 +1044,15 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}
 
 			// Remove the content block from the file
-			newContent := strings.Replace(string(existingContent), params.Content, "", 1)
+			newContent := strings.Replace(existingContent, params.Content, "", 1)
 			// Clean up any resulting double newlines
 			for strings.Contains(newContent, "\n\n\n") {
 				newContent = strings.ReplaceAll(newContent, "\n\n\n", "\n\n")
 			}
 
 			// Write the modified content back using atomic write
-			tmpPath := resolvedPath + ".pm-tmp"
-			cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", tmpPath)
-			cmd.Stdin = strings.NewReader(newContent)
-			if _, err := runCommand(cmd); err != nil {
-				runSudoCommand(ctx, "rm", "-f", tmpPath)
-				return nil, false, fmt.Errorf("write file: %w", err)
-			}
-
-			// Preserve original mode and ownership
-			if params.Mode != "" {
-				if _, err := runSudoCommand(ctx, "chmod", params.Mode, tmpPath); err != nil {
-					runSudoCommand(ctx, "rm", "-f", tmpPath)
-					return nil, false, fmt.Errorf("chmod: %w", err)
-				}
-			}
-			if params.Owner != "" || params.Group != "" {
-				ownership := params.Owner
-				if params.Group != "" {
-					ownership += ":" + params.Group
-				}
-				if _, err := runSudoCommand(ctx, "chown", ownership, tmpPath); err != nil {
-					runSudoCommand(ctx, "rm", "-f", tmpPath)
-					return nil, false, fmt.Errorf("chown: %w", err)
-				}
-			}
-
-			if _, err := runSudoCommand(ctx, "mv", "-f", tmpPath, resolvedPath); err != nil {
-				runSudoCommand(ctx, "rm", "-f", tmpPath)
-				return nil, false, fmt.Errorf("move file into place: %w", err)
+			if err := atomicWriteFile(ctx, resolvedPath, newContent, params.Mode, params.Owner, params.Group); err != nil {
+				return nil, false, err
 			}
 
 			return &pb.CommandOutput{
@@ -1203,7 +1062,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// For regular mode, delete the entire file
-		if _, err := runSudoCommand(ctx, "rm", "-f", resolvedPath); err != nil {
+		if _, err := removeFileStrict(ctx, resolvedPath); err != nil {
 			return nil, false, fmt.Errorf("remove: %w", err)
 		}
 		return &pb.CommandOutput{
@@ -1260,28 +1119,18 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 		}
 	}
 
-	// Check owner/group if specified (requires stat syscall)
+	// Check owner/group if specified
 	if params.Owner != "" || params.Group != "" {
-		// Use stat command to get current owner:group
-		cmd := exec.Command("stat", "-c", "%U:%G", path)
-		out, err := cmd.Output()
-		if err != nil {
+		currentOwner, currentGroup := getFileOwnership(path)
+		if currentOwner == "" && currentGroup == "" {
 			return false
-		}
-		currentOwnership := strings.TrimSpace(string(out))
-		desiredOwnership := params.Owner
-		if params.Group != "" {
-			desiredOwnership += ":" + params.Group
-		} else {
-			desiredOwnership += ":"
 		}
 		// Handle case where only owner is specified
 		if params.Group == "" {
-			parts := strings.Split(currentOwnership, ":")
-			if len(parts) > 0 && parts[0] != params.Owner {
+			if currentOwner != params.Owner {
 				return false
 			}
-		} else if currentOwnership != desiredOwnership {
+		} else if currentOwner != params.Owner || currentGroup != params.Group {
 			return false
 		}
 	}
@@ -1373,33 +1222,9 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
 
-		// Create directory (with -p flag if recursive is true, which is default)
-		mkdirArgs := []string{}
-		if params.Recursive {
-			mkdirArgs = append(mkdirArgs, "-p")
-		}
-		mkdirArgs = append(mkdirArgs, cleanPath)
-
-		if _, err := runSudoCommand(ctx, "mkdir", mkdirArgs...); err != nil {
-			return nil, false, fmt.Errorf("create directory: %w", err)
-		}
-
-		// Set mode using sudo chmod
-		if params.Mode != "" {
-			if _, err := runSudoCommand(ctx, "chmod", params.Mode, cleanPath); err != nil {
-				return nil, false, fmt.Errorf("chmod: %w", err)
-			}
-		}
-
-		// Set owner using sudo chown
-		if params.Owner != "" || params.Group != "" {
-			ownership := params.Owner
-			if params.Group != "" {
-				ownership += ":" + params.Group
-			}
-			if _, err := runSudoCommand(ctx, "chown", ownership, cleanPath); err != nil {
-				return nil, false, fmt.Errorf("chown: %w", err)
-			}
+		// Create directory with permissions (handles mkdir, chmod, and chown)
+		if err := createDirectoryWithPermissions(ctx, cleanPath, params.Mode, params.Owner, params.Group, params.Recursive); err != nil {
+			return nil, false, err
 		}
 
 		return &pb.CommandOutput{
@@ -1430,7 +1255,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Remove directory (use -r for recursive removal if it has contents)
-		if _, err := runSudoCommand(ctx, "rm", "-rf", cleanPath); err != nil {
+		if _, err := removeDirectory(ctx, cleanPath); err != nil {
 			return nil, false, fmt.Errorf("remove directory: %w", err)
 		}
 		return &pb.CommandOutput{
@@ -1468,24 +1293,15 @@ func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryPara
 
 	// Check owner/group if specified
 	if params.Owner != "" || params.Group != "" {
-		cmd := exec.Command("stat", "-c", "%U:%G", path)
-		out, err := cmd.Output()
-		if err != nil {
+		currentOwner, currentGroup := getFileOwnership(path)
+		if currentOwner == "" && currentGroup == "" {
 			return false
 		}
-		currentOwnership := strings.TrimSpace(string(out))
-		desiredOwnership := params.Owner
-		if params.Group != "" {
-			desiredOwnership += ":" + params.Group
-		} else {
-			desiredOwnership += ":"
-		}
 		if params.Group == "" {
-			parts := strings.Split(currentOwnership, ":")
-			if len(parts) > 0 && parts[0] != params.Owner {
+			if currentOwner != params.Owner {
 				return false
 			}
-		} else if currentOwnership != desiredOwnership {
+		} else if currentOwner != params.Owner || currentGroup != params.Group {
 			return false
 		}
 	}
@@ -1535,158 +1351,180 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	return nil
 }
 
-func runCommand(c *exec.Cmd) (*pb.CommandOutput, error) {
-	var stdoutBuf, stderrBuf bytes.Buffer
-	stdout := &limitWriter{buf: &stdoutBuf, limit: maxOutputBytes}
-	stderr := &limitWriter{buf: &stderrBuf, limit: maxOutputBytes}
-	c.Stdout = stdout
-	c.Stderr = stderr
-
-	err := c.Run()
-
-	stdoutStr := stdoutBuf.String()
-	stderrStr := stderrBuf.String()
-	if stdout.n > stdout.limit {
-		stdoutStr += "\n[output truncated]"
+// getAptCommand returns the preferred apt command ("apt" or "apt-get").
+// Prefers "apt" if available as it provides better progress output.
+func getAptCommand() string {
+	if _, err := exec.LookPath("apt"); err == nil {
+		return "apt"
 	}
-	if stderr.n > stderr.limit {
-		stderrStr += "\n[output truncated]"
-	}
-
-	output := &pb.CommandOutput{
-		Stdout: stdoutStr,
-		Stderr: stderrStr,
-	}
-
-	if c.ProcessState != nil {
-		output.ExitCode = int32(c.ProcessState.ExitCode())
-	}
-
-	return output, err
+	return "apt-get"
 }
 
-// runCommandStreaming executes a command with real-time output streaming using go-cmd/cmd.
-// The callback is called for each line of output as it's produced.
-func runCommandStreaming(ctx context.Context, name string, args []string, envVars []string, dir string, callback OutputCallback) (*pb.CommandOutput, error) {
-	// Create command with streaming enabled
-	c := cmd.NewCmdOptions(cmd.Options{
-		Buffered:  false, // Don't buffer, stream instead
-		Streaming: true,  // Enable streaming
-	}, name, args...)
+// =============================================================================
+// APT Helper Functions
+// =============================================================================
 
-	if dir != "" {
-		c.Dir = dir
-	}
-	if len(envVars) > 0 {
-		c.Env = envVars
-	}
-
-	// Start the command
-	statusChan := c.Start()
-
-	var stdoutSeq, stderrSeq int64
-	var stdoutBuf, stderrBuf strings.Builder
-	var stdoutBytes, stderrBytes int64
-
-	// Create done channel for cleanup
-	done := make(chan struct{})
-
-	// Stream output in a goroutine
-	go func() {
-		defer close(done)
-		for {
-			select {
-			case line, ok := <-c.Stdout:
-				if !ok {
-					// Channel closed, drain stderr and exit
-					for line := range c.Stderr {
-						lineBytes := int64(len(line) + 1)
-						if atomic.AddInt64(&stderrBytes, lineBytes) <= int64(maxOutputBytes) {
-							stderrBuf.WriteString(line + "\n")
-						}
-						if callback != nil {
-							callback(2, line+"\n", atomic.AddInt64(&stderrSeq, 1)-1)
-						}
-					}
-					return
-				}
-				lineBytes := int64(len(line) + 1)
-				if atomic.AddInt64(&stdoutBytes, lineBytes) <= int64(maxOutputBytes) {
-					stdoutBuf.WriteString(line + "\n")
-				}
-				if callback != nil {
-					callback(1, line+"\n", atomic.AddInt64(&stdoutSeq, 1)-1)
-				}
-			case line, ok := <-c.Stderr:
-				if !ok {
-					// Channel closed, drain stdout and exit
-					for line := range c.Stdout {
-						lineBytes := int64(len(line) + 1)
-						if atomic.AddInt64(&stdoutBytes, lineBytes) <= int64(maxOutputBytes) {
-							stdoutBuf.WriteString(line + "\n")
-						}
-						if callback != nil {
-							callback(1, line+"\n", atomic.AddInt64(&stdoutSeq, 1)-1)
-						}
-					}
-					return
-				}
-				lineBytes := int64(len(line) + 1)
-				if atomic.AddInt64(&stderrBytes, lineBytes) <= int64(maxOutputBytes) {
-					stderrBuf.WriteString(line + "\n")
-				}
-				if callback != nil {
-					callback(2, line+"\n", atomic.AddInt64(&stderrSeq, 1)-1)
-				}
-			case <-ctx.Done():
-				c.Stop()
-				return
-			}
-		}
-	}()
-
-	// Wait for command to complete
-	status := <-statusChan
-
-	// Wait for streaming goroutine to finish
-	<-done
-
-	stdoutStr := stdoutBuf.String()
-	stderrStr := stderrBuf.String()
-	if atomic.LoadInt64(&stdoutBytes) > int64(maxOutputBytes) {
-		stdoutStr += "\n[output truncated]"
-	}
-	if atomic.LoadInt64(&stderrBytes) > int64(maxOutputBytes) {
-		stderrStr += "\n[output truncated]"
-	}
-
-	return &pb.CommandOutput{
-		Stdout:   stdoutStr,
-		Stderr:   stderrStr,
-		ExitCode: int32(status.Exit),
-	}, status.Error
+// aptUpdate runs apt update to refresh package lists.
+func aptUpdate(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, getAptCommand(), "update")
 }
 
-// formatCmdError formats a command error with stderr output for better diagnostics.
-func formatCmdError(err error, output *pb.CommandOutput) string {
-	if output != nil && output.Stderr != "" {
-		return fmt.Sprintf("%v: %s", err, strings.TrimSpace(output.Stderr))
-	}
-	return err.Error()
+// aptUpgrade runs apt upgrade -y to upgrade all packages.
+func aptUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, getAptCommand(), "upgrade", "-y")
 }
 
-// runSudoCommand wraps a command with sudo for privileged operations.
-// Uses -n (non-interactive) to avoid password prompts that would hang.
-func runSudoCommand(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-	// Resolve to absolute path so the command matches sudoers rules,
-	// which require full paths (e.g., /usr/bin/cp instead of cp).
-	absPath, err := exec.LookPath(name)
+// aptDistUpgrade runs apt dist-upgrade -y for held-back packages.
+func aptDistUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, getAptCommand(), "dist-upgrade", "-y")
+}
+
+// aptAutoremove runs apt autoremove -y to remove unused packages.
+func aptAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, getAptCommand(), "autoremove", "-y")
+}
+
+// aptFixBroken runs apt --fix-broken install -y to repair broken dependencies.
+func aptFixBroken(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, getAptCommand(), "--fix-broken", "install", "-y")
+}
+
+// =============================================================================
+// DNF Helper Functions
+// =============================================================================
+
+// dnfMakecache runs dnf makecache to refresh package metadata.
+func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "dnf", "-y", "makecache")
+}
+
+// dnfUpgrade runs dnf upgrade. If securityOnly is true, only security updates are applied.
+func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, error) {
+	if securityOnly {
+		return runSudoCmd(ctx, "dnf", "-y", "upgrade", "--security")
+	}
+	return runSudoCmd(ctx, "dnf", "-y", "upgrade")
+}
+
+// dnfAutoremove runs dnf autoremove -y to remove unused packages.
+func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
+}
+
+// =============================================================================
+// Zypper Helper Functions
+// =============================================================================
+
+// zypperRefresh runs zypper refresh to update repository metadata.
+func zypperRefresh(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "zypper", "--non-interactive", "refresh")
+}
+
+// zypperUpdate runs zypper update to upgrade all packages.
+func zypperUpdate(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "zypper", "--non-interactive", "update")
+}
+
+// =============================================================================
+// Pacman Helper Functions
+// =============================================================================
+
+// pacmanSync runs pacman -Sy to sync package databases.
+func pacmanSync(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "pacman", "-Sy", "--noconfirm")
+}
+
+// pacmanUpgrade runs pacman -Syu to sync and upgrade all packages.
+func pacmanUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
+	return runSudoCmd(ctx, "pacman", "-Syu", "--noconfirm")
+}
+
+// =============================================================================
+// Package Pinning Helper Functions
+// =============================================================================
+
+// isPackagePinned checks if a package is pinned (held from upgrades).
+// Uses the underlying package manager's pinning mechanism:
+// - APT: apt-mark hold
+// - DNF: dnf versionlock
+// - Pacman: IgnorePkg in pacman.conf
+// - Zypper: zypper lock
+// - Flatpak: flatpak mask
+func (e *Executor) isPackagePinned(pkgName string) (bool, error) {
+	if e.pkgManager == nil {
+		return false, fmt.Errorf("no package manager available")
+	}
+	return e.pkgManager.IsPinned(pkgName)
+}
+
+// pinPackage pins a package to prevent it from being upgraded.
+// Returns (changed, error) where changed is true if the package was newly pinned.
+func (e *Executor) pinPackage(pkgName string) (bool, error) {
+	if e.pkgManager == nil {
+		return false, fmt.Errorf("no package manager available")
+	}
+
+	// Check if already pinned
+	isPinned, err := e.pkgManager.IsPinned(pkgName)
 	if err != nil {
-		return nil, fmt.Errorf("command not found: %s", name)
+		return false, fmt.Errorf("check pin status: %w", err)
 	}
-	sudoArgs := append([]string{"-n", absPath}, args...)
-	cmd := exec.CommandContext(ctx, "sudo", sudoArgs...)
-	return runCommand(cmd)
+	if isPinned {
+		return false, nil // Already pinned, no change
+	}
+
+	// Pin the package
+	_, err = e.pkgManager.Pin(pkgName).Run()
+	if err != nil {
+		return false, fmt.Errorf("pin package: %w", err)
+	}
+	return true, nil
+}
+
+// unpinPackage unpins a package to allow it to be upgraded.
+// Returns (changed, error) where changed is true if the package was unpinned.
+func (e *Executor) unpinPackage(pkgName string) (bool, error) {
+	if e.pkgManager == nil {
+		return false, fmt.Errorf("no package manager available")
+	}
+
+	// Check if currently pinned
+	isPinned, err := e.pkgManager.IsPinned(pkgName)
+	if err != nil {
+		return false, fmt.Errorf("check pin status: %w", err)
+	}
+	if !isPinned {
+		return false, nil // Already unpinned, no change
+	}
+
+	// Unpin the package
+	_, err = e.pkgManager.Unpin(pkgName).Run()
+	if err != nil {
+		return false, fmt.Errorf("unpin package: %w", err)
+	}
+	return true, nil
+}
+
+// ensurePackagePinned ensures a package is pinned. Returns true if a change was made.
+// This is a convenience method that handles filesystem repair before pinning.
+func (e *Executor) ensurePackagePinned(ctx context.Context, pkgName string) (bool, error) {
+	// Check if already pinned first (no filesystem write needed)
+	isPinned, _ := e.isPackagePinned(pkgName)
+	if isPinned {
+		return false, nil
+	}
+
+	// Repair filesystem if needed before writing
+	if !e.repairFilesystem(ctx) {
+		return false, fmt.Errorf("filesystem is read-only")
+	}
+
+	return e.pinPackage(pkgName)
+}
+
+// ensurePackageUnpinned ensures a package is unpinned. Returns true if a change was made.
+func (e *Executor) ensurePackageUnpinned(pkgName string) (bool, error) {
+	return e.unpinPackage(pkgName)
 }
 
 // repairFilesystem attempts to fix read-only filesystem issues.
@@ -1728,7 +1566,7 @@ func (e *Executor) repairFilesystem(ctx context.Context) bool {
 			e.logger.Warn("root filesystem is mounted read-only, attempting remount")
 
 			// Try to remount as read-write
-			output, err := runSudoCommand(ctx, "mount", "-o", "remount,rw", "/")
+			output, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", "/")
 			if err != nil {
 				e.logger.Error("failed to remount filesystem as read-write",
 					"error", err,
@@ -1777,32 +1615,26 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 // - Broken dependencies (apt -f install)
 // - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
-	// Determine preferred apt command (apt if available, apt-get as fallback)
-	aptCmd := "apt-get"
-	if _, err := exec.LookPath("apt"); err == nil {
-		aptCmd = "apt"
-	}
-
 	// Remove stale lock files that may be left from interrupted operations
-	runSudoCommand(ctx, "rm", "-f", "/var/lib/dpkg/lock-frontend")
-	runSudoCommand(ctx, "rm", "-f", "/var/lib/dpkg/lock")
-	runSudoCommand(ctx, "rm", "-f", "/var/lib/apt/lists/lock")
-	runSudoCommand(ctx, "rm", "-f", "/var/cache/apt/archives/lock")
+	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock-frontend")
+	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock")
+	runSudoCmd(ctx, "rm", "-f", "/var/lib/apt/lists/lock")
+	runSudoCmd(ctx, "rm", "-f", "/var/cache/apt/archives/lock")
 
 	// Fix any interrupted dpkg operations
 	// This handles "dpkg was interrupted, you must manually run 'dpkg --configure -a'"
-	runSudoCommand(ctx, "dpkg", "--configure", "-a")
+	runSudoCmd(ctx, "dpkg", "--configure", "-a")
 
 	// Update package lists to get latest dependency info
 	// This is crucial for resolving dependency version mismatches
-	runSudoCommand(ctx, aptCmd, "update")
+	aptUpdate(ctx)
 
 	// Fix broken dependencies and install missing ones
 	// This handles "unmet dependencies" and "held broken packages" issues
-	runSudoCommand(ctx, aptCmd, "--fix-broken", "install", "-y")
+	aptFixBroken(ctx)
 
 	// Remove unused packages that might be causing conflicts
-	runSudoCommand(ctx, aptCmd, "autoremove", "-y")
+	aptAutoremove(ctx)
 }
 
 // repairDnf fixes common dnf/rpm issues:
@@ -1812,15 +1644,15 @@ func (e *Executor) repairApt(ctx context.Context) {
 func (e *Executor) repairDnf(ctx context.Context) {
 	// Complete any interrupted transactions
 	// This is similar to "dnf-automatic" leaving things half-done
-	runSudoCommand(ctx, "dnf", "-y", "history", "redo", "last")
+	runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last")
 
 	// Clean up any duplicate packages
-	runSudoCommand(ctx, "dnf", "-y", "remove", "--duplicates")
+	runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates")
 
 	// Rebuild rpm database if corrupted
 	// First try to verify, if that fails, rebuild
-	if output, err := runSudoCommand(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCommand(ctx, "rpm", "--rebuilddb")
+	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
+		runSudoCmd(ctx, "rpm", "--rebuilddb")
 	}
 }
 
@@ -1831,16 +1663,16 @@ func (e *Executor) repairDnf(ctx context.Context) {
 func (e *Executor) repairPacman(ctx context.Context) {
 	// Remove stale lock file if it exists
 	// This handles "unable to lock database" errors from interrupted operations
-	runSudoCommand(ctx, "rm", "-f", "/var/lib/pacman/db.lck")
+	runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck")
 
 	// Refresh package database to fix potential corruption
 	// Using -Syy to force refresh even if recently updated
-	runSudoCommand(ctx, "pacman", "-Syy", "--noconfirm")
+	runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm")
 
 	// Reinitialize keyring if there are signature issues
 	// This fixes "signature is unknown trust" errors
-	runSudoCommand(ctx, "pacman-key", "--init")
-	runSudoCommand(ctx, "pacman-key", "--populate", "archlinux")
+	runSudoCmd(ctx, "pacman-key", "--init")
+	runSudoCmd(ctx, "pacman-key", "--populate", "archlinux")
 }
 
 // repairZypper fixes common zypper/rpm issues:
@@ -1850,20 +1682,20 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
 	// Remove stale lock files
-	runSudoCommand(ctx, "rm", "-f", "/var/run/zypp.pid")
+	runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid")
 
 	// Clean repository metadata cache to fix stale metadata issues
-	runSudoCommand(ctx, "zypper", "--non-interactive", "clean", "--all")
+	runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all")
 
 	// Refresh repositories to get fresh metadata
-	runSudoCommand(ctx, "zypper", "--non-interactive", "refresh")
+	runSudoCmd(ctx, "zypper", "--non-interactive", "refresh")
 
 	// Verify and fix dependency issues
-	runSudoCommand(ctx, "zypper", "--non-interactive", "verify", "--recommends")
+	runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends")
 
 	// Rebuild rpm database if corrupted
-	if output, err := runSudoCommand(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCommand(ctx, "rpm", "--rebuilddb")
+	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
+		runSudoCmd(ctx, "rpm", "--rebuilddb")
 	}
 }
 
@@ -1872,10 +1704,10 @@ func (e *Executor) repairZypper(ctx context.Context) {
 // - Broken remotes
 func (e *Executor) repairFlatpak(ctx context.Context) {
 	// Repair any broken installations (removes partial/orphaned refs)
-	runSudoCommand(ctx, "flatpak", "repair", "--system")
+	runSudoCmd(ctx, "flatpak", "repair", "--system")
 
 	// Update appstream metadata to fix stale cache issues
-	runSudoCommand(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system")
+	runSudoCmd(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system")
 }
 
 // executeUpdate performs a system-wide package update.
@@ -1943,13 +1775,13 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		if pkg.IsApt() {
-			if output, err := runSudoCommand(ctx, "apt-get", "autoremove", "-y"); err == nil {
+			if output, err := aptAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		} else if pkg.IsDnf() {
-			if output, err := runSudoCommand(ctx, "dnf", "-y", "autoremove"); err == nil {
+			if output, err := dnfAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
@@ -1963,7 +1795,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if params != nil && params.RebootIfRequired {
 			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
-			runSudoCommand(ctx, "shutdown", "-r", "+1", "System update requires reboot")
+			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
 		}
 	}
 
@@ -1980,26 +1812,23 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 
 // executeAptUpgrade performs apt-specific upgrade.
 func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
-	var args []string
-
 	if params != nil && params.SecurityOnly {
 		// Use unattended-upgrades for security-only updates if available
 		if _, err := exec.LookPath("unattended-upgrade"); err == nil {
-			cmdOutput, err := runSudoCommand(ctx, "unattended-upgrade", "-v")
+			cmdOutput, err := runSudoCmd(ctx, "unattended-upgrade", "-v")
 			if cmdOutput != nil {
 				output.WriteString(cmdOutput.Stdout)
 				output.WriteString(cmdOutput.Stderr)
 			}
 			return err
 		}
-		// Fallback: try apt-get with security pocket only
+		// Fallback: try apt with security pocket only
 		// This is distribution-specific and may not work everywhere
 		output.WriteString("Note: security-only updates requested but unattended-upgrade not available\n")
 	}
 
 	// Standard upgrade
-	args = []string{"upgrade", "-y"}
-	cmdOutput, err := runSudoCommand(ctx, "apt-get", args...)
+	cmdOutput, err := aptUpgrade(ctx)
 	if cmdOutput != nil {
 		output.WriteString(cmdOutput.Stdout)
 		output.WriteString(cmdOutput.Stderr)
@@ -2007,7 +1836,7 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 
 	// Also run dist-upgrade for held-back packages (still respects holds)
 	output.WriteString("\n=== Dist-Upgrade ===\n")
-	distOutput, _ := runSudoCommand(ctx, "apt-get", "dist-upgrade", "-y")
+	distOutput, _ := aptDistUpgrade(ctx)
 	if distOutput != nil {
 		output.WriteString(distOutput.Stdout)
 		output.WriteString(distOutput.Stderr)
@@ -2018,15 +1847,8 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 
 // executeDnfUpgrade performs dnf-specific upgrade.
 func (e *Executor) executeDnfUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
-	var args []string
-
-	if params != nil && params.SecurityOnly {
-		args = []string{"-y", "upgrade", "--security"}
-	} else {
-		args = []string{"-y", "upgrade"}
-	}
-
-	cmdOutput, err := runSudoCommand(ctx, "dnf", args...)
+	securityOnly := params != nil && params.SecurityOnly
+	cmdOutput, err := dnfUpgrade(ctx, securityOnly)
 	if cmdOutput != nil {
 		output.WriteString(cmdOutput.Stdout)
 		output.WriteString(cmdOutput.Stderr)
@@ -2044,12 +1866,10 @@ func (e *Executor) checkRebootRequired() bool {
 
 	// RHEL/Fedora: check needs-restarting
 	if pkg.IsDnf() {
-		cmd := exec.Command("needs-restarting", "-r")
-		if err := cmd.Run(); err != nil {
-			// Exit code 1 means reboot required
-			if exitErr, ok := err.(*exec.ExitError); ok && exitErr.ExitCode() == 1 {
-				return true
-			}
+		_, exitCode, _ := queryCmdOutput("needs-restarting", "-r")
+		// Exit code 1 means reboot required
+		if exitCode == 1 {
+			return true
 		}
 	}
 
@@ -2186,7 +2006,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 					}
 					if keyPath != "" && strings.HasPrefix(keyPath, "/") {
 						output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-						runSudoCommand(ctx, "rm", "-f", keyPath)
+						runSudoCmd(ctx, "rm", "-f", keyPath)
 					}
 				}
 			}
@@ -2205,13 +2025,13 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 				}
 				if len(match) > 1 && strings.HasPrefix(keyPath, "/") {
 					output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-					runSudoCommand(ctx, "rm", "-f", keyPath)
+					runSudoCmd(ctx, "rm", "-f", keyPath)
 				}
 			}
 		}
 
 		// Remove the repository file
-		runSudoCommand(ctx, "rm", "-f", filePath)
+		runSudoCmd(ctx, "rm", "-f", filePath)
 	}
 }
 
@@ -2226,14 +2046,14 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Remove repository file
-		if _, err := runSudoCommand(ctx, "rm", "-f", repoFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
 			return nil, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		// Also try to remove legacy .list format
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
-		runSudoCommand(ctx, "rm", "-f", legacyFile)
+		runSudoCmd(ctx, "rm", "-f", legacyFile)
 		// Remove GPG key
-		runSudoCommand(ctx, "rm", "-f", keyFile)
+		runSudoCmd(ctx, "rm", "-f", keyFile)
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
 
@@ -2252,7 +2072,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
 		if _, err := os.Stat(legacyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy repository file: %s\n", legacyFile))
-			runSudoCommand(ctx, "rm", "-f", legacyFile)
+			runSudoCmd(ctx, "rm", "-f", legacyFile)
 		}
 		// Also check for old .sources file with potentially different config
 		if _, err := os.Stat(repoFile); err == nil {
@@ -2264,11 +2084,11 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy GPG key: %s\n", legacyKeyFile))
-			runSudoCommand(ctx, "rm", "-f", legacyKeyFile)
+			runSudoCmd(ctx, "rm", "-f", legacyKeyFile)
 		}
 
 		// Ensure keyrings directory exists
-		if _, err := runSudoCommand(ctx, "mkdir", "-p", "/etc/apt/keyrings"); err != nil {
+		if _, err := runSudoCmd(ctx, "mkdir", "-p", "/etc/apt/keyrings"); err != nil {
 			return nil, fmt.Errorf("failed to create keyrings directory: %w", err)
 		}
 
@@ -2313,16 +2133,14 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		}
 
 		// Write the sources file
-		cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", repoFile)
-		cmd.Stdin = strings.NewReader(content.String())
-		if _, err := runCommand(cmd); err != nil {
+		if _, err := writeFileWithSudo(ctx, repoFile, content.String()); err != nil {
 			return nil, fmt.Errorf("failed to write repo file: %w", err)
 		}
 
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
 
 		// Update package index
-		updateOutput, _ := runSudoCommand(ctx, "apt-get", "update")
+		updateOutput, _ := aptUpdate(ctx)
 		if updateOutput != nil {
 			output.WriteString(updateOutput.Stdout)
 		}
@@ -2381,9 +2199,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 	}
 
 	// Dearmor the key using gpg with stdin piping (no shell involved)
-	gpgCmd := exec.CommandContext(ctx, "gpg", "--yes", "--dearmor", "-o", tempPath)
-	gpgCmd.Stdin = bytes.NewReader(rawKey)
-	if _, err := runCommand(gpgCmd); err != nil {
+	if _, err := runCmdWithStdin(ctx, bytes.NewReader(rawKey), "gpg", "--yes", "--dearmor", "-o", tempPath); err != nil {
 		return false, fmt.Errorf("failed to dearmor GPG key: %w", err)
 	}
 
@@ -2406,7 +2222,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 		output.WriteString("GPG key not found, installing\n")
 	} else {
 		// Other error reading the file - try to read with sudo
-		cmdOutput, sudoErr := runSudoCommand(ctx, "cat", keyFile)
+		cmdOutput, sudoErr := runSudoCmd(ctx, "cat", keyFile)
 		if sudoErr == nil && cmdOutput != nil {
 			if bytes.Equal([]byte(cmdOutput.Stdout), newKey) {
 				output.WriteString("GPG key already installed and matches\n")
@@ -2419,13 +2235,13 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 	}
 
 	// Copy the new key to the target location with sudo
-	_, err = runSudoCommand(ctx, "cp", tempPath, keyFile)
+	_, err = runSudoCmd(ctx, "cp", tempPath, keyFile)
 	if err != nil {
 		return false, fmt.Errorf("failed to install GPG key: %w", err)
 	}
 
 	// Set proper permissions
-	runSudoCommand(ctx, "chmod", "644", keyFile)
+	runSudoCmd(ctx, "chmod", "644", keyFile)
 
 	return true, nil
 }
@@ -2437,7 +2253,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		if _, err := runSudoCommand(ctx, "rm", "-f", repoFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
 			return nil, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
@@ -2448,7 +2264,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// This handles cases where the repository was previously configured with different settings
 		if _, err := os.Stat(repoFile); err == nil {
 			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-			runSudoCommand(ctx, "rm", "-f", repoFile)
+			runSudoCmd(ctx, "rm", "-f", repoFile)
 		}
 
 		// Build repo file content
@@ -2483,9 +2299,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		}
 
 		// Write the repo file
-		cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", repoFile)
-		cmd.Stdin = strings.NewReader(content.String())
-		if _, err := runCommand(cmd); err != nil {
+		if _, err := writeFileWithSudo(ctx, repoFile, content.String()); err != nil {
 			return nil, fmt.Errorf("failed to write repo file: %w", err)
 		}
 
@@ -2494,14 +2308,14 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// Import GPG key if provided
 		// rpm --import is idempotent - re-importing an existing key is a no-op
 		if repo.Gpgkey != "" {
-			keyOutput, _ := runSudoCommand(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, _ := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
 			}
 		}
 
 		// Refresh metadata (use -y for non-interactive mode)
-		refreshOutput, _ := runSudoCommand(ctx, "dnf", "-y", "makecache", "--repo", name)
+		refreshOutput, _ := runSudoCmd(ctx, "dnf", "-y", "makecache", "--repo", name)
 		if refreshOutput != nil {
 			output.WriteString(refreshOutput.Stdout)
 		}
@@ -2561,9 +2375,7 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 
 		// Remove the repository section in Go (no sed, no shell injection risk)
 		newConf := removePacmanSection(confStr, name)
-		teeCmd := exec.CommandContext(ctx, "sudo", "-n", "tee", confFile)
-		teeCmd.Stdin = strings.NewReader(newConf)
-		if _, err := runCommand(teeCmd); err != nil {
+		if _, err := writeFileWithSudo(ctx, confFile, newConf); err != nil {
 			return nil, fmt.Errorf("failed to update pacman.conf: %w", err)
 		}
 
@@ -2586,16 +2398,14 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 		}
 		newConf += section.String()
 
-		teeCmd := exec.CommandContext(ctx, "sudo", "-n", "tee", confFile)
-		teeCmd.Stdin = strings.NewReader(newConf)
-		if _, err := runCommand(teeCmd); err != nil {
+		if _, err := writeFileWithSudo(ctx, confFile, newConf); err != nil {
 			return nil, fmt.Errorf("failed to write pacman.conf: %w", err)
 		}
 
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
 
 		// Sync database (--noconfirm for non-interactive mode)
-		syncOutput, _ := runSudoCommand(ctx, "pacman", "-Sy", "--noconfirm")
+		syncOutput, _ := runSudoCmd(ctx, "pacman", "-Sy", "--noconfirm")
 		if syncOutput != nil {
 			output.WriteString(syncOutput.Stdout)
 		}
@@ -2613,7 +2423,7 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		cmdOutput, err := runSudoCommand(ctx, "zypper", "--non-interactive", "removerepo", name)
+		cmdOutput, err := runSudoCmd(ctx, "zypper", "--non-interactive", "removerepo", name)
 		if err != nil {
 			// Ignore if repo doesn't exist
 			if cmdOutput != nil && strings.Contains(cmdOutput.Stderr, "not found") {
@@ -2638,10 +2448,10 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 		}
 
 		// Check if repo exists, remove first if it does
-		runSudoCommand(ctx, "zypper", "--non-interactive", "removerepo", name)
+		runSudoCmd(ctx, "zypper", "--non-interactive", "removerepo", name)
 
 		args = append(args, repo.Url, name)
-		cmdOutput, err := runSudoCommand(ctx, "zypper", args...)
+		cmdOutput, err := runSudoCmd(ctx, "zypper", args...)
 		if err != nil {
 			if cmdOutput != nil {
 				output.WriteString(cmdOutput.Stderr)
@@ -2653,31 +2463,31 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 
 		// Set description if provided
 		if repo.Description != "" {
-			runSudoCommand(ctx, "zypper", "--non-interactive", "modifyrepo", "--name", repo.Description, name)
+			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--name", repo.Description, name)
 		}
 
 		// Enable/disable
 		if repo.Enabled {
-			runSudoCommand(ctx, "zypper", "--non-interactive", "modifyrepo", "--enable", name)
+			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--enable", name)
 		} else {
-			runSudoCommand(ctx, "zypper", "--non-interactive", "modifyrepo", "--disable", name)
+			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--disable", name)
 		}
 
 		// Set autorefresh
 		if repo.Autorefresh {
-			runSudoCommand(ctx, "zypper", "--non-interactive", "modifyrepo", "--refresh", name)
+			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--refresh", name)
 		}
 
 		// Import GPG key if provided
 		if repo.Gpgkey != "" {
-			keyOutput, _ := runSudoCommand(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, _ := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
 			}
 		}
 
 		// Refresh repository
-		refreshOutput, _ := runSudoCommand(ctx, "zypper", "--non-interactive", "refresh", name)
+		refreshOutput, _ := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh", name)
 		if refreshOutput != nil {
 			output.WriteString(refreshOutput.Stdout)
 		}
@@ -2701,7 +2511,7 @@ func IsInstantAction(t pb.ActionType) bool {
 
 // executeReboot schedules a system reboot in 5 minutes.
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
-	output, err := runSudoCommand(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
+	output, err := runSudoCmd(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
 	if err != nil {
 		return output, fmt.Errorf("failed to schedule reboot: %w", err)
 	}
@@ -2745,129 +2555,8 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	}
 }
 
-// isValidUsername checks if a username is valid and safe.
-func isValidUsername(username string) bool {
-	if len(username) == 0 || len(username) > 32 {
-		return false
-	}
-	// Must start with a lowercase letter
-	if username[0] < 'a' || username[0] > 'z' {
-		return false
-	}
-	// Rest can be lowercase letters, digits, underscores, or hyphens
-	for _, c := range username[1:] {
-		if !((c >= 'a' && c <= 'z') || (c >= '0' && c <= '9') || c == '_' || c == '-') {
-			return false
-		}
-	}
-	return true
-}
-
-// generateTempPassword creates a cryptographically secure temporary password.
-// Returns a 16-character password using alphanumeric characters.
-func generateTempPassword() (string, error) {
-	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	const length = 16
-
-	password := make([]byte, length)
-	randomBytes := make([]byte, length)
-
-	if _, err := rand.Read(randomBytes); err != nil {
-		return "", fmt.Errorf("failed to generate random bytes: %w", err)
-	}
-
-	for i := 0; i < length; i++ {
-		password[i] = charset[randomBytes[i]%byte(len(charset))]
-	}
-
-	return string(password), nil
-}
-
-// userExists checks if a user already exists on the system.
-func userExists(username string) bool {
-	cmd := exec.Command("id", username)
-	return cmd.Run() == nil
-}
-
-// userInfo holds the current state of a user account.
-type userInfo struct {
-	uid     int
-	gid     int
-	comment string
-	homeDir string
-	shell   string
-	groups  []string
-	locked  bool
-}
-
-// getUserInfo retrieves the current state of a user from the system.
-func getUserInfo(username string) (*userInfo, error) {
-	// Get passwd entry: username:x:uid:gid:comment:home:shell
-	cmd := exec.Command("getent", "passwd", username)
-	out, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("user not found: %w", err)
-	}
-
-	fields := strings.Split(strings.TrimSpace(string(out)), ":")
-	if len(fields) < 7 {
-		return nil, fmt.Errorf("invalid passwd entry")
-	}
-
-	uid, _ := strconv.Atoi(fields[2])
-	gid, _ := strconv.Atoi(fields[3])
-
-	info := &userInfo{
-		uid:     uid,
-		gid:     gid,
-		comment: fields[4],
-		homeDir: fields[5],
-		shell:   fields[6],
-	}
-
-	// Get supplementary groups
-	cmd = exec.Command("id", "-Gn", username)
-	if out, err := cmd.Output(); err == nil {
-		groups := strings.Fields(strings.TrimSpace(string(out)))
-		// Filter out the primary group (first group returned by id -Gn is usually primary)
-		// We need to get primary group name separately
-		cmd = exec.Command("id", "-gn", username)
-		if primaryOut, err := cmd.Output(); err == nil {
-			primaryGroup := strings.TrimSpace(string(primaryOut))
-			for _, g := range groups {
-				if g != primaryGroup {
-					info.groups = append(info.groups, g)
-				}
-			}
-		}
-	}
-
-	// Check if account is locked (password field starts with ! or *)
-	cmd = exec.Command("sudo", "-n", "getent", "shadow", username)
-	if out, err := cmd.Output(); err == nil {
-		shadowFields := strings.Split(string(out), ":")
-		if len(shadowFields) >= 2 {
-			passField := shadowFields[1]
-			info.locked = strings.HasPrefix(passField, "!") || strings.HasPrefix(passField, "*")
-		}
-	}
-
-	return info, nil
-}
-
-// groupsContains checks if all desired groups are present in current groups.
-func groupsContains(current, desired []string) bool {
-	currentMap := make(map[string]bool)
-	for _, g := range current {
-		currentMap[g] = true
-	}
-	for _, g := range desired {
-		if !currentMap[g] {
-			return false
-		}
-	}
-	return true
-}
+// Note: isValidUsername, generateTempPassword, userExists, getUserInfo, and groupsContains
+// are now defined in user.go for reusability.
 
 // createOrUpdateUser creates a new user or updates an existing one.
 // Returns the command output, whether changes were made, and any error.
@@ -2899,7 +2588,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Ensure group exists
-		e.ensureGroupExists(ctx, params.PrimaryGroup)
+		ensureGroupExists(ctx, params.PrimaryGroup)
 		args = append(args, "-g", params.PrimaryGroup)
 	}
 
@@ -2971,7 +2660,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	args = append(args, params.Username)
 
 	// Create the user
-	cmdOutput, err := runSudoCommand(ctx, "useradd", args...)
+	cmdOutput, err := runSudoCmd(ctx, "useradd", args...)
 	if err != nil {
 		if cmdOutput != nil {
 			output.WriteString(cmdOutput.Stderr)
@@ -2987,16 +2676,14 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
 		} else {
 			// Set password using chpasswd
-			chpasswdCmd := exec.CommandContext(ctx, "sudo", "-n", "chpasswd")
-			chpasswdCmd.Stdin = strings.NewReader(fmt.Sprintf("%s:%s", params.Username, tempPassword))
-			if chpasswdOutput, chpasswdErr := runCommand(chpasswdCmd); chpasswdErr != nil {
+			if chpasswdOutput, chpasswdErr := runSudoCmdWithStdin(ctx, strings.NewReader(fmt.Sprintf("%s:%s", params.Username, tempPassword)), "chpasswd"); chpasswdErr != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to set temporary password: %v\n", chpasswdErr))
 				if chpasswdOutput != nil {
 					output.WriteString(chpasswdOutput.Stderr)
 				}
 			} else {
 				// Force password change on first login
-				if _, chageErr := runSudoCommand(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
+				if _, chageErr := runSudoCmd(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
 				}
 				output.WriteString(fmt.Sprintf("TEMPORARY PASSWORD for %s: %s (must be changed on first login)\n", params.Username, tempPassword))
@@ -3006,7 +2693,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// If home directory already existed, fix ownership
 	if homeExists && createHome {
-		if chownOutput, chownErr := runSudoCommand(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
+		if chownOutput, chownErr := runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
 			if chownOutput != nil {
 				output.WriteString(chownOutput.Stderr)
@@ -3018,7 +2705,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// Handle disabled state (lock the account)
 	if params.Disabled {
-		if lockOutput, lockErr := runSudoCommand(ctx, "usermod", "-L", params.Username); lockErr != nil {
+		if lockOutput, lockErr := runSudoCmd(ctx, "usermod", "-L", params.Username); lockErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
 			if lockOutput != nil {
 				output.WriteString(lockOutput.Stderr)
@@ -3052,30 +2739,30 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	}
 
 	// Shell - only change if explicitly set and different
-	if desiredShell != "" && currentInfo.shell != desiredShell {
+	if desiredShell != "" && currentInfo.Shell != desiredShell {
 		args = append(args, "-s", desiredShell)
-		output.WriteString(fmt.Sprintf("shell: %s -> %s\n", currentInfo.shell, desiredShell))
+		output.WriteString(fmt.Sprintf("shell: %s -> %s\n", currentInfo.Shell, desiredShell))
 	}
 
 	// Home directory - only if explicitly set and different
-	if params.HomeDir != "" && currentInfo.homeDir != params.HomeDir {
+	if params.HomeDir != "" && currentInfo.HomeDir != params.HomeDir {
 		args = append(args, "-d", params.HomeDir)
-		output.WriteString(fmt.Sprintf("home: %s -> %s\n", currentInfo.homeDir, params.HomeDir))
+		output.WriteString(fmt.Sprintf("home: %s -> %s\n", currentInfo.HomeDir, params.HomeDir))
 	}
 
 	// Comment - only if explicitly set and different
-	if params.Comment != "" && currentInfo.comment != params.Comment {
+	if params.Comment != "" && currentInfo.Comment != params.Comment {
 		args = append(args, "-c", params.Comment)
-		output.WriteString(fmt.Sprintf("comment: %s -> %s\n", currentInfo.comment, params.Comment))
+		output.WriteString(fmt.Sprintf("comment: %s -> %s\n", currentInfo.Comment, params.Comment))
 	}
 
 	// Primary group - only if explicitly set and different
-	if params.Gid > 0 && currentInfo.gid != int(params.Gid) {
+	if params.Gid > 0 && currentInfo.GID != int(params.Gid) {
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
-		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.gid, params.Gid))
+		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		e.ensureGroupExists(ctx, params.PrimaryGroup)
+		ensureGroupExists(ctx, params.PrimaryGroup)
 		// For simplicity, always set if specified by name (could be optimized)
 		args = append(args, "-g", params.PrimaryGroup)
 	}
@@ -3087,7 +2774,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				return nil, false, fmt.Errorf("invalid group name: %s", g)
 			}
 		}
-		if !groupsContains(currentInfo.groups, params.Groups) {
+		if !groupsContains(currentInfo.Groups, params.Groups) {
 			args = append(args, "-aG", strings.Join(params.Groups, ","))
 			output.WriteString(fmt.Sprintf("groups: adding %v\n", params.Groups))
 		}
@@ -3096,7 +2783,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	// Apply usermod if we have changes
 	if len(args) > 0 {
 		args = append(args, params.Username)
-		cmdOutput, err := runSudoCommand(ctx, "usermod", args...)
+		cmdOutput, err := runSudoCmd(ctx, "usermod", args...)
 		if err != nil {
 			if cmdOutput != nil {
 				output.WriteString(cmdOutput.Stderr)
@@ -3108,9 +2795,9 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 
 	// Handle disabled/locked state - only change if different
 	desiredLocked := params.Disabled
-	if desiredLocked != currentInfo.locked {
+	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
-			if lockOutput, err := runSudoCommand(ctx, "usermod", "-L", params.Username); err != nil {
+			if lockOutput, err := runSudoCmd(ctx, "usermod", "-L", params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
 				if lockOutput != nil {
 					output.WriteString(lockOutput.Stderr)
@@ -3120,7 +2807,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				changed = true
 			}
 		} else {
-			if unlockOutput, err := runSudoCommand(ctx, "usermod", "-U", params.Username); err != nil {
+			if unlockOutput, err := runSudoCmd(ctx, "usermod", "-U", params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to unlock user: %v\n", err))
 				if unlockOutput != nil {
 					output.WriteString(unlockOutput.Stderr)
@@ -3151,7 +2838,7 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	}
 
 	// Remove user and their home directory
-	output, err := runSudoCommand(ctx, "userdel", "-r", username)
+	output, err := runSudoCmd(ctx, "userdel", "-r", username)
 	if err != nil {
 		// If home directory doesn't exist, userdel -r may still succeed
 		// but report an error. Check if user is actually removed.
@@ -3174,14 +2861,5 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 }
 
 // ensureGroupExists creates a group if it doesn't exist.
-func (e *Executor) ensureGroupExists(ctx context.Context, groupName string) {
-	// Check if group exists
-	cmd := exec.Command("getent", "group", groupName)
-	if cmd.Run() == nil {
-		return // Group exists
-	}
-
-	// Create the group
-	runSudoCommand(ctx, "groupadd", groupName)
-}
+// Note: ensureGroupExists is now defined in user.go as a package-level function.
 
