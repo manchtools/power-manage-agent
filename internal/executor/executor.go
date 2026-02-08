@@ -4,6 +4,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
@@ -67,13 +68,41 @@ func resolveAndValidatePath(path string) (string, error) {
 	if !filepath.IsAbs(clean) {
 		return "", fmt.Errorf("path must be absolute: %s", path)
 	}
+
+	// Walk up from the target file to find the first existing parent directory
+	// This handles cases where intermediate directories don't exist yet
 	dir := filepath.Dir(clean)
-	resolved, err := filepath.EvalSymlinks(dir)
-	if err != nil {
-		if os.IsNotExist(err) {
-			return clean, nil // parent doesn't exist yet, clean path is safe
+	var existingParent, missingTail string
+
+	for dir != "/" && dir != "." {
+		if _, err := os.Stat(dir); err == nil {
+			existingParent = dir
+			break
+		} else if os.IsNotExist(err) {
+			// Directory doesn't exist, add to missing tail and continue up
+			missingTail = filepath.Join(filepath.Base(dir), missingTail)
+			dir = filepath.Dir(dir)
+		} else {
+			// Permission denied or other error - continue up the tree
+			missingTail = filepath.Join(filepath.Base(dir), missingTail)
+			dir = filepath.Dir(dir)
 		}
-		return "", fmt.Errorf("resolve symlinks: %w", err)
+	}
+
+	if existingParent == "" {
+		existingParent = "/"
+	}
+
+	// Resolve symlinks only in the existing portion of the path
+	resolved, err := filepath.EvalSymlinks(existingParent)
+	if err != nil {
+		// If we still can't resolve the root parent, just use clean path
+		return clean, nil
+	}
+
+	// Rebuild the full path with resolved parent + missing components + filename
+	if missingTail != "" {
+		return filepath.Join(resolved, missingTail, filepath.Base(clean)), nil
 	}
 	return filepath.Join(resolved, filepath.Base(clean)), nil
 }
@@ -908,6 +937,10 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	// Check and update enable/disable status
 	isEnabled := e.isUnitEnabled(params.UnitName)
 	if params.Enable && !isEnabled {
+		// Check if unit is masked - provide helpful error
+		if e.isUnitMasked(params.UnitName) {
+			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
+		}
 		if _, err := runSudoCommand(ctx, "systemctl", "enable", params.UnitName); err != nil {
 			return nil, changed, fmt.Errorf("enable: %v", err)
 		}
@@ -962,12 +995,29 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, changed, nil
 }
 
-// isUnitEnabled checks if a systemd unit is enabled.
+// isUnitEnabled checks if a systemd unit is enabled or in a state where
+// enabling is not needed (static, indirect, generated units).
 func (e *Executor) isUnitEnabled(unitName string) bool {
 	cmd := exec.Command("systemctl", "is-enabled", unitName)
 	out, _ := cmd.Output()
 	status := strings.TrimSpace(string(out))
-	return status == "enabled" || status == "enabled-runtime"
+	switch status {
+	case "enabled", "enabled-runtime":
+		return true
+	case "static", "indirect", "generated":
+		// These units cannot or don't need to be enabled explicitly
+		return true
+	default:
+		// disabled, masked, or unknown
+		return false
+	}
+}
+
+// isUnitMasked checks if a systemd unit is masked.
+func (e *Executor) isUnitMasked(unitName string) bool {
+	cmd := exec.Command("systemctl", "is-enabled", unitName)
+	out, _ := cmd.Output()
+	return strings.TrimSpace(string(out)) == "masked"
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
@@ -1011,6 +1061,26 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			return nil, false, fmt.Errorf("create directories: %w", err)
 		}
 
+		// Determine final content based on managed block mode
+		var finalContent string
+		actionVerb := "created"
+		if params.ManagedBlock {
+			// For managed block: read existing content and append block if not present
+			existingContent, err := os.ReadFile(resolvedPath)
+			if err != nil && !os.IsNotExist(err) {
+				return nil, false, fmt.Errorf("read existing file: %w", err)
+			}
+			// Ensure there's a newline before appending block if file exists and doesn't end with newline
+			existing := string(existingContent)
+			if len(existing) > 0 && !strings.HasSuffix(existing, "\n") {
+				existing += "\n"
+			}
+			finalContent = existing + params.Content
+			actionVerb = "added block to"
+		} else {
+			finalContent = params.Content
+		}
+
 		// Atomic write: write to temp file, then move into place.
 		// This avoids TOCTOU race conditions where the file could be
 		// swapped between write and chmod/chown operations.
@@ -1018,7 +1088,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 
 		// Write content to temp file using sudo tee
 		cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", tmpPath)
-		cmd.Stdin = strings.NewReader(params.Content)
+		cmd.Stdin = strings.NewReader(finalContent)
 		if _, err := runCommand(cmd); err != nil {
 			runSudoCommand(ctx, "rm", "-f", tmpPath) // cleanup
 			return nil, false, fmt.Errorf("write file: %w", err)
@@ -1052,7 +1122,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 
 		return &pb.CommandOutput{
 			ExitCode: 0,
-			Stdout:   fmt.Sprintf("created %s", resolvedPath),
+			Stdout:   fmt.Sprintf("%s %s", actionVerb, resolvedPath),
 		}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
@@ -1072,6 +1142,67 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
 
+		// For managed block mode, remove only the specified content block from the file
+		if params.ManagedBlock {
+			existingContent, err := os.ReadFile(resolvedPath)
+			if err != nil {
+				return nil, false, fmt.Errorf("read file: %w", err)
+			}
+
+			// Check if content exists in file
+			if !strings.Contains(string(existingContent), params.Content) {
+				return &pb.CommandOutput{
+					ExitCode: 0,
+					Stdout:   fmt.Sprintf("content not found in %s, nothing to remove", resolvedPath),
+				}, false, nil
+			}
+
+			// Remove the content block from the file
+			newContent := strings.Replace(string(existingContent), params.Content, "", 1)
+			// Clean up any resulting double newlines
+			for strings.Contains(newContent, "\n\n\n") {
+				newContent = strings.ReplaceAll(newContent, "\n\n\n", "\n\n")
+			}
+
+			// Write the modified content back using atomic write
+			tmpPath := resolvedPath + ".pm-tmp"
+			cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", tmpPath)
+			cmd.Stdin = strings.NewReader(newContent)
+			if _, err := runCommand(cmd); err != nil {
+				runSudoCommand(ctx, "rm", "-f", tmpPath)
+				return nil, false, fmt.Errorf("write file: %w", err)
+			}
+
+			// Preserve original mode and ownership
+			if params.Mode != "" {
+				if _, err := runSudoCommand(ctx, "chmod", params.Mode, tmpPath); err != nil {
+					runSudoCommand(ctx, "rm", "-f", tmpPath)
+					return nil, false, fmt.Errorf("chmod: %w", err)
+				}
+			}
+			if params.Owner != "" || params.Group != "" {
+				ownership := params.Owner
+				if params.Group != "" {
+					ownership += ":" + params.Group
+				}
+				if _, err := runSudoCommand(ctx, "chown", ownership, tmpPath); err != nil {
+					runSudoCommand(ctx, "rm", "-f", tmpPath)
+					return nil, false, fmt.Errorf("chown: %w", err)
+				}
+			}
+
+			if _, err := runSudoCommand(ctx, "mv", "-f", tmpPath, resolvedPath); err != nil {
+				runSudoCommand(ctx, "rm", "-f", tmpPath)
+				return nil, false, fmt.Errorf("move file into place: %w", err)
+			}
+
+			return &pb.CommandOutput{
+				ExitCode: 0,
+				Stdout:   fmt.Sprintf("removed content block from %s", resolvedPath),
+			}, true, nil
+		}
+
+		// For regular mode, delete the entire file
 		if _, err := runSudoCommand(ctx, "rm", "-f", resolvedPath); err != nil {
 			return nil, false, fmt.Errorf("remove: %w", err)
 		}
@@ -1097,15 +1228,24 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 		return false
 	}
 
-	// Check content by comparing hashes
+	// Check content
 	content, err := os.ReadFile(path)
 	if err != nil {
 		return false
 	}
-	currentHash := sha256.Sum256(content)
-	desiredHash := sha256.Sum256([]byte(params.Content))
-	if currentHash != desiredHash {
-		return false
+
+	if params.ManagedBlock {
+		// For managed block mode, check if content block is already present in file
+		if !strings.Contains(string(content), params.Content) {
+			return false
+		}
+	} else {
+		// For regular mode, check exact content match via hash
+		currentHash := sha256.Sum256(content)
+		desiredHash := sha256.Sum256([]byte(params.Content))
+		if currentHash != desiredHash {
+			return false
+		}
 	}
 
 	// Check mode if specified
@@ -2623,6 +2763,26 @@ func isValidUsername(username string) bool {
 	return true
 }
 
+// generateTempPassword creates a cryptographically secure temporary password.
+// Returns a 16-character password using alphanumeric characters.
+func generateTempPassword() (string, error) {
+	const charset = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
+	const length = 16
+
+	password := make([]byte, length)
+	randomBytes := make([]byte, length)
+
+	if _, err := rand.Read(randomBytes); err != nil {
+		return "", fmt.Errorf("failed to generate random bytes: %w", err)
+	}
+
+	for i := 0; i < length; i++ {
+		password[i] = charset[randomBytes[i]%byte(len(charset))]
+	}
+
+	return string(password), nil
+}
+
 // userExists checks if a user already exists on the system.
 func userExists(username string) bool {
 	cmd := exec.Command("id", username)
@@ -2631,14 +2791,13 @@ func userExists(username string) bool {
 
 // userInfo holds the current state of a user account.
 type userInfo struct {
-	uid      int
-	gid      int
-	comment  string
-	homeDir  string
-	shell    string
-	groups   []string
-	locked   bool
-	sshKeys  []string
+	uid     int
+	gid     int
+	comment string
+	homeDir string
+	shell   string
+	groups  []string
+	locked  bool
 }
 
 // getUserInfo retrieves the current state of a user from the system.
@@ -2693,37 +2852,7 @@ func getUserInfo(username string) (*userInfo, error) {
 		}
 	}
 
-	// Read SSH authorized keys if they exist
-	authKeysPath := filepath.Join(info.homeDir, ".ssh", "authorized_keys")
-	if content, err := os.ReadFile(authKeysPath); err == nil {
-		lines := strings.Split(strings.TrimSpace(string(content)), "\n")
-		for _, line := range lines {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "#") {
-				info.sshKeys = append(info.sshKeys, line)
-			}
-		}
-	}
-
 	return info, nil
-}
-
-// sshKeysEqual compares two SSH key slices for equality.
-func sshKeysEqual(a, b []string) bool {
-	if len(a) != len(b) {
-		return false
-	}
-	// Create maps for comparison (order doesn't matter)
-	aMap := make(map[string]bool)
-	for _, key := range a {
-		aMap[strings.TrimSpace(key)] = true
-	}
-	for _, key := range b {
-		if !aMap[strings.TrimSpace(key)] {
-			return false
-		}
-	}
-	return true
 }
 
 // groupsContains checks if all desired groups are present in current groups.
@@ -2851,6 +2980,30 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	}
 	output.WriteString(fmt.Sprintf("created user: %s\n", params.Username))
 
+	// Generate and set temporary password for non-system users
+	if !params.SystemUser && !params.Disabled {
+		tempPassword, err := generateTempPassword()
+		if err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
+		} else {
+			// Set password using chpasswd
+			chpasswdCmd := exec.CommandContext(ctx, "sudo", "-n", "chpasswd")
+			chpasswdCmd.Stdin = strings.NewReader(fmt.Sprintf("%s:%s", params.Username, tempPassword))
+			if chpasswdOutput, chpasswdErr := runCommand(chpasswdCmd); chpasswdErr != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to set temporary password: %v\n", chpasswdErr))
+				if chpasswdOutput != nil {
+					output.WriteString(chpasswdOutput.Stderr)
+				}
+			} else {
+				// Force password change on first login
+				if _, chageErr := runSudoCommand(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
+					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
+				}
+				output.WriteString(fmt.Sprintf("TEMPORARY PASSWORD for %s: %s (must be changed on first login)\n", params.Username, tempPassword))
+			}
+		}
+	}
+
 	// If home directory already existed, fix ownership
 	if homeExists && createHome {
 		if chownOutput, chownErr := runSudoCommand(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
@@ -2872,13 +3025,6 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 			}
 		} else {
 			output.WriteString("account locked (disabled)\n")
-		}
-	}
-
-	// Setup SSH authorized keys if provided
-	if len(params.SshAuthorizedKeys) > 0 {
-		if err := e.setupSSHKeys(ctx, params, output); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
 		}
 	}
 
@@ -2986,17 +3132,6 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Update SSH authorized keys if provided and different
-	if len(params.SshAuthorizedKeys) > 0 {
-		if !sshKeysEqual(currentInfo.sshKeys, params.SshAuthorizedKeys) {
-			if err := e.setupSSHKeys(ctx, params, output); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
-			} else {
-				changed = true
-			}
-		}
-	}
-
 	if !changed {
 		output.WriteString(fmt.Sprintf("user %s is already in desired state\n", params.Username))
 	}
@@ -3048,68 +3183,5 @@ func (e *Executor) ensureGroupExists(ctx context.Context, groupName string) {
 
 	// Create the group
 	runSudoCommand(ctx, "groupadd", groupName)
-}
-
-// setupSSHKeys configures SSH authorized keys for a user.
-func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, output *strings.Builder) error {
-	// Determine home directory
-	homeDir := params.HomeDir
-	if homeDir == "" {
-		if params.SystemUser {
-			homeDir = "/"
-		} else {
-			homeDir = filepath.Join("/home", params.Username)
-		}
-	}
-
-	sshDir := filepath.Join(homeDir, ".ssh")
-	authKeysFile := filepath.Join(sshDir, "authorized_keys")
-
-	// Create .ssh directory
-	if _, err := runSudoCommand(ctx, "mkdir", "-p", sshDir); err != nil {
-		return fmt.Errorf("failed to create .ssh directory: %w", err)
-	}
-
-	// Set ownership and permissions on .ssh directory
-	if _, err := runSudoCommand(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
-		return fmt.Errorf("failed to set .ssh ownership: %w", err)
-	}
-	if _, err := runSudoCommand(ctx, "chmod", "700", sshDir); err != nil {
-		return fmt.Errorf("failed to set .ssh permissions: %w", err)
-	}
-
-	// Build authorized_keys content
-	var keysContent strings.Builder
-	for _, key := range params.SshAuthorizedKeys {
-		// Basic validation - SSH keys should start with ssh-rsa, ssh-ed25519, etc.
-		trimmedKey := strings.TrimSpace(key)
-		if trimmedKey == "" {
-			continue
-		}
-		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
-			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key (doesn't start with ssh- or ecdsa-): %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
-			continue
-		}
-		keysContent.WriteString(trimmedKey)
-		keysContent.WriteString("\n")
-	}
-
-	// Write authorized_keys file
-	cmd := exec.CommandContext(ctx, "sudo", "-n", "tee", authKeysFile)
-	cmd.Stdin = strings.NewReader(keysContent.String())
-	if _, err := runCommand(cmd); err != nil {
-		return fmt.Errorf("failed to write authorized_keys: %w", err)
-	}
-
-	// Set ownership and permissions on authorized_keys
-	if _, err := runSudoCommand(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
-		return fmt.Errorf("failed to set authorized_keys ownership: %w", err)
-	}
-	if _, err := runSudoCommand(ctx, "chmod", "600", authKeysFile); err != nil {
-		return fmt.Errorf("failed to set authorized_keys permissions: %w", err)
-	}
-
-	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
-	return nil
 }
 
