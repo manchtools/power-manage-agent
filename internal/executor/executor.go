@@ -655,7 +655,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 			return nil, false, fmt.Errorf("create temp file: %w", err)
 		}
 		defer os.Remove(tmpFile.Name())
-		tmpFile.Close()
+		_ = tmpFile.Close()
 
 		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
@@ -732,7 +732,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 			return nil, false, fmt.Errorf("create temp file: %w", err)
 		}
 		defer os.Remove(tmpFile.Name())
-		tmpFile.Close()
+		_ = tmpFile.Close()
 
 		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
@@ -1329,26 +1329,28 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	if err != nil {
 		return err
 	}
-	defer file.Close()
 
 	if expectedChecksum != "" {
 		hasher := sha256.New()
 		reader := io.TeeReader(resp.Body, hasher)
 		if _, err := io.Copy(file, reader); err != nil {
+			_ = file.Close()
 			return err
 		}
 		actual := hex.EncodeToString(hasher.Sum(nil))
 		if actual != expectedChecksum {
+			_ = file.Close()
 			os.Remove(dest)
 			return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 		}
 	} else {
 		if _, err := io.Copy(file, resp.Body); err != nil {
+			_ = file.Close()
 			return err
 		}
 	}
 
-	return nil
+	return file.Close()
 }
 
 // getAptCommand returns the preferred apt command ("apt" or "apt-get").
@@ -2168,7 +2170,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 		return false, fmt.Errorf("failed to create temp file: %w", err)
 	}
 	tempPath := tempFile.Name()
-	tempFile.Close()
+	_ = tempFile.Close()
 	defer os.Remove(tempPath)
 
 	// Obtain raw key bytes (download or use provided content)

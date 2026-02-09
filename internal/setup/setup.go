@@ -44,11 +44,14 @@ func InstallSudoers(user string) error {
 	}
 
 	if err := tmpl.Execute(f, SudoersData{User: user}); err != nil {
-		f.Close()
+		_ = f.Close()
 		os.Remove(tmpFile)
 		return fmt.Errorf("render sudoers template: %w", err)
 	}
-	f.Close()
+	if err := f.Close(); err != nil {
+		os.Remove(tmpFile)
+		return fmt.Errorf("close temp sudoers file: %w", err)
+	}
 
 	// Validate syntax with visudo
 	if err := exec.Command("visudo", "-c", "-f", tmpFile).Run(); err != nil {
