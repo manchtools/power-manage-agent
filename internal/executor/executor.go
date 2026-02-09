@@ -2703,6 +2703,13 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
+	// Setup SSH authorized keys
+	if len(params.SshAuthorizedKeys) > 0 {
+		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+		}
+	}
+
 	// Handle disabled state (lock the account)
 	if params.Disabled {
 		if lockOutput, lockErr := runSudoCmd(ctx, "usermod", "-L", params.Username); lockErr != nil {
@@ -2819,6 +2826,15 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
+	// Setup SSH authorized keys
+	if len(params.SshAuthorizedKeys) > 0 {
+		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+		} else {
+			changed = true
+		}
+	}
+
 	if !changed {
 		output.WriteString(fmt.Sprintf("user %s is already in desired state\n", params.Username))
 	}
@@ -2858,6 +2874,66 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 		ExitCode: 0,
 		Stdout:   fmt.Sprintf("removed user: %s\n", username),
 	}, true, nil
+}
+
+// setupSSHKeys configures SSH authorized keys for a user.
+func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, output *strings.Builder) error {
+	// Determine home directory
+	homeDir := params.HomeDir
+	if homeDir == "" {
+		if params.SystemUser {
+			homeDir = "/"
+		} else {
+			homeDir = filepath.Join("/home", params.Username)
+		}
+	}
+
+	sshDir := filepath.Join(homeDir, ".ssh")
+	authKeysFile := filepath.Join(sshDir, "authorized_keys")
+
+	// Create .ssh directory
+	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
+		return fmt.Errorf("failed to create .ssh directory: %w", err)
+	}
+
+	// Set ownership and permissions on .ssh directory
+	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+		return fmt.Errorf("failed to set .ssh ownership: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
+		return fmt.Errorf("failed to set .ssh permissions: %w", err)
+	}
+
+	// Build authorized_keys content
+	var keysContent strings.Builder
+	for _, key := range params.SshAuthorizedKeys {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
+			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key (doesn't start with ssh- or ecdsa-): %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
+			continue
+		}
+		keysContent.WriteString(trimmedKey)
+		keysContent.WriteString("\n")
+	}
+
+	// Write authorized_keys file
+	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(keysContent.String()), "tee", authKeysFile); err != nil {
+		return fmt.Errorf("failed to write authorized_keys: %w", err)
+	}
+
+	// Set ownership and permissions on authorized_keys
+	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
+		return fmt.Errorf("failed to set authorized_keys ownership: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
+		return fmt.Errorf("failed to set authorized_keys permissions: %w", err)
+	}
+
+	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
+	return nil
 }
 
 // ensureGroupExists creates a group if it doesn't exist.
