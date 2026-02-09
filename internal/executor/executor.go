@@ -318,11 +318,9 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 		e.repairPackageManager(ctx)
 
 		// Update package index first to avoid stale package references
-		if updateResult, updateErr := e.pkgManager.Update(); updateErr != nil {
+		if _, updateErr := e.pkgManager.Update(); updateErr != nil {
 			// Log update failure but continue with install attempt
-			if updateResult != nil {
-				result = updateResult
-			}
+			_ = updateErr
 		}
 
 		// Install the package
