@@ -193,6 +193,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, changed, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
 		result.Changed = changed
+	case pb.ActionType_ACTION_TYPE_SSH:
+		var changed bool
+		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState)
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	default:
@@ -2934,6 +2938,221 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 
 	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
 	return nil
+}
+
+// executeSsh configures SSH access for a user by placing an sshd_config.d
+// drop-in file and optionally managing authorized_keys.
+func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
+	if params == nil {
+		return nil, false, fmt.Errorf("ssh params required")
+	}
+	if !isValidUsername(params.Username) {
+		return nil, false, fmt.Errorf("invalid username: %s", params.Username)
+	}
+
+	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%s.conf", params.Username)
+
+	switch state {
+	case pb.DesiredState_DESIRED_STATE_ABSENT:
+		return e.removeSshAccess(ctx, params, configPath)
+	default:
+		return e.setupSshAccess(ctx, params, configPath)
+	}
+}
+
+// generateSshdConfig generates sshd_config content for a user.
+func generateSshdConfig(params *pb.SshParams) string {
+	var lines []string
+	lines = append(lines, fmt.Sprintf("Match User %s", params.Username))
+	if params.AllowPubkey {
+		lines = append(lines, "    PubkeyAuthentication yes")
+		lines = append(lines, "    AuthorizedKeysFile .ssh/authorized_keys")
+	} else {
+		lines = append(lines, "    PubkeyAuthentication no")
+	}
+	if params.AllowPassword {
+		lines = append(lines, "    PasswordAuthentication yes")
+	} else {
+		lines = append(lines, "    PasswordAuthentication no")
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// setupSshAccess creates the sshd_config.d file and optionally sets up authorized_keys.
+func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, configPath string) (*pb.CommandOutput, bool, error) {
+	var output strings.Builder
+	changed := false
+
+	// Generate sshd config content
+	content := generateSshdConfig(params)
+
+	// Check if config already matches desired state
+	configMatches := e.sshConfigMatchesDesired(configPath, content)
+
+	if !configMatches {
+		if !e.repairFilesystem(ctx) {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   "filesystem is read-only and could not be remounted",
+			}, false, fmt.Errorf("filesystem is read-only")
+		}
+
+		// Ensure /etc/ssh/sshd_config.d exists
+		if _, err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
+			return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
+		}
+
+		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
+			return nil, false, fmt.Errorf("write ssh config: %w", err)
+		}
+		changed = true
+		output.WriteString(fmt.Sprintf("created SSH config: %s\n", configPath))
+	} else {
+		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
+	}
+
+	// Set up authorized keys if pubkey auth is enabled and keys are provided
+	if params.AllowPubkey && len(params.AuthorizedKeys) > 0 {
+		keysChanged, err := e.setupSshAuthorizedKeys(ctx, params, &output)
+		if err != nil {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stdout:   output.String(),
+				Stderr:   err.Error(),
+			}, changed, err
+		}
+		if keysChanged {
+			changed = true
+		}
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   output.String(),
+	}, changed, nil
+}
+
+// removeSshAccess removes the sshd_config.d file and optionally the authorized_keys.
+func (e *Executor) removeSshAccess(ctx context.Context, params *pb.SshParams, configPath string) (*pb.CommandOutput, bool, error) {
+	var output strings.Builder
+	changed := false
+
+	// Remove sshd config file
+	if _, err := os.Stat(configPath); err == nil {
+		if !e.repairFilesystem(ctx) {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   "filesystem is read-only and could not be remounted",
+			}, false, fmt.Errorf("filesystem is read-only")
+		}
+		if _, err := removeFileStrict(ctx, configPath); err != nil {
+			return nil, false, fmt.Errorf("remove ssh config: %w", err)
+		}
+		changed = true
+		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
+	} else {
+		output.WriteString(fmt.Sprintf("SSH config does not exist: %s\n", configPath))
+	}
+
+	// Remove authorized_keys if keys were specified
+	if len(params.AuthorizedKeys) > 0 {
+		homeDir := params.HomeDir
+		if homeDir == "" {
+			homeDir = filepath.Join("/home", params.Username)
+		}
+		authKeysFile := filepath.Join(homeDir, ".ssh", "authorized_keys")
+
+		if _, err := os.Stat(authKeysFile); err == nil {
+			if _, err := removeFileStrict(ctx, authKeysFile); err != nil {
+				return nil, changed, fmt.Errorf("remove authorized_keys: %w", err)
+			}
+			changed = true
+			output.WriteString(fmt.Sprintf("removed authorized_keys: %s\n", authKeysFile))
+		}
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   output.String(),
+	}, changed, nil
+}
+
+// setupSshAuthorizedKeys creates ~/.ssh/authorized_keys for the SSH action.
+func (e *Executor) setupSshAuthorizedKeys(ctx context.Context, params *pb.SshParams, output *strings.Builder) (bool, error) {
+	homeDir := params.HomeDir
+	if homeDir == "" {
+		homeDir = filepath.Join("/home", params.Username)
+	}
+
+	sshDir := filepath.Join(homeDir, ".ssh")
+	authKeysFile := filepath.Join(sshDir, "authorized_keys")
+
+	// Build authorized_keys content
+	var keysContent strings.Builder
+	validKeys := 0
+	for _, key := range params.AuthorizedKeys {
+		trimmedKey := strings.TrimSpace(key)
+		if trimmedKey == "" {
+			continue
+		}
+		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
+			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key: %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
+			continue
+		}
+		keysContent.WriteString(trimmedKey)
+		keysContent.WriteString("\n")
+		validKeys++
+	}
+
+	if validKeys == 0 {
+		output.WriteString("no valid SSH keys to configure\n")
+		return false, nil
+	}
+
+	// Check if authorized_keys already matches
+	existing, _ := readFileWithSudo(ctx, authKeysFile)
+	if existing == keysContent.String() {
+		output.WriteString(fmt.Sprintf("authorized_keys already up to date: %s\n", authKeysFile))
+		return false, nil
+	}
+
+	// Create .ssh directory
+	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
+		return false, fmt.Errorf("create .ssh directory: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+		return false, fmt.Errorf("set .ssh ownership: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
+		return false, fmt.Errorf("set .ssh permissions: %w", err)
+	}
+
+	// Write authorized_keys
+	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(keysContent.String()), "tee", authKeysFile); err != nil {
+		return false, fmt.Errorf("write authorized_keys: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
+		return false, fmt.Errorf("set authorized_keys ownership: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
+		return false, fmt.Errorf("set authorized_keys permissions: %w", err)
+	}
+
+	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s): %s\n", validKeys, authKeysFile))
+	return true, nil
+}
+
+// sshConfigMatchesDesired checks if an SSH config file already has the desired content.
+func (e *Executor) sshConfigMatchesDesired(path, desiredContent string) bool {
+	info, err := os.Stat(path)
+	if err != nil || info.IsDir() {
+		return false
+	}
+	existing, err := readFileWithSudo(context.Background(), path)
+	if err != nil {
+		return false
+	}
+	return existing == desiredContent
 }
 
 // ensureGroupExists creates a group if it doesn't exist.
