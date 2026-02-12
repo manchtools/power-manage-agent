@@ -2698,6 +2698,18 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	}
 	output.WriteString(fmt.Sprintf("created user: %s\n", params.Username))
 
+	// If home directory already existed, fix ownership
+	if homeExists && createHome {
+		if chownOutput, chownErr := runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
+			if chownOutput != nil {
+				output.WriteString(chownOutput.Stderr)
+			}
+		} else {
+			output.WriteString(fmt.Sprintf("fixed ownership of existing home directory: %s\n", homeDir))
+		}
+	}
+
 	// Generate and set temporary password for non-system users
 	if !params.SystemUser && !params.Disabled {
 		tempPassword, err := generateTempPassword()
@@ -2717,18 +2729,6 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 				}
 				output.WriteString(fmt.Sprintf("TEMPORARY PASSWORD for %s: %s (must be changed on first login)\n", params.Username, tempPassword))
 			}
-		}
-	}
-
-	// If home directory already existed, fix ownership
-	if homeExists && createHome {
-		if chownOutput, chownErr := runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
-			if chownOutput != nil {
-				output.WriteString(chownOutput.Stderr)
-			}
-		} else {
-			output.WriteString(fmt.Sprintf("fixed ownership of existing home directory: %s\n", homeDir))
 		}
 	}
 
@@ -2814,6 +2814,32 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 			return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, false, fmt.Errorf("failed to update user: %w", err)
 		}
 		changed = true
+	}
+
+	// Ensure home directory exists (may be missing if a prior run failed)
+	createHome := params.CreateHome
+	if !params.SystemUser && !params.CreateHome {
+		createHome = true
+	}
+	if createHome {
+		homeDir := params.HomeDir
+		if homeDir == "" {
+			homeDir = currentInfo.HomeDir
+		}
+		if homeDir == "" {
+			homeDir = "/home/" + params.Username
+		}
+		if _, err := os.Stat(homeDir); os.IsNotExist(err) {
+			if _, mkErr := runSudoCmd(ctx, "mkdir", "-p", homeDir); mkErr != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
+			} else {
+				runSudoCmd(ctx, "cp", "-a", "/etc/skel/.", homeDir)
+				runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir)
+				runSudoCmd(ctx, "chmod", "0700", homeDir)
+				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
+				changed = true
+			}
+		}
 	}
 
 	// Handle disabled/locked state - only change if different
