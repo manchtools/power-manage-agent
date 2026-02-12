@@ -118,6 +118,14 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 
+	// Never allow removal of the agent's own service group
+	if groupName == "power-manage" {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "refusing to remove the power-manage service group\n",
+		}, false, fmt.Errorf("cannot remove protected group: power-manage")
+	}
+
 	if !groupExists(groupName) {
 		output.WriteString(fmt.Sprintf("group %s does not exist, nothing to remove\n", groupName))
 		return &pb.CommandOutput{
