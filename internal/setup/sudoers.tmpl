@@ -49,9 +49,19 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/ss *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/lsof *
 
+# Process and session management
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/pkill *
+{{.User}} ALL=(root) NOPASSWD: /bin/pkill *
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/loginctl *
+{{.User}} ALL=(root) NOPASSWD: /bin/loginctl *
+
 # Filesystem repair (remount read-only filesystems)
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw /
 {{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw /
+
+# Sudoers validation (used by sudo action to validate files before install)
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/visudo *
+{{.User}} ALL=(root) NOPASSWD: /sbin/visudo *
 
 # User management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/useradd *
