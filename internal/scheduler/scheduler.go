@@ -312,32 +312,17 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 		"removed", len(syncResult.RemovedActions),
 	)
 
-	// Undo removed actions by inverting their desired_state
-	for _, removed := range syncResult.RemovedActions {
-		select {
-		case <-ctx.Done():
-			return ctx.Err()
-		default:
+	// Log removed actions (no longer undone — unassigning an action should not
+	// destroy state on the device, e.g. deleting users or removing packages).
+	if len(syncResult.RemovedActions) > 0 {
+		for _, removed := range syncResult.RemovedActions {
+			if removed.Id != nil {
+				s.logger.Info("action unassigned from device",
+					"action_id", removed.Id.Value,
+					"type", removed.Type.String(),
+				)
+			}
 		}
-
-		if removed.Id == nil {
-			continue
-		}
-
-		// Invert desired_state for undo
-		if removed.DesiredState == pb.DesiredState_DESIRED_STATE_PRESENT {
-			removed.DesiredState = pb.DesiredState_DESIRED_STATE_ABSENT
-		} else {
-			removed.DesiredState = pb.DesiredState_DESIRED_STATE_PRESENT
-		}
-
-		s.logger.Info("undoing removed action",
-			"action_id", removed.Id.Value,
-			"type", removed.Type.String(),
-			"inverted_desired_state", removed.DesiredState.String(),
-		)
-
-		s.executor.Execute(ctx, removed)
 	}
 
 	// Determine which stored actions to execute
