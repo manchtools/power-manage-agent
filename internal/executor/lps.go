@@ -231,6 +231,8 @@ func killUserSessions(ctx context.Context, username string) {
 	runSudoCmd(ctx, "loginctl", "terminate-user", username)
 	// Forceful: kill all remaining processes owned by the user
 	runSudoCmd(ctx, "pkill", "-KILL", "-u", username)
+	// Brief wait for processes to fully exit
+	time.Sleep(500 * time.Millisecond)
 }
 
 // generatePassword creates a cryptographically random password from the given character set.

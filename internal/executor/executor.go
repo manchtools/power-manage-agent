@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log/slog"
@@ -191,8 +192,12 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_USER:
 		var changed bool
-		output, changed, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
+		var metadata map[string]string
+		output, changed, metadata, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
 		result.Changed = changed
+		if len(metadata) > 0 {
+			result.Metadata = metadata
+		}
 	case pb.ActionType_ACTION_TYPE_GROUP:
 		var changed bool
 		output, changed, execErr = e.executeGroup(ctx, action.GetGroup(), action.DesiredState)
@@ -855,6 +860,14 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("systemd params required")
+	}
+
+	// Never allow managing the agent's own service
+	if params.UnitName == "power-manage-agent.service" || params.UnitName == "power-manage-agent" {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "refusing to manage the power-manage-agent service\n",
+		}, false, fmt.Errorf("cannot manage protected service: power-manage-agent")
 	}
 
 	var output strings.Builder
@@ -2563,18 +2576,18 @@ func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error)
 }
 
 // executeUser manages user accounts (create, update, disable, remove).
-func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
+func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state pb.DesiredState) (*pb.CommandOutput, bool, map[string]string, error) {
 	if params == nil {
-		return nil, false, fmt.Errorf("user params required")
+		return nil, false, nil, fmt.Errorf("user params required")
 	}
 
 	if params.Username == "" {
-		return nil, false, fmt.Errorf("username is required")
+		return nil, false, nil, fmt.Errorf("username is required")
 	}
 
 	// Validate username format (prevent injection)
 	if !isValidUsername(params.Username) {
-		return nil, false, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
+		return nil, false, nil, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
 	}
 
 	// Repair filesystem if mounted read-only
@@ -2582,16 +2595,17 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 		return &pb.CommandOutput{
 			ExitCode: 1,
 			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, fmt.Errorf("filesystem is read-only")
+		}, false, nil, fmt.Errorf("filesystem is read-only")
 	}
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		return e.createOrUpdateUser(ctx, params)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		return e.removeUser(ctx, params.Username)
+		output, changed, err := e.removeUser(ctx, params.Username)
+		return output, changed, nil, err
 	default:
-		return nil, false, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, nil, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
@@ -2599,23 +2613,24 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 // are now defined in user.go for reusability.
 
 // createOrUpdateUser creates a new user or updates an existing one.
-// Returns the command output, whether changes were made, and any error.
-func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, error) {
+// Returns the command output, whether changes were made, metadata, and any error.
+func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists := userExists(params.Username)
 
 	if exists {
 		// Update existing user
-		return e.updateUser(ctx, params, &output)
+		cmdOutput, changed, err := e.updateUser(ctx, params, &output)
+		return cmdOutput, changed, nil, err
 	}
 
 	// Create new user - always a change
-	cmdOutput, err := e.createUser(ctx, params, &output)
-	return cmdOutput, true, err
+	cmdOutput, metadata, err := e.createUser(ctx, params, &output)
+	return cmdOutput, true, metadata, err
 }
 
 // createUser creates a new user account.
-func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, error) {
+func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, map[string]string, error) {
 	args := []string{}
 
 	// UID
@@ -2694,7 +2709,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		if cmdOutput != nil {
 			output.WriteString(cmdOutput.Stderr)
 		}
-		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, fmt.Errorf("failed to create user: %w", err)
+		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, nil, fmt.Errorf("failed to create user: %w", err)
 	}
 	output.WriteString(fmt.Sprintf("created user: %s\n", params.Username))
 
@@ -2711,6 +2726,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	}
 
 	// Generate and set temporary password for non-system users
+	var metadata map[string]string
 	if !params.SystemUser && !params.Disabled {
 		tempPassword, err := generateTempPassword()
 		if err != nil {
@@ -2727,14 +2743,25 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 				if _, chageErr := runSudoCmd(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
 				}
-				output.WriteString(fmt.Sprintf("TEMPORARY PASSWORD for %s: %s (must be changed on first login)\n", params.Username, tempPassword))
+				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
+
+				// Report password via lps.rotations metadata so it's stored in the LPS table
+				rotations := []lpsRotationEntry{{
+					Username:  params.Username,
+					Password:  tempPassword,
+					RotatedAt: time.Now().UTC().Format(time.RFC3339),
+					Reason:    "user_created",
+				}}
+				if rotationsJSON, err := json.Marshal(rotations); err == nil {
+					metadata = map[string]string{"lps.rotations": string(rotationsJSON)}
+				}
 			}
 		}
 	}
 
 	// Setup SSH authorized keys
 	if len(params.SshAuthorizedKeys) > 0 {
-		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+		if _, err := e.setupSSHKeys(ctx, params, output); err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
 		}
 	}
@@ -2751,7 +2778,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, metadata, nil
 }
 
 // updateUser modifies an existing user account.
@@ -2870,9 +2897,9 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 
 	// Setup SSH authorized keys
 	if len(params.SshAuthorizedKeys) > 0 {
-		if err := e.setupSSHKeys(ctx, params, output); err != nil {
+		if keysChanged, err := e.setupSSHKeys(ctx, params, output); err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
-		} else {
+		} else if keysChanged {
 			changed = true
 		}
 	}
@@ -2887,6 +2914,14 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 // removeUser removes a user account from the system.
 // Returns the command output, whether changes were made, and any error.
 func (e *Executor) removeUser(ctx context.Context, username string) (*pb.CommandOutput, bool, error) {
+	// Never allow removal of the agent's own service user
+	if username == "power-manage" {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "refusing to remove the power-manage service user\n",
+		}, false, fmt.Errorf("cannot remove protected user: power-manage")
+	}
+
 	if !userExists(username) {
 		// User doesn't exist, no change needed
 		return &pb.CommandOutput{
@@ -2894,6 +2929,9 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 			Stdout:   fmt.Sprintf("user %s does not exist, nothing to remove\n", username),
 		}, false, nil
 	}
+
+	// Kill all processes and sessions for this user before removal
+	killUserSessions(ctx, username)
 
 	// Remove user and their home directory
 	output, err := runSudoCmd(ctx, "userdel", "-r", username)
@@ -2919,7 +2957,7 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 }
 
 // setupSSHKeys configures SSH authorized keys for a user.
-func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, output *strings.Builder) error {
+func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, output *strings.Builder) (bool, error) {
 	// Determine home directory
 	homeDir := params.HomeDir
 	if homeDir == "" {
@@ -2933,20 +2971,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	sshDir := filepath.Join(homeDir, ".ssh")
 	authKeysFile := filepath.Join(sshDir, "authorized_keys")
 
-	// Create .ssh directory
-	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
-		return fmt.Errorf("failed to create .ssh directory: %w", err)
-	}
-
-	// Set ownership and permissions on .ssh directory
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
-		return fmt.Errorf("failed to set .ssh ownership: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
-		return fmt.Errorf("failed to set .ssh permissions: %w", err)
-	}
-
-	// Build authorized_keys content
+	// Build desired authorized_keys content
 	var keysContent strings.Builder
 	for _, key := range params.SshAuthorizedKeys {
 		trimmedKey := strings.TrimSpace(key)
@@ -2960,22 +2985,42 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		keysContent.WriteString(trimmedKey)
 		keysContent.WriteString("\n")
 	}
+	desiredContent := keysContent.String()
+
+	// Check if authorized_keys already has the desired content (idempotency)
+	existing, _ := readFileWithSudo(ctx, authKeysFile)
+	if existing == desiredContent {
+		return false, nil
+	}
+
+	// Create .ssh directory
+	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
+		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
+	}
+
+	// Set ownership and permissions on .ssh directory
+	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
+		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
+	}
 
 	// Write authorized_keys file
-	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(keysContent.String()), "tee", authKeysFile); err != nil {
-		return fmt.Errorf("failed to write authorized_keys: %w", err)
+	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(desiredContent), "tee", authKeysFile); err != nil {
+		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
 
 	// Set ownership and permissions on authorized_keys
 	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
-		return fmt.Errorf("failed to set authorized_keys ownership: %w", err)
+		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
-		return fmt.Errorf("failed to set authorized_keys permissions: %w", err)
+		return false, fmt.Errorf("failed to set authorized_keys permissions: %w", err)
 	}
 
 	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
-	return nil
+	return true, nil
 }
 
 // sshGroupName creates a valid Linux group name from the action ID for SSH access.
