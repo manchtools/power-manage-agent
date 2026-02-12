@@ -193,6 +193,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, changed, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
 		result.Changed = changed
+	case pb.ActionType_ACTION_TYPE_GROUP:
+		var changed bool
+		output, changed, execErr = e.executeGroup(ctx, action.GetGroup(), action.DesiredState)
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSH:
 		var changed bool
 		sshActionID := ""
@@ -2591,7 +2595,7 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	}
 }
 
-// Note: isValidUsername, generateTempPassword, userExists, getUserInfo, and groupsContains
+// Note: isValidUsername, generateTempPassword, userExists, and getUserInfo
 // are now defined in user.go for reusability.
 
 // createOrUpdateUser creates a new user or updates an existing one.
@@ -2679,17 +2683,6 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	// Comment/GECOS
 	if params.Comment != "" {
 		args = append(args, "-c", params.Comment)
-	}
-
-	// Additional groups
-	if len(params.Groups) > 0 {
-		// Validate group names
-		for _, g := range params.Groups {
-			if !isValidUsername(g) {
-				return nil, fmt.Errorf("invalid group name: %s", g)
-			}
-		}
-		args = append(args, "-G", strings.Join(params.Groups, ","))
 	}
 
 	// Add username as last argument
@@ -2808,19 +2801,6 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		ensureGroupExists(ctx, params.PrimaryGroup)
 		// For simplicity, always set if specified by name (could be optimized)
 		args = append(args, "-g", params.PrimaryGroup)
-	}
-
-	// Additional groups - only if specified and not already present
-	if len(params.Groups) > 0 {
-		for _, g := range params.Groups {
-			if !isValidUsername(g) {
-				return nil, false, fmt.Errorf("invalid group name: %s", g)
-			}
-		}
-		if !groupsContains(currentInfo.Groups, params.Groups) {
-			args = append(args, "-aG", strings.Join(params.Groups, ","))
-			output.WriteString(fmt.Sprintf("groups: adding %v\n", params.Groups))
-		}
 	}
 
 	// Apply usermod if we have changes
@@ -3066,7 +3046,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 	content := generateSshGroupConfig(groupName, params)
 
 	// Check idempotency: file content + group membership
-	fileMatches := e.sshConfigMatchesDesired(configPath, content)
+	fileMatches := e.configMatchesDesired(configPath, content)
 	membersMatch := sudoGroupMembersMatch(groupName, users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
@@ -3201,8 +3181,8 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 	}, changed, nil
 }
 
-// sshConfigMatchesDesired checks if an SSH config file already has the desired content.
-func (e *Executor) sshConfigMatchesDesired(path, desiredContent string) bool {
+// configMatchesDesired checks if a config file already has the desired content.
+func (e *Executor) configMatchesDesired(path, desiredContent string) bool {
 	info, err := os.Stat(path)
 	if err != nil || info.IsDir() {
 		return false
@@ -3253,7 +3233,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 	content := generateSshdGlobalConfig(params)
 
 	// Check idempotency
-	if e.sshConfigMatchesDesired(configPath, content) {
+	if e.configMatchesDesired(configPath, content) {
 		output.WriteString(fmt.Sprintf("SSHD config already up to date: %s\n", configPath))
 		return &pb.CommandOutput{
 			ExitCode: 0,

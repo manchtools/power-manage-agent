@@ -136,20 +136,6 @@ func isValidUsername(username string) bool {
 	return true
 }
 
-// groupsContains checks if all desired groups are present in current groups.
-func groupsContains(current, desired []string) bool {
-	currentMap := make(map[string]bool)
-	for _, g := range current {
-		currentMap[g] = true
-	}
-	for _, g := range desired {
-		if !currentMap[g] {
-			return false
-		}
-	}
-	return true
-}
-
 // =============================================================================
 // User Management Operations
 // =============================================================================
@@ -188,9 +174,11 @@ func userUnlock(ctx context.Context, username string) (*pb.CommandOutput, error)
 // Group Management Operations
 // =============================================================================
 
-// groupAdd creates a new group.
-func groupAdd(ctx context.Context, groupName string) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "groupadd", groupName)
+// groupAdd creates a new group. Optional args are passed before the group name
+// (e.g., "-g", "1001", "-r" for GID and system group).
+func groupAdd(ctx context.Context, groupName string, extraArgs ...string) (*pb.CommandOutput, error) {
+	args := append(extraArgs, groupName)
+	return runSudoCmd(ctx, "groupadd", args...)
 }
 
 // ensureGroupExists creates a group if it doesn't exist.

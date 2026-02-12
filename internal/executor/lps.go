@@ -42,7 +42,7 @@ type lpsRotationEntry struct {
 	Reason    string `json:"reason"`
 }
 
-// executeLps manages local user password rotation (Linux Password Solution).
+// executeLps manages local user password rotation (Local Password Solution).
 func (e *Executor) executeLps(ctx context.Context, params *pb.LpsParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	if params == nil {
 		return nil, false, nil, fmt.Errorf("lps params required")
