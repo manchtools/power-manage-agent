@@ -128,8 +128,8 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		}
 		verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature)
 		if verifyErr != nil {
-			// Shell scripts: hard reject unsigned/tampered actions
-			if action.Type == pb.ActionType_ACTION_TYPE_SHELL {
+			// Shell scripts and sudo policies: hard reject unsigned/tampered actions
+			if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SUDO || action.Type == pb.ActionType_ACTION_TYPE_LPS {
 				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 				result.Error = fmt.Sprintf("refusing to execute unsigned/tampered shell script: %v", verifyErr)
 				result.CompletedAt = timestamppb.Now()
@@ -195,8 +195,40 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSH:
 		var changed bool
-		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState)
+		sshActionID := ""
+		if action.Id != nil {
+			sshActionID = action.Id.Value
+		}
+		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, sshActionID)
 		result.Changed = changed
+	case pb.ActionType_ACTION_TYPE_SSHD:
+		var changed bool
+		sshdActionID := ""
+		if action.Id != nil {
+			sshdActionID = action.Id.Value
+		}
+		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, sshdActionID)
+		result.Changed = changed
+	case pb.ActionType_ACTION_TYPE_SUDO:
+		var changed bool
+		sudoActionID := ""
+		if action.Id != nil {
+			sudoActionID = action.Id.Value
+		}
+		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, sudoActionID)
+		result.Changed = changed
+	case pb.ActionType_ACTION_TYPE_LPS:
+		var changed bool
+		var metadata map[string]string
+		lpsActionID := ""
+		if action.Id != nil {
+			lpsActionID = action.Id.Value
+		}
+		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, lpsActionID)
+		result.Changed = changed
+		if len(metadata) > 0 {
+			result.Metadata = metadata
+		}
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	default:
@@ -2940,30 +2972,77 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	return nil
 }
 
-// executeSsh configures SSH access for a user by placing an sshd_config.d
-// drop-in file and optionally managing authorized_keys.
-func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
+// sshGroupName creates a valid Linux group name from the action ID for SSH access.
+// Linux group names: max 32 chars. pm-ssh- (7 chars) + up to 25 chars of action ID.
+func sshGroupName(actionID string) string {
+	lower := strings.ToLower(actionID)
+	if len(lower) > 25 {
+		lower = lower[:25]
+	}
+	return "pm-ssh-" + lower
+}
+
+// sshConfigPath returns the path for an SSH config drop-in file.
+func sshConfigPath(actionID string) string {
+	return fmt.Sprintf("/etc/ssh/sshd_config.d/pm-ssh-%s.conf", strings.ToLower(actionID))
+}
+
+// sshEffectiveUsers returns the merged user list, handling backward compat with the deprecated username field.
+func sshEffectiveUsers(params *pb.SshParams) []string {
+	users := params.Users
+	// Backward compat: if deprecated username is set and not already in users, include it
+	if params.Username != "" {
+		found := false
+		for _, u := range users {
+			if u == params.Username {
+				found = true
+				break
+			}
+		}
+		if !found {
+			users = append([]string{params.Username}, users...)
+		}
+	}
+	return users
+}
+
+// executeSsh configures SSH access via an sshd_config.d drop-in file with a Match Group directive.
+// Each action creates a Linux group pm-ssh-{actionId} and users are added to the group.
+func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("ssh params required")
 	}
-	if !isValidUsername(params.Username) {
-		return nil, false, fmt.Errorf("invalid username: %s", params.Username)
+	if actionID == "" {
+		return nil, false, fmt.Errorf("action ID required for ssh group/file naming")
 	}
 
-	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%s.conf", params.Username)
+	users := sshEffectiveUsers(params)
+	if len(users) == 0 {
+		return nil, false, fmt.Errorf("at least one user is required")
+	}
+	for _, u := range users {
+		if !isValidUsername(u) {
+			return nil, false, fmt.Errorf("invalid username: %s", u)
+		}
+	}
+
+	groupName := sshGroupName(actionID)
+	configPath := sshConfigPath(actionID)
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		return e.removeSshAccess(ctx, params, configPath)
+		return e.removeSshAccess(ctx, groupName, configPath)
 	default:
-		return e.setupSshAccess(ctx, params, configPath)
+		return e.setupSshAccess(ctx, params, users, groupName, configPath)
 	}
 }
 
-// generateSshdConfig generates sshd_config content for a user.
-func generateSshdConfig(params *pb.SshParams) string {
-	var lines []string
-	lines = append(lines, fmt.Sprintf("Match User %s", params.Username))
+// generateSshGroupConfig generates sshd_config content using Match Group.
+func generateSshGroupConfig(groupName string, params *pb.SshParams) string {
+	lines := []string{
+		"# Managed by Power Manage - do not edit manually",
+		fmt.Sprintf("Match Group %s", groupName),
+	}
 	if params.AllowPubkey {
 		lines = append(lines, "    PubkeyAuthentication yes")
 		lines = append(lines, "    AuthorizedKeysFile .ssh/authorized_keys")
@@ -2978,51 +3057,90 @@ func generateSshdConfig(params *pb.SshParams) string {
 	return strings.Join(lines, "\n") + "\n"
 }
 
-// setupSshAccess creates the sshd_config.d file and optionally sets up authorized_keys.
-func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, configPath string) (*pb.CommandOutput, bool, error) {
+// setupSshAccess creates or updates the SSH access group and sshd_config.d file.
+func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, users []string, groupName, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	changed := false
 
 	// Generate sshd config content
-	content := generateSshdConfig(params)
+	content := generateSshGroupConfig(groupName, params)
 
-	// Check if config already matches desired state
-	configMatches := e.sshConfigMatchesDesired(configPath, content)
+	// Check idempotency: file content + group membership
+	fileMatches := e.sshConfigMatchesDesired(configPath, content)
+	membersMatch := sudoGroupMembersMatch(groupName, users)
+	if fileMatches && membersMatch {
+		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   output.String(),
+		}, false, nil
+	}
 
-	if !configMatches {
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted",
-			}, false, fmt.Errorf("filesystem is read-only")
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted",
+		}, false, fmt.Errorf("filesystem is read-only")
+	}
+
+	// Ensure group exists
+	if !groupExists(groupName) {
+		if grpOut, err := groupAdd(ctx, groupName); err != nil {
+			errMsg := "failed to create group"
+			if grpOut != nil && grpOut.Stderr != "" {
+				errMsg = strings.TrimSpace(grpOut.Stderr)
+			}
+			return nil, false, fmt.Errorf("create group %s: %s", groupName, errMsg)
 		}
+		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
+		changed = true
+	}
 
+	// Write sshd config file
+	if !fileMatches {
 		// Ensure /etc/ssh/sshd_config.d exists
 		if _, err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
 			return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 		}
-
 		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
 			return nil, false, fmt.Errorf("write ssh config: %w", err)
 		}
+		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
 		changed = true
-		output.WriteString(fmt.Sprintf("created SSH config: %s\n", configPath))
-	} else {
-		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
 	}
 
-	// Set up authorized keys if pubkey auth is enabled and keys are provided
-	if params.AllowPubkey && len(params.AuthorizedKeys) > 0 {
-		keysChanged, err := e.setupSshAuthorizedKeys(ctx, params, &output)
-		if err != nil {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stdout:   output.String(),
-				Stderr:   err.Error(),
-			}, changed, err
+	// Add users to group
+	for _, username := range users {
+		if !userExists(username) {
+			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
+			continue
 		}
-		if keysChanged {
-			changed = true
+		if !userInGroup(username, groupName) {
+			if addOut, err := addUserToGroup(ctx, username, groupName); err != nil {
+				errMsg := "failed to add user to group"
+				if addOut != nil && addOut.Stderr != "" {
+					errMsg = strings.TrimSpace(addOut.Stderr)
+				}
+				output.WriteString(fmt.Sprintf("warning: %s for user %s: %s\n", errMsg, username, err))
+			} else {
+				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
+				changed = true
+			}
+		}
+	}
+
+	// Remove users that are no longer in the list
+	currentMembers := getGroupMembers(groupName)
+	desiredSet := make(map[string]bool, len(users))
+	for _, u := range users {
+		desiredSet[u] = true
+	}
+	for _, member := range currentMembers {
+		if !desiredSet[member] {
+			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
+				changed = true
+			}
 		}
 	}
 
@@ -3032,8 +3150,8 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, con
 	}, changed, nil
 }
 
-// removeSshAccess removes the sshd_config.d file and optionally the authorized_keys.
-func (e *Executor) removeSshAccess(ctx context.Context, params *pb.SshParams, configPath string) (*pb.CommandOutput, bool, error) {
+// removeSshAccess removes the sshd_config.d file, group membership, and group.
+func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	changed := false
 
@@ -3048,98 +3166,39 @@ func (e *Executor) removeSshAccess(ctx context.Context, params *pb.SshParams, co
 		if _, err := removeFileStrict(ctx, configPath); err != nil {
 			return nil, false, fmt.Errorf("remove ssh config: %w", err)
 		}
-		changed = true
 		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
-	} else {
-		output.WriteString(fmt.Sprintf("SSH config does not exist: %s\n", configPath))
+		changed = true
 	}
 
-	// Remove authorized_keys if keys were specified
-	if len(params.AuthorizedKeys) > 0 {
-		homeDir := params.HomeDir
-		if homeDir == "" {
-			homeDir = filepath.Join("/home", params.Username)
-		}
-		authKeysFile := filepath.Join(homeDir, ".ssh", "authorized_keys")
-
-		if _, err := os.Stat(authKeysFile); err == nil {
-			if _, err := removeFileStrict(ctx, authKeysFile); err != nil {
-				return nil, changed, fmt.Errorf("remove authorized_keys: %w", err)
+	// Remove group and membership
+	if groupExists(groupName) {
+		members := getGroupMembers(groupName)
+		for _, member := range members {
+			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
+				changed = true
 			}
-			changed = true
-			output.WriteString(fmt.Sprintf("removed authorized_keys: %s\n", authKeysFile))
 		}
+		if delOut, err := groupDel(ctx, groupName); err != nil {
+			errMsg := "failed to delete group"
+			if delOut != nil && delOut.Stderr != "" {
+				errMsg = strings.TrimSpace(delOut.Stderr)
+			}
+			output.WriteString(fmt.Sprintf("warning: %s %s: %s\n", errMsg, groupName, err))
+		} else {
+			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
+			changed = true
+		}
+	}
+
+	if !changed {
+		output.WriteString("SSH access does not exist, nothing to remove\n")
 	}
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),
 	}, changed, nil
-}
-
-// setupSshAuthorizedKeys creates ~/.ssh/authorized_keys for the SSH action.
-func (e *Executor) setupSshAuthorizedKeys(ctx context.Context, params *pb.SshParams, output *strings.Builder) (bool, error) {
-	homeDir := params.HomeDir
-	if homeDir == "" {
-		homeDir = filepath.Join("/home", params.Username)
-	}
-
-	sshDir := filepath.Join(homeDir, ".ssh")
-	authKeysFile := filepath.Join(sshDir, "authorized_keys")
-
-	// Build authorized_keys content
-	var keysContent strings.Builder
-	validKeys := 0
-	for _, key := range params.AuthorizedKeys {
-		trimmedKey := strings.TrimSpace(key)
-		if trimmedKey == "" {
-			continue
-		}
-		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
-			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key: %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
-			continue
-		}
-		keysContent.WriteString(trimmedKey)
-		keysContent.WriteString("\n")
-		validKeys++
-	}
-
-	if validKeys == 0 {
-		output.WriteString("no valid SSH keys to configure\n")
-		return false, nil
-	}
-
-	// Check if authorized_keys already matches
-	existing, _ := readFileWithSudo(ctx, authKeysFile)
-	if existing == keysContent.String() {
-		output.WriteString(fmt.Sprintf("authorized_keys already up to date: %s\n", authKeysFile))
-		return false, nil
-	}
-
-	// Create .ssh directory
-	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
-		return false, fmt.Errorf("create .ssh directory: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
-		return false, fmt.Errorf("set .ssh ownership: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
-		return false, fmt.Errorf("set .ssh permissions: %w", err)
-	}
-
-	// Write authorized_keys
-	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(keysContent.String()), "tee", authKeysFile); err != nil {
-		return false, fmt.Errorf("write authorized_keys: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
-		return false, fmt.Errorf("set authorized_keys ownership: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
-		return false, fmt.Errorf("set authorized_keys permissions: %w", err)
-	}
-
-	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s): %s\n", validKeys, authKeysFile))
-	return true, nil
 }
 
 // sshConfigMatchesDesired checks if an SSH config file already has the desired content.
@@ -3153,6 +3212,150 @@ func (e *Executor) sshConfigMatchesDesired(path, desiredContent string) bool {
 		return false
 	}
 	return existing == desiredContent
+}
+
+// executeSshd configures the SSH daemon via sshd_config.d drop-in files.
+func (e *Executor) executeSshd(ctx context.Context, params *pb.SshdParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
+	if params == nil {
+		return nil, false, fmt.Errorf("sshd params required")
+	}
+	if len(params.Directives) == 0 && state != pb.DesiredState_DESIRED_STATE_ABSENT {
+		return nil, false, fmt.Errorf("at least one directive is required")
+	}
+	if actionID == "" {
+		return nil, false, fmt.Errorf("action ID required for sshd config file naming")
+	}
+
+	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, actionID)
+
+	switch state {
+	case pb.DesiredState_DESIRED_STATE_ABSENT:
+		return e.removeSshdConfig(ctx, configPath)
+	default:
+		return e.setupSshdConfig(ctx, params, configPath)
+	}
+}
+
+// generateSshdGlobalConfig generates sshd_config content from directives.
+func generateSshdGlobalConfig(params *pb.SshdParams) string {
+	var lines []string
+	lines = append(lines, "# Managed by Power Manage - do not edit manually")
+	for _, d := range params.Directives {
+		lines = append(lines, fmt.Sprintf("%s %s", d.Key, d.Value))
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// setupSshdConfig creates or updates an sshd_config.d drop-in file and reloads sshd if changed.
+func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, configPath string) (*pb.CommandOutput, bool, error) {
+	var output strings.Builder
+
+	content := generateSshdGlobalConfig(params)
+
+	// Check idempotency
+	if e.sshConfigMatchesDesired(configPath, content) {
+		output.WriteString(fmt.Sprintf("SSHD config already up to date: %s\n", configPath))
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   output.String(),
+		}, false, nil
+	}
+
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted",
+		}, false, fmt.Errorf("filesystem is read-only")
+	}
+
+	// Ensure /etc/ssh/sshd_config.d exists
+	if _, err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
+		return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
+	}
+
+	if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
+		return nil, false, fmt.Errorf("write sshd config: %w", err)
+	}
+	output.WriteString(fmt.Sprintf("created SSHD config: %s\n", configPath))
+
+	// Validate config
+	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
+	if validateErr != nil {
+		// Config is invalid — remove it and report error
+		removeFileStrict(ctx, configPath)
+		errMsg := "sshd config validation failed"
+		if validateOut != nil && validateOut.Stderr != "" {
+			errMsg = strings.TrimSpace(validateOut.Stderr)
+		}
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   errMsg,
+		}, false, fmt.Errorf("sshd -t validation failed: %s", errMsg)
+	}
+
+	// Reload sshd
+	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
+	if reloadErr != nil {
+		// Try ssh.service as fallback (some distros use ssh instead of sshd)
+		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	}
+	if reloadErr != nil {
+		output.WriteString("warning: failed to reload sshd\n")
+		if reloadOut != nil && reloadOut.Stderr != "" {
+			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
+		}
+	} else {
+		output.WriteString("reloaded sshd\n")
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   output.String(),
+	}, true, nil
+}
+
+// removeSshdConfig removes an sshd_config.d drop-in file and reloads sshd.
+func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb.CommandOutput, bool, error) {
+	var output strings.Builder
+
+	if _, err := os.Stat(configPath); err != nil {
+		output.WriteString(fmt.Sprintf("SSHD config does not exist: %s\n", configPath))
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   output.String(),
+		}, false, nil
+	}
+
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted",
+		}, false, fmt.Errorf("filesystem is read-only")
+	}
+
+	if _, err := removeFileStrict(ctx, configPath); err != nil {
+		return nil, false, fmt.Errorf("remove sshd config: %w", err)
+	}
+	output.WriteString(fmt.Sprintf("removed SSHD config: %s\n", configPath))
+
+	// Reload sshd
+	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
+	if reloadErr != nil {
+		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	}
+	if reloadErr != nil {
+		output.WriteString("warning: failed to reload sshd\n")
+		if reloadOut != nil && reloadOut.Stderr != "" {
+			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
+		}
+	} else {
+		output.WriteString("reloaded sshd\n")
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   output.String(),
+	}, true, nil
 }
 
 // ensureGroupExists creates a group if it doesn't exist.
