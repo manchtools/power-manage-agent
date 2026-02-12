@@ -495,21 +495,24 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		newDesiredState := int32(action.DesiredState)
 
 		local, exists := localActions[actionID]
-		if !exists {
-			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState {
-			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
-		}
-
-		isNew := !exists
 
 		actionJSON, err := protojson.Marshal(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
+		isChanged := false
+		if !exists {
+			result.NewActionIDs = append(result.NewActionIDs, actionID)
+		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) {
+			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
+			isChanged = true
+		}
+
+		isNew := !exists
+
 		// Calculate next execution time - run immediately for new or changed actions
-		runNow := isNew || (exists && local.desiredState != newDesiredState)
+		runNow := isNew || isChanged
 		nextExecute := s.calculateNextExecute(action, nil, runNow)
 
 		// Upsert: insert new or update existing (but preserve execution history)
@@ -520,7 +523,9 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 				action_json = excluded.action_json,
 				desired_state = excluded.desired_state,
 				next_execute_at = CASE
-					WHEN excluded.desired_state != actions.desired_state THEN excluded.next_execute_at
+					WHEN excluded.desired_state != actions.desired_state
+						OR excluded.action_json != actions.action_json
+					THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
 		`, actionID, string(actionJSON), nextExecute, newDesiredState)
