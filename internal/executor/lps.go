@@ -23,10 +23,23 @@ const (
 	complexChars      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?"
 )
 
-// lpsState tracks local LPS rotation state per action.
-type lpsState struct {
+// lpsUserState tracks local LPS rotation state for a single user.
+type lpsUserState struct {
 	LastRotatedAt time.Time `json:"last_rotated_at"`
 	PasswordHash  string    `json:"password_hash"`
+}
+
+// lpsState tracks local LPS rotation state for all managed users in an action.
+type lpsState struct {
+	Users map[string]lpsUserState `json:"users"`
+}
+
+// lpsRotationEntry is the JSON structure reported in action result metadata.
+type lpsRotationEntry struct {
+	Username  string `json:"username"`
+	Password  string `json:"password"`
+	RotatedAt string `json:"rotated_at"`
+	Reason    string `json:"reason"`
 }
 
 // executeLps manages local user password rotation (Linux Password Solution).
@@ -37,26 +50,26 @@ func (e *Executor) executeLps(ctx context.Context, params *pb.LpsParams, state p
 	if actionID == "" {
 		return nil, false, nil, fmt.Errorf("action ID required for LPS state tracking")
 	}
-	if !isValidUsername(params.Username) {
-		return nil, false, nil, fmt.Errorf("invalid username: %q", params.Username)
+	if len(params.Usernames) == 0 {
+		return nil, false, nil, fmt.Errorf("at least one username is required")
+	}
+	for _, u := range params.Usernames {
+		if !isValidUsername(u) {
+			return nil, false, nil, fmt.Errorf("invalid username: %q", u)
+		}
 	}
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		return e.removeLpsManagement(ctx, actionID)
 	default:
-		return e.setupLpsPassword(ctx, params, actionID)
+		return e.setupLpsPasswords(ctx, params, actionID)
 	}
 }
 
-// setupLpsPassword checks if password rotation is needed and rotates if so.
-func (e *Executor) setupLpsPassword(ctx context.Context, params *pb.LpsParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
+// setupLpsPasswords checks if password rotation is needed for each user and rotates if so.
+func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
-
-	// Verify user exists
-	if !userExists(params.Username) {
-		return nil, false, nil, fmt.Errorf("user %q does not exist on this system", params.Username)
-	}
 
 	// Load local state
 	localState, err := loadLpsState(actionID)
@@ -64,57 +77,104 @@ func (e *Executor) setupLpsPassword(ctx context.Context, params *pb.LpsParams, a
 		e.logger.Warn("failed to load LPS state, will treat as initial rotation", "action_id", actionID, "error", err)
 		localState = nil
 	}
+	if localState == nil {
+		localState = &lpsState{Users: make(map[string]lpsUserState)}
+	}
 
-	// Determine if rotation is needed
-	rotate, reason := shouldRotateLps(localState, params)
-	if !rotate {
-		output.WriteString("LPS: password is up to date, no rotation needed\n")
+	charset := alphanumericChars
+	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
+		charset = complexChars
+	}
+
+	var rotations []lpsRotationEntry
+	var anyError error
+
+	for _, username := range params.Usernames {
+		// Verify user exists
+		if !userExists(username) {
+			output.WriteString(fmt.Sprintf("LPS: user %q does not exist, skipping\n", username))
+			e.logger.Warn("LPS user does not exist, skipping", "username", username)
+			continue
+		}
+
+		// Get per-user state
+		var userState *lpsUserState
+		if us, ok := localState.Users[username]; ok {
+			userState = &us
+		}
+
+		// Determine if rotation is needed
+		rotate, reason := shouldRotateLps(userState, params, username)
+		if !rotate {
+			output.WriteString(fmt.Sprintf("LPS: %s — password up to date\n", username))
+			continue
+		}
+
+		// Generate new password
+		password, err := generatePassword(int(params.PasswordLength), charset)
+		if err != nil {
+			anyError = fmt.Errorf("generate password for %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to generate password: %v\n", username, err))
+			continue
+		}
+
+		// Set the password
+		if err := setUserPassword(ctx, username, password); err != nil {
+			anyError = fmt.Errorf("set password for %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
+			continue
+		}
+
+		// Kill all user sessions after password rotation
+		killUserSessions(ctx, username)
+
+		now := time.Now().UTC()
+		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s), sessions terminated\n", username, reason))
+
+		// Update per-user state
+		hash := sha256.Sum256([]byte(password))
+		localState.Users[username] = lpsUserState{
+			LastRotatedAt: now,
+			PasswordHash:  hex.EncodeToString(hash[:]),
+		}
+
+		rotations = append(rotations, lpsRotationEntry{
+			Username:  username,
+			Password:  password,
+			RotatedAt: now.Format(time.RFC3339),
+			Reason:    reason,
+		})
+	}
+
+	// Save updated state
+	if err := saveLpsState(actionID, localState); err != nil {
+		e.logger.Warn("failed to save LPS state", "action_id", actionID, "error", err)
+	}
+
+	// If no rotations occurred
+	if len(rotations) == 0 {
+		if anyError != nil {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stdout:   output.String(),
+			}, false, nil, anyError
+		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   output.String(),
 		}, false, nil, nil
 	}
 
-	// Generate new password
-	charset := alphanumericChars
-	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
-		charset = complexChars
-	}
-	password, err := generatePassword(int(params.PasswordLength), charset)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("generate password: %w", err)
-	}
-
-	// Set the password
-	if err := setUserPassword(ctx, params.Username, password); err != nil {
-		return nil, false, nil, fmt.Errorf("set password for user %s: %w", params.Username, err)
-	}
-
-	now := time.Now().UTC()
-	output.WriteString(fmt.Sprintf("LPS: rotated password for user %s (reason: %s)\n", params.Username, reason))
-
-	// Save local state
-	hash := sha256.Sum256([]byte(password))
-	newState := &lpsState{
-		LastRotatedAt: now,
-		PasswordHash:  hex.EncodeToString(hash[:]),
-	}
-	if err := saveLpsState(actionID, newState); err != nil {
-		e.logger.Warn("failed to save LPS state", "action_id", actionID, "error", err)
-	}
-
-	// Build metadata for server-side password storage
+	// Build metadata with JSON array of rotations
+	rotationsJSON, _ := json.Marshal(rotations)
 	metadata := map[string]string{
-		"lps.username":   params.Username,
-		"lps.password":   password,
-		"lps.rotated_at": now.Format(time.RFC3339),
-		"lps.reason":     reason,
+		"lps.rotations": string(rotationsJSON),
 	}
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),
-	}, true, metadata, nil
+	}, true, metadata, anyError
 }
 
 // removeLpsManagement handles ABSENT state — stops managing, cleans up local state.
@@ -134,8 +194,8 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 	}, false, nil, nil
 }
 
-// shouldRotateLps determines if a password rotation is needed and returns the reason.
-func shouldRotateLps(state *lpsState, params *pb.LpsParams) (bool, string) {
+// shouldRotateLps determines if a password rotation is needed for a user and returns the reason.
+func shouldRotateLps(state *lpsUserState, params *pb.LpsParams, username string) (bool, string) {
 	now := time.Now().UTC()
 
 	// No state = first run
@@ -151,7 +211,7 @@ func shouldRotateLps(state *lpsState, params *pb.LpsParams) (bool, string) {
 
 	// Auth-based rotation: check if user authenticated since last rotation
 	if params.GracePeriodHours > 0 {
-		lastAuth, err := getLastAuthTime(params.Username)
+		lastAuth, err := getLastAuthTime(username)
 		if err == nil && !lastAuth.IsZero() && lastAuth.After(state.LastRotatedAt) {
 			graceDuration := time.Duration(params.GracePeriodHours) * time.Hour
 			if now.Sub(lastAuth) >= graceDuration {
@@ -161,6 +221,16 @@ func shouldRotateLps(state *lpsState, params *pb.LpsParams) (bool, string) {
 	}
 
 	return false, ""
+}
+
+// killUserSessions terminates all sessions and processes for a user.
+// This ensures the old password cannot be used after rotation.
+// Errors are logged but not returned — the user may not have active sessions.
+func killUserSessions(ctx context.Context, username string) {
+	// Graceful: terminate systemd-logind sessions
+	runSudoCmd(ctx, "loginctl", "terminate-user", username)
+	// Forceful: kill all remaining processes owned by the user
+	runSudoCmd(ctx, "pkill", "-KILL", "-u", username)
 }
 
 // generatePassword creates a cryptographically random password from the given character set.
@@ -259,6 +329,9 @@ func loadLpsState(actionID string) (*lpsState, error) {
 	var state lpsState
 	if err := json.Unmarshal(data, &state); err != nil {
 		return nil, err
+	}
+	if state.Users == nil {
+		state.Users = make(map[string]lpsUserState)
 	}
 	return &state, nil
 }
