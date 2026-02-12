@@ -62,6 +62,16 @@
 {{.User}} ALL=(root) NOPASSWD: /sbin/userdel *
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/groupadd *
 {{.User}} ALL=(root) NOPASSWD: /sbin/groupadd *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/groupdel *
+{{.User}} ALL=(root) NOPASSWD: /sbin/groupdel *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/gpasswd *
+{{.User}} ALL=(root) NOPASSWD: /sbin/gpasswd *
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/chpasswd
+{{.User}} ALL=(root) NOPASSWD: /sbin/chpasswd
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/chage *
+{{.User}} ALL=(root) NOPASSWD: /bin/chage *
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/getent *
+{{.User}} ALL=(root) NOPASSWD: /bin/getent *
 
 # Shell execution (for shell actions with run_as_root)
 {{.User}} ALL=(root) NOPASSWD: /bin/bash *

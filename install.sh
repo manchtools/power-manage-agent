@@ -276,7 +276,7 @@ RestartSec=10
 # Security hardening
 NoNewPrivileges=false
 ProtectSystem=false
-ProtectHome=read-only
+ProtectHome=false
 PrivateTmp=false
 ProtectKernelTunables=true
 ProtectKernelModules=true
