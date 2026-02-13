@@ -3207,7 +3207,7 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 	changed := false
 
 	// Remove sshd config file
-	if _, err := os.Stat(configPath); err == nil {
+	if fileExistsWithSudo(ctx, configPath) {
 		if !e.repairFilesystem(ctx) {
 			return &pb.CommandOutput{
 				ExitCode: 1,
@@ -3254,8 +3254,7 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 
 // configMatchesDesired checks if a config file already has the desired content.
 func (e *Executor) configMatchesDesired(path, desiredContent string) bool {
-	info, err := os.Stat(path)
-	if err != nil || info.IsDir() {
+	if !fileExistsWithSudo(context.Background(), path) {
 		return false
 	}
 	existing, err := readFileWithSudo(context.Background(), path)
@@ -3369,7 +3368,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 
-	if _, err := os.Stat(configPath); err != nil {
+	if !fileExistsWithSudo(ctx, configPath) {
 		output.WriteString(fmt.Sprintf("SSHD config does not exist: %s\n", configPath))
 		return &pb.CommandOutput{
 			ExitCode: 0,

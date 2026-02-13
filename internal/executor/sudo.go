@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"os"
 	"sort"
 	"strings"
 
@@ -175,7 +174,7 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 	changed := false
 
 	// Remove sudoers file
-	if _, err := os.Stat(sudoersPath); err == nil {
+	if fileExistsWithSudo(ctx, sudoersPath) {
 		if !e.repairFilesystem(ctx) {
 			return &pb.CommandOutput{
 				ExitCode: 1,

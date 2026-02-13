@@ -63,6 +63,10 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/visudo *
 {{.User}} ALL=(root) NOPASSWD: /sbin/visudo *
 
+# SSHD config validation (used by sshd action to validate config before reload)
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/sshd *
+{{.User}} ALL=(root) NOPASSWD: /sbin/sshd *
+
 # User management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/useradd *
 {{.User}} ALL=(root) NOPASSWD: /sbin/useradd *

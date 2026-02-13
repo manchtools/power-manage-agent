@@ -141,6 +141,15 @@ func readFileWithSudo(ctx context.Context, path string) (string, error) {
 	return output.Stdout, nil
 }
 
+// fileExistsWithSudo checks whether a path exists using sudo test -e.
+// This is needed for paths in directories not readable by the current user
+// (e.g. /etc/sudoers.d is mode 0750 on Fedora/RHEL).
+func fileExistsWithSudo(ctx context.Context, path string) bool {
+	output, err := runSudoCmd(ctx, "sh", "-c", "test -e "+path)
+	_ = output
+	return err == nil
+}
+
 // =============================================================================
 // File Delete Operations
 // =============================================================================
