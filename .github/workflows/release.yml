@@ -9,8 +9,13 @@ permissions:
   contents: write
 
 jobs:
+  integration-tests:
+    name: Integration Tests
+    uses: ./.github/workflows/integration-test.yml
+
   build:
     name: Build (${{ matrix.arch }})
+    needs: [integration-tests]
     runs-on: ubuntu-latest
     strategy:
       matrix:

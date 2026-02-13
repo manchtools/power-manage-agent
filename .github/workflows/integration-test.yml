@@ -1,0 +1,95 @@
+name: Integration Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'cmd/**'
+      - 'test/**'
+      - 'internal/**'
+      - '.github/workflows/integration-test.yml'
+  pull_request:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - 'Makefile'
+      - 'cmd/**'
+      - 'test/**'
+      - 'internal/**'
+      - '.github/workflows/integration-test.yml'
+  workflow_call:
+
+jobs:
+  integration:
+    name: ${{ matrix.distro }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - distro: debian
+            dockerfile: test/Dockerfile.integration
+          - distro: fedora
+            dockerfile: test/Dockerfile.integration.fedora
+          - distro: opensuse
+            dockerfile: test/Dockerfile.integration.opensuse
+          - distro: archlinux
+            dockerfile: test/Dockerfile.integration.archlinux
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: agent
+
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          repository: MANCHTOOLS/power-manage-sdk
+          path: sdk
+
+      - name: Build test image
+        run: |
+          docker build \
+            -f agent/${{ matrix.dockerfile }} \
+            -t pm-agent-test-${{ matrix.distro }} \
+            .
+
+      - name: Run integration tests
+        run: |
+          docker run --rm pm-agent-test-${{ matrix.distro }} \
+            runuser -u power-manage -- /usr/local/go/bin/go test \
+              -v -tags=integration -count=1 -timeout=10m \
+              ./agent/internal/executor/ -run Integration
+
+  integration-edgecase:
+    name: edge-cases (privileged)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: agent
+
+      - name: Checkout SDK
+        uses: actions/checkout@v4
+        with:
+          repository: MANCHTOOLS/power-manage-sdk
+          path: sdk
+
+      - name: Build test image
+        run: |
+          docker build \
+            -f agent/test/Dockerfile.integration \
+            -t pm-agent-test-debian \
+            .
+
+      - name: Run edge case tests
+        run: |
+          docker run --rm --privileged pm-agent-test-debian \
+            runuser -u power-manage -- /usr/local/go/bin/go test \
+              -v -tags=integration -count=1 -timeout=10m \
+              ./agent/internal/executor/ -run Integration -run EdgeCase
