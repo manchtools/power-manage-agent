@@ -14,8 +14,8 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 │  │   commands  │  │   Interval  │  │ - Shell scripts         │  │
 │  │ - Reports   │  │   execution │  │ - File management       │  │
 │  │   results   │  │ - Offline   │  │ - Systemd units         │  │
-│  └─────────────┘  │   capable   │  │ - App installations     │  │
-│         │         └──────┬──────┘  │ - System updates        │  │
+│  └─────────────┘  │   capable   │  │ - User/group management │  │
+│         │         └──────┬──────┘  │ - SSH/sudo policies     │  │
 │         │                │         └───────────┬─────────────┘  │
 │         └────────────────┴─────────────────────┘                │
 │                          │                                      │
@@ -23,7 +23,7 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 │                    │  Results  │                                │
 │                    │   Store   │                                │
 │                    └───────────┘                                │
-└───────────┬─────────────────────────────────┬───────────────────┘
+└───────────┬─────────────────────────────────────┬───────────────┘
             │ (1) Register                    │ (2) Stream
             ▼                                 ▼
 ┌───────────────────────────┐   ┌─────────────────────────────────┐
@@ -103,11 +103,11 @@ URI Parameters:
 
 ## Action Types
 
-The agent supports various action types for managing the system:
+The agent supports 15 action types for managing the system:
 
 ### Package Management (`PACKAGE`)
 
-Install, update, or remove system packages using the detected package manager (apt, dnf, or pacman).
+Install, update, or remove system packages using the detected package manager (apt, dnf, pacman, or zypper).
 
 | Field | Description |
 |-------|-------------|
@@ -140,6 +140,7 @@ Execute arbitrary shell scripts on the device.
 | `script` | The script content to execute |
 | `interpreter` | Interpreter path (default: `/bin/bash`) |
 | `run_as_root` | Execute with root privileges |
+| `timeout_seconds` | Maximum execution time (default: 300s) |
 
 **Desired State:** Not applicable - scripts execute the same regardless of state. Implement conditional logic within the script if needed.
 
@@ -170,6 +171,117 @@ Create, modify, or remove files on the system.
 **Desired State:**
 - `PRESENT`: Create or update the file with specified content and permissions
 - `ABSENT`: Remove the file
+
+### Directory Management (`DIRECTORY`)
+
+Create or remove directories on the system.
+
+| Field | Description |
+|-------|-------------|
+| `path` | Absolute path to the directory |
+| `owner` | Directory owner (username) |
+| `group` | Directory group |
+| `mode` | Directory permissions (e.g., `0755`) |
+
+**Desired State:**
+- `PRESENT`: Create or update the directory with specified ownership and permissions
+- `ABSENT`: Remove the directory
+
+### User Management (`USER`)
+
+Create, modify, or remove system users.
+
+| Field | Description |
+|-------|-------------|
+| `username` | Login name |
+| `comment` | Full name / GECOS field |
+| `shell` | Login shell (e.g., `/bin/bash`) |
+| `groups` | Supplementary groups |
+
+On creation, a temporary password is generated and returned in the `lps.rotations` metadata field. The `power-manage` system user is protected from deletion.
+
+**Desired State:**
+- `PRESENT`: Create the user or update attributes (shell, groups, comment)
+- `ABSENT`: Delete the user and remove their home directory
+
+### Group Management (`GROUP`)
+
+Create, modify, or remove system groups.
+
+| Field | Description |
+|-------|-------------|
+| `name` | Group name |
+| `members` | List of usernames to add as group members |
+
+The `power-manage` system group is protected from deletion.
+
+**Desired State:**
+- `PRESENT`: Create the group or update membership
+- `ABSENT`: Delete the group
+
+### Sudo Policy (`SUDO`)
+
+Manage per-action sudoers policies in `/etc/sudoers.d/`.
+
+| Field | Description |
+|-------|-------------|
+| `access_level` | `FULL` (unrestricted) or `LIMITED` (specific commands only) |
+| `users` | Users to grant sudo access |
+| `commands` | Allowed commands (for LIMITED access) |
+
+Each policy is installed as a separate file, validated with `visudo -c` before activation. A dedicated group is created for each policy and users are added to it.
+
+**Desired State:**
+- `PRESENT`: Install or update the sudoers policy
+- `ABSENT`: Remove the sudoers file and associated group
+
+### SSH Access (`SSH`)
+
+Manage per-action SSH access policies in `/etc/ssh/sshd_config.d/`.
+
+| Field | Description |
+|-------|-------------|
+| `users` | Users to grant SSH access |
+| `allow_pubkey` | Allow public key authentication |
+| `allow_password` | Allow password authentication |
+
+Creates a dedicated group per policy and adds an `sshd_config.d` snippet restricting access. The SSHD config is validated with `sshd -t` before applying.
+
+**Desired State:**
+- `PRESENT`: Install or update the SSH access policy
+- `ABSENT`: Remove the SSH config snippet and associated group
+
+### SSHD Configuration (`SSHD`)
+
+Manage global SSHD configuration directives in `/etc/ssh/sshd_config.d/`.
+
+| Field | Description |
+|-------|-------------|
+| `priority` | Config file priority (0-9999, lower = applied first) |
+| `directives` | Map of SSHD directive key-value pairs |
+
+Configuration is validated with `sshd -t` before applying and the service is reloaded.
+
+**Desired State:**
+- `PRESENT`: Install or update the SSHD configuration
+- `ABSENT`: Remove the configuration snippet
+
+### Local Password Store (`LPS`)
+
+Automated password rotation with encrypted state tracking.
+
+| Field | Description |
+|-------|-------------|
+| `usernames` | Users whose passwords to manage |
+| `password_length` | Generated password length |
+| `complexity` | `ALPHANUMERIC` or `COMPLEX` |
+| `rotation_interval_days` | Days between rotations |
+
+Rotated passwords are returned in the `lps.rotations` metadata field and stored encrypted on the server. The LPS state is tracked per-action in `/var/lib/power-manage/lps/`.
+
+**Desired State:**
+- `PRESENT`: Rotate passwords if the rotation interval has elapsed
+- `ABSENT`: Remove LPS state tracking (does not change existing passwords)
 
 ### App Image (`APP_IMAGE`)
 
@@ -209,6 +321,24 @@ Install or remove RPM packages directly from URLs.
 - `PRESENT`: Download and install with `rpm`
 - `ABSENT`: Remove the package
 
+### Repository (`REPOSITORY`)
+
+Manage package manager repositories.
+
+| Field | Description |
+|-------|-------------|
+| `name` | Repository identifier |
+| `apt` | APT repository config (url, distribution, components, gpg_key, trusted) |
+| `dnf` | DNF repository config (baseurl, gpgkey, gpgcheck) |
+| `pacman` | Pacman repository config (server, sig_level) |
+| `zypper` | Zypper repository config (baseurl, gpgkey, gpgcheck) |
+
+Only one repository type should be set per action. The matching type is determined by the detected package manager.
+
+**Desired State:**
+- `PRESENT`: Add or update the repository configuration
+- `ABSENT`: Remove the repository configuration and GPG keys
+
 ## Desired State Summary
 
 | Action Type | Supports Desired State | PRESENT | ABSENT |
@@ -218,6 +348,14 @@ Install or remove RPM packages directly from URLs.
 | `DEB` | Yes | Install package | Remove package |
 | `RPM` | Yes | Install package | Remove package |
 | `FILE` | Yes | Create/update file | Remove file |
+| `DIRECTORY` | Yes | Create/update directory | Remove directory |
+| `USER` | Yes | Create/update user | Delete user |
+| `GROUP` | Yes | Create/update group | Delete group |
+| `SUDO` | Yes | Install sudoers policy | Remove policy |
+| `SSH` | Yes | Install SSH access policy | Remove policy |
+| `SSHD` | Yes | Install SSHD config | Remove config |
+| `LPS` | Yes | Rotate passwords | Remove state tracking |
+| `REPOSITORY` | Yes | Add/update repository | Remove repository |
 | `SHELL` | No | Execute script | Execute script (same) |
 | `UPDATE` | No | Run update | Run update (same) |
 | `SYSTEMD` | No | Uses `SystemdUnitState` | Uses `SystemdUnitState` |
@@ -261,13 +399,42 @@ The agent automatically detects the system's package manager:
 | Debian, Ubuntu | apt |
 | Fedora, RHEL, CentOS | dnf |
 | Arch Linux | pacman |
+| openSUSE | zypper |
 
 ## Security
+
+### Dedicated Service User
+
+The agent runs as a dedicated `power-manage` system user with restricted sudo access. The install script (`power-manage-agent setup`) creates:
+
+- A `power-manage` system user with `/usr/sbin/nologin` shell
+- A sudoers policy at `/etc/sudoers.d/power-manage` granting access only to specific commands
+
+The sudoers template (`internal/setup/sudoers.tmpl`) restricts access to:
+- Package managers (apt, dnf, pacman, zypper, flatpak)
+- Systemd service management (start, stop, restart, reload, enable, disable, status, daemon-reload)
+- File operations (tee, chown, chmod, mkdir, rm, cp, mv, cat)
+- System information (ss, lsof)
+- Process management (pkill, loginctl)
+- User/group management (useradd, usermod, userdel, groupadd, groupdel, gpasswd, chpasswd, chage, getent)
+- Sudoers/SSHD validation (visudo, sshd)
+- Shell execution for `run_as_root` scripts (bash, sh)
+- Filesystem repair (mount -o remount,rw /)
+- System power management (shutdown)
+
+All privileged commands are executed via `sudo -n` with absolute paths for sudoers matching. The agent itself never runs as root.
+
+### Self-Protection
+
+The agent prevents actions from modifying its own infrastructure:
+- The `power-manage` user and group cannot be deleted via USER/GROUP actions
+- This prevents accidental self-destruction through misconfigured actions
+
+### Network Security
 
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
 - **mTLS**: After registration, the agent connects to the Gateway using mutual TLS with certificates signed by the Control Server CA
 - **Certificate Storage**: Certificates stored in `$DATA_DIR/certs/`
-- **Privileged Operations**: Some actions require root privileges (systemd, package management)
 
 ## Logging
 
@@ -285,8 +452,9 @@ journalctl -u power-manage-agent -f
 ├── certs/
 │   ├── device.crt      # Device certificate
 │   └── device.key      # Device private key
-├── state.json          # Agent state
-└── results/            # Pending execution results
+├── lps/                 # LPS password rotation state (per-action JSON files)
+├── state.json           # Agent state
+└── results/             # Pending execution results
 ```
 
 ## Systemd Service
@@ -301,6 +469,7 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+User=power-manage
 ExecStart=/usr/local/bin/power-manage-agent
 Restart=always
 RestartSec=10
@@ -317,3 +486,195 @@ sudo systemctl stop power-manage-agent
 sudo systemctl status power-manage-agent
 sudo systemctl enable power-manage-agent
 ```
+
+## Development
+
+### Building
+
+```bash
+# Build for current platform
+make build
+
+# Cross-compile for ARM64
+make build GOARCH=arm64
+```
+
+### Deploying to a Test Server
+
+```bash
+# Build + deploy + restart on remote machine
+make deploy SSH=user@testserver
+
+# Full install (including setup)
+make install SSH=user@testserver
+```
+
+### Running Integration Tests
+
+The agent includes a comprehensive integration test suite that runs inside Docker/Podman containers. Tests execute as the `power-manage` user with the production sudoers template, ensuring the test environment matches production exactly.
+
+```bash
+# Run tests on a single distro
+make test-integration-debian
+make test-integration-fedora
+make test-integration-opensuse
+make test-integration-archlinux
+
+# Run all 4 distros in parallel
+make test-integration-all
+
+# Run privileged edge case tests (requires --privileged container)
+make test-integration-edgecase
+```
+
+### CI/CD
+
+Integration tests run automatically on push to `main` and on pull requests via GitHub Actions (`.github/workflows/integration-test.yml`). The workflow is triggered only on actual code changes (Go files, go.mod/sum, Makefile, cmd/**, test/**, internal/**).
+
+The release workflow (`.github/workflows/release.yml`) gates binary builds on passing integration tests, ensuring no release is published without all tests passing across all 4 distros.
+
+## Integration Test Suite
+
+The test suite (`internal/executor/integration_test.go`, ~3,500 lines) exercises the executor against real system state inside containerized environments. Each test container mimics the production setup: a `power-manage` system user with the real sudoers template from `internal/setup/sudoers.tmpl`, so any missing sudo permission causes an immediate test failure.
+
+### Test Containers
+
+Each distro has its own Dockerfile in `test/`:
+
+| Container | Dockerfile | Base Image | Package Manager |
+|-----------|------------|------------|-----------------|
+| Debian | `Dockerfile.integration` | `golang:1.25-bookworm` | apt |
+| Fedora | `Dockerfile.integration.fedora` | `fedora:latest` | dnf |
+| openSUSE | `Dockerfile.integration.opensuse` | `opensuse/tumbleweed` | zypper |
+| Arch Linux | `Dockerfile.integration.archlinux` | `archlinux:base` | pacman |
+
+Container setup:
+1. Install Go toolchain and test dependencies
+2. Create `power-manage` system user (matching production)
+3. Install the real sudoers template rendered with `sed 's/{{.User}}/power-manage/g'`
+4. Install test-only sudoers for mount/umount/chattr (edge case tests only)
+5. Create LPS state directory owned by `power-manage`
+6. Set up SSHD host keys and config directory for validation tests
+7. Pre-download Go module dependencies
+
+Tests run via `runuser -u power-manage -- go test ...`, so every privileged operation must go through sudo, exactly as in production.
+
+### Core Action Tests
+
+These tests verify the full lifecycle (create, idempotent re-run, update, remove) for each action type:
+
+| Test | Action Type | What It Verifies |
+|------|-------------|------------------|
+| `TestIntegration_Package` | PACKAGE | Install, idempotent re-install, remove via apt |
+| `TestIntegration_Package_Dnf` | PACKAGE | Install, idempotent re-install, remove via dnf |
+| `TestIntegration_Package_Pacman` | PACKAGE | Install, idempotent re-install, remove via pacman |
+| `TestIntegration_Package_Zypper` | PACKAGE | Install, idempotent re-install, remove via zypper |
+| `TestIntegration_Package_GracefulSkip` | PACKAGE | Graceful handling when package is not in any repo (apt) |
+| `TestIntegration_Package_GracefulSkip_Dnf` | PACKAGE | Graceful handling when package is not in any repo (dnf) |
+| `TestIntegration_Package_GracefulSkip_Pacman` | PACKAGE | Graceful handling when package is not in any repo (pacman) |
+| `TestIntegration_Package_GracefulSkip_Zypper` | PACKAGE | Graceful handling when package is not in any repo (zypper) |
+| `TestIntegration_Update` | UPDATE | System update via apt |
+| `TestIntegration_Update_Dnf` | UPDATE | System update via dnf |
+| `TestIntegration_Update_Pacman` | UPDATE | System update via pacman |
+| `TestIntegration_Update_Zypper` | UPDATE | System update via zypper |
+| `TestIntegration_Shell` | SHELL | Basic execution, exit code handling, stderr capture, timeout, `run_as_root`, working directory, environment variables, multi-line scripts |
+| `TestIntegration_File` | FILE | Create with content/owner/group/mode, idempotent re-create, update content, remove, binary content |
+| `TestIntegration_Directory` | DIRECTORY | Create with owner/group/mode, idempotent re-create, update permissions, nested directories, remove, remove non-existent |
+| `TestIntegration_User` | USER | Create, idempotent re-create, update shell, remove, remove non-existent, protect `power-manage` |
+| `TestIntegration_Group` | GROUP | Create, idempotent re-create, add members, remove, protect `power-manage` |
+| `TestIntegration_Sudo` | SUDO | Full-access policy setup, idempotent re-setup, remove (sudoers file + group) |
+| `TestIntegration_SSH` | SSH | Access policy setup (group + sshd_config.d snippet), idempotent re-setup, remove |
+| `TestIntegration_SSHD` | SSHD | Config directives setup, idempotent re-setup, `sshd -t` validation, remove |
+| `TestIntegration_LPS` | LPS | Initial password rotation, idempotent skip (interval not elapsed), remove state |
+| `TestIntegration_Deb` | DEB | Build test .deb, serve via HTTP, install via dpkg, remove |
+| `TestIntegration_Rpm` | RPM | Build test .rpm via rpmbuild, serve via HTTP, install, remove |
+| `TestIntegration_AppImage` | APP_IMAGE | Download with checksum verification, install to custom path, idempotent, remove |
+| `TestIntegration_Repository` | REPOSITORY | Add/remove apt sources.list.d entry |
+| `TestIntegration_Repository_Dnf` | REPOSITORY | Add/remove dnf .repo file |
+| `TestIntegration_Repository_Pacman` | REPOSITORY | Add/remove pacman.conf server entry |
+| `TestIntegration_Repository_Zypper` | REPOSITORY | Add/remove zypper repository |
+| `TestIntegration_Systemd` | SYSTEMD | Unit file creation, daemon-reload, start, status check, stop, remove, invalid unit handling |
+
+### Edge Case Tests
+
+These tests verify resilience against real-world failure conditions. Some require `--privileged` containers:
+
+**Package manager lock recovery:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_AptLock` | Stale `/var/lib/dpkg/lock*` files are cleaned up before install |
+| `EdgeCase_PacmanLock` | Stale `/var/lib/pacman/db.lck` is removed before install |
+| `EdgeCase_ZypperLock` | Stale `/var/run/zypp.pid` is removed before install |
+| `EdgeCase_DnfStaleHistory` | DNF repair path (`history redo`, `remove --duplicates`, `rpm --verifydb`) runs cleanly |
+| `EdgeCase_InterruptedDpkg` | `dpkg --configure -a` repairs interrupted dpkg state |
+| `EdgeCase_InterruptedDpkgConfigure` | Partial dpkg configure is repaired before package install |
+| `EdgeCase_PackagePinConflict` | Package version pinning conflict is handled gracefully |
+
+**LPS state corruption:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_LpsInvalidJson` | Corrupted JSON state file is treated as initial rotation |
+| `EdgeCase_LpsMissingDirectory` | Missing `/var/lib/power-manage/lps/` directory is re-created |
+
+**Missing system directories:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_MissingSudoersDir` | Missing `/etc/sudoers.d/` is re-created before policy install |
+| `EdgeCase_MissingSshdConfigDir` | Missing `/etc/ssh/sshd_config.d/` is re-created before config install |
+
+**Download failures:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_DownloadHttp500` | HTTP 500 from download server returns FAILED status |
+| `EdgeCase_DownloadHttp404` | HTTP 404 returns FAILED status |
+| `EdgeCase_DownloadChecksumMismatch` | SHA256 checksum mismatch is detected and reported |
+| `EdgeCase_DownloadTimeout` | Slow/hanging server is handled with timeout |
+| `EdgeCase_DNSResolutionFailure` | Unresolvable hostname returns FAILED status |
+| `EdgeCase_HTTPSCertError` | Invalid TLS certificate returns FAILED status |
+
+**Invalid input:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_NilParams` | Nil action params for all types return FAILED status |
+| `EdgeCase_InvalidUsername` | Usernames with special characters (`../`, `;`, etc.) are rejected |
+| `EdgeCase_InvalidPaths` | Path traversal (`../../etc/passwd`), relative paths, and empty paths are rejected |
+| `EdgeCase_SystemdInvalidUnit` | Invalid systemd unit names are rejected |
+
+**Filesystem edge cases (require `--privileged`):**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_DiskFull` | File write to a full tmpfs reports clear error |
+| `EdgeCase_ReadOnlyMount` | File write to read-only filesystem reports clear error |
+| `EdgeCase_ImmutableFile` | Overwriting a `chattr +i` immutable file reports clear error |
+| `EdgeCase_SymlinkCircular` | Circular symlink at target path is detected |
+| `EdgeCase_VeryLongFilePath` | Paths exceeding filesystem limits are handled |
+
+**User/group edge cases:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_UserExistsDifferentShell` | Updating a user's shell correctly reports `changed=true` |
+| `EdgeCase_UserDeleteWhileLoggedIn` | Deleting a user with active sessions terminates sessions first |
+| `EdgeCase_GroupIsPrimaryGroup` | Deleting a user's primary group returns clear error |
+
+**File content edge cases:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_FileExistsDifferentPerms` | Updating permissions on existing file reports `changed=true` |
+| `EdgeCase_FileExistsAsDirectory` | Writing file to path that is a directory returns FAILED |
+| `EdgeCase_EmptyFileContent` | Empty content creates a zero-byte file |
+| `EdgeCase_BinaryFileContent` | Binary content with null bytes is written correctly |
+| `EdgeCase_ConcurrentFileWrites` | Parallel file writes to different paths all succeed (atomic write safety) |
+
+**SSH/sudo edge cases:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_BrokenSudoersFile` | Pre-existing broken sudoers file is replaced with valid policy |
+| `EdgeCase_SSHDirWrongPermissions` | `~/.ssh` directory with wrong permissions is corrected |
+
+**Other edge cases:**
+| Test | Description |
+|------|-------------|
+| `EdgeCase_ShellTimeout` | Shell script exceeding timeout is killed |
+| `EdgeCase_LargeShellOutput` | Large stdout/stderr output is captured without truncation or hang |
+| `EdgeCase_PartialAppImage` | Incomplete download leaves no partial file on disk |
+| `EdgeCase_RepositoryExpiredGPGKey` | Expired GPG key is handled gracefully |
