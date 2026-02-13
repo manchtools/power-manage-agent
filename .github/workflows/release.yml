@@ -98,6 +98,22 @@ jobs:
             curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${{ github.ref_name }}/install.sh | sudo bash -s -- -v ${{ github.ref_name }} -s https://your-server.example.com -t YOUR_TOKEN
             ```
 
+            ## Update
+
+            To update an already registered agent to the latest version:
+
+            ```bash
+            curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash
+            ```
+
+            Or update to this specific version:
+
+            ```bash
+            curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${{ github.ref_name }}/install.sh | sudo bash -s -- -v ${{ github.ref_name }}
+            ```
+
+            The update stops the running service, downloads the new binary, updates the sudoers configuration, and restarts the service. Existing registration and credentials are preserved.
+
             ## Binaries
 
             | Binary | Platform |
