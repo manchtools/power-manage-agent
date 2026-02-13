@@ -22,7 +22,10 @@ LDFLAGS     := -s -w -X main.version=$(VERSION)
 SSH_OPTS    := $(if $(KEY),-i $(KEY),)
 
 # ── Targets ────────────────────────────────────────────────────
-.PHONY: build deploy install logs status restart stop
+.PHONY: build deploy install logs status restart stop \
+    test-integration test-integration-debian test-integration-fedora \
+    test-integration-opensuse test-integration-archlinux test-integration-all \
+    test-integration-edgecase
 
 build:
 	@mkdir -p $(BUILD_DIR)
@@ -60,3 +63,34 @@ restart:
 
 stop:
 	ssh $(SSH_OPTS) $(SSH) 'sudo systemctl stop $(SERVICE)'
+
+CONTAINER_CMD := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
+TEST_CMD := runuser -u power-manage -- /usr/local/go/bin/go test -v -tags=integration -count=1 -timeout=10m ./agent/internal/executor/ -run Integration
+
+test-integration-debian:
+	$(CONTAINER_CMD) build -f test/Dockerfile.integration -t pm-agent-test-debian ../
+	$(CONTAINER_CMD) run --rm pm-agent-test-debian $(TEST_CMD)
+
+test-integration-fedora:
+	$(CONTAINER_CMD) build -f test/Dockerfile.integration.fedora -t pm-agent-test-fedora ../
+	$(CONTAINER_CMD) run --rm pm-agent-test-fedora $(TEST_CMD)
+
+test-integration-opensuse:
+	$(CONTAINER_CMD) build -f test/Dockerfile.integration.opensuse -t pm-agent-test-opensuse ../
+	$(CONTAINER_CMD) run --rm pm-agent-test-opensuse $(TEST_CMD)
+
+test-integration-archlinux:
+	$(CONTAINER_CMD) build -f test/Dockerfile.integration.archlinux -t pm-agent-test-archlinux ../
+	$(CONTAINER_CMD) run --rm pm-agent-test-archlinux $(TEST_CMD)
+
+# Backward-compatible alias (Debian only)
+test-integration: test-integration-debian
+
+# Run all 4 distros in parallel
+test-integration-all:
+	$(MAKE) -j4 test-integration-debian test-integration-fedora test-integration-opensuse test-integration-archlinux
+
+# Edge case tests in privileged Debian container (disk-full, read-only FS, etc.)
+test-integration-edgecase:
+	$(CONTAINER_CMD) build -f test/Dockerfile.integration -t pm-agent-test-debian ../
+	$(CONTAINER_CMD) run --rm --privileged pm-agent-test-debian $(TEST_CMD) -run EdgeCase

@@ -1,0 +1,53 @@
+FROM golang:1.25-bookworm
+
+RUN apt-get update && apt-get install -y \
+    sudo \
+    gpg \
+    openssh-server \
+    systemd \
+    && rm -rf /var/lib/apt/lists/*
+
+# Create power-manage user (matches production setup)
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin power-manage && \
+    mkdir -p /home/power-manage && \
+    chown power-manage:power-manage /home/power-manage
+
+# sshd_config.d directory + host keys for sshd -t validation
+RUN mkdir -p /etc/ssh/sshd_config.d && ssh-keygen -A
+
+# Ensure Include directive exists in sshd_config for sshd_config.d
+RUN grep -q 'Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config || \
+    echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
+
+# LPS state directory (owned by power-manage, matches production)
+RUN mkdir -p /var/lib/power-manage/lps && \
+    chown -R power-manage:power-manage /var/lib/power-manage
+
+# sshd privilege separation directory (needed by sshd -t)
+RUN mkdir -p /run/sshd
+
+WORKDIR /workspace
+
+# Copy only the modules needed for agent tests (avoids server/, web/, .git)
+COPY sdk/ ./sdk/
+COPY agent/ ./agent/
+
+# Create a trimmed go.work (excludes server which isn't needed for agent tests)
+RUN printf 'go 1.25\n\nuse (\n\t./sdk\n\t./agent\n)\n' > go.work
+
+# Pre-download dependencies
+RUN cd agent && go mod download
+
+# Install real sudoers from production template (single source of truth)
+RUN sed 's/{{.User}}/power-manage/g' agent/internal/setup/sudoers.tmpl \
+      > /etc/sudoers.d/power-manage && \
+    chmod 0440 /etc/sudoers.d/power-manage && \
+    visudo -c -f /etc/sudoers.d/power-manage
+
+# Test-only sudoers: mount/umount for privileged edge case tests (NOT in production template)
+RUN printf 'power-manage ALL=(root) NOPASSWD: /usr/bin/mount *, /bin/mount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/umount *, /bin/umount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/chattr *, /bin/chattr *\n' \
+      > /etc/sudoers.d/power-manage-test && \
+    chmod 0440 /etc/sudoers.d/power-manage-test
+
+# Own workspace and Go caches so power-manage user can compile tests
+RUN chown -R power-manage:power-manage /workspace /home/power-manage

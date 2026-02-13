@@ -1,0 +1,62 @@
+# Stage 1: Get Go toolchain + pre-download modules
+FROM golang:1.25-bookworm AS go-builder
+WORKDIR /workspace
+COPY sdk/ ./sdk/
+COPY agent/ ./agent/
+RUN printf 'go 1.25\n\nuse (\n\t./sdk\n\t./agent\n)\n' > go.work
+RUN cd agent && go mod download
+
+# Stage 2: Fedora base with Go copied in
+FROM fedora:42
+
+COPY --from=go-builder /usr/local/go /usr/local/go
+ENV PATH="/usr/local/go/bin:${PATH}"
+ENV GOPATH="/go"
+ENV GOMODCACHE="/go/pkg/mod"
+
+RUN dnf install -y \
+    sudo \
+    gnupg2 \
+    openssh-server \
+    systemd \
+    rpm-build \
+    && dnf clean all
+
+# Create power-manage user (matches production setup)
+RUN useradd --system --no-create-home --shell /usr/sbin/nologin power-manage && \
+    mkdir -p /home/power-manage && \
+    chown power-manage:power-manage /home/power-manage
+
+# sshd_config.d directory + host keys for sshd -t validation
+RUN mkdir -p /etc/ssh/sshd_config.d && ssh-keygen -A
+
+# Ensure Include directive exists in sshd_config for sshd_config.d
+RUN grep -q 'Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config || \
+    echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
+
+# LPS state directory (owned by power-manage, matches production)
+RUN mkdir -p /var/lib/power-manage/lps && \
+    chown -R power-manage:power-manage /var/lib/power-manage
+
+# sshd privilege separation directory (needed by sshd -t)
+RUN mkdir -p /run/sshd
+
+# Test-only sudoers: mount/umount for privileged edge case tests (NOT in production template)
+RUN printf 'power-manage ALL=(root) NOPASSWD: /usr/bin/mount *, /bin/mount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/umount *, /bin/umount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/chattr *, /bin/chattr *\n' \
+      > /etc/sudoers.d/power-manage-test && \
+    chmod 0440 /etc/sudoers.d/power-manage-test
+
+WORKDIR /workspace
+
+# Copy pre-built workspace from builder
+COPY --from=go-builder /workspace ./
+COPY --from=go-builder /go/pkg/mod /go/pkg/mod
+
+# Install real sudoers from production template (single source of truth)
+RUN sed 's/{{.User}}/power-manage/g' agent/internal/setup/sudoers.tmpl \
+      > /etc/sudoers.d/power-manage && \
+    chmod 0440 /etc/sudoers.d/power-manage && \
+    visudo -c -f /etc/sudoers.d/power-manage
+
+# Own workspace and Go caches so power-manage user can compile tests
+RUN chown -R power-manage:power-manage /workspace /go/pkg/mod /home/power-manage
