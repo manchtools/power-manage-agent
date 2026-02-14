@@ -10,7 +10,8 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manchtools/power-manage/agent/internal/executor"
+	"google.golang.org/protobuf/proto"
+
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
@@ -22,10 +23,15 @@ const (
 	ResultRetention = 7 * 24 * time.Hour
 )
 
+// ActionExecutor is the interface for executing actions.
+type ActionExecutor interface {
+	Execute(ctx context.Context, action *pb.Action) *pb.ActionResult
+}
+
 // Scheduler manages autonomous action execution.
 type Scheduler struct {
 	store    *store.Store
-	executor *executor.Executor
+	executor ActionExecutor
 	logger   *slog.Logger
 
 	mu        sync.RWMutex
@@ -44,7 +50,7 @@ type ExecutionResult struct {
 }
 
 // New creates a new scheduler.
-func New(store *store.Store, executor *executor.Executor, logger *slog.Logger) *Scheduler {
+func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Scheduler {
 	return &Scheduler{
 		store:     store,
 		executor:  executor,
@@ -114,8 +120,14 @@ func (s *Scheduler) AddAction(action *pb.Action) error {
 	return s.store.SaveAction(action, runOnAssign)
 }
 
-// RemoveAction removes an action from the store.
-func (s *Scheduler) RemoveAction(actionID string) error {
+// RemoveAction removes an action from the store. Policy-type actions (SSH,
+// SSHD, Sudo, LPS) are executed with DESIRED_STATE_ABSENT first to clean up
+// their effects on the device.
+func (s *Scheduler) RemoveAction(ctx context.Context, actionID string) error {
+	stored, err := s.store.GetAction(actionID)
+	if err == nil && stored != nil && shouldRevertOnUnassign(stored.Action.Type) {
+		s.revertAction(ctx, stored.Action)
+	}
 	return s.store.RemoveAction(actionID)
 }
 
@@ -286,7 +298,9 @@ func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.Acti
 
 // SyncActions replaces all stored actions with the provided list from the server.
 // This syncs the local action store with the server's assigned actions.
-// Removed actions are undone (inverted desired_state).
+// Removed actions: policy-type actions (SSH, SSHD, Sudo, LPS) are reverted
+// to ABSENT state before removal. Other action types are removed without
+// reverting to avoid destructive side effects.
 // Changed actions (desired_state flipped) are re-executed.
 // New actions are executed immediately.
 // If firstSync is true, all actions are executed (used on agent startup).
@@ -312,15 +326,24 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 		"removed", len(syncResult.RemovedActions),
 	)
 
-	// Log removed actions (no longer undone — unassigning an action should not
-	// destroy state on the device, e.g. deleting users or removing packages).
+	// Revert policy-type actions before removal to clean up their effects.
+	// Non-policy actions (Package, User, File, etc.) are just removed without
+	// reverting to avoid destructive side effects.
 	if len(syncResult.RemovedActions) > 0 {
 		for _, removed := range syncResult.RemovedActions {
 			if removed.Id != nil {
-				s.logger.Info("action unassigned from device",
-					"action_id", removed.Id.Value,
-					"type", removed.Type.String(),
-				)
+				if shouldRevertOnUnassign(removed.Type) {
+					s.logger.Info("reverting policy action before unassignment",
+						"action_id", removed.Id.Value,
+						"type", removed.Type.String(),
+					)
+					s.revertAction(ctx, removed)
+				} else {
+					s.logger.Info("action unassigned from device",
+						"action_id", removed.Id.Value,
+						"type", removed.Type.String(),
+					)
+				}
 			}
 		}
 	}
@@ -374,4 +397,39 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 	}
 
 	return nil
+}
+
+// shouldRevertOnUnassign returns true for action types whose effects should
+// be cleaned up when the action is unassigned from a device.
+func shouldRevertOnUnassign(actionType pb.ActionType) bool {
+	switch actionType {
+	case pb.ActionType_ACTION_TYPE_SSH,
+		pb.ActionType_ACTION_TYPE_SSHD,
+		pb.ActionType_ACTION_TYPE_SUDO,
+		pb.ActionType_ACTION_TYPE_LPS:
+		return true
+	default:
+		return false
+	}
+}
+
+// revertAction executes an action with DESIRED_STATE_ABSENT to clean up its
+// effects. This is best-effort — failures are logged but do not block removal.
+func (s *Scheduler) revertAction(ctx context.Context, action *pb.Action) {
+	reverted := proto.Clone(action).(*pb.Action)
+	reverted.DesiredState = pb.DesiredState_DESIRED_STATE_ABSENT
+
+	result := s.executor.Execute(ctx, reverted)
+	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
+		s.logger.Warn("failed to revert action",
+			"action_id", action.Id.Value,
+			"type", action.Type.String(),
+			"error", result.Error,
+		)
+	} else {
+		s.logger.Info("action reverted successfully",
+			"action_id", action.Id.Value,
+			"type", action.Type.String(),
+		)
+	}
 }

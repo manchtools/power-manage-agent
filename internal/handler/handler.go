@@ -171,7 +171,7 @@ func (h *Handler) OnActionRemove(ctx context.Context, actionID string) error {
 	h.logger.Info("received action removal", "action_id", actionID)
 
 	if h.scheduler != nil {
-		if err := h.scheduler.RemoveAction(actionID); err != nil {
+		if err := h.scheduler.RemoveAction(ctx, actionID); err != nil {
 			h.logger.Error("failed to remove action", "action_id", actionID, "error", err)
 			return err
 		}
