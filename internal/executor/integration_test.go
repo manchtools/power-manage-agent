@@ -801,6 +801,29 @@ func TestIntegration_Group(t *testing.T) {
 		}
 	})
 
+	t.Run("EmptyMembersRemovesAll", func(t *testing.T) {
+		// After AddMembers, the group has pmgrpuser1 and pmgrpuser2.
+		// Syncing with an empty members list should remove them all
+		// but keep the group itself.
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_Group{Group: &pb.GroupParams{
+			Name:    groupName,
+			Members: []string{},
+		}}
+		result := e.Execute(ctx, action)
+		assertSuccess(t, result)
+		assertChanged(t, result, true)
+		if !groupExists(groupName) {
+			t.Error("group should still exist")
+		}
+		if userInGroup("pmgrpuser1", groupName) {
+			t.Error("pmgrpuser1 should have been removed from group")
+		}
+		if userInGroup("pmgrpuser2", groupName) {
+			t.Error("pmgrpuser2 should have been removed from group")
+		}
+	})
+
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: groupName}}
