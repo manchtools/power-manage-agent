@@ -23,6 +23,8 @@ import (
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 // resolveAndValidatePath resolves symlinks in the parent directory of the given
@@ -976,17 +978,17 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 // isUnitEnabled checks if a systemd unit is enabled or in a state where
 // enabling is not needed (static, indirect, generated units).
 func (e *Executor) isUnitEnabled(unitName string) bool {
-	return isUnitEnabled(unitName)
+	return syssystemd.IsEnabled(unitName)
 }
 
 // isUnitMasked checks if a systemd unit is masked.
 func (e *Executor) isUnitMasked(unitName string) bool {
-	return isUnitMasked(unitName)
+	return syssystemd.IsMasked(unitName)
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
 func (e *Executor) isUnitActive(unitName string) bool {
-	return isUnitActive(unitName)
+	return syssystemd.IsActive(unitName)
 }
 
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -1020,7 +1022,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 
 		// Create parent directories using sudo
 		parentDir := filepath.Dir(resolvedPath)
-		if _, err := createDirectory(ctx, parentDir, true); err != nil {
+		if err := createDirectory(ctx, parentDir, true); err != nil {
 			return nil, false, fmt.Errorf("create directory %s: %w", parentDir, err)
 		}
 
@@ -1113,7 +1115,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// For regular mode, delete the entire file
-		if _, err := removeFileStrict(ctx, resolvedPath); err != nil {
+		if err := removeFileStrict(ctx, resolvedPath); err != nil {
 			return nil, false, fmt.Errorf("remove: %w", err)
 		}
 		return &pb.CommandOutput{
@@ -1306,7 +1308,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Remove directory (use -r for recursive removal if it has contents)
-		if _, err := removeDirectory(ctx, cleanPath); err != nil {
+		if err := removeDirectory(ctx, cleanPath); err != nil {
 			return nil, false, fmt.Errorf("remove directory: %w", err)
 		}
 		return &pb.CommandOutput{
@@ -2586,7 +2588,7 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	}
 
 	// Validate username format (prevent injection)
-	if !isValidUsername(params.Username) {
+	if !sysuser.IsValidName(params.Username) {
 		return nil, false, nil, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
 	}
 
@@ -2609,8 +2611,6 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	}
 }
 
-// Note: isValidUsername, generateTempPassword, userExists, and getUserInfo
-// are now defined in user.go for reusability.
 
 // createOrUpdateUser creates a new user or updates an existing one.
 // Returns the command output, whether changes were made, metadata, and any error.
@@ -2643,7 +2643,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Ensure group exists
-		ensureGroupExists(ctx, params.PrimaryGroup)
+		_ = sysuser.GroupEnsureExists(ctx, params.PrimaryGroup)
 		args = append(args, "-g", params.PrimaryGroup)
 	}
 
@@ -2728,7 +2728,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	// Generate and set temporary password for non-system users
 	var metadata map[string]string
 	if !params.SystemUser && !params.Disabled {
-		tempPassword, err := generateTempPassword()
+		tempPassword, err := sysuser.GeneratePassword(16, false)
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
 		} else {
@@ -2784,7 +2784,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 // updateUser modifies an existing user account.
 func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, bool, error) {
 	// Get current user state
-	currentInfo, err := getUserInfo(params.Username)
+	currentInfo, err := sysuser.Get(params.Username)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to get current user info: %w", err)
 	}
@@ -2825,7 +2825,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		ensureGroupExists(ctx, params.PrimaryGroup)
+		_ = sysuser.GroupEnsureExists(ctx, params.PrimaryGroup)
 		// For simplicity, always set if specified by name (could be optimized)
 		args = append(args, "-g", params.PrimaryGroup)
 	}
@@ -3072,7 +3072,7 @@ func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state p
 		return nil, false, fmt.Errorf("at least one user is required")
 	}
 	for _, u := range users {
-		if !isValidUsername(u) {
+		if !sysuser.IsValidName(u) {
 			return nil, false, fmt.Errorf("invalid username: %s", u)
 		}
 	}
@@ -3136,12 +3136,8 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if grpOut, err := groupAdd(ctx, groupName); err != nil {
-			errMsg := "failed to create group"
-			if grpOut != nil && grpOut.Stderr != "" {
-				errMsg = strings.TrimSpace(grpOut.Stderr)
-			}
-			return nil, false, fmt.Errorf("create group %s: %s", groupName, errMsg)
+		if err := sysuser.GroupCreate(ctx, groupName); err != nil {
+			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
 		changed = true
@@ -3150,7 +3146,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 	// Write sshd config file
 	if !fileMatches {
 		// Ensure /etc/ssh/sshd_config.d exists
-		if _, err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
+		if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
 			return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 		}
 		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
@@ -3167,12 +3163,8 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 			continue
 		}
 		if !userInGroup(username, groupName) {
-			if addOut, err := addUserToGroup(ctx, username, groupName); err != nil {
-				errMsg := "failed to add user to group"
-				if addOut != nil && addOut.Stderr != "" {
-					errMsg = strings.TrimSpace(addOut.Stderr)
-				}
-				output.WriteString(fmt.Sprintf("warning: %s for user %s: %s\n", errMsg, username, err))
+			if err := addUserToGroup(ctx, username, groupName); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
 			} else {
 				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
 				changed = true
@@ -3188,7 +3180,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 	}
 	for _, member := range currentMembers {
 		if !desiredSet[member] {
-			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
@@ -3214,7 +3206,7 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 				Stderr:   "filesystem is read-only and could not be remounted",
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
-		if _, err := removeFileStrict(ctx, configPath); err != nil {
+		if err := removeFileStrict(ctx, configPath); err != nil {
 			return nil, false, fmt.Errorf("remove ssh config: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
@@ -3225,17 +3217,13 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 	if groupExists(groupName) {
 		members := getGroupMembers(groupName)
 		for _, member := range members {
-			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
 		}
-		if delOut, err := groupDel(ctx, groupName); err != nil {
-			errMsg := "failed to delete group"
-			if delOut != nil && delOut.Stderr != "" {
-				errMsg = strings.TrimSpace(delOut.Stderr)
-			}
-			output.WriteString(fmt.Sprintf("warning: %s %s: %s\n", errMsg, groupName, err))
+		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
 		} else {
 			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
 			changed = true
@@ -3319,7 +3307,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 	}
 
 	// Ensure /etc/ssh/sshd_config.d exists
-	if _, err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
+	if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
 		return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 	}
 
@@ -3383,7 +3371,7 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 		}, false, fmt.Errorf("filesystem is read-only")
 	}
 
-	if _, err := removeFileStrict(ctx, configPath); err != nil {
+	if err := removeFileStrict(ctx, configPath); err != nil {
 		return nil, false, fmt.Errorf("remove sshd config: %w", err)
 	}
 	output.WriteString(fmt.Sprintf("removed SSHD config: %s\n", configPath))
@@ -3408,6 +3396,4 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 	}, true, nil
 }
 
-// ensureGroupExists creates a group if it doesn't exist.
-// Note: ensureGroupExists is now defined in user.go as a package-level function.
 

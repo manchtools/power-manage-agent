@@ -4,6 +4,8 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 
 ## Architecture
 
+The executor delegates low-level system operations to the SDK's `sys/` packages (`sys/exec`, `sys/fs`, `sys/user`, `sys/systemd`), keeping the agent focused on action dispatch, idempotency checks, and result reporting.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Agent                                    │
@@ -18,11 +20,12 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 │         │         └──────┬──────┘  │ - SSH/sudo policies     │  │
 │         │                │         └───────────┬─────────────┘  │
 │         └────────────────┴─────────────────────┘                │
-│                          │                                      │
-│                    ┌─────▼─────┐                                │
-│                    │  Results  │                                │
-│                    │   Store   │                                │
-│                    └───────────┘                                │
+│                          │              │                       │
+│                    ┌─────▼─────┐  ┌─────▼──────────────┐       │
+│                    │  Results  │  │  SDK sys/ packages  │       │
+│                    │   Store   │  │  (exec, fs, user,   │       │
+│                    └───────────┘  │   systemd)          │       │
+│                                   └────────────────────┘       │
 └───────────┬─────────────────────────────────────┬───────────────┘
             │ (1) Register                    │ (2) Stream
             ▼                                 ▼

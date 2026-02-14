@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 const (
@@ -54,7 +55,7 @@ func (e *Executor) executeLps(ctx context.Context, params *pb.LpsParams, state p
 		return nil, false, nil, fmt.Errorf("at least one username is required")
 	}
 	for _, u := range params.Usernames {
-		if !isValidUsername(u) {
+		if !sysuser.IsValidName(u) {
 			return nil, false, nil, fmt.Errorf("invalid username: %q", u)
 		}
 	}
@@ -119,7 +120,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Set the password
-		if err := setUserPassword(ctx, username, password); err != nil {
+		if err := sysuser.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
 			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
 			continue

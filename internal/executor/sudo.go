@@ -3,10 +3,10 @@ package executor
 import (
 	"context"
 	"fmt"
-	"sort"
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 // sanitizeSudoGroupName creates a valid Linux group name from the action ID.
@@ -51,7 +51,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 
 	// Validate usernames
 	for _, u := range params.Users {
-		if !isValidUsername(u) {
+		if !sysuser.IsValidName(u) {
 			return nil, false, fmt.Errorf("invalid username: %q", u)
 		}
 	}
@@ -92,12 +92,8 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if grpOut, err := groupAdd(ctx, groupName); err != nil {
-			errMsg := "failed to create group"
-			if grpOut != nil && grpOut.Stderr != "" {
-				errMsg = strings.TrimSpace(grpOut.Stderr)
-			}
-			return nil, false, fmt.Errorf("create group %s: %s", groupName, errMsg)
+		if err := sysuser.GroupCreate(ctx, groupName); err != nil {
+			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
 		changed = true
@@ -134,12 +130,8 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 			continue
 		}
 		if !userInGroup(username, groupName) {
-			if addOut, err := addUserToGroup(ctx, username, groupName); err != nil {
-				errMsg := "failed to add user to group"
-				if addOut != nil && addOut.Stderr != "" {
-					errMsg = strings.TrimSpace(addOut.Stderr)
-				}
-				output.WriteString(fmt.Sprintf("warning: %s for user %s: %s\n", errMsg, username, err))
+			if err := addUserToGroup(ctx, username, groupName); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
 			} else {
 				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
 				changed = true
@@ -155,7 +147,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 	}
 	for _, member := range currentMembers {
 		if !desiredSet[member] {
-			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
@@ -181,7 +173,7 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 				Stderr:   "filesystem is read-only and could not be remounted",
 			}, false, fmt.Errorf("filesystem is read-only")
 		}
-		if _, err := removeFileStrict(ctx, sudoersPath); err != nil {
+		if err := removeFileStrict(ctx, sudoersPath); err != nil {
 			return nil, false, fmt.Errorf("remove sudoers file: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed sudoers file: %s\n", sudoersPath))
@@ -192,19 +184,15 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 	if groupExists(groupName) {
 		members := getGroupMembers(groupName)
 		for _, member := range members {
-			if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
 		}
 
 		// Delete group
-		if delOut, err := groupDel(ctx, groupName); err != nil {
-			errMsg := "failed to delete group"
-			if delOut != nil && delOut.Stderr != "" {
-				errMsg = strings.TrimSpace(delOut.Stderr)
-			}
-			output.WriteString(fmt.Sprintf("warning: %s %s: %s\n", errMsg, groupName, err))
+		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
 		} else {
 			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
 			changed = true
@@ -290,66 +278,26 @@ func generateCustomSudoConfig(groupName, customConfig string) string {
 // =============================================================================
 
 // addUserToGroup adds a user to a supplementary group.
-func addUserToGroup(ctx context.Context, username, groupName string) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "usermod", "-aG", groupName, username)
+func addUserToGroup(ctx context.Context, username, groupName string) error {
+	return sysuser.GroupAddUser(ctx, username, groupName)
 }
 
 // removeUserFromGroup removes a user from a supplementary group.
-func removeUserFromGroup(ctx context.Context, username, groupName string) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "gpasswd", "-d", username, groupName)
-}
-
-// groupDel deletes a group.
-func groupDel(ctx context.Context, groupName string) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "groupdel", groupName)
+func removeUserFromGroup(ctx context.Context, username, groupName string) error {
+	return sysuser.GroupRemoveUser(ctx, username, groupName)
 }
 
 // getGroupMembers returns the members of a group.
 func getGroupMembers(groupName string) []string {
-	out, err := queryCmd("getent", "group", groupName)
-	if err != nil {
-		return nil
-	}
-	fields := strings.Split(strings.TrimSpace(out), ":")
-	if len(fields) < 4 || fields[3] == "" {
-		return nil
-	}
-	return strings.Split(fields[3], ",")
+	return sysuser.GroupMembers(groupName)
 }
 
 // userInGroup checks if a user is a member of the specified group.
 func userInGroup(username, groupName string) bool {
-	members := getGroupMembers(groupName)
-	for _, m := range members {
-		if m == username {
-			return true
-		}
-	}
-	return false
+	return sysuser.GroupHasUser(username, groupName)
 }
 
 // sudoGroupMembersMatch checks if the current group members match the desired list.
 func sudoGroupMembersMatch(groupName string, desiredUsers []string) bool {
-	if !groupExists(groupName) {
-		return len(desiredUsers) == 0
-	}
-	current := getGroupMembers(groupName)
-	if len(current) != len(desiredUsers) {
-		return false
-	}
-	// Sort both and compare
-	sortedCurrent := make([]string, len(current))
-	copy(sortedCurrent, current)
-	sort.Strings(sortedCurrent)
-
-	sortedDesired := make([]string, len(desiredUsers))
-	copy(sortedDesired, desiredUsers)
-	sort.Strings(sortedDesired)
-
-	for i := range sortedCurrent {
-		if sortedCurrent[i] != sortedDesired[i] {
-			return false
-		}
-	}
-	return true
+	return sysuser.GroupMembersMatch(groupName, desiredUsers)
 }

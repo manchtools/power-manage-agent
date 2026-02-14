@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 // executeGroup manages Linux groups and their members.
@@ -13,12 +14,12 @@ func (e *Executor) executeGroup(ctx context.Context, params *pb.GroupParams, sta
 	if params == nil {
 		return nil, false, fmt.Errorf("group params required")
 	}
-	if !isValidUsername(params.Name) {
+	if !sysuser.IsValidName(params.Name) {
 		return nil, false, fmt.Errorf("invalid group name: %q", params.Name)
 	}
 
 	for _, m := range params.Members {
-		if !isValidUsername(m) {
+		if !sysuser.IsValidName(m) {
 			return nil, false, fmt.Errorf("invalid member username: %q", m)
 		}
 	}
@@ -62,12 +63,8 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 			extraArgs = append(extraArgs, "-r")
 		}
 
-		if grpOut, err := groupAdd(ctx, params.Name, extraArgs...); err != nil {
-			errMsg := "failed to create group"
-			if grpOut != nil && grpOut.Stderr != "" {
-				errMsg = strings.TrimSpace(grpOut.Stderr)
-			}
-			return nil, false, fmt.Errorf("create group %s: %s", params.Name, errMsg)
+		if err := sysuser.GroupCreate(ctx, params.Name, extraArgs...); err != nil {
+			return nil, false, fmt.Errorf("create group %s: %v", params.Name, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", params.Name))
 		changed = true
@@ -80,12 +77,8 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 			continue
 		}
 		if !userInGroup(member, params.Name) {
-			if addOut, err := addUserToGroup(ctx, member, params.Name); err != nil {
-				errMsg := "failed to add user to group"
-				if addOut != nil && addOut.Stderr != "" {
-					errMsg = strings.TrimSpace(addOut.Stderr)
-				}
-				output.WriteString(fmt.Sprintf("warning: %s for user %s: %s\n", errMsg, member, err))
+			if err := addUserToGroup(ctx, member, params.Name); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", member, err))
 			} else {
 				output.WriteString(fmt.Sprintf("added user %s to group %s\n", member, params.Name))
 				changed = true
@@ -101,7 +94,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	}
 	for _, member := range currentMembers {
 		if !desiredSet[member] {
-			if _, err := removeUserFromGroup(ctx, member, params.Name); err == nil {
+			if err := removeUserFromGroup(ctx, member, params.Name); err == nil {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, params.Name))
 				changed = true
 			}
@@ -144,18 +137,14 @@ func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.Comma
 	// Remove all members from group
 	members := getGroupMembers(groupName)
 	for _, member := range members {
-		if _, err := removeUserFromGroup(ctx, member, groupName); err == nil {
+		if err := removeUserFromGroup(ctx, member, groupName); err == nil {
 			output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 		}
 	}
 
 	// Delete group
-	if delOut, err := groupDel(ctx, groupName); err != nil {
-		errMsg := "failed to delete group"
-		if delOut != nil && delOut.Stderr != "" {
-			errMsg = strings.TrimSpace(delOut.Stderr)
-		}
-		return nil, false, fmt.Errorf("delete group %s: %s", groupName, errMsg)
+	if err := sysuser.GroupDelete(ctx, groupName); err != nil {
+		return nil, false, fmt.Errorf("delete group %s: %v", groupName, err)
 	}
 	output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
 

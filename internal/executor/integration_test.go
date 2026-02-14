@@ -20,6 +20,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 // =============================================================================
@@ -703,7 +704,7 @@ func TestIntegration_User(t *testing.T) {
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		info, err := getUserInfo(username)
+		info, err := sysuser.Get(username)
 		if err != nil {
 			t.Fatal(err)
 		}
