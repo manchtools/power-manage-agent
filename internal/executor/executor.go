@@ -1584,63 +1584,64 @@ func (e *Executor) ensurePackageUnpinned(pkgName string) (bool, error) {
 
 // repairFilesystem attempts to fix read-only filesystem issues.
 // This can happen when the kernel remounts the filesystem as read-only due to errors.
-// Returns true if the filesystem is writable, false if repair failed.
+// It checks all real (non-virtual) filesystem mounts, not just /, because partitions
+// like /usr may be mounted separately and go read-only independently.
+// Returns true if all filesystems are writable, false if any repair failed.
 func (e *Executor) repairFilesystem(ctx context.Context) bool {
-	// Check if root filesystem is mounted read-only
 	mounts, err := os.ReadFile("/proc/mounts")
 	if err != nil {
 		e.logger.Warn("could not read /proc/mounts", "error", err)
 		return true // Assume writable, let operations fail naturally
 	}
 
-	// Look for root filesystem mount options
+	allOk := true
 	for _, line := range strings.Split(string(mounts), "\n") {
 		fields := strings.Fields(line)
 		if len(fields) < 4 {
 			continue
 		}
+		device := fields[0]
 		mountPoint := fields[1]
 		options := fields[3]
 
-		// Check root filesystem
-		if mountPoint == "/" {
-			// Check if mounted read-only
-			optionList := strings.Split(options, ",")
-			isReadOnly := false
-			for _, opt := range optionList {
-				if opt == "ro" {
-					isReadOnly = true
-					break
-				}
+		// Only check real block device filesystems (skip virtual: proc, sys, cgroup, etc.)
+		if !strings.HasPrefix(device, "/dev/") {
+			continue
+		}
+
+		isReadOnly := false
+		for _, opt := range strings.Split(options, ",") {
+			if opt == "ro" {
+				isReadOnly = true
+				break
 			}
+		}
+		if !isReadOnly {
+			continue
+		}
 
-			if !isReadOnly {
-				return true // Filesystem is already read-write
-			}
+		e.logger.Warn("filesystem is mounted read-only, attempting remount",
+			"mount", mountPoint, "device", device,
+		)
 
-			e.logger.Warn("root filesystem is mounted read-only, attempting remount")
-
-			// Try to remount as read-write
-			output, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", "/")
-			if err != nil {
-				e.logger.Error("failed to remount filesystem as read-write",
-					"error", err,
-					"output", output,
-				)
-
-				// Check if there are filesystem errors that need fsck
-				e.logger.Error("filesystem may have errors - system likely needs reboot and fsck",
-					"hint", "try: sudo fsck -y / (requires reboot to single-user mode)",
-				)
-				return false
-			}
-
-			e.logger.Info("successfully remounted root filesystem as read-write")
-			return true
+		output, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", mountPoint)
+		if err != nil {
+			e.logger.Error("failed to remount filesystem as read-write",
+				"mount", mountPoint, "device", device,
+				"error", err, "output", output,
+			)
+			e.logger.Error("filesystem may have errors - system likely needs reboot and fsck",
+				"mount", mountPoint,
+			)
+			allOk = false
+		} else {
+			e.logger.Info("successfully remounted filesystem as read-write",
+				"mount", mountPoint, "device", device,
+			)
 		}
 	}
 
-	return true // No issues detected
+	return allOk
 }
 
 // repairPackageManager attempts to fix common broken package manager states.
