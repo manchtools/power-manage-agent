@@ -138,6 +138,12 @@ func readFileWithSudo(ctx context.Context, path string) (string, error) {
 		}
 		return "", err
 	}
+	// go-cmd splits output into lines and joins with "\n", which strips the
+	// trailing newline that text files have. Restore it so content comparisons
+	// (e.g. configMatchesDesired) work correctly.
+	if output.Stdout != "" {
+		return output.Stdout + "\n", nil
+	}
 	return output.Stdout, nil
 }
 

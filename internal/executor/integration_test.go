@@ -879,13 +879,7 @@ func TestIntegration_Sudo(t *testing.T) {
 		}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
-		// Note: configMatchesDesired uses sudo cat via go-cmd which strips trailing
-		// newlines, so the content comparison always fails and the file is rewritten.
-		// This is a known limitation — verify setup is correct rather than changed=false.
-		filePath := sudoersFilePath(actionID)
-		if !sudoFileExists(filePath) {
-			t.Error("sudoers file missing after idempotent run")
-		}
+		assertChanged(t, result, false)
 	})
 
 	t.Run("Remove", func(t *testing.T) {
@@ -964,11 +958,7 @@ func TestIntegration_SSH(t *testing.T) {
 		}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
-		// Note: configMatchesDesired uses sudo cat which strips trailing newlines,
-		// so file comparison always fails and config is rewritten. Verify state instead.
-		if !groupExists(sshGroupName(actionID)) {
-			t.Error("SSH group not present after idempotent run")
-		}
+		assertChanged(t, result, false)
 	})
 
 	t.Run("RemoveAccess", func(t *testing.T) {
@@ -1039,10 +1029,7 @@ func TestIntegration_SSHD(t *testing.T) {
 		}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
-		// Note: configMatchesDesired trailing newline issue causes rewrite. Verify state.
-		if !sudoFileExists(configPath) {
-			t.Error("SSHD config missing after idempotent run")
-		}
+		assertChanged(t, result, false)
 	})
 
 	t.Run("Remove", func(t *testing.T) {
