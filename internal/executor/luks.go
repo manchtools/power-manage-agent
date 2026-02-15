@@ -58,21 +58,41 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 	}, false, nil, nil
 }
 
-// setupLuks handles PRESENT state — auto-detect volume, check conflicts, take ownership, rotate, reconcile device key.
+// setupLuks handles PRESENT state — detect volume, check conflicts, take ownership, rotate, reconcile device key.
 func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 
-	// Auto-detect LUKS volume
-	vol, err := sysluks.DetectVolume(ctx)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("no LUKS-encrypted volumes detected on this device")
+	// Load local state
+	localState, _ := e.store.GetLuksState(actionID)
+
+	// Determine device path
+	var devicePath string
+	if localState != nil && localState.OwnershipTaken && localState.DevicePath != "" {
+		// Subsequent run — use stored device path
+		devicePath = localState.DevicePath
+		isLuks, err := sysluks.IsLuks(ctx, devicePath)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("failed to check LUKS status: %w", err)
+		}
+		if !isLuks {
+			return nil, false, nil, fmt.Errorf("previously managed device %s is no longer a LUKS volume", devicePath)
+		}
+		output.WriteString(fmt.Sprintf("LUKS: managing volume %s\n", devicePath))
+	} else {
+		// First run — detect volume by PSK
+		vol, err := sysluks.DetectVolumeByKey(ctx, params.PresharedKey)
+		if err != nil {
+			// Fall back to heuristic detection (PSK may have been removed by a partial prior run)
+			vol, err = sysluks.DetectVolume(ctx)
+			if err != nil {
+				return nil, false, nil, fmt.Errorf("no LUKS-encrypted volumes detected on this device")
+			}
+			output.WriteString(fmt.Sprintf("LUKS: detected volume %s (fallback)\n", vol.DevicePath))
+		} else {
+			output.WriteString(fmt.Sprintf("LUKS: matched volume %s by pre-shared key\n", vol.DevicePath))
+		}
+		devicePath = vol.DevicePath
 	}
-	devicePath := vol.DevicePath
-	output.WriteString(fmt.Sprintf("LUKS: detected volume %s", devicePath))
-	if vol.MountPoint != "" {
-		output.WriteString(fmt.Sprintf(" (mounted at %s)", vol.MountPoint))
-	}
-	output.WriteString("\n")
 
 	// Conflict resolution — check if another LUKS action should win
 	if e.actionStore != nil {
@@ -85,17 +105,6 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 		}
 	}
 
-	// Validate volume
-	isLuks, err := sysluks.IsLuks(ctx, devicePath)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("failed to check LUKS status: %w", err)
-	}
-	if !isLuks {
-		return nil, false, nil, fmt.Errorf("device %s is not a LUKS volume", devicePath)
-	}
-
-	// Load local state
-	localState, _ := e.store.GetLuksState(actionID)
 	changed := false
 
 	// Take ownership if not done yet
@@ -111,7 +120,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 
 	// Check if rotation is due
 	if localState != nil && localState.OwnershipTaken {
-		rotated, err := e.checkAndRotate(ctx, params, actionID, devicePath)
+		rotated, err := e.checkAndRotate(ctx, params, localState, actionID, devicePath)
 		if err != nil {
 			e.logger.Warn("LUKS rotation failed", "action_id", actionID, "error", err)
 			output.WriteString(fmt.Sprintf("LUKS: rotation check failed: %v\n", err))
@@ -183,18 +192,20 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 }
 
 // checkAndRotate checks if a rotation is due and rotates the managed passphrase if needed.
-func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, actionID, devicePath string) (bool, error) {
-	// Get current key from server to check rotation timing
-	// The server knows when the last rotation occurred
+func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
+	// Check if rotation interval has elapsed
+	if !localState.LastRotatedAt.IsZero() && params.RotationIntervalDays > 0 {
+		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour
+		if time.Since(localState.LastRotatedAt) < intervalDuration {
+			return false, nil
+		}
+	}
+
+	// Get current key from server
 	currentKey, err := e.luksKeyStore.GetKey(ctx, actionID)
 	if err != nil {
 		return false, fmt.Errorf("get current key: %w", err)
 	}
-
-	// For now, rotation is handled by re-executing on schedule.
-	// The scheduler controls when this action runs based on rotation_interval_days.
-	// If we got here and the action is scheduled, rotation is due.
-	_ = currentKey // Used in the actual rotation below
 
 	minWords := int(params.MinWords)
 	if minWords < 3 {
@@ -222,6 +233,11 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, ac
 	// Server confirmed — now safe to remove old key
 	if err := sysluks.RemoveKey(ctx, devicePath, currentKey); err != nil {
 		e.logger.Warn("failed to remove old key after rotation (both keys work)", "error", err)
+	}
+
+	// Record rotation time locally
+	if err := e.store.SetLuksLastRotatedAt(actionID, time.Now().UTC()); err != nil {
+		e.logger.Warn("failed to record LUKS rotation time", "action_id", actionID, "error", err)
 	}
 
 	return true, nil

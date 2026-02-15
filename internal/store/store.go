@@ -124,7 +124,8 @@ func (s *Store) migrate() error {
 		action_id TEXT PRIMARY KEY,
 		device_path TEXT NOT NULL DEFAULT '',
 		ownership_taken BOOLEAN NOT NULL DEFAULT FALSE,
-		device_key_type TEXT NOT NULL DEFAULT 'none'
+		device_key_type TEXT NOT NULL DEFAULT 'none',
+		last_rotated_at TEXT NOT NULL DEFAULT ''
 	);
 
 	CREATE TABLE IF NOT EXISTS luks_user_passphrase_history (
@@ -633,6 +634,7 @@ type LuksState struct {
 	DevicePath     string
 	OwnershipTaken bool
 	DeviceKeyType  string // "none", "tpm", "user_passphrase"
+	LastRotatedAt  time.Time
 }
 
 // GetLuksState returns the LUKS state for an action, or nil if not found.
@@ -641,15 +643,19 @@ func (s *Store) GetLuksState(actionID string) (*LuksState, error) {
 	defer s.mu.RUnlock()
 
 	var state LuksState
+	var lastRotated string
 	err := s.db.QueryRow(
-		"SELECT action_id, device_path, ownership_taken, device_key_type FROM luks_state WHERE action_id = ?",
+		"SELECT action_id, device_path, ownership_taken, device_key_type, last_rotated_at FROM luks_state WHERE action_id = ?",
 		actionID,
-	).Scan(&state.ActionID, &state.DevicePath, &state.OwnershipTaken, &state.DeviceKeyType)
+	).Scan(&state.ActionID, &state.DevicePath, &state.OwnershipTaken, &state.DeviceKeyType, &lastRotated)
 	if err != nil {
 		if errors.Is(err, sql.ErrNoRows) {
 			return nil, nil
 		}
 		return nil, err
+	}
+	if lastRotated != "" {
+		state.LastRotatedAt, _ = time.Parse(time.RFC3339, lastRotated)
 	}
 	return &state, nil
 }
@@ -659,13 +665,15 @@ func (s *Store) SetLuksOwnershipTaken(actionID, devicePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	now := time.Now().UTC().Format(time.RFC3339)
 	_, err := s.db.Exec(`
-		INSERT INTO luks_state (action_id, device_path, ownership_taken, device_key_type)
-		VALUES (?, ?, TRUE, 'none')
+		INSERT INTO luks_state (action_id, device_path, ownership_taken, device_key_type, last_rotated_at)
+		VALUES (?, ?, TRUE, 'none', ?)
 		ON CONFLICT(action_id) DO UPDATE SET
 			device_path = excluded.device_path,
-			ownership_taken = TRUE
-	`, actionID, devicePath)
+			ownership_taken = TRUE,
+			last_rotated_at = excluded.last_rotated_at
+	`, actionID, devicePath, now)
 	return err
 }
 
@@ -677,6 +685,18 @@ func (s *Store) SetLuksDeviceKeyType(actionID, keyType string) error {
 	_, err := s.db.Exec(
 		"UPDATE luks_state SET device_key_type = ? WHERE action_id = ?",
 		keyType, actionID,
+	)
+	return err
+}
+
+// SetLuksLastRotatedAt records the time of the most recent key rotation.
+func (s *Store) SetLuksLastRotatedAt(actionID string, t time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		"UPDATE luks_state SET last_rotated_at = ? WHERE action_id = ?",
+		t.UTC().Format(time.RFC3339), actionID,
 	)
 	return err
 }
