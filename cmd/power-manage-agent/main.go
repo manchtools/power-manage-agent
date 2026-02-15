@@ -357,8 +357,9 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		connStart := time.Now()
 		err := client.Run(sessionCtx, hostname, version, defaultHeartbeatInterval, h)
 
-		// Stop the goroutines
+		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
+		h.Executor().SetLuksKeyStore(nil)
 		<-syncDone
 		<-resultsDone
 

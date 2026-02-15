@@ -95,6 +95,12 @@
 {{.User}} ALL=(root) NOPASSWD: /bin/sh *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/sh *
 
+# LUKS disk encryption management
+{{.User}} ALL=(root) NOPASSWD: /usr/sbin/cryptsetup *
+{{.User}} ALL=(root) NOPASSWD: /sbin/cryptsetup *
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/systemd-cryptenroll *
+{{.User}} ALL=(root) NOPASSWD: /bin/systemd-cryptenroll *
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *

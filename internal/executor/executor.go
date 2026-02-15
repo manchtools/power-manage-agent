@@ -2810,6 +2810,11 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
+	// Hide from login screen if requested
+	if params.Hidden {
+		setUserHidden(ctx, params.Username, true, output)
+	}
+
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, metadata, nil
 }
 
@@ -2936,6 +2941,11 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
+	// Hide/show on login screen
+	if setUserHidden(ctx, params.Username, params.Hidden, output) {
+		changed = true
+	}
+
 	if !changed {
 		output.WriteString(fmt.Sprintf("user %s is already in desired state\n", params.Username))
 	}
@@ -2965,6 +2975,9 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	// Kill all processes and sessions for this user before removal
 	killUserSessions(ctx, username)
 
+	// Clean up AccountsService override if present
+	removeAccountsServiceFile(ctx, username)
+
 	// Remove user and their home directory
 	output, err := runSudoCmd(ctx, "userdel", "-r", username)
 	if err != nil {
@@ -2986,6 +2999,56 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 		ExitCode: 0,
 		Stdout:   fmt.Sprintf("removed user: %s\n", username),
 	}, true, nil
+}
+
+// accountsServicePath returns the AccountsService override file path for a user.
+const accountsServiceDir = "/var/lib/AccountsService/users"
+
+// setUserHidden writes or removes the AccountsService override to hide/show a user
+// on graphical login screens. Returns whether a change was made. Skips silently if
+// AccountsService is not installed (headless systems).
+func setUserHidden(ctx context.Context, username string, hidden bool, output *strings.Builder) bool {
+	filePath := accountsServiceDir + "/" + username
+
+	if _, err := os.Stat(accountsServiceDir); os.IsNotExist(err) {
+		return false // AccountsService not installed, skip
+	}
+
+	desiredContent := "[User]\nSystemAccount=true\n"
+
+	if hidden {
+		// Check idempotency
+		existing, _ := readFileWithSudo(ctx, filePath)
+		if existing == desiredContent {
+			return false
+		}
+		if err := atomicWriteFile(ctx, filePath, desiredContent, "0644", "root", "root"); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to hide user from login screen: %v\n", err))
+			return false
+		}
+		output.WriteString("hidden from login screen (AccountsService)\n")
+		return true
+	}
+
+	// hidden=false: remove the file if it exists and was set by us
+	existing, err := readFileWithSudo(ctx, filePath)
+	if err != nil || existing != desiredContent {
+		return false // File doesn't exist or wasn't ours
+	}
+	if err := removeFileStrict(ctx, filePath); err != nil {
+		output.WriteString(fmt.Sprintf("warning: failed to unhide user from login screen: %v\n", err))
+		return false
+	}
+	output.WriteString("visible on login screen (AccountsService removed)\n")
+	return true
+}
+
+// removeAccountsServiceFile removes the AccountsService override for a user during user deletion.
+func removeAccountsServiceFile(ctx context.Context, username string) {
+	filePath := accountsServiceDir + "/" + username
+	if fileExistsWithSudo(ctx, filePath) {
+		removeFileStrict(ctx, filePath)
+	}
 }
 
 // setupSSHKeys configures SSH authorized keys for a user.

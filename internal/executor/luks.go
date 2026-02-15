@@ -63,7 +63,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 	var output strings.Builder
 
 	// Auto-detect LUKS volume
-	vol, err := sysluks.DetectVolume()
+	vol, err := sysluks.DetectVolume(ctx)
 	if err != nil {
 		return nil, false, nil, fmt.Errorf("no LUKS-encrypted volumes detected on this device")
 	}

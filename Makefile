@@ -19,7 +19,9 @@ BUILD_DIR   := dist
 VERSION     := dev-$(shell date +%Y%m%d-%H%M%S)
 LDFLAGS     := -s -w -X main.version=$(VERSION)
 
-SSH_OPTS    := $(if $(KEY),-i $(KEY),)
+KEY_OPTS    := $(if $(KEY),-i $(KEY),)
+SSH_OPTS    := -t $(KEY_OPTS)
+SCP_OPTS    := $(KEY_OPTS)
 
 # ── Targets ────────────────────────────────────────────────────
 .PHONY: build deploy install logs status restart stop \
@@ -37,7 +39,7 @@ build:
 
 deploy: build
 	ssh $(SSH_OPTS) $(SSH) 'sudo rm -f /tmp/$(BINARY) /tmp/install.sh'
-	scp $(SSH_OPTS) $(BUILD_DIR)/$(BINARY)-linux-$(GOARCH) $(SSH):/tmp/$(BINARY)
+	scp $(SCP_OPTS) $(BUILD_DIR)/$(BINARY)-linux-$(GOARCH) $(SSH):/tmp/$(BINARY)
 	ssh $(SSH_OPTS) $(SSH) 'sudo systemctl stop $(SERVICE) 2>/dev/null; \
 		sudo mv /tmp/$(BINARY) $(REMOTE_BIN) && \
 		sudo chmod +x $(REMOTE_BIN) && \
@@ -47,8 +49,8 @@ deploy: build
 
 install: build
 	ssh $(SSH_OPTS) $(SSH) 'sudo rm -f /tmp/$(BINARY) /tmp/install.sh'
-	scp $(SSH_OPTS) $(BUILD_DIR)/$(BINARY)-linux-$(GOARCH) $(SSH):/tmp/$(BINARY)
-	scp $(SSH_OPTS) install.sh $(SSH):/tmp/install.sh
+	scp $(SCP_OPTS) $(BUILD_DIR)/$(BINARY)-linux-$(GOARCH) $(SSH):/tmp/$(BINARY)
+	scp $(SCP_OPTS) install.sh $(SSH):/tmp/install.sh
 	ssh $(SSH_OPTS) $(SSH) 'sudo mv /tmp/$(BINARY) $(REMOTE_BIN) && sudo chmod +x $(REMOTE_BIN) && sudo bash /tmp/install.sh --skip-download'
 	@echo "Full install on $(SSH) complete"
 
