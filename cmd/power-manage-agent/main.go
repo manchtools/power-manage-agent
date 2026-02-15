@@ -636,8 +636,7 @@ func parseFlags() *Config {
 
 	// Route LUKS URIs to the LUKS subcommand (power-manage://luks/...)
 	if uri != "" && strings.HasPrefix(uri, "power-manage://luks/") {
-		runLuksURI(uri)
-		os.Exit(0) // never reached, runLuksURI exits
+		runLuksURI(uri) // runLuksURI always exits
 	}
 
 	// Parse power-manage:// URI if provided (registration URIs)
