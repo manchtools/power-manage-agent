@@ -62,8 +62,10 @@ jobs:
       - name: Run integration tests
         run: |
           docker run --rm pm-agent-test-${{ matrix.distro }} \
-            runuser -u power-manage -- /usr/local/go/bin/go test \
-              -v -tags=integration -count=1 -timeout=10m \
+            runuser -u power-manage -- /go/bin/gotestsum \
+              --format testdox \
+              --format-hide-empty-pkg \
+              -- -tags=integration -count=1 -timeout=10m \
               ./agent/internal/executor/ -run Integration
 
   integration-edgecase:
@@ -90,6 +92,8 @@ jobs:
       - name: Run edge case tests
         run: |
           docker run --rm --privileged pm-agent-test-debian \
-            runuser -u power-manage -- /usr/local/go/bin/go test \
-              -v -tags=integration -count=1 -timeout=10m \
+            runuser -u power-manage -- /go/bin/gotestsum \
+              --format testdox \
+              --format-hide-empty-pkg \
+              -- -tags=integration -count=1 -timeout=10m \
               ./agent/internal/executor/ -run Integration -run EdgeCase

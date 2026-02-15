@@ -35,8 +35,9 @@ COPY agent/ ./agent/
 # Create a trimmed go.work (excludes server which isn't needed for agent tests)
 RUN printf 'go 1.25\n\nuse (\n\t./sdk\n\t./agent\n)\n' > go.work
 
-# Pre-download dependencies
+# Pre-download dependencies and install gotestsum for clear failure reporting
 RUN cd agent && go mod download
+RUN go install gotest.tools/gotestsum@latest
 
 # Install real sudoers from production template (single source of truth)
 RUN sed 's/{{.User}}/power-manage/g' agent/internal/setup/sudoers.tmpl \
