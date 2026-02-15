@@ -243,6 +243,19 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 	return hb
 }
 
+// OnRevokeLuksDeviceKey handles a LUKS device-bound key revocation request from the server.
+// Implements sdk.LuksHandler.
+func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (bool, string) {
+	h.logger.Info("received LUKS device key revocation", "action_id", actionID)
+	success, errMsg := h.executor.RevokeLuksDeviceKey(ctx, actionID)
+	if !success {
+		h.logger.Error("LUKS device key revocation failed", "action_id", actionID, "error", errMsg)
+	} else {
+		h.logger.Info("LUKS device key revoked", "action_id", actionID)
+	}
+	return success, errMsg
+}
+
 // Executor returns the executor for direct use.
 func (h *Handler) Executor() *executor.Executor {
 	return h.executor

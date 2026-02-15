@@ -118,6 +118,28 @@ func (s *Store) migrate() error {
 	// Add desired_state column if it doesn't exist (migration)
 	s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0")
 
+	// LUKS state tables
+	luksSchema := `
+	CREATE TABLE IF NOT EXISTS luks_state (
+		action_id TEXT PRIMARY KEY,
+		device_path TEXT NOT NULL DEFAULT '',
+		ownership_taken BOOLEAN NOT NULL DEFAULT FALSE,
+		device_key_type TEXT NOT NULL DEFAULT 'none'
+	);
+
+	CREATE TABLE IF NOT EXISTS luks_user_passphrase_history (
+		id INTEGER PRIMARY KEY AUTOINCREMENT,
+		action_id TEXT NOT NULL,
+		passphrase_hash TEXT NOT NULL,
+		created_at TEXT NOT NULL DEFAULT (datetime('now'))
+	);
+
+	CREATE INDEX IF NOT EXISTS idx_luks_passphrase_history_action ON luks_user_passphrase_history(action_id);
+	`
+	if _, err := s.db.Exec(luksSchema); err != nil {
+		return err
+	}
+
 	return nil
 }
 
@@ -599,4 +621,121 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		return now
 	}
 	return lastExecuted.Add(time.Duration(interval) * time.Hour)
+}
+
+// =============================================================================
+// LUKS State
+// =============================================================================
+
+// LuksState represents the local LUKS state for an action.
+type LuksState struct {
+	ActionID       string
+	DevicePath     string
+	OwnershipTaken bool
+	DeviceKeyType  string // "none", "tpm", "user_passphrase"
+}
+
+// GetLuksState returns the LUKS state for an action, or nil if not found.
+func (s *Store) GetLuksState(actionID string) (*LuksState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var state LuksState
+	err := s.db.QueryRow(
+		"SELECT action_id, device_path, ownership_taken, device_key_type FROM luks_state WHERE action_id = ?",
+		actionID,
+	).Scan(&state.ActionID, &state.DevicePath, &state.OwnershipTaken, &state.DeviceKeyType)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			return nil, nil
+		}
+		return nil, err
+	}
+	return &state, nil
+}
+
+// SetLuksOwnershipTaken marks ownership as taken and stores the detected device path.
+func (s *Store) SetLuksOwnershipTaken(actionID, devicePath string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO luks_state (action_id, device_path, ownership_taken, device_key_type)
+		VALUES (?, ?, TRUE, 'none')
+		ON CONFLICT(action_id) DO UPDATE SET
+			device_path = excluded.device_path,
+			ownership_taken = TRUE
+	`, actionID, devicePath)
+	return err
+}
+
+// SetLuksDeviceKeyType updates the device-bound key type.
+func (s *Store) SetLuksDeviceKeyType(actionID, keyType string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(
+		"UPDATE luks_state SET device_key_type = ? WHERE action_id = ?",
+		keyType, actionID,
+	)
+	return err
+}
+
+// DeleteLuksState removes the LUKS state for an action.
+func (s *Store) DeleteLuksState(actionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM luks_state WHERE action_id = ?", actionID)
+	return err
+}
+
+// GetLuksPassphraseHashes returns the most recent passphrase hashes for an action (max 3).
+func (s *Store) GetLuksPassphraseHashes(actionID string) ([]string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		"SELECT passphrase_hash FROM luks_user_passphrase_history WHERE action_id = ? ORDER BY created_at DESC LIMIT 3",
+		actionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var hashes []string
+	for rows.Next() {
+		var hash string
+		if err := rows.Scan(&hash); err != nil {
+			return nil, err
+		}
+		hashes = append(hashes, hash)
+	}
+	return hashes, rows.Err()
+}
+
+// AddLuksPassphraseHash stores a passphrase hash and prunes old entries beyond 3.
+func (s *Store) AddLuksPassphraseHash(actionID, hash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	if _, err := s.db.Exec(
+		"INSERT INTO luks_user_passphrase_history (action_id, passphrase_hash) VALUES (?, ?)",
+		actionID, hash,
+	); err != nil {
+		return err
+	}
+
+	// Keep only the 3 most recent entries per action
+	_, err := s.db.Exec(`
+		DELETE FROM luks_user_passphrase_history
+		WHERE action_id = ? AND id NOT IN (
+			SELECT id FROM luks_user_passphrase_history
+			WHERE action_id = ?
+			ORDER BY created_at DESC
+			LIMIT 3
+		)
+	`, actionID, actionID)
+	return err
 }

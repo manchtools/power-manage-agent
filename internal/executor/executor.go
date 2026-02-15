@@ -21,6 +21,7 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/agent/internal/store"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
@@ -80,10 +81,13 @@ var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
 // Executor handles the execution of actions.
 type Executor struct {
-	httpClient *http.Client
-	pkgManager *pkg.PackageManager
-	verifier   *verify.ActionVerifier
-	logger     *slog.Logger
+	httpClient   *http.Client
+	pkgManager   *pkg.PackageManager
+	verifier     *verify.ActionVerifier
+	logger       *slog.Logger
+	luksKeyStore LuksKeyStore
+	store        *store.Store
+	actionStore  ActionStore
 }
 
 // NewExecutor creates a new action executor.
@@ -98,6 +102,21 @@ func NewExecutor(verifier *verify.ActionVerifier) *Executor {
 		verifier:   verifier,
 		logger:     slog.Default(),
 	}
+}
+
+// SetLuksKeyStore sets the LUKS key store for stream-based key operations.
+func (e *Executor) SetLuksKeyStore(ks LuksKeyStore) {
+	e.luksKeyStore = ks
+}
+
+// SetStore sets the agent store for LUKS state persistence.
+func (e *Executor) SetStore(s *store.Store) {
+	e.store = s
+}
+
+// SetActionStore sets the action store for LUKS conflict resolution.
+func (e *Executor) SetActionStore(as ActionStore) {
+	e.actionStore = as
 }
 
 // Execute runs an action and returns the result.
@@ -236,6 +255,18 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 			lpsActionID = action.Id.Value
 		}
 		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, lpsActionID)
+		result.Changed = changed
+		if len(metadata) > 0 {
+			result.Metadata = metadata
+		}
+	case pb.ActionType_ACTION_TYPE_LUKS:
+		var changed bool
+		var metadata map[string]string
+		luksActionID := ""
+		if action.Id != nil {
+			luksActionID = action.Id.Value
+		}
+		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, luksActionID)
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata

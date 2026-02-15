@@ -365,10 +365,20 @@ uninstall() {
         systemctl daemon-reload
     fi
 
-    # Remove sudoers file
+    # Remove sudoers files
     if [[ -f "/etc/sudoers.d/$SERVICE_USER" ]]; then
         log_info "Removing sudoers configuration..."
         rm -f "/etc/sudoers.d/$SERVICE_USER"
+    fi
+    if [[ -f "/etc/sudoers.d/power-manage-luks" ]]; then
+        log_info "Removing LUKS sudoers configuration..."
+        rm -f "/etc/sudoers.d/power-manage-luks"
+    fi
+
+    # Remove desktop handler
+    if [[ -f "/usr/share/applications/power-manage-agent.desktop" ]]; then
+        log_info "Removing desktop handler..."
+        rm -f "/usr/share/applications/power-manage-agent.desktop"
     fi
 
     # Ask about data directory
@@ -396,6 +406,53 @@ uninstall() {
     fi
 
     log_info "Uninstall complete"
+}
+
+install_desktop_handler() {
+    local desktop_file="/usr/share/applications/power-manage-agent.desktop"
+
+    log_info "Installing desktop URI handler..."
+
+    cat > "$desktop_file" << EOF
+[Desktop Entry]
+Name=Power Manage Agent
+Comment=Power Manage device agent
+Exec=sudo $BINARY_PATH %u
+Terminal=true
+Type=Application
+MimeType=x-scheme-handler/power-manage;
+NoDisplay=true
+EOF
+
+    chmod 644 "$desktop_file"
+
+    # Register the URI scheme handler
+    if command -v xdg-mime &>/dev/null; then
+        xdg-mime default power-manage-agent.desktop x-scheme-handler/power-manage 2>/dev/null || true
+    fi
+
+    log_info "Desktop URI handler installed"
+}
+
+install_luks_sudoers() {
+    local sudoers_file="/etc/sudoers.d/power-manage-luks"
+
+    log_info "Installing LUKS sudoers rule..."
+
+    cat > "$sudoers_file" << 'EOF'
+# Allow all users to run LUKS passphrase commands without password
+ALL ALL=(root) NOPASSWD: /usr/local/bin/power-manage-agent luks *
+EOF
+
+    chmod 440 "$sudoers_file"
+
+    # Validate sudoers syntax
+    if visudo -c -f "$sudoers_file" &>/dev/null; then
+        log_info "LUKS sudoers rule installed"
+    else
+        log_error "Invalid sudoers syntax, removing file"
+        rm -f "$sudoers_file"
+    fi
 }
 
 show_status() {
@@ -452,6 +509,8 @@ main() {
     setup_sudo
     create_directories
     install_systemd_service
+    install_desktop_handler
+    install_luks_sudoers
 
     if [[ -n "$REGISTRATION_TOKEN" ]] && [[ -n "$SERVER_URL" ]]; then
         register_agent
