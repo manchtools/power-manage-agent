@@ -101,6 +101,10 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/systemd-cryptenroll *
 {{.User}} ALL=(root) NOPASSWD: /bin/systemd-cryptenroll *
 
+# User notification
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/wall
+{{.User}} ALL=(root) NOPASSWD: /bin/wall
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *

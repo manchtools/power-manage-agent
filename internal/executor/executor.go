@@ -24,6 +24,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
@@ -1881,6 +1882,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if rebootRequired {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if params != nil && params.RebootIfRequired {
+			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
 			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
 		}
@@ -2598,6 +2600,8 @@ func IsInstantAction(t pb.ActionType) bool {
 
 // executeReboot schedules a system reboot in 5 minutes.
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
+	sysnotify.NotifyAll(ctx, "System Reboot", "This system will reboot in 5 minutes. Please save your work.")
+
 	output, err := runSudoCmd(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
 	if err != nil {
 		return output, fmt.Errorf("failed to schedule reboot: %w", err)

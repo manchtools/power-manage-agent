@@ -14,6 +14,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
@@ -88,6 +89,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	}
 
 	var rotations []lpsRotationEntry
+	var rotatedUsers []string
 	var anyError error
 
 	for _, username := range params.Usernames {
@@ -126,11 +128,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			continue
 		}
 
-		// Kill all user sessions after password rotation
-		killUserSessions(ctx, username)
+		rotatedUsers = append(rotatedUsers, username)
 
 		now := time.Now().UTC()
-		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s), sessions terminated\n", username, reason))
+		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
 		// Update per-user state
 		hash := sha256.Sum256([]byte(password))
@@ -145,6 +146,24 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			RotatedAt: now.Format(time.RFC3339),
 			Reason:    reason,
 		})
+	}
+
+	// Notify affected users and terminate sessions after a grace period
+	if len(rotatedUsers) > 0 {
+		sysnotify.NotifyUsers(ctx, rotatedUsers, "Session Termination",
+			"Your password has been changed by Power Manage. All sessions will be terminated in 60 seconds. Please save your work.")
+		output.WriteString(fmt.Sprintf("LPS: notified %d user(s), waiting 60 seconds before session termination\n", len(rotatedUsers)))
+
+		select {
+		case <-time.After(60 * time.Second):
+		case <-ctx.Done():
+			output.WriteString("LPS: grace period interrupted\n")
+		}
+
+		for _, username := range rotatedUsers {
+			killUserSessions(ctx, username)
+		}
+		output.WriteString(fmt.Sprintf("LPS: terminated sessions for %d user(s)\n", len(rotatedUsers)))
 	}
 
 	// Save updated state
