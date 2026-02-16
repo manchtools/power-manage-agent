@@ -101,7 +101,11 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
 		}
 		if winnerID != actionID {
-			return nil, false, nil, fmt.Errorf("conflicting LUKS action — using action %s instead", winnerID)
+			output.WriteString(fmt.Sprintf("LUKS: skipped — another action %s takes precedence\n", winnerID))
+			return &pb.CommandOutput{
+				ExitCode: 0,
+				Stdout:   output.String(),
+			}, false, nil, nil
 		}
 	}
 

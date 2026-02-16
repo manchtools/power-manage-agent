@@ -270,6 +270,7 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 		"kernel_info",
 		"block_devices",
 		"interface_details",
+		"interface_addresses",
 		"usb_devices",
 		"pci_devices",
 		"memory_info",
