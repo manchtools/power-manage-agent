@@ -256,6 +256,65 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (b
 	return success, errMsg
 }
 
+// CollectInventory queries osquery for hardware/software inventory tables.
+// Returns nil if osquery is not installed.
+func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
+	if h.osquery == nil {
+		return nil
+	}
+
+	// Core inventory tables (always collected)
+	coreTables := []string{
+		"system_info",
+		"os_version",
+		"kernel_info",
+		"block_devices",
+		"interface_details",
+		"usb_devices",
+		"pci_devices",
+		"memory_info",
+	}
+
+	// Package tables (best-effort — skip if unavailable)
+	packageTables := []string{
+		"deb_packages",
+		"rpm_packages",
+		"python_packages",
+	}
+
+	var tables []*pb.InventoryTable
+
+	for _, tableName := range coreTables {
+		rows, err := h.osquery.QueryTable(tableName)
+		if err != nil {
+			h.logger.Debug("inventory table unavailable", "table", tableName, "error", err)
+			continue
+		}
+		tables = append(tables, &pb.InventoryTable{
+			TableName: tableName,
+			Rows:      rows,
+		})
+	}
+
+	for _, tableName := range packageTables {
+		rows, err := h.osquery.QueryTable(tableName)
+		if err != nil {
+			continue // expected to fail on non-matching distros
+		}
+		tables = append(tables, &pb.InventoryTable{
+			TableName: tableName,
+			Rows:      rows,
+		})
+	}
+
+	if len(tables) == 0 {
+		return nil
+	}
+
+	h.logger.Info("inventory collected", "tables", len(tables))
+	return &pb.DeviceInventory{Tables: tables}
+}
+
 // Executor returns the executor for direct use.
 func (h *Handler) Executor() *executor.Executor {
 	return h.executor
