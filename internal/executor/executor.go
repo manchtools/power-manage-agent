@@ -80,6 +80,42 @@ func resolveAndValidatePath(path string) (string, error) {
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// validEnvVarName matches safe environment variable names (letters, digits, underscore).
+var validEnvVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// blockedEnvVars are environment variable names that must never be overridden
+// because they can hijack process execution (library injection, path manipulation).
+var blockedEnvVars = map[string]bool{
+	"LD_PRELOAD":      true,
+	"LD_LIBRARY_PATH": true,
+	"LD_AUDIT":        true,
+	"LD_DEBUG":        true,
+	"LD_PROFILE":      true,
+	"PATH":            true,
+	"IFS":             true,
+	"ENV":             true,
+	"BASH_ENV":        true,
+	"CDPATH":          true,
+	"GLOBIGNORE":      true,
+	"BASH_FUNC_":      true,
+}
+
+// isAllowedEnvVar returns true if the environment variable name is safe to set.
+func isAllowedEnvVar(name string) bool {
+	if !validEnvVarName.MatchString(name) {
+		return false
+	}
+	upper := strings.ToUpper(name)
+	if blockedEnvVars[upper] {
+		return false
+	}
+	// Block LD_* and BASH_FUNC_* prefixes
+	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "BASH_FUNC_") {
+		return false
+	}
+	return true
+}
+
 // Executor handles the execution of actions.
 type Executor struct {
 	httpClient   *http.Client
@@ -873,11 +909,15 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		args = []string{"-c", params.Script}
 	}
 
-	// Build environment
+	// Build environment — reject dangerous variable names that could
+	// hijack the child process (e.g. LD_PRELOAD, PATH, LD_LIBRARY_PATH).
 	var envVars []string
 	if len(params.Environment) > 0 {
 		envVars = os.Environ()
 		for k, v := range params.Environment {
+			if !isAllowedEnvVar(k) {
+				return nil, fmt.Errorf("environment variable %q is not allowed", k)
+			}
 			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
@@ -1394,6 +1434,9 @@ func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryPara
 	return true
 }
 
+// maxDownloadSize is the maximum allowed download size (2 GiB).
+const maxDownloadSize = 2 << 30
+
 func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1410,17 +1453,32 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 		return fmt.Errorf("download failed: %s", resp.Status)
 	}
 
+	// Reject downloads that advertise a size larger than the limit.
+	if resp.ContentLength > maxDownloadSize {
+		return fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
+	}
+
+	// Wrap the body with a size limit to protect against servers that
+	// lie about Content-Length or use chunked encoding.
+	body := io.LimitReader(resp.Body, maxDownloadSize+1)
+
 	file, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 
+	var written int64
 	if expectedChecksum != "" {
 		hasher := sha256.New()
-		reader := io.TeeReader(resp.Body, hasher)
-		if _, err := io.Copy(file, reader); err != nil {
+		reader := io.TeeReader(body, hasher)
+		if written, err = io.Copy(file, reader); err != nil {
 			_ = file.Close()
 			return err
+		}
+		if written > maxDownloadSize {
+			_ = file.Close()
+			os.Remove(dest)
+			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
 		}
 		actual := hex.EncodeToString(hasher.Sum(nil))
 		if actual != expectedChecksum {
@@ -1429,9 +1487,14 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 			return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 		}
 	} else {
-		if _, err := io.Copy(file, resp.Body); err != nil {
+		if written, err = io.Copy(file, body); err != nil {
 			_ = file.Close()
 			return err
+		}
+		if written > maxDownloadSize {
+			_ = file.Close()
+			os.Remove(dest)
+			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
 		}
 	}
 
@@ -2246,8 +2309,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, keyContent string, output *strings.Builder) (bool, error) {
 	// Validate URL scheme to prevent file:// or other protocol abuse
 	if keyUrl != "" {
-		if !strings.HasPrefix(keyUrl, "https://") && !strings.HasPrefix(keyUrl, "http://") {
-			return false, fmt.Errorf("GPG key URL must use http:// or https:// scheme, got: %s", keyUrl)
+		if !strings.HasPrefix(keyUrl, "https://") {
+			return false, fmt.Errorf("GPG key URL must use https:// scheme, got: %s", keyUrl)
 		}
 	}
 

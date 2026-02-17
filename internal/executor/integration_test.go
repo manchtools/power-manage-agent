@@ -3406,7 +3406,7 @@ func TestIntegration_EdgeCase_RepositoryExpiredGPGKey(t *testing.T) {
 			Url:          "https://example.com/apt",
 			Distribution: "bookworm",
 			Components:   []string{"main"},
-			GpgKeyUrl:    "http://this-domain-does-not-exist-xyzzy.invalid/key.gpg",
+			GpgKeyUrl:    "https://this-domain-does-not-exist-xyzzy.invalid/key.gpg",
 		},
 	}}
 	result := e.Execute(ctx, action)
