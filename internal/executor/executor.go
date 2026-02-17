@@ -2063,8 +2063,7 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no APT repository configuration provided",
 			}, false, nil
 		}
-		output, err := e.executeAptRepository(ctx, params.Name, params.Apt, state)
-		return output, err == nil, err
+		return e.executeAptRepository(ctx, params.Name, params.Apt, state)
 
 	case pkg.IsDnf():
 		if params.Dnf == nil || params.Dnf.Disabled {
@@ -2190,7 +2189,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 // executeAptRepository configures an APT repository.
 // This function is idempotent - it checks if files already exist with correct content
 // and only updates them if they differ.
-func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *pb.AptRepository, state pb.DesiredState) (*pb.CommandOutput, error) {
+func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *pb.AptRepository, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	repoFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.sources", name)
 	keyFile := fmt.Sprintf("/etc/apt/keyrings/%s.gpg", name)
@@ -2199,7 +2198,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Remove repository file
 		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
-			return nil, fmt.Errorf("failed to remove repo file: %w", err)
+			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		// Also try to remove legacy .list format
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
@@ -2207,41 +2206,35 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		// Remove GPG key
 		runSudoCmd(ctx, "rm", "-f", keyFile)
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
+		changed := false
+
 		// First, scan for and remove any existing repository configs that use the same URL
 		// This prevents "conflicting values set for option Signed-By" errors when the same
 		// repository was previously configured under a different name or with different keys
 		// We skip our own repo file and key file to allow the comparison logic to work
 		e.cleanupConflictingAptRepos(ctx, repo.Url, repoFile, keyFile, &output)
 
-		// Clean up any existing repository configuration to ensure clean state
-		// This handles cases where:
-		// - A legacy .list file exists that should be replaced with .sources format
-		// - The repository was previously configured with different settings
-		// - Stale GPG keys from previous configurations
+		// Clean up legacy .list file if it exists
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
 		if _, err := os.Stat(legacyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy repository file: %s\n", legacyFile))
 			runSudoCmd(ctx, "rm", "-f", legacyFile)
+			changed = true
 		}
-		// Also check for old .sources file with potentially different config
-		if _, err := os.Stat(repoFile); err == nil {
-			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-		}
-		// Note: We don't delete the existing GPG key here - updateGpgKeyIfNeeded
-		// will compare the existing key with the new one and only update if different.
-		// Also check for keys in the legacy trusted.gpg.d location
+		// Clean up legacy GPG key location
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy GPG key: %s\n", legacyKeyFile))
 			runSudoCmd(ctx, "rm", "-f", legacyKeyFile)
+			changed = true
 		}
 
 		// Ensure keyrings directory exists
 		if _, err := runSudoCmd(ctx, "mkdir", "-p", "/etc/apt/keyrings"); err != nil {
-			return nil, fmt.Errorf("failed to create keyrings directory: %w", err)
+			return nil, false, fmt.Errorf("failed to create keyrings directory: %w", err)
 		}
 
 		// Import GPG key if provided
@@ -2249,10 +2242,11 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		if repo.GpgKeyUrl != "" || repo.GpgKey != "" {
 			keyUpdated, keyErr := e.updateGpgKeyIfNeeded(ctx, keyFile, repo.GpgKeyUrl, repo.GpgKey, &output)
 			if keyErr != nil {
-				return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: keyErr.Error()}, keyErr
+				return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: keyErr.Error()}, false, keyErr
 			}
 			if keyUpdated {
 				output.WriteString("GPG key updated\n")
+				changed = true
 			} else {
 				output.WriteString("GPG key unchanged\n")
 			}
@@ -2284,23 +2278,35 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 			content.WriteString("Trusted: yes\n")
 		}
 
+		// Compare with existing file — skip write and apt update if unchanged
+		desiredContent := content.String()
+		existing, _ := readFileWithSudo(ctx, repoFile)
+		if existing == desiredContent && !changed {
+			output.WriteString(fmt.Sprintf("repository already up to date: %s\n", name))
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
+		}
+
 		// Write the sources file
-		if _, err := writeFileWithSudo(ctx, repoFile, content.String()); err != nil {
-			return nil, fmt.Errorf("failed to write repo file: %w", err)
+		if existing != desiredContent {
+			if _, err := writeFileWithSudo(ctx, repoFile, desiredContent); err != nil {
+				return nil, false, fmt.Errorf("failed to write repo file: %w", err)
+			}
+			output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
+			changed = true
 		}
 
-		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
-
-		// Update package index
-		updateOutput, _ := aptUpdate(ctx)
-		if updateOutput != nil {
-			output.WriteString(updateOutput.Stdout)
+		// Update package index only when something changed
+		if changed {
+			updateOutput, _ := aptUpdate(ctx)
+			if updateOutput != nil {
+				output.WriteString(updateOutput.Stdout)
+			}
 		}
 
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, changed, nil
 
 	default:
-		return nil, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
