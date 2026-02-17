@@ -28,6 +28,8 @@
 
 # File operations
 # Include both /bin and /usr/bin paths for compatibility across distros
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/test *
+{{.User}} ALL=(root) NOPASSWD: /bin/test *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/tee *
 {{.User}} ALL=(root) NOPASSWD: /bin/tee *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/chown *
@@ -56,8 +58,8 @@
 {{.User}} ALL=(root) NOPASSWD: /bin/loginctl *
 
 # Filesystem repair (remount read-only filesystems)
-{{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw /
-{{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw /
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw *
+{{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw *
 
 # Sudoers validation (used by sudo action to validate files before install)
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/visudo *
