@@ -105,6 +105,11 @@
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/wall
 {{.User}} ALL=(root) NOPASSWD: /bin/wall
 
+# OSQuery (run with root to access all tables)
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/osqueryi *
+{{.User}} ALL=(root) NOPASSWD: /usr/local/bin/osqueryi *
+{{.User}} ALL=(root) NOPASSWD: /opt/osquery/bin/osqueryi *
+
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *
 {{.User}} ALL=(root) NOPASSWD: /sbin/shutdown *
