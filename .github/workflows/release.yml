@@ -99,12 +99,24 @@ jobs:
           ## Installation
 
           \`\`\`bash
+          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre -s https://your-server.example.com -t YOUR_TOKEN
+          \`\`\`
+
+          Or install this specific version:
+
+          \`\`\`bash
           curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN
           \`\`\`
 
           ## Update
 
-          To update an already registered agent to this prerelease:
+          To update an already registered agent to the latest prerelease:
+
+          \`\`\`bash
+          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre
+          \`\`\`
+
+          Or update to this specific version:
 
           \`\`\`bash
           curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}
