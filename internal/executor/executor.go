@@ -1783,9 +1783,6 @@ func (e *Executor) repairApt(ctx context.Context) {
 	// Fix broken dependencies and install missing ones
 	// This handles "unmet dependencies" and "held broken packages" issues
 	aptFixBroken(ctx)
-
-	// Remove unused packages that might be causing conflicts
-	aptAutoremove(ctx)
 }
 
 // repairDnf fixes common dnf/rpm issues:
