@@ -185,16 +185,19 @@ func main() {
 	}
 	defer actionStore.Close()
 
-	// Initialize action signature verifier from the CA certificate
+	// Initialize action signature verifier from the CA certificate (required)
 	var actionVerifier *verify.ActionVerifier
 	if len(creds.CACert) > 0 {
 		v, err := verify.NewActionVerifier(creds.CACert)
 		if err != nil {
-			logger.Warn("failed to initialize action verifier, signature checks disabled", "error", err)
-		} else {
-			actionVerifier = v
-			logger.Info("action signature verification enabled")
+			logger.Error("failed to initialize action verifier", "error", err)
+			os.Exit(1)
 		}
+		actionVerifier = v
+		logger.Info("action signature verification enabled")
+	} else {
+		logger.Error("CA certificate missing from credentials, cannot verify action signatures")
+		os.Exit(1)
 	}
 
 	// Initialize the scheduler for autonomous action execution

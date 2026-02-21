@@ -195,12 +195,12 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 				result.DurationMs = time.Since(start).Milliseconds()
 				return result
 			}
-			// Other types: log warning (grace period for rollout)
-			e.logger.Warn("action signature verification failed",
-				"action_id", actionID,
-				"action_type", action.Type.String(),
-				"error", verifyErr,
-			)
+			// All other types: also hard reject unsigned/tampered actions
+			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
+			result.CompletedAt = timestamppb.Now()
+			result.DurationMs = time.Since(start).Milliseconds()
+			return result
 		}
 	}
 
@@ -950,6 +950,15 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	// Check and update unit file content if provided
 	if params.UnitContent != "" {
 		unitPath := filepath.Join("/etc/systemd/system", params.UnitName)
+
+		// Validate the resolved path stays within /etc/systemd/system/
+		cleanPath := filepath.Clean(unitPath)
+		if !strings.HasPrefix(cleanPath, "/etc/systemd/system/") {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   fmt.Sprintf("invalid unit path: %s resolves outside /etc/systemd/system/\n", params.UnitName),
+			}, false, fmt.Errorf("path traversal in unit name: %s", params.UnitName)
+		}
 
 		// Check if unit file already has the correct content
 		needsUpdate := true
