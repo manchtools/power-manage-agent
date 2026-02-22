@@ -45,6 +45,7 @@ type Credentials struct {
 	Certificate []byte `json:"certificate"`
 	PrivateKey  []byte `json:"private_key"`
 	GatewayAddr string `json:"gateway_addr"`
+	ControlAddr string `json:"control_addr,omitempty"` // Control Server URL for device auth proxy
 }
 
 // Store manages encrypted credential storage.
