@@ -434,8 +434,7 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 
 		// Update package index first to avoid stale package references
 		if _, updateErr := e.pkgManager.Update(); updateErr != nil {
-			// Log update failure but continue with install attempt
-			_ = updateErr
+			e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
 		}
 
 		// Install the package
@@ -2754,7 +2753,9 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Ensure group exists
-		_ = sysuser.GroupEnsureExists(ctx, params.PrimaryGroup)
+		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+			e.logger.Warn("failed to ensure primary group exists", "group", params.PrimaryGroup, "error", err)
+		}
 		args = append(args, "-g", params.PrimaryGroup)
 	}
 
@@ -2941,7 +2942,9 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		_ = sysuser.GroupEnsureExists(ctx, params.PrimaryGroup)
+		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+			e.logger.Warn("failed to ensure primary group exists for usermod", "group", params.PrimaryGroup, "error", err)
+		}
 		// For simplicity, always set if specified by name (could be optimized)
 		args = append(args, "-g", params.PrimaryGroup)
 	}

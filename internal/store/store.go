@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"sync"
@@ -423,7 +424,9 @@ func (s *Store) GetUnsyncedResults() ([]*StoredResult, error) {
 
 		if outputJSON.Valid && outputJSON.String != "" {
 			r.Output = &pb.CommandOutput{}
-			json.Unmarshal([]byte(outputJSON.String), r.Output)
+			if err := json.Unmarshal([]byte(outputJSON.String), r.Output); err != nil {
+				slog.Warn("failed to unmarshal stored command output", "result_id", r.ID, "error", err)
+			}
 		}
 
 		results = append(results, &r)
@@ -658,7 +661,11 @@ func (s *Store) GetLuksState(actionID string) (*LuksState, error) {
 		return nil, err
 	}
 	if lastRotated != "" {
-		state.LastRotatedAt, _ = time.Parse(time.RFC3339, lastRotated)
+		var parseErr error
+		state.LastRotatedAt, parseErr = time.Parse(time.RFC3339, lastRotated)
+		if parseErr != nil {
+			slog.Warn("failed to parse LUKS last_rotated_at", "action_id", actionID, "value", lastRotated, "error", parseErr)
+		}
 	}
 	return &state, nil
 }

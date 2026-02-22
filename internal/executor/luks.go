@@ -119,7 +119,11 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 		output.WriteString("LUKS: ownership taken, managed passphrase set\n")
 		changed = true
 		// Reload state after ownership
-		localState, _ = e.store.GetLuksState(actionID)
+		var reloadErr error
+		localState, reloadErr = e.store.GetLuksState(actionID)
+		if reloadErr != nil {
+			e.logger.Warn("failed to reload LUKS state after ownership", "action_id", actionID, "error", reloadErr)
+		}
 	}
 
 	// Check if rotation is due
