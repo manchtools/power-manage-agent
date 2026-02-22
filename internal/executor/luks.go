@@ -213,7 +213,14 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 		return fmt.Errorf("store key on server: %w", err)
 	}
 
-	// Server confirmed — now safe to remove PSK
+	// Round-trip verification: re-fetch the key from the server, verify it
+	// matches exactly, and test it against the volume. Retries give the
+	// server time to process the event projection.
+	if err := e.verifyKeyRoundTrip(ctx, actionID, devicePath, passphrase); err != nil {
+		return fmt.Errorf("round-trip verification failed, keeping both keys: %w", err)
+	}
+
+	// Verified — now safe to remove PSK
 	if err := sysluks.RemoveKey(ctx, devicePath, params.PresharedKey); err != nil {
 		e.logger.Warn("failed to remove PSK after ownership (both keys work)", "error", err)
 	}
@@ -266,7 +273,13 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, lo
 		return false, fmt.Errorf("store new key on server: %w", err)
 	}
 
-	// Server confirmed — now safe to remove old key
+	// Round-trip verification: re-fetch the key from the server, verify it
+	// matches exactly, and test it against the volume.
+	if err := e.verifyKeyRoundTrip(ctx, actionID, devicePath, newPassphrase); err != nil {
+		return false, fmt.Errorf("round-trip verification failed, keeping both keys: %w", err)
+	}
+
+	// Verified — now safe to remove old key
 	if err := sysluks.RemoveKey(ctx, devicePath, currentKey); err != nil {
 		e.logger.Warn("failed to remove old key after rotation (both keys work)", "error", err)
 	}
@@ -437,6 +450,56 @@ func (e *Executor) resolveLuksConflict(actionID string) (string, error) {
 	}
 
 	return winner.id, nil
+}
+
+// verifyKeyRoundTrip re-fetches the key from the server and verifies it matches
+// the expected passphrase exactly, then tests it against the LUKS volume.
+// Retries up to 3 times with 2-second delays to allow the server's event
+// projection to complete. This catches:
+//   - Projection failures (event stored but is_current not updated)
+//   - Encryption key mismatches (PM_ENCRYPTION_KEY changed)
+//   - Stale reads returning the old key instead of the new one
+func (e *Executor) verifyKeyRoundTrip(ctx context.Context, actionID, devicePath, expectedKey string) error {
+	const maxAttempts = 3
+	const retryDelay = 2 * time.Second
+
+	for attempt := 1; attempt <= maxAttempts; attempt++ {
+		storedKey, err := e.luksKeyStore.GetKey(ctx, actionID)
+		if err != nil {
+			e.logger.Warn("LUKS: round-trip fetch failed",
+				"attempt", attempt, "max_attempts", maxAttempts, "error", err)
+			if attempt < maxAttempts {
+				time.Sleep(retryDelay)
+				continue
+			}
+			return fmt.Errorf("failed to re-fetch key after %d attempts: %w", maxAttempts, err)
+		}
+
+		// Exact match check: the server must return the key we just stored,
+		// not a stale/old key that also happens to unlock the volume.
+		if storedKey != expectedKey {
+			e.logger.Warn("LUKS: round-trip key mismatch (server returned different key)",
+				"attempt", attempt, "max_attempts", maxAttempts,
+				"stored_len", len(storedKey), "expected_len", len(expectedKey))
+			if attempt < maxAttempts {
+				time.Sleep(retryDelay)
+				continue
+			}
+			return fmt.Errorf("server returned different key than stored (projection may be lagging)")
+		}
+
+		// Defense-in-depth: verify the key actually unlocks the volume.
+		ok, testErr := sysluks.TestPassphrase(ctx, devicePath, storedKey)
+		if testErr != nil || !ok {
+			return fmt.Errorf("server-stored key does not unlock volume (test_ok=%v, err=%v)", ok, testErr)
+		}
+
+		e.logger.Info("LUKS: round-trip verification passed",
+			"action_id", actionID, "attempts", attempt)
+		return nil
+	}
+
+	return fmt.Errorf("round-trip verification exhausted %d attempts", maxAttempts)
 }
 
 // ActionStore is the interface for accessing stored actions (for conflict resolution).
