@@ -24,6 +24,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
@@ -78,6 +79,42 @@ func resolveAndValidatePath(path string) (string, error) {
 // validRepoName restricts repository names to safe characters only.
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+
+// validEnvVarName matches safe environment variable names (letters, digits, underscore).
+var validEnvVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
+
+// blockedEnvVars are environment variable names that must never be overridden
+// because they can hijack process execution (library injection, path manipulation).
+var blockedEnvVars = map[string]bool{
+	"LD_PRELOAD":      true,
+	"LD_LIBRARY_PATH": true,
+	"LD_AUDIT":        true,
+	"LD_DEBUG":        true,
+	"LD_PROFILE":      true,
+	"PATH":            true,
+	"IFS":             true,
+	"ENV":             true,
+	"BASH_ENV":        true,
+	"CDPATH":          true,
+	"GLOBIGNORE":      true,
+	"BASH_FUNC_":      true,
+}
+
+// isAllowedEnvVar returns true if the environment variable name is safe to set.
+func isAllowedEnvVar(name string) bool {
+	if !validEnvVarName.MatchString(name) {
+		return false
+	}
+	upper := strings.ToUpper(name)
+	if blockedEnvVars[upper] {
+		return false
+	}
+	// Block LD_* and BASH_FUNC_* prefixes
+	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "BASH_FUNC_") {
+		return false
+	}
+	return true
+}
 
 // Executor handles the execution of actions.
 type Executor struct {
@@ -158,12 +195,12 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 				result.DurationMs = time.Since(start).Milliseconds()
 				return result
 			}
-			// Other types: log warning (grace period for rollout)
-			e.logger.Warn("action signature verification failed",
-				"action_id", actionID,
-				"action_type", action.Type.String(),
-				"error", verifyErr,
-			)
+			// All other types: also hard reject unsigned/tampered actions
+			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
+			result.CompletedAt = timestamppb.Now()
+			result.DurationMs = time.Since(start).Milliseconds()
+			return result
 		}
 	}
 
@@ -872,11 +909,15 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		args = []string{"-c", params.Script}
 	}
 
-	// Build environment
+	// Build environment — reject dangerous variable names that could
+	// hijack the child process (e.g. LD_PRELOAD, PATH, LD_LIBRARY_PATH).
 	var envVars []string
 	if len(params.Environment) > 0 {
 		envVars = os.Environ()
 		for k, v := range params.Environment {
+			if !isAllowedEnvVar(k) {
+				return nil, fmt.Errorf("environment variable %q is not allowed", k)
+			}
 			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
@@ -909,6 +950,15 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	// Check and update unit file content if provided
 	if params.UnitContent != "" {
 		unitPath := filepath.Join("/etc/systemd/system", params.UnitName)
+
+		// Validate the resolved path stays within /etc/systemd/system/
+		cleanPath := filepath.Clean(unitPath)
+		if !strings.HasPrefix(cleanPath, "/etc/systemd/system/") {
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   fmt.Sprintf("invalid unit path: %s resolves outside /etc/systemd/system/\n", params.UnitName),
+			}, false, fmt.Errorf("path traversal in unit name: %s", params.UnitName)
+		}
 
 		// Check if unit file already has the correct content
 		needsUpdate := true
@@ -1393,6 +1443,9 @@ func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryPara
 	return true
 }
 
+// maxDownloadSize is the maximum allowed download size (2 GiB).
+const maxDownloadSize = 2 << 30
+
 func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
@@ -1409,17 +1462,32 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 		return fmt.Errorf("download failed: %s", resp.Status)
 	}
 
+	// Reject downloads that advertise a size larger than the limit.
+	if resp.ContentLength > maxDownloadSize {
+		return fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
+	}
+
+	// Wrap the body with a size limit to protect against servers that
+	// lie about Content-Length or use chunked encoding.
+	body := io.LimitReader(resp.Body, maxDownloadSize+1)
+
 	file, err := os.Create(dest)
 	if err != nil {
 		return err
 	}
 
+	var written int64
 	if expectedChecksum != "" {
 		hasher := sha256.New()
-		reader := io.TeeReader(resp.Body, hasher)
-		if _, err := io.Copy(file, reader); err != nil {
+		reader := io.TeeReader(body, hasher)
+		if written, err = io.Copy(file, reader); err != nil {
 			_ = file.Close()
 			return err
+		}
+		if written > maxDownloadSize {
+			_ = file.Close()
+			os.Remove(dest)
+			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
 		}
 		actual := hex.EncodeToString(hasher.Sum(nil))
 		if actual != expectedChecksum {
@@ -1428,9 +1496,14 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 			return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
 		}
 	} else {
-		if _, err := io.Copy(file, resp.Body); err != nil {
+		if written, err = io.Copy(file, body); err != nil {
 			_ = file.Close()
 			return err
+		}
+		if written > maxDownloadSize {
+			_ = file.Close()
+			os.Remove(dest)
+			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
 		}
 	}
 
@@ -1719,9 +1792,6 @@ func (e *Executor) repairApt(ctx context.Context) {
 	// Fix broken dependencies and install missing ones
 	// This handles "unmet dependencies" and "held broken packages" issues
 	aptFixBroken(ctx)
-
-	// Remove unused packages that might be causing conflicts
-	aptAutoremove(ctx)
 }
 
 // repairDnf fixes common dnf/rpm issues:
@@ -1881,6 +1951,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if rebootRequired {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if params != nil && params.RebootIfRequired {
+			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
 			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
 		}
@@ -1998,8 +2069,7 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no APT repository configuration provided",
 			}, false, nil
 		}
-		output, err := e.executeAptRepository(ctx, params.Name, params.Apt, state)
-		return output, err == nil, err
+		return e.executeAptRepository(ctx, params.Name, params.Apt, state)
 
 	case pkg.IsDnf():
 		if params.Dnf == nil || params.Dnf.Disabled {
@@ -2125,7 +2195,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 // executeAptRepository configures an APT repository.
 // This function is idempotent - it checks if files already exist with correct content
 // and only updates them if they differ.
-func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *pb.AptRepository, state pb.DesiredState) (*pb.CommandOutput, error) {
+func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *pb.AptRepository, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	repoFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.sources", name)
 	keyFile := fmt.Sprintf("/etc/apt/keyrings/%s.gpg", name)
@@ -2134,7 +2204,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Remove repository file
 		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
-			return nil, fmt.Errorf("failed to remove repo file: %w", err)
+			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		// Also try to remove legacy .list format
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
@@ -2142,41 +2212,35 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		// Remove GPG key
 		runSudoCmd(ctx, "rm", "-f", keyFile)
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
+		changed := false
+
 		// First, scan for and remove any existing repository configs that use the same URL
 		// This prevents "conflicting values set for option Signed-By" errors when the same
 		// repository was previously configured under a different name or with different keys
 		// We skip our own repo file and key file to allow the comparison logic to work
 		e.cleanupConflictingAptRepos(ctx, repo.Url, repoFile, keyFile, &output)
 
-		// Clean up any existing repository configuration to ensure clean state
-		// This handles cases where:
-		// - A legacy .list file exists that should be replaced with .sources format
-		// - The repository was previously configured with different settings
-		// - Stale GPG keys from previous configurations
+		// Clean up legacy .list file if it exists
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
 		if _, err := os.Stat(legacyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy repository file: %s\n", legacyFile))
 			runSudoCmd(ctx, "rm", "-f", legacyFile)
+			changed = true
 		}
-		// Also check for old .sources file with potentially different config
-		if _, err := os.Stat(repoFile); err == nil {
-			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-		}
-		// Note: We don't delete the existing GPG key here - updateGpgKeyIfNeeded
-		// will compare the existing key with the new one and only update if different.
-		// Also check for keys in the legacy trusted.gpg.d location
+		// Clean up legacy GPG key location
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy GPG key: %s\n", legacyKeyFile))
 			runSudoCmd(ctx, "rm", "-f", legacyKeyFile)
+			changed = true
 		}
 
 		// Ensure keyrings directory exists
 		if _, err := runSudoCmd(ctx, "mkdir", "-p", "/etc/apt/keyrings"); err != nil {
-			return nil, fmt.Errorf("failed to create keyrings directory: %w", err)
+			return nil, false, fmt.Errorf("failed to create keyrings directory: %w", err)
 		}
 
 		// Import GPG key if provided
@@ -2184,10 +2248,11 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		if repo.GpgKeyUrl != "" || repo.GpgKey != "" {
 			keyUpdated, keyErr := e.updateGpgKeyIfNeeded(ctx, keyFile, repo.GpgKeyUrl, repo.GpgKey, &output)
 			if keyErr != nil {
-				return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: keyErr.Error()}, keyErr
+				return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: keyErr.Error()}, false, keyErr
 			}
 			if keyUpdated {
 				output.WriteString("GPG key updated\n")
+				changed = true
 			} else {
 				output.WriteString("GPG key unchanged\n")
 			}
@@ -2219,23 +2284,35 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 			content.WriteString("Trusted: yes\n")
 		}
 
+		// Compare with existing file — skip write and apt update if unchanged
+		desiredContent := content.String()
+		existing, _ := readFileWithSudo(ctx, repoFile)
+		if existing == desiredContent && !changed {
+			output.WriteString(fmt.Sprintf("repository already up to date: %s\n", name))
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
+		}
+
 		// Write the sources file
-		if _, err := writeFileWithSudo(ctx, repoFile, content.String()); err != nil {
-			return nil, fmt.Errorf("failed to write repo file: %w", err)
+		if existing != desiredContent {
+			if _, err := writeFileWithSudo(ctx, repoFile, desiredContent); err != nil {
+				return nil, false, fmt.Errorf("failed to write repo file: %w", err)
+			}
+			output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
+			changed = true
 		}
 
-		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
-
-		// Update package index
-		updateOutput, _ := aptUpdate(ctx)
-		if updateOutput != nil {
-			output.WriteString(updateOutput.Stdout)
+		// Update package index only when something changed
+		if changed {
+			updateOutput, _ := aptUpdate(ctx)
+			if updateOutput != nil {
+				output.WriteString(updateOutput.Stdout)
+			}
 		}
 
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, changed, nil
 
 	default:
-		return nil, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
@@ -2244,8 +2321,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, keyContent string, output *strings.Builder) (bool, error) {
 	// Validate URL scheme to prevent file:// or other protocol abuse
 	if keyUrl != "" {
-		if !strings.HasPrefix(keyUrl, "https://") && !strings.HasPrefix(keyUrl, "http://") {
-			return false, fmt.Errorf("GPG key URL must use http:// or https:// scheme, got: %s", keyUrl)
+		if !strings.HasPrefix(keyUrl, "https://") {
+			return false, fmt.Errorf("GPG key URL must use https:// scheme, got: %s", keyUrl)
 		}
 	}
 
@@ -2598,6 +2675,8 @@ func IsInstantAction(t pb.ActionType) bool {
 
 // executeReboot schedules a system reboot in 5 minutes.
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
+	sysnotify.NotifyAll(ctx, "System Reboot", "This system will reboot in 5 minutes. Please save your work.")
+
 	output, err := runSudoCmd(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
 	if err != nil {
 		return output, fmt.Errorf("failed to schedule reboot: %w", err)

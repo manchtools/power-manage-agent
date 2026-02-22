@@ -5,8 +5,11 @@
 # Downloads the agent binary, installs it as a systemd service, and optionally
 # registers with a control server — all in one step.
 #
-# One-liner install:
+# One-liner install (stable):
 #   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN
+#
+# One-liner install (prerelease):
+#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre -s https://your-server.example.com -t YOUR_TOKEN
 #
 # Usage:
 #   sudo ./install.sh [OPTIONS]
@@ -15,6 +18,7 @@
 #   -t, --token TOKEN       Registration token for initial setup
 #   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
 #   -v, --version VERSION   Version to install (default: latest)
+#   --pre                   Install the latest prerelease (release candidate) version
 #   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
 #   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
 #   -u, --user USER         Service user name (default: power-manage)
@@ -37,6 +41,7 @@ REGISTRATION_TOKEN=""
 SERVER_URL=""
 SKIP_VERIFY=""
 SKIP_DOWNLOAD=""
+PRE_RELEASE=""
 VERSION="latest"
 
 # Colors for output
@@ -46,15 +51,15 @@ YELLOW='\033[1;33m'
 NC='\033[0m' # No Color
 
 log_info() {
-    echo -e "${GREEN}[INFO]${NC} $1"
+    echo -e "${GREEN}[INFO]${NC} $1" >&2
 }
 
 log_warn() {
-    echo -e "${YELLOW}[WARN]${NC} $1"
+    echo -e "${YELLOW}[WARN]${NC} $1" >&2
 }
 
 log_error() {
-    echo -e "${RED}[ERROR]${NC} $1"
+    echo -e "${RED}[ERROR]${NC} $1" >&2
 }
 
 show_help() {
@@ -71,6 +76,7 @@ Options:
   -t, --token TOKEN       Registration token for initial setup
   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
   -v, --version VERSION   Version to install (e.g., v2026.2.0; default: latest)
+  --pre                   Install the latest prerelease (release candidate) version
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
   -u, --user USER         Service user name (default: power-manage)
@@ -82,6 +88,9 @@ Options:
 Examples:
   # Download, install and register (one-liner)
   curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s https://power-manage.example.com -t abc123
+
+  # Install the latest prerelease version
+  sudo ./install.sh --pre -s https://power-manage.example.com -t abc123
 
   # Install a specific version
   sudo ./install.sh -v v2026.2.0 -s https://power-manage.example.com -t abc123
@@ -120,6 +129,10 @@ parse_args() {
             -v|--version)
                 VERSION="$2"
                 shift 2
+                ;;
+            --pre)
+                PRE_RELEASE="true"
+                shift
                 ;;
             --skip-verify)
                 SKIP_VERIFY="true"
@@ -166,6 +179,32 @@ detect_arch() {
     esac
 }
 
+resolve_latest_prerelease() {
+    local api_url="https://api.github.com/repos/${GITHUB_REPO}/releases"
+    log_info "Querying GitHub API for latest prerelease..."
+
+    local response
+    if command -v curl &>/dev/null; then
+        response=$(curl -gfsSL "$api_url")
+    elif command -v wget &>/dev/null; then
+        response=$(wget -qO- "$api_url")
+    else
+        log_error "Neither curl nor wget found. Please install one and try again."
+        exit 1
+    fi
+
+    # Extract tag_name from the first release where prerelease is true
+    local tag
+    tag=$(echo "$response" | awk '/"tag_name"/{tag=$2} /"prerelease": true/{print tag; exit}' | tr -dc 'a-zA-Z0-9._-')
+
+    if [[ -z "$tag" ]]; then
+        log_error "No prerelease found on GitHub"
+        exit 1
+    fi
+
+    echo "$tag"
+}
+
 download_binary() {
     if [[ -n "$SKIP_DOWNLOAD" ]]; then
         if [[ ! -f "$BINARY_PATH" ]]; then
@@ -175,6 +214,12 @@ download_binary() {
         log_info "Using existing binary at $BINARY_PATH"
         chmod +x "$BINARY_PATH"
         return
+    fi
+
+    # Resolve version for --pre flag
+    if [[ -n "$PRE_RELEASE" ]] && [[ "$VERSION" == "latest" ]]; then
+        VERSION=$(resolve_latest_prerelease)
+        log_info "Latest prerelease: ${VERSION}"
     fi
 
     local arch
@@ -192,7 +237,7 @@ download_binary() {
     log_info "Downloading agent from ${download_url}..."
 
     if command -v curl &>/dev/null; then
-        if ! curl -fSL --progress-bar -o "$BINARY_PATH" "$download_url"; then
+        if ! curl -gfSL --progress-bar -o "$BINARY_PATH" "$download_url"; then
             log_error "Download failed. Check the version and that the release exists."
             exit 1
         fi

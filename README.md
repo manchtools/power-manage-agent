@@ -106,7 +106,7 @@ URI Parameters:
 
 ## Action Types
 
-The agent supports 15 action types for managing the system:
+The agent supports 16 action types for managing the system:
 
 ### Package Management (`PACKAGE`)
 
@@ -324,6 +324,25 @@ Install or remove RPM packages directly from URLs.
 - `PRESENT`: Download and install with `rpm`
 - `ABSENT`: Remove the package
 
+### LUKS Disk Encryption (`LUKS`)
+
+Manage LUKS disk encryption on the device. The agent auto-detects the primary LUKS-encrypted volume, generates a managed passphrase stored on the server, and rotates it on schedule. Optionally, a device-bound key (TPM or user passphrase) can be enrolled in LUKS slot 7.
+
+| Field | Description |
+|-------|-------------|
+| `preshared_key` | Pre-shared key for initial ownership (agent uses this to authenticate against the volume on first run) |
+| `rotation_interval_days` | Days between scheduled passphrase rotations (1–365) |
+| `min_words` | Minimum words in generated managed passphrase (default 5, range 3–10) |
+| `device_bound_key_type` | What goes in LUKS slot 7: `NONE`, `TPM` (auto-unlock at boot), or `USER_PASSPHRASE` (user-defined via CLI) |
+| `user_passphrase_min_length` | Minimum length for user-defined passphrases (16–128, only for `USER_PASSPHRASE` type) |
+| `user_passphrase_complexity` | Complexity requirement for user-defined passphrases (`ALPHANUMERIC` or `COMPLEX`) |
+
+The agent communicates with the server via bidirectional stream messages (`GetLuksKey`, `StoreLuksKey`) to retrieve and store managed passphrases. Key rotation only proceeds after the server confirms receipt of the new passphrase, preventing key loss.
+
+**Desired State:**
+- `PRESENT`: Take ownership of the LUKS volume, rotate the managed passphrase if the interval has elapsed
+- `ABSENT`: Remove LUKS state tracking (does not modify the LUKS volume itself)
+
 ### Repository (`REPOSITORY`)
 
 Manage package manager repositories.
@@ -358,6 +377,7 @@ Only one repository type should be set per action. The matching type is determin
 | `SSH` | Yes | Install SSH access policy | Remove policy |
 | `SSHD` | Yes | Install SSHD config | Remove config |
 | `LPS` | Yes | Rotate passwords | Remove state tracking |
+| `LUKS` | Yes | Take ownership, rotate passphrase | Remove state tracking |
 | `REPOSITORY` | Yes | Add/update repository | Remove repository |
 | `SHELL` | No | Execute script | Execute script (same) |
 | `UPDATE` | No | Run update | Run update (same) |
@@ -424,6 +444,7 @@ The sudoers template (`internal/setup/sudoers.tmpl`) restricts access to:
 - Shell execution for `run_as_root` scripts (bash, sh)
 - Filesystem repair (mount -o remount,rw /)
 - System power management (shutdown)
+- LUKS disk encryption management (cryptsetup)
 
 All privileged commands are executed via `sudo -n` with absolute paths for sudoers matching. The agent itself never runs as root.
 
@@ -456,6 +477,7 @@ journalctl -u power-manage-agent -f
 │   ├── device.crt      # Device certificate
 │   └── device.key      # Device private key
 ├── lps/                 # LPS password rotation state (per-action JSON files)
+├── luks/                # LUKS encryption state (per-action SQLite databases)
 ├── state.json           # Agent state
 └── results/             # Pending execution results
 ```

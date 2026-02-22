@@ -28,6 +28,8 @@
 
 # File operations
 # Include both /bin and /usr/bin paths for compatibility across distros
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/test *
+{{.User}} ALL=(root) NOPASSWD: /bin/test *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/tee *
 {{.User}} ALL=(root) NOPASSWD: /bin/tee *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/chown *
@@ -56,8 +58,8 @@
 {{.User}} ALL=(root) NOPASSWD: /bin/loginctl *
 
 # Filesystem repair (remount read-only filesystems)
-{{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw /
-{{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw /
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/mount -o remount\,rw *
+{{.User}} ALL=(root) NOPASSWD: /bin/mount -o remount\,rw *
 
 # Sudoers validation (used by sudo action to validate files before install)
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/visudo *
@@ -100,6 +102,15 @@
 {{.User}} ALL=(root) NOPASSWD: /sbin/cryptsetup *
 {{.User}} ALL=(root) NOPASSWD: /usr/bin/systemd-cryptenroll *
 {{.User}} ALL=(root) NOPASSWD: /bin/systemd-cryptenroll *
+
+# User notification
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/wall
+{{.User}} ALL=(root) NOPASSWD: /bin/wall
+
+# OSQuery (run with root to access all tables)
+{{.User}} ALL=(root) NOPASSWD: /usr/bin/osqueryi *
+{{.User}} ALL=(root) NOPASSWD: /usr/local/bin/osqueryi *
+{{.User}} ALL=(root) NOPASSWD: /opt/osquery/bin/osqueryi *
 
 # System power management
 {{.User}} ALL=(root) NOPASSWD: /usr/sbin/shutdown *

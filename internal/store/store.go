@@ -141,6 +141,9 @@ func (s *Store) migrate() error {
 		return err
 	}
 
+	// Add last_rotated_at column if it doesn't exist (migration for pre-existing tables)
+	s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''")
+
 	return nil
 }
 

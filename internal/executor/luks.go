@@ -101,7 +101,11 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
 		}
 		if winnerID != actionID {
-			return nil, false, nil, fmt.Errorf("conflicting LUKS action — using action %s instead", winnerID)
+			output.WriteString(fmt.Sprintf("LUKS: skipped — another action %s takes precedence\n", winnerID))
+			return &pb.CommandOutput{
+				ExitCode: 0,
+				Stdout:   output.String(),
+			}, false, nil, nil
 		}
 	}
 
@@ -158,7 +162,30 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 
 // takeOwnership takes ownership of the LUKS volume by replacing the PSK with a managed passphrase.
 // Server-confirmed: the old key is only removed after the server confirms receipt of the new key.
+// If the server already has a working key (e.g. from a previous run with lost local state),
+// ownership is recovered without re-using the PSK.
 func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, actionID, devicePath string) error {
+	// Recovery: check if server already has a key for this action (state loss recovery).
+	existingKey, getKeyErr := e.luksKeyStore.GetKey(ctx, actionID)
+	if getKeyErr == nil && existingKey != "" {
+		e.logger.Info("LUKS: server has stored key, testing against volume",
+			"action_id", actionID, "key_len", len(existingKey),
+			"key_prefix", safePrefix(existingKey), "key_suffix", safeSuffix(existingKey))
+		ok, testErr := sysluks.TestPassphrase(ctx, devicePath, existingKey)
+		e.logger.Info("LUKS: test-passphrase result", "ok", ok, "error", testErr)
+		if testErr == nil && ok {
+			e.logger.Info("LUKS: recovered ownership from server-stored key", "action_id", actionID)
+			return e.store.SetLuksOwnershipTaken(actionID, devicePath)
+		}
+		e.logger.Warn("LUKS: server has key but it does not unlock the volume, proceeding with PSK",
+			"action_id", actionID, "test_error", testErr)
+	} else if getKeyErr != nil {
+		// Server unreachable — cannot verify existing keys or store new ones.
+		// Do NOT fall through to PSK because StoreKey will also fail,
+		// and the PSK may have already been consumed by a prior run.
+		return fmt.Errorf("server not reachable, cannot manage LUKS keys (retry when connected): %w", getKeyErr)
+	}
+
 	minWords := int(params.MinWords)
 	if minWords < 3 {
 		minWords = 5
@@ -171,6 +198,10 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	}
 
 	// Add managed passphrase using PSK (both keys now valid)
+	e.logger.Info("LUKS: adding managed key using PSK",
+		"psk_len", len(params.PresharedKey),
+		"psk_prefix", safePrefix(params.PresharedKey), "psk_suffix", safeSuffix(params.PresharedKey),
+		"new_key_len", len(passphrase))
 	if err := sysluks.AddKey(ctx, devicePath, params.PresharedKey, passphrase); err != nil {
 		return fmt.Errorf("add managed key: %w", err)
 	}
@@ -194,7 +225,12 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 // checkAndRotate checks if a rotation is due and rotates the managed passphrase if needed.
 func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
 	// Check if rotation interval has elapsed
-	if !localState.LastRotatedAt.IsZero() && params.RotationIntervalDays > 0 {
+	if params.RotationIntervalDays > 0 {
+		// No previous rotation recorded — set the timestamp and skip.
+		if localState.LastRotatedAt.IsZero() {
+			e.store.SetLuksLastRotatedAt(actionID, time.Now())
+			return false, nil
+		}
 		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour
 		if time.Since(localState.LastRotatedAt) < intervalDuration {
 			return false, nil
@@ -406,4 +442,20 @@ func (e *Executor) resolveLuksConflict(actionID string) (string, error) {
 // ActionStore is the interface for accessing stored actions (for conflict resolution).
 type ActionStore interface {
 	GetStoredActions() ([]*store.StoredAction, error)
+}
+
+// safePrefix returns the first 3 characters of a string for diagnostic logging.
+func safePrefix(s string) string {
+	if len(s) <= 3 {
+		return "***"
+	}
+	return s[:3] + "..."
+}
+
+// safeSuffix returns the last 3 characters of a string for diagnostic logging.
+func safeSuffix(s string) string {
+	if len(s) <= 3 {
+		return "***"
+	}
+	return "..." + s[len(s)-3:]
 }

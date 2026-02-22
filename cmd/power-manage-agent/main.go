@@ -105,6 +105,8 @@ func main() {
 
 	// Setup logger
 	logger := setupLogger(cfg.LogLevel, cfg.LogFormat)
+	slog.SetDefault(logger)
+	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
 	// Get hostname
 	hostname, err := os.Hostname()
@@ -183,16 +185,19 @@ func main() {
 	}
 	defer actionStore.Close()
 
-	// Initialize action signature verifier from the CA certificate
+	// Initialize action signature verifier from the CA certificate (required)
 	var actionVerifier *verify.ActionVerifier
 	if len(creds.CACert) > 0 {
 		v, err := verify.NewActionVerifier(creds.CACert)
 		if err != nil {
-			logger.Warn("failed to initialize action verifier, signature checks disabled", "error", err)
-		} else {
-			actionVerifier = v
-			logger.Info("action signature verification enabled")
+			logger.Error("failed to initialize action verifier", "error", err)
+			os.Exit(1)
 		}
+		actionVerifier = v
+		logger.Info("action signature verification enabled")
+	} else {
+		logger.Error("CA certificate missing from credentials, cannot verify action signatures")
+		os.Exit(1)
 	}
 
 	// Initialize the scheduler for autonomous action execution
@@ -310,34 +315,32 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 			)
 		}
 
+		// Create a child context for this connection session
+		sessionCtx, cancelSession := context.WithCancel(ctx)
+
 		// Wire LUKS key store to the current client for this connection session
 		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
 
-		// Initial sync on connect - updates sync interval from server
-		// On first sync, execute ALL actions; on reconnect, only new actions
-		newInterval := syncActionsFromServer(ctx, client, sched, firstSync, logger)
+		// Start stream in background (opens connection, heartbeats, receives)
+		streamDone := make(chan error, 1)
+		go func() {
+			streamDone <- client.Run(sessionCtx, hostname, version, defaultHeartbeatInterval, h)
+		}()
+
+		// Send any results stored while offline (before syncing new actions)
+		syncPendingResults(sessionCtx, sched, client, logger)
+
+		// Sync actions from server (unary RPC — stream is connecting in parallel)
+		newInterval := syncActionsFromServer(sessionCtx, client, sched, firstSync, logger)
 		if newInterval > 0 {
 			syncInterval = newInterval
 			firstSync = false
 		}
 
-		// Send security alert if pending (only on first connection attempt)
 		if securityAlert != nil {
-			go sendSecurityAlert(ctx, client, securityAlert, logger)
-			securityAlert = nil // Only send once
+			go sendSecurityAlert(sessionCtx, client, securityAlert, logger)
+			securityAlert = nil
 		}
-
-		// Create a child context for this connection session
-		sessionCtx, cancelSession := context.WithCancel(ctx)
-
-		// Sync any pending results after connection is established (wait for welcome)
-		go func() {
-			// Wait for welcome message to be received before sending results
-			if err := h.WaitConnected(sessionCtx); err != nil {
-				return // Connection cancelled
-			}
-			syncPendingResults(sessionCtx, sched, client, logger)
-		}()
 
 		// Start periodic sync goroutine (also listens for instant sync triggers)
 		syncDone := make(chan struct{})
@@ -353,9 +356,9 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 			sendScheduledResults(sessionCtx, client, sched, logger)
 		}()
 
-		// Run the stream connection (handles heartbeats, receives server messages)
+		// Wait for the stream to end
 		connStart := time.Now()
-		err := client.Run(sessionCtx, hostname, version, defaultHeartbeatInterval, h)
+		err := <-streamDone
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()

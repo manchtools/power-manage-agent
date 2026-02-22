@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
 
 var (
@@ -88,10 +89,24 @@ func (c *Client) ListTables(ctx context.Context) ([]string, error) {
 	return tables, nil
 }
 
+// tableSQL returns custom SQL for tables that need JOINs or special handling.
+// Tables like authorized_keys scope to the current user by default and need
+// a JOIN against the users table to return data for all users.
+var tableSQL = map[string]string{
+	"authorized_keys": "SELECT authorized_keys.* FROM users JOIN authorized_keys USING (uid)",
+}
+
 // Query executes an osquery SQL query and returns the results.
 func (c *Client) Query(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error) {
-	// Build the SQL query - SELECT * FROM table_name
-	sql := fmt.Sprintf("SELECT * FROM %s", query.Table)
+	// If raw SQL is provided, execute it directly
+	var sql string
+	if query.RawSql != "" {
+		sql = query.RawSql
+	} else if custom, ok := tableSQL[query.Table]; ok {
+		sql = custom
+	} else {
+		sql = fmt.Sprintf("SELECT * FROM %s", query.Table)
+	}
 
 	rows, err := c.QuerySQL(ctx, sql)
 	if err != nil {
@@ -134,11 +149,16 @@ func (c *Client) QuerySQL(ctx context.Context, sql string) ([]*pb.OSQueryRow, er
 
 // QueryTable queries a specific table by name.
 func (c *Client) QueryTable(ctx context.Context, tableName string) ([]*pb.OSQueryRow, error) {
-	sql := fmt.Sprintf("SELECT * FROM %s", tableName)
+	sql, ok := tableSQL[tableName]
+	if !ok {
+		sql = fmt.Sprintf("SELECT * FROM %s", tableName)
+	}
 	return c.QuerySQL(ctx, sql)
 }
 
-// execQuery executes an osquery command and returns the output.
+// execQuery executes an osquery command via sudo and returns the output.
+// Running with sudo allows osquery to access tables that require root
+// privileges (e.g. authorized_keys, iptables).
 func (c *Client) execQuery(ctx context.Context, query string) (string, error) {
 	// Create context with timeout if none set
 	if _, ok := ctx.Deadline(); !ok {
@@ -160,18 +180,19 @@ func (c *Client) execQuery(ctx context.Context, query string) (string, error) {
 		args = append(args, "--json", query)
 	}
 
-	cmd := exec.CommandContext(ctx, c.binaryPath, args...)
-
-	output, err := cmd.Output()
+	result, err := sysexec.Sudo(ctx, c.binaryPath, args...)
 	if err != nil {
-		var exitErr *exec.ExitError
-		if errors.As(err, &exitErr) {
-			return "", fmt.Errorf("%w: %s", ErrQueryFailed, string(exitErr.Stderr))
+		stderr := ""
+		if result != nil {
+			stderr = result.Stderr
+		}
+		if stderr != "" {
+			return "", fmt.Errorf("%w: %s", ErrQueryFailed, stderr)
 		}
 		return "", fmt.Errorf("%w: %v", ErrQueryFailed, err)
 	}
 
-	return strings.TrimSpace(string(output)), nil
+	return strings.TrimSpace(result.Stdout), nil
 }
 
 // Registry provides backwards compatibility with the old interface.
