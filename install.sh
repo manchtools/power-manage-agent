@@ -347,29 +347,42 @@ EOF
     systemctl daemon-reload
 }
 
-register_agent() {
+enroll_agent() {
     if [[ -z "$REGISTRATION_TOKEN" ]] || [[ -z "$SERVER_URL" ]]; then
-        log_warn "No registration token or server URL provided, skipping registration"
-        log_info "You can register later by running:"
-        log_info "  sudo -u $SERVICE_USER $BINARY_PATH -server=<URL> -token=<TOKEN> -data-dir=$DATA_DIR"
+        log_warn "No registration token or server URL provided, skipping enrollment"
+        log_info "You can enroll later by running (no sudo required):"
+        log_info "  $BINARY_PATH enroll -server=<URL> -token=<TOKEN>"
         return
     fi
 
-    log_info "Registering agent with server..."
+    log_info "Enrolling agent with server via socket..."
 
-    local register_cmd="$BINARY_PATH -server=$SERVER_URL -token=$REGISTRATION_TOKEN -data-dir=$DATA_DIR"
+    local enroll_cmd="$BINARY_PATH enroll -server=$SERVER_URL -token=$REGISTRATION_TOKEN"
 
     if [[ -n "$SKIP_VERIFY" ]]; then
-        register_cmd="$register_cmd -skip-verify"
+        enroll_cmd="$enroll_cmd -skip-verify"
     fi
 
-    # Run registration as the service user
-    if sudo -u "$SERVICE_USER" $register_cmd; then
-        log_info "Agent registered successfully"
+    # Wait for the enrollment socket to become available (agent needs to start first)
+    local max_wait=10
+    local waited=0
+    while [[ ! -S "/run/pm-agent/enroll.sock" ]] && [[ $waited -lt $max_wait ]]; do
+        sleep 1
+        waited=$((waited + 1))
+    done
+
+    if [[ ! -S "/run/pm-agent/enroll.sock" ]]; then
+        log_warn "Enrollment socket not available after ${max_wait}s, agent may already be enrolled"
+        return
+    fi
+
+    # Enroll via socket — no sudo needed, any user can connect
+    if $enroll_cmd; then
+        log_info "Agent enrolled successfully"
     else
-        log_error "Agent registration failed"
+        log_error "Agent enrollment failed"
         log_info "You can try again later by running:"
-        log_info "  sudo -u $SERVICE_USER $register_cmd"
+        log_info "  $enroll_cmd"
         return 1
     fi
 }
@@ -378,15 +391,11 @@ enable_and_start_service() {
     log_info "Enabling and starting service..."
 
     systemctl enable "$SERVICE_NAME"
+    systemctl start "$SERVICE_NAME"
+    log_info "Service started"
 
-    # Only start if credentials exist (agent is registered)
-    if [[ -f "$DATA_DIR/credentials.enc" ]]; then
-        systemctl start "$SERVICE_NAME"
-        log_info "Service started"
-    else
-        log_warn "Agent not registered yet - service will not start until registered"
-        log_info "After registration, start the service with: sudo systemctl start $SERVICE_NAME"
-    fi
+    # If not yet enrolled, the agent will listen on the enrollment socket
+    # and wait for enrollment via: power-manage-agent enroll -server=URL -token=TOKEN
 }
 
 uninstall() {
@@ -462,7 +471,7 @@ install_desktop_handler() {
 [Desktop Entry]
 Name=Power Manage Agent
 Comment=Power Manage device agent
-Exec=sudo $BINARY_PATH %u
+Exec=$BINARY_PATH %u
 Terminal=true
 Type=Application
 MimeType=x-scheme-handler/power-manage;
@@ -520,14 +529,11 @@ show_status() {
     echo ""
 
     if [[ -f "$DATA_DIR/credentials.enc" ]]; then
-        echo "Agent is registered and ready."
+        echo "Agent is enrolled and ready."
     else
-        echo "Agent is NOT registered yet."
-        echo "To register, run:"
-        echo "  sudo -u $SERVICE_USER $BINARY_PATH -server=<URL> -token=<TOKEN> -data-dir=$DATA_DIR"
-        echo ""
-        echo "Then start the service:"
-        echo "  sudo systemctl start $SERVICE_NAME"
+        echo "Agent is NOT enrolled yet."
+        echo "To enroll (no sudo required), run:"
+        echo "  $BINARY_PATH enroll -server=<URL> -token=<TOKEN>"
     fi
     echo ""
 }
@@ -557,11 +563,12 @@ main() {
     install_desktop_handler
     install_luks_sudoers
 
+    enable_and_start_service
+
     if [[ -n "$REGISTRATION_TOKEN" ]] && [[ -n "$SERVER_URL" ]]; then
-        register_agent
+        enroll_agent
     fi
 
-    enable_and_start_service
     show_status
 }
 

@@ -19,6 +19,7 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"connectrpc.com/connect"
 	"golang.org/x/net/http2"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
@@ -31,6 +32,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 	"github.com/manchtools/power-manage/agent/internal/verify"
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 	sdk "github.com/manchtools/power-manage/sdk/go"
 	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
 
@@ -105,6 +107,9 @@ func main() {
 		case "luks":
 			runLuks(os.Args[2:])
 			return
+		case "enroll":
+			runEnroll(os.Args[2:])
+			return
 		}
 	}
 
@@ -157,14 +162,8 @@ func main() {
 		if cfg.Token != "" {
 			logger.Debug("ignoring registration token - agent is already registered")
 		}
-	} else {
-		// Need to register
-		if cfg.Token == "" {
-			logger.Error("no stored credentials found, registration token required")
-			logger.Info("usage: power-manage-agent -token=<token> -server=<url>")
-			logger.Info("   or: power-manage-agent 'power-manage://server:port?token=xxx'")
-			os.Exit(1)
-		}
+	} else if cfg.Token != "" {
+		// Direct registration (backwards compatible, works with sudo)
 		if cfg.ServerURL == "" {
 			logger.Error("server URL required for registration")
 			os.Exit(1)
@@ -182,6 +181,31 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Info("credentials saved", "data_dir", credStore.DataDir())
+	} else {
+		// No credentials and no token — start enrollment socket and wait
+		logger.Info("agent not enrolled, waiting for enrollment via socket",
+			"socket", deviceauth.EnrollSocketPath)
+
+		enrollCh := make(chan *credentials.Credentials, 1)
+		enrollHandler := deviceauth.NewEnrollHandler(hostname, version, credStore, logger, func(c *credentials.Credentials) {
+			enrollCh <- c
+		})
+		enrollServer := deviceauth.NewEnrollServer(enrollHandler, deviceauth.EnrollSocketPath, logger)
+
+		go func() {
+			if err := enrollServer.Start(ctx); err != nil {
+				logger.Error("enrollment server failed", "error", err)
+			}
+		}()
+
+		select {
+		case creds = <-enrollCh:
+			logger.Info("enrollment complete", "device_id", creds.DeviceID)
+			enrollServer.Shutdown()
+		case <-ctx.Done():
+			logger.Info("agent stopped while waiting for enrollment")
+			return
+		}
 	}
 
 	// Initialize the action store for offline persistence
@@ -707,6 +731,11 @@ func parseFlags() *Config {
 	// Format: power-manage://server:port?token=xxx[&skip-verify=true]
 	if uri != "" {
 		if parsed, err := parseRegistrationURI(uri); err == nil {
+			// Try socket enrollment first (no sudo needed)
+			if trySocketEnroll(parsed) {
+				os.Exit(0)
+			}
+			// Fallback to direct registration (sudo/service mode)
 			cfg.ServerURL = parsed.ServerURL
 			cfg.Token = parsed.Token
 			cfg.SkipVerify = parsed.SkipVerify
@@ -1245,4 +1274,123 @@ func runLuksSetPassphrase(token, dataDir string) {
 	agentStore.AddLuksPassphraseHash(result.ActionID, sysluks.HashPassphrase(passphrase))
 
 	fmt.Println("LUKS passphrase set successfully.")
+}
+
+// runEnroll handles the "enroll" subcommand.
+// Usage: power-manage-agent enroll -server=URL -token=TOKEN
+//
+//	power-manage-agent enroll 'power-manage://server:port?token=xxx'
+func runEnroll(args []string) {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	token := fs.String("token", "", "Registration token")
+	server := fs.String("server", "", "Control server URL")
+	skipVerify := fs.Bool("skip-verify", false, "Skip TLS verification")
+	socketPath := fs.String("socket", deviceauth.EnrollSocketPath, "Agent enrollment socket")
+	fs.Parse(args)
+
+	// Accept power-manage:// URI as positional arg
+	if fs.NArg() > 0 {
+		arg := fs.Arg(0)
+		if strings.HasPrefix(arg, "power-manage://") {
+			if parsed, err := parseRegistrationURI(arg); err == nil {
+				*server = parsed.ServerURL
+				*token = parsed.Token
+				*skipVerify = parsed.SkipVerify
+			} else {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	if *token == "" || *server == "" {
+		fmt.Fprintln(os.Stderr, "error: -server and -token are required")
+		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token=TOKEN")
+		fmt.Fprintln(os.Stderr, "   or: power-manage-agent enroll 'power-manage://server:port?token=xxx'")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Connect to the enrollment socket
+	httpClient := unixSocketHTTPClient(*socketPath)
+	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+
+	// Check enrollment status first
+	status, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot connect to agent enrollment socket at %s\n", *socketPath)
+		fmt.Fprintln(os.Stderr, "Is the agent service running? Check: systemctl status power-manage-agent")
+		os.Exit(1)
+	}
+
+	if status.Msg.Enrolled {
+		fmt.Printf("Agent is already enrolled (device ID: %s)\n", status.Msg.DeviceId)
+		return
+	}
+
+	// Enroll via socket
+	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
+		ServerUrl:  *server,
+		Token:      *token,
+		SkipVerify: *skipVerify,
+	}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: enrollment failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !resp.Msg.Success {
+		fmt.Fprintf(os.Stderr, "error: enrollment failed: %s\n", resp.Msg.Error)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Enrolled successfully. Device ID: %s\n", resp.Msg.DeviceId)
+}
+
+// trySocketEnroll attempts to enroll via the agent's enrollment socket.
+// Returns true if enrollment succeeded (caller should exit).
+func trySocketEnroll(parsed *registrationURI) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	httpClient := unixSocketHTTPClient(deviceauth.EnrollSocketPath)
+	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+
+	// Check if the enrollment socket is available
+	_, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))
+	if err != nil {
+		// Socket not available — fall back to direct registration
+		return false
+	}
+
+	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
+		ServerUrl:  parsed.ServerURL,
+		Token:      parsed.Token,
+		SkipVerify: parsed.SkipVerify,
+	}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %v\n", err)
+		return false
+	}
+
+	if !resp.Msg.Success {
+		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %s\n", resp.Msg.Error)
+		return false
+	}
+
+	fmt.Printf("Enrolled successfully via agent socket. Device ID: %s\n", resp.Msg.DeviceId)
+	return true
+}
+
+// unixSocketHTTPClient returns an HTTP client that dials the given unix socket.
+func unixSocketHTTPClient(socketPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
 }

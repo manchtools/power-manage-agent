@@ -37,26 +37,72 @@ The executor delegates low-level system operations to the SDK's `sys/` packages 
 └───────────────────────────┘   └─────────────────────────────────┘
 ```
 
-### Registration Flow
+### Enrollment Flow
 
-1. The agent calls the **Control Server** `Register` RPC with a registration token and CSR
-2. The Control Server validates the token, signs the certificate, and returns:
+The agent supports two enrollment methods:
+
+#### Socket-based enrollment (recommended, no sudo required)
+
+1. The install script starts the agent as a systemd service
+2. The unenrolled agent opens an **enrollment socket** at `/run/pm-agent/enroll.sock` (mode 0666, any local user can connect)
+3. A regular user runs `power-manage-agent enroll -server=URL -token=TOKEN`
+4. The CLI sends an `Enroll` RPC to the agent over the unix socket
+5. The agent calls the **Control Server** `Register` RPC with the token and a locally-generated CSR
+6. The Control Server validates the token, signs the certificate, and returns credentials
+7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and connects to the gateway
+
+```
+                                  ┌─────────────────────────┐
+  User (no sudo)                  │   Agent (systemd svc)   │
+  power-manage-agent enroll ───►  │   /run/pm-agent/        │
+    -server=URL -token=TOK        │     enroll.sock (0666)  │
+                                  │         │               │
+                                  │    Register RPC ──────► Control Server
+                                  │         │               │   - Validate token
+                                  │    Save credentials     │   - Sign certificate
+                                  │    Close enroll socket  │   - Return gateway URL
+                                  │    Start auth socket    │
+                                  │    Connect to gateway   │
+                                  └─────────────────────────┘
+```
+
+#### Direct enrollment (backwards compatible, requires sudo)
+
+For environments where the agent is not yet running as a service, direct enrollment still works:
+
+```bash
+sudo power-manage-agent -server=URL -token=TOKEN
+```
+
+This is equivalent to the previous behavior: the agent registers directly, saves credentials, and starts.
+
+### Registration Protocol
+
+Both enrollment methods use the same underlying protocol:
+1. The agent generates an ECDSA P-256 key pair and CSR locally — the private key never leaves the device
+2. The Control Server validates the registration token, signs the certificate, and returns:
    - Device ID
    - Signed mTLS certificate
    - CA certificate
    - Gateway URL
-3. The agent stores the credentials and connects to the **Gateway** using mTLS for streaming communication
+3. The agent stores the encrypted credentials and connects to the **Gateway** using mTLS for streaming communication
 
 ## Installation
 
 ### Using the Install Script
 
 ```bash
-# Download and run the install script
+# Download, install, and enroll in one step
 curl -fsSL https://your-server/install.sh | sudo bash -s -- \
   --server control.example.com:8081 \
   --token YOUR_REGISTRATION_TOKEN
 ```
+
+The install script:
+1. Downloads and installs the agent binary
+2. Creates the `power-manage` service user
+3. Installs and starts the systemd service
+4. Enrolls via the enrollment socket (no sudo needed for the enrollment step)
 
 ### Manual Installation
 
@@ -64,13 +110,17 @@ curl -fsSL https://your-server/install.sh | sudo bash -s -- \
 # Build the agent
 go build -o power-manage-agent ./agent/cmd/agent
 
-# Run with registration
-./power-manage-agent -server=https://control.example.com:8081 -token=YOUR_TOKEN
+# Start the agent (as a service or directly) — it will wait for enrollment
+./power-manage-agent
+
+# In another terminal (as any user), enroll:
+power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_TOKEN
 ```
 
 ### Using URI Scheme
 
-The agent supports a URI scheme for easy registration:
+The agent supports a `power-manage://` URI scheme for easy enrollment from the web UI.
+When clicked, the desktop handler launches the agent which tries socket enrollment first (no sudo), falling back to direct registration.
 
 ```bash
 power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
@@ -81,6 +131,16 @@ URI Parameters:
 - `token` - Registration token (required for first run)
 - `skip-verify=true` - Skip TLS verification (development only)
 - `tls=false` - Use HTTP instead of HTTPS
+
+### Subcommands
+
+| Subcommand | Description |
+|------------|-------------|
+| `enroll` | Enroll the agent via the enrollment socket (no sudo required) |
+| `version` | Print agent version |
+| `setup` | Install sudoers configuration |
+| `query` | Query system information via osquery |
+| `luks` | LUKS passphrase management |
 
 ## Configuration
 
