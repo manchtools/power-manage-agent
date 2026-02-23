@@ -308,6 +308,14 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
+	case pb.ActionType_ACTION_TYPE_WIFI:
+		var changed bool
+		wifiActionID := ""
+		if action.Id != nil {
+			wifiActionID = action.Id.Value
+		}
+		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, wifiActionID)
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	default:
