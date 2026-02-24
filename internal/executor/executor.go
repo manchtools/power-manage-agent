@@ -235,8 +235,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, detectionOutput, changed, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
 		result.Changed = changed
-		result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
 		result.DetectionOutput = detectionOutput
+		if action.GetShell().GetIsCompliance() {
+			result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
+		}
 	case pb.ActionType_ACTION_TYPE_SYSTEMD:
 		var changed bool
 		output, changed, execErr = e.executeSystemd(ctx, action.GetSystemd())
@@ -955,6 +957,16 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		}
 		output, err := e.runShellScript(ctx, params, params.Script, callback)
 		return output, nil, true, err
+	}
+
+	// Compliance mode: run detection only, never execute remediation
+	if params.GetIsCompliance() {
+		e.logger.Debug("compliance mode: running detection script only")
+		detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
+		if err != nil {
+			return nil, detectionOutput, false, err
+		}
+		return nil, detectionOutput, false, nil
 	}
 
 	// Step 1: Run detection script
