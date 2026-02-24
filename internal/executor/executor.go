@@ -230,8 +230,13 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, changed, execErr = e.executeRpm(ctx, action.GetApp(), action.DesiredState)
 		result.Changed = changed
-	case pb.ActionType_ACTION_TYPE_SHELL:
-		output, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
+	case pb.ActionType_ACTION_TYPE_SHELL, pb.ActionType_ACTION_TYPE_SCRIPT_RUN:
+		var detectionOutput *pb.CommandOutput
+		var changed bool
+		output, detectionOutput, changed, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
+		result.Changed = changed
+		result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
+		result.DetectionOutput = detectionOutput
 	case pb.ActionType_ACTION_TYPE_SYSTEMD:
 		var changed bool
 		output, changed, execErr = e.executeSystemd(ctx, action.GetSystemd())
@@ -891,29 +896,26 @@ func (e *Executor) isRpmInstalled(pkgName string) bool {
 }
 
 func (e *Executor) executeShell(ctx context.Context, params *pb.ShellParams) (*pb.CommandOutput, error) {
-	return e.executeShellStreaming(ctx, params, nil)
+	execOutput, _, _, err := e.executeShellStreaming(ctx, params, nil)
+	return execOutput, err
 }
 
-// executeShellStreaming executes a shell script with optional output streaming.
-func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellParams, callback OutputCallback) (*pb.CommandOutput, error) {
-	if params == nil {
-		return nil, fmt.Errorf("shell params required")
-	}
-
+// runShellScript executes a single shell script string using the shared interpreter,
+// environment, sudo, and working directory settings from ShellParams.
+func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, script string, callback OutputCallback) (*pb.CommandOutput, error) {
 	interpreter := params.Interpreter
 	if interpreter == "" {
 		interpreter = "/bin/sh"
 	}
 
-	// Build command name and args
 	var name string
 	var args []string
 	if params.RunAsRoot {
 		name = "sudo"
-		args = []string{"-n", interpreter, "-c", params.Script}
+		args = []string{"-n", interpreter, "-c", script}
 	} else {
 		name = interpreter
-		args = []string{"-c", params.Script}
+		args = []string{"-c", script}
 	}
 
 	// Build environment — reject dangerous variable names that could
@@ -929,13 +931,71 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		}
 	}
 
-	// Use streaming execution if callback provided, otherwise fall back to standard
-	if callback != nil {
-		return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+}
+
+// executeShellStreaming executes a shell action with optional detection/execution/verification flow.
+// Returns (executionOutput, detectionOutput, changed, error).
+//
+// Flow:
+//  1. No detection_script: run script as-is (current behavior)
+//  2. Run detection_script. Exit 0 = compliant, skip execution.
+//  3. No script (detection-only): return non-compliant status
+//  4. Run script (remediation)
+//  5. Re-run detection_script to verify
+func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellParams, callback OutputCallback) (*pb.CommandOutput, *pb.CommandOutput, bool, error) {
+	if params == nil {
+		return nil, nil, false, fmt.Errorf("shell params required")
 	}
 
-	// Non-streaming fallback - use runCmdStreaming with nil callback for consistent behavior
-	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, nil)
+	// No detection script — run execution script directly (original behavior)
+	if params.DetectionScript == "" {
+		if params.Script == "" {
+			return nil, nil, false, fmt.Errorf("at least one of script or detection_script is required")
+		}
+		output, err := e.runShellScript(ctx, params, params.Script, callback)
+		return output, nil, true, err
+	}
+
+	// Step 1: Run detection script
+	e.logger.Debug("running detection script")
+	detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
+	if err != nil {
+		return nil, detectionOutput, false, fmt.Errorf("detection script error: %w", err)
+	}
+
+	// Step 2: If detection exits 0, system is compliant — skip execution
+	if detectionOutput.ExitCode == 0 {
+		e.logger.Debug("detection script passed (exit 0), system is compliant")
+		return nil, detectionOutput, false, nil
+	}
+
+	// Step 3: No execution script (detection-only) — report non-compliant
+	if params.Script == "" {
+		e.logger.Debug("detection script failed (non-zero), no execution script — reporting non-compliant")
+		return nil, detectionOutput, false, nil
+	}
+
+	// Step 4: Run execution/remediation script
+	e.logger.Debug("detection script failed (non-zero), running remediation script")
+	execOutput, execErr := e.runShellScript(ctx, params, params.Script, callback)
+	if execErr != nil {
+		return execOutput, detectionOutput, true, execErr
+	}
+
+	// Step 5: Re-run detection script to verify remediation
+	e.logger.Debug("re-running detection script to verify remediation")
+	verifyOutput, verifyErr := e.runShellScript(ctx, params, params.DetectionScript, nil)
+	if verifyErr != nil {
+		return execOutput, verifyOutput, true, fmt.Errorf("verification detection script error: %w", verifyErr)
+	}
+
+	if verifyOutput.ExitCode != 0 {
+		return execOutput, verifyOutput, true, fmt.Errorf("remediation did not resolve the issue (detection still exits %d)", verifyOutput.ExitCode)
+	}
+
+	e.logger.Debug("verification passed, remediation successful")
+	return execOutput, verifyOutput, true, nil
 }
 
 func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams) (*pb.CommandOutput, bool, error) {

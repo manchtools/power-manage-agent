@@ -114,8 +114,8 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 		}, nil
 	}
 
-	// Store the action for scheduled execution (skip for instant actions — they're one-shot)
-	if h.scheduler != nil && !executor.IsInstantAction(action.Type) {
+	// Store the action for scheduled execution (skip for instant and one-off actions)
+	if h.scheduler != nil && !executor.IsInstantAction(action.Type) && action.Type != pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
 		if err := h.scheduler.AddAction(action); err != nil {
 			h.logger.Error("failed to store action", "action_id", action.Id.Value, "error", err)
 		} else {
