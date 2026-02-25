@@ -521,8 +521,11 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			continue
 		}
 
-		// Update credentials on disk with new certificate
+		// Update credentials on disk with new certificate (and CA cert if rotated)
 		creds.Certificate = result.Certificate
+		if len(result.CACert) > 0 {
+			creds.CACert = result.CACert
+		}
 		if err := credStore.Save(creds); err != nil {
 			logger.Error("cert rotation: failed to save new certificate", "error", err)
 			select {

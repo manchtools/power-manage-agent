@@ -518,7 +518,7 @@ The agent prevents actions from modifying its own infrastructure:
 
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
 - **mTLS**: After registration, the agent connects to the Gateway using mutual TLS with certificates signed by the Control Server CA
-- **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. On failure, the agent retries hourly. No re-registration is required.
+- **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
 - **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id
 
 ### Enrollment Rate Limiting
