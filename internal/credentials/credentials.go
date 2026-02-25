@@ -304,3 +304,36 @@ func GenerateCSR(hostname string) (csrPEM, keyPEM []byte, err error) {
 
 	return csrPEM, keyPEM, nil
 }
+
+// GenerateCSRFromKey creates a CSR using an existing private key (PEM-encoded).
+// This is used for certificate renewal where the key pair is reused.
+func GenerateCSRFromKey(hostname string, keyPEM []byte) (csrPEM []byte, err error) {
+	keyBlock, _ := pem.Decode(keyPEM)
+	if keyBlock == nil {
+		return nil, fmt.Errorf("failed to decode key PEM")
+	}
+
+	privateKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return nil, fmt.Errorf("parse private key: %w", err)
+	}
+
+	template := &x509.CertificateRequest{
+		Subject: pkix.Name{
+			CommonName: hostname,
+		},
+		DNSNames: []string{hostname},
+	}
+
+	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
+	if err != nil {
+		return nil, fmt.Errorf("create CSR: %w", err)
+	}
+
+	csrPEM = pem.EncodeToMemory(&pem.Block{
+		Type:  "CERTIFICATE REQUEST",
+		Bytes: csrDER,
+	})
+
+	return csrPEM, nil
+}

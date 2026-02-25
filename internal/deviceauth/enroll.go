@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sync"
+	"time"
 
 	"connectrpc.com/connect"
 
@@ -26,6 +28,9 @@ type EnrollHandler struct {
 	credStore  *credentials.Store
 	logger     *slog.Logger
 	onEnrolled func(creds *credentials.Credentials)
+
+	rateMu       sync.Mutex
+	lastAttempts []time.Time
 }
 
 // NewEnrollHandler creates a handler for enrollment RPCs.
@@ -42,6 +47,29 @@ func NewEnrollHandler(hostname, version string, credStore *credentials.Store, lo
 
 // Enroll registers the agent with the PM server using the provided token.
 func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.EnrollRequest]) (*connect.Response[pm.EnrollResponse], error) {
+	// Rate limiting: max 5 attempts per minute
+	h.rateMu.Lock()
+	now := time.Now()
+	cutoff := now.Add(-1 * time.Minute)
+	var recent []time.Time
+	for _, t := range h.lastAttempts {
+		if t.After(cutoff) {
+			recent = append(recent, t)
+		}
+	}
+	recent = append(recent, now)
+	h.lastAttempts = recent
+	count := len(recent)
+	h.rateMu.Unlock()
+
+	if count > 5 {
+		h.logger.Warn("enrollment rate limit exceeded")
+		return connect.NewResponse(&pm.EnrollResponse{
+			Success: false,
+			Error:   "rate limit exceeded, try again later",
+		}), nil
+	}
+
 	h.logger.Info("enrollment request received", "server_url", req.Msg.ServerUrl)
 
 	if req.Msg.ServerUrl == "" || req.Msg.Token == "" {

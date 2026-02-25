@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log/slog"
@@ -251,6 +252,11 @@ func main() {
 		startDeviceAuthServer(ctx, creds, logger)
 	}
 
+	// Start certificate rotation goroutine
+	if creds.ControlAddr != "" {
+		go startCertRotation(ctx, credStore, hostname, logger)
+	}
+
 	// Run the agent
 	logger.Info("starting agent",
 		"gateway", creds.GatewayAddr,
@@ -431,6 +437,106 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		if currentBackoff > maxBackoff {
 			currentBackoff = maxBackoff
 		}
+	}
+}
+
+// startCertRotation runs a background loop that renews the agent's mTLS
+// certificate before it expires. Renewal is attempted at 80% of the cert's
+// lifetime. On failure it retries every hour.
+func startCertRotation(ctx context.Context, credStore *credentials.Store, hostname string, logger *slog.Logger) {
+	const retryInterval = 1 * time.Hour
+
+	for {
+		creds, err := credStore.Load()
+		if err != nil {
+			logger.Error("cert rotation: failed to load credentials", "error", err)
+			return
+		}
+
+		// Parse current certificate to determine expiry
+		block, _ := pem.Decode(creds.Certificate)
+		if block == nil {
+			logger.Error("cert rotation: failed to decode certificate PEM")
+			return
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			logger.Error("cert rotation: failed to parse certificate", "error", err)
+			return
+		}
+
+		// Calculate renewal time at 80% of lifetime
+		lifetime := cert.NotAfter.Sub(cert.NotBefore)
+		renewAt := cert.NotBefore.Add(time.Duration(float64(lifetime) * 0.8))
+		waitDuration := time.Until(renewAt)
+		if waitDuration <= 0 {
+			waitDuration = 1 * time.Minute
+		}
+
+		logger.Info("cert rotation: scheduled",
+			"not_after", cert.NotAfter,
+			"renew_at", renewAt,
+			"wait", waitDuration.String(),
+		)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(waitDuration):
+		}
+
+		// Generate CSR from existing private key
+		csrPEM, err := credentials.GenerateCSRFromKey(hostname, creds.PrivateKey)
+		if err != nil {
+			logger.Error("cert rotation: failed to generate CSR", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Build mTLS client using current (still valid) certificate
+		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+		if err != nil {
+			logger.Error("cert rotation: failed to configure mTLS", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Call RenewCertificate on the control server
+		result, err := sdk.RenewCertificate(ctx, creds.ControlAddr, csrPEM, creds.Certificate, mtlsOpt)
+		if err != nil {
+			logger.Error("cert rotation: renewal failed, will retry", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Update credentials on disk with new certificate
+		creds.Certificate = result.Certificate
+		if err := credStore.Save(creds); err != nil {
+			logger.Error("cert rotation: failed to save new certificate", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		logger.Info("cert rotation: certificate renewed successfully",
+			"not_after", result.NotAfter,
+		)
+		// Loop to schedule next renewal based on the new cert
 	}
 }
 
