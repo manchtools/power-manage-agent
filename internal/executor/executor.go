@@ -792,7 +792,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
 		if err != nil {
 			// Try to fix dependencies
-			aptFixBroken(ctx)
+			pkg.NewAptWithContext(ctx).FixBroken()
 		}
 		return output, true, err
 
@@ -1589,44 +1589,6 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	return file.Close()
 }
 
-// getAptCommand returns the preferred apt command ("apt" or "apt-get").
-// Prefers "apt" if available as it provides better progress output.
-func getAptCommand() string {
-	if _, err := exec.LookPath("apt"); err == nil {
-		return "apt"
-	}
-	return "apt-get"
-}
-
-// =============================================================================
-// APT Helper Functions
-// =============================================================================
-
-// aptUpdate runs apt update to refresh package lists.
-func aptUpdate(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "update")
-}
-
-// aptUpgrade runs apt upgrade -y to upgrade all packages.
-func aptUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "upgrade", "-y")
-}
-
-// aptDistUpgrade runs apt dist-upgrade -y for held-back packages.
-func aptDistUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "dist-upgrade", "-y")
-}
-
-// aptAutoremove runs apt autoremove -y to remove unused packages.
-func aptAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "autoremove", "-y")
-}
-
-// aptFixBroken runs apt --fix-broken install -y to repair broken dependencies.
-func aptFixBroken(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "--fix-broken", "install", "-y")
-}
-
 // =============================================================================
 // DNF Helper Functions
 // =============================================================================
@@ -1864,13 +1826,15 @@ func (e *Executor) repairApt(ctx context.Context) {
 	// This handles "dpkg was interrupted, you must manually run 'dpkg --configure -a'"
 	runSudoCmd(ctx, "dpkg", "--configure", "-a")
 
+	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
+	// Without this, kernel/grub postinst scripts hang waiting for debconf input.
+	apt := pkg.NewAptWithContext(ctx)
+
 	// Update package lists to get latest dependency info
-	// This is crucial for resolving dependency version mismatches
-	aptUpdate(ctx)
+	apt.Update()
 
 	// Fix broken dependencies and install missing ones
-	// This handles "unmet dependencies" and "held broken packages" issues
-	aptFixBroken(ctx)
+	apt.FixBroken()
 }
 
 // repairDnf fixes common dnf/rpm issues:
@@ -2011,7 +1975,8 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		if pkg.IsApt() {
-			if output, err := aptAutoremove(ctx); err == nil {
+			apt := pkg.NewAptWithContext(ctx)
+			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
@@ -2064,8 +2029,11 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 		output.WriteString("Note: security-only updates requested but unattended-upgrade not available\n")
 	}
 
+	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
+	apt := pkg.NewAptWithContext(ctx)
+
 	// Standard upgrade
-	cmdOutput, err := aptUpgrade(ctx)
+	cmdOutput, err := apt.Upgrade()
 	if cmdOutput != nil {
 		output.WriteString(cmdOutput.Stdout)
 		output.WriteString(cmdOutput.Stderr)
@@ -2073,7 +2041,7 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 
 	// Also run dist-upgrade for held-back packages (still respects holds)
 	output.WriteString("\n=== Dist-Upgrade ===\n")
-	distOutput, _ := aptDistUpgrade(ctx)
+	distOutput, _ := apt.DistUpgrade()
 	if distOutput != nil {
 		output.WriteString(distOutput.Stdout)
 		output.WriteString(distOutput.Stderr)
@@ -2382,7 +2350,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 
 		// Update package index only when something changed
 		if changed {
-			updateOutput, _ := aptUpdate(ctx)
+			apt := pkg.NewAptWithContext(ctx)
+			updateOutput, _ := apt.Update()
 			if updateOutput != nil {
 				output.WriteString(updateOutput.Stdout)
 			}
