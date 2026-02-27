@@ -10,6 +10,7 @@ import (
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
 	"net"
 	"net/http"
 	"net/url"
@@ -48,10 +49,17 @@ const (
 	defaultSyncInterval      = 30 * time.Minute
 
 	// Exponential backoff constants for reconnection
-	initialBackoff = 1 * time.Second
-	maxBackoff     = 5 * time.Minute
-	backoffFactor  = 2.0
+	minInitialBackoff = 5 * time.Second
+	maxInitialBackoff = 10 * time.Second
+	maxBackoff        = 5 * time.Minute
+	backoffFactor     = 2.0
 )
+
+// randomBackoff returns a random duration between minInitialBackoff and maxInitialBackoff.
+func randomBackoff() time.Duration {
+	jitter := rand.Int64N(int64(maxInitialBackoff - minInitialBackoff))
+	return minInitialBackoff + time.Duration(jitter)
+}
 
 // Config holds the agent configuration.
 type Config struct {
@@ -329,7 +337,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 	firstSync := true
 
 	// Exponential backoff for reconnection
-	currentBackoff := initialBackoff
+	currentBackoff := randomBackoff()
 
 	for {
 		// Reset handler connection state for new connection
@@ -416,7 +424,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 		// Reset backoff if the connection was stable (lasted longer than the backoff interval)
 		if time.Since(connStart) > currentBackoff {
-			currentBackoff = initialBackoff
+			currentBackoff = randomBackoff()
 		}
 
 		logger.Error("connection lost, continuing with scheduled actions",
