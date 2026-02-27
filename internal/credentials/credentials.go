@@ -9,6 +9,7 @@ import (
 	"crypto/ecdsa"
 	"crypto/elliptic"
 	"crypto/rand"
+	"log/slog"
 	"crypto/x509"
 	"crypto/x509/pkix"
 	"encoding/json"
@@ -149,8 +150,12 @@ func (s *Store) Delete() error {
 	credPath := filepath.Join(s.dataDir, credentialsFile)
 	saltPath := filepath.Join(s.dataDir, saltFile)
 
-	os.Remove(credPath)
-	os.Remove(saltPath)
+	if err := os.Remove(credPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove credentials file", "path", credPath, "error", err)
+	}
+	if err := os.Remove(saltPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove salt file", "path", saltPath, "error", err)
+	}
 
 	return nil
 }

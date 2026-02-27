@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"log/slog"
 	"fmt"
 	"math/big"
 	"os"
@@ -186,7 +187,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	}
 
 	// Build metadata with JSON array of rotations
-	rotationsJSON, _ := json.Marshal(rotations)
+	rotationsJSON, err := json.Marshal(rotations)
+	if err != nil {
+		slog.Warn("failed to marshal LPS rotations", "error", err)
+	}
 	metadata := map[string]string{
 		"lps.rotations": string(rotationsJSON),
 	}

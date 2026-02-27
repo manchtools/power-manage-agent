@@ -2913,7 +2913,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 					RotatedAt: time.Now().UTC().Format(time.RFC3339),
 					Reason:    "user_created",
 				}}
-				if rotationsJSON, err := json.Marshal(rotations); err == nil {
+				rotationsJSON, err := json.Marshal(rotations)
+				if err != nil {
+					slog.Warn("failed to marshal user creation rotations", "error", err)
+				} else {
 					metadata = map[string]string{"lps.rotations": string(rotationsJSON)}
 				}
 			}

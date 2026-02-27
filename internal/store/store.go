@@ -117,7 +117,9 @@ func (s *Store) migrate() error {
 	}
 
 	// Add desired_state column if it doesn't exist (migration)
-	s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0")
+	if _, err := s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0"); err != nil {
+		slog.Debug("migration: desired_state column may already exist", "error", err)
+	}
 
 	// LUKS state tables
 	luksSchema := `
@@ -143,7 +145,9 @@ func (s *Store) migrate() error {
 	}
 
 	// Add last_rotated_at column if it doesn't exist (migration for pre-existing tables)
-	s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''")
+	if _, err := s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''"); err != nil {
+		slog.Debug("migration: last_rotated_at column may already exist", "error", err)
+	}
 
 	return nil
 }
@@ -353,7 +357,11 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 	// Store the result
 	var outputJSON []byte
 	if result.Output != nil {
-		outputJSON, _ = json.Marshal(result.Output)
+		var err error
+		outputJSON, err = json.Marshal(result.Output)
+		if err != nil {
+			slog.Warn("failed to marshal execution output", "error", err)
+		}
 	}
 
 	resultID := fmt.Sprintf("%s-%d", actionID, now.UnixNano())
@@ -505,7 +513,9 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		if _, exists := serverActions[localID]; !exists {
 			// Load the full action for undo
 			action := &pb.Action{}
-			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err == nil {
+			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
+				slog.Warn("failed to unmarshal removed action for undo", "action_id", localID, "error", err)
+			} else {
 				result.RemovedActions = append(result.RemovedActions, action)
 			}
 			if _, err := tx.Exec("DELETE FROM actions WHERE id = ?", localID); err != nil {
