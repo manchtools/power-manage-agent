@@ -540,19 +540,18 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
-		isChanged := false
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
 		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
-			isChanged = true
 		}
 
-		isNew := !exists
-
-		// Calculate next execution time - run immediately for new or changed actions
-		runNow := isNew || isChanged
-		nextExecute := s.calculateNextExecute(action, nil, runNow)
+		// Always set next_execute_at to the future. The caller (scheduler.SyncActions)
+		// executes new/changed actions immediately via ID lists, not via next_execute_at.
+		// Setting next_execute_at to "now" caused the scheduler's runDueActions ticker
+		// to double-execute actions while the sync execution was still running.
+		now := time.Now()
+		nextExecute := s.calculateNextExecute(action, &now, false)
 
 		// Upsert: insert new or update existing (but preserve execution history)
 		_, err = tx.Exec(`
