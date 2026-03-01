@@ -10,6 +10,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -74,7 +75,7 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	store := &Store{db: db}
-	if err := store.migrate(); err != nil {
+	if err := store.migrate(dataDir); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("migrate database: %w", err)
 	}
@@ -83,7 +84,7 @@ func New(dataDir string) (*Store, error) {
 }
 
 // migrate creates or updates the database schema.
-func (s *Store) migrate() error {
+func (s *Store) migrate(dataDir string) error {
 	schema := `
 	CREATE TABLE IF NOT EXISTS actions (
 		id TEXT PRIMARY KEY,
@@ -149,7 +150,87 @@ func (s *Store) migrate() error {
 		slog.Debug("migration: last_rotated_at column may already exist", "error", err)
 	}
 
+	// LPS state table
+	lpsSchema := `
+	CREATE TABLE IF NOT EXISTS lps_state (
+		action_id TEXT NOT NULL,
+		username TEXT NOT NULL,
+		last_rotated_at TEXT NOT NULL DEFAULT '',
+		password_hash TEXT NOT NULL DEFAULT '',
+		PRIMARY KEY (action_id, username)
+	);
+	`
+	if _, err := s.db.Exec(lpsSchema); err != nil {
+		return err
+	}
+
+	// Migrate legacy LPS JSON files into SQLite.
+	s.migrateLpsJsonFiles(dataDir)
+
 	return nil
+}
+
+// migrateLpsJsonFiles imports legacy /var/lib/power-manage/lps/lps-*.json files
+// into the lps_state table and removes the files afterwards.
+func (s *Store) migrateLpsJsonFiles(dataDir string) {
+	lpsDir := filepath.Join(dataDir, "lps")
+	entries, err := os.ReadDir(lpsDir)
+	if err != nil {
+		return // directory doesn't exist — nothing to migrate
+	}
+
+	type legacyUserState struct {
+		LastRotatedAt time.Time `json:"last_rotated_at"`
+		PasswordHash  string    `json:"password_hash"`
+	}
+	type legacyState struct {
+		Users map[string]legacyUserState `json:"users"`
+	}
+
+	migrated := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasPrefix(name, "lps-") || !strings.HasSuffix(name, ".json") {
+			continue
+		}
+
+		actionID := strings.TrimSuffix(strings.TrimPrefix(name, "lps-"), ".json")
+		filePath := filepath.Join(lpsDir, name)
+
+		data, err := os.ReadFile(filePath)
+		if err != nil {
+			slog.Warn("migration: failed to read LPS JSON file", "path", filePath, "error", err)
+			continue
+		}
+
+		var state legacyState
+		if err := json.Unmarshal(data, &state); err != nil {
+			slog.Warn("migration: failed to parse LPS JSON file", "path", filePath, "error", err)
+			continue
+		}
+
+		for username, us := range state.Users {
+			_, err := s.db.Exec(`
+				INSERT OR IGNORE INTO lps_state (action_id, username, last_rotated_at, password_hash)
+				VALUES (?, ?, ?, ?)
+			`, actionID, username, us.LastRotatedAt.UTC().Format(time.RFC3339), us.PasswordHash)
+			if err != nil {
+				slog.Warn("migration: failed to insert LPS state", "action_id", actionID, "username", username, "error", err)
+			}
+		}
+
+		if err := os.Remove(filePath); err != nil {
+			slog.Warn("migration: failed to remove LPS JSON file", "path", filePath, "error", err)
+		} else {
+			migrated++
+		}
+	}
+
+	if migrated > 0 {
+		slog.Info("migration: migrated LPS state from JSON files to SQLite", "count", migrated)
+		// Remove empty lps directory
+		os.Remove(lpsDir)
+	}
 }
 
 // Close closes the database connection.
@@ -776,5 +857,74 @@ func (s *Store) AddLuksPassphraseHash(actionID, hash string) error {
 			LIMIT 3
 		)
 	`, actionID, actionID)
+	return err
+}
+
+// =============================================================================
+// LPS State
+// =============================================================================
+
+// LpsUserState represents the LPS rotation state for a single user within an action.
+type LpsUserState struct {
+	ActionID      string
+	Username      string
+	LastRotatedAt time.Time
+	PasswordHash  string
+}
+
+// GetLpsState returns all LPS user states for an action.
+func (s *Store) GetLpsState(actionID string) (map[string]*LpsUserState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	rows, err := s.db.Query(
+		"SELECT action_id, username, last_rotated_at, password_hash FROM lps_state WHERE action_id = ?",
+		actionID,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	users := make(map[string]*LpsUserState)
+	for rows.Next() {
+		var state LpsUserState
+		var lastRotated string
+		if err := rows.Scan(&state.ActionID, &state.Username, &lastRotated, &state.PasswordHash); err != nil {
+			return nil, err
+		}
+		if lastRotated != "" {
+			if t, parseErr := time.Parse(time.RFC3339, lastRotated); parseErr == nil {
+				state.LastRotatedAt = t
+			} else {
+				slog.Warn("failed to parse LPS last_rotated_at", "action_id", actionID, "username", state.Username, "error", parseErr)
+			}
+		}
+		users[state.Username] = &state
+	}
+	return users, rows.Err()
+}
+
+// SetLpsUserState upserts the LPS rotation state for a single user.
+func (s *Store) SetLpsUserState(actionID, username string, lastRotatedAt time.Time, passwordHash string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO lps_state (action_id, username, last_rotated_at, password_hash)
+		VALUES (?, ?, ?, ?)
+		ON CONFLICT(action_id, username) DO UPDATE SET
+			last_rotated_at = excluded.last_rotated_at,
+			password_hash = excluded.password_hash
+	`, actionID, username, lastRotatedAt.UTC().Format(time.RFC3339), passwordHash)
+	return err
+}
+
+// DeleteLpsState removes all LPS state for an action.
+func (s *Store) DeleteLpsState(actionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM lps_state WHERE action_id = ?", actionID)
 	return err
 }
