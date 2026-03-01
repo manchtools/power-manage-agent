@@ -237,33 +237,38 @@ func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredActio
 	}
 }
 
-// detectChanges compares the current output with the previous output.
+// detectChanges determines whether an execution result should be reported to
+// the server. It uses the executor's Changed flag (set accurately by every
+// action type) and optionally compares output hashes for SkipIfUnchanged actions.
 func (s *Scheduler) detectChanges(stored *store.StoredAction, result *pb.ActionResult) bool {
-	// Always consider failures as changes
+	// Always consider non-success statuses as changes
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
 		return true
 	}
 
-	// If skip_if_unchanged is not set, always report as changed
-	if stored.Action.Schedule == nil || !stored.Action.Schedule.SkipIfUnchanged {
-		return true
+	// Use the executor's changed flag — all action types set this accurately.
+	// For example, package already installed → false, SSH config matches → false.
+	if !result.Changed {
+		return false
 	}
 
-	// No previous hash means first execution
-	if stored.LastResultHash == "" {
-		return true
+	// For SkipIfUnchanged actions, also compare output hashes. This catches
+	// shell scripts (which always set Changed=true without a detection script)
+	// that produce identical output across runs.
+	if stored.Action.Schedule != nil && stored.Action.Schedule.SkipIfUnchanged {
+		if stored.LastResultHash != "" {
+			currentHash := ""
+			if result.Output != nil {
+				h := sha256.New()
+				h.Write([]byte(result.Output.Stdout))
+				h.Write([]byte(result.Output.Stderr))
+				currentHash = hex.EncodeToString(h.Sum(nil))
+			}
+			return currentHash != stored.LastResultHash
+		}
 	}
 
-	// Compare output hash
-	currentHash := ""
-	if result.Output != nil {
-		h := sha256.New()
-		h.Write([]byte(result.Output.Stdout))
-		h.Write([]byte(result.Output.Stderr))
-		currentHash = hex.EncodeToString(h.Sum(nil))
-	}
-
-	return currentHash != stored.LastResultHash
+	return true
 }
 
 // GetUnsyncedResults returns results that need to be synced to the server.
