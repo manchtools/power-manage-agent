@@ -329,7 +329,7 @@ Configuration is validated with `sshd -t` before applying and the service is rel
 - `PRESENT`: Install or update the SSHD configuration
 - `ABSENT`: Remove the configuration snippet
 
-### Local Password Store (`LPS`)
+### Local Password Solution (`LPS`)
 
 Automated password rotation with encrypted state tracking.
 
