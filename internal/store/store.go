@@ -194,7 +194,7 @@ func (s *Store) migrateLpsJsonFiles(dataDir string) {
 			continue
 		}
 
-		actionID := strings.TrimSuffix(strings.TrimPrefix(name, "lps-"), ".json")
+		actionID := strings.ToUpper(strings.TrimSuffix(strings.TrimPrefix(name, "lps-"), ".json"))
 		filePath := filepath.Join(lpsDir, name)
 
 		data, err := os.ReadFile(filePath)
