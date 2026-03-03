@@ -246,6 +246,14 @@ func (s *Scheduler) detectChanges(stored *store.StoredAction, result *pb.ActionR
 		return true
 	}
 
+	// Compliance/detection scripts must always be reported so the server
+	// can track compliance status, even when the detection result is unchanged.
+	if shell := stored.Action.GetShell(); shell != nil {
+		if shell.GetIsCompliance() || (shell.GetDetectionScript() != "" && shell.GetScript() == "") {
+			return true
+		}
+	}
+
 	// Use the executor's changed flag — all action types set this accurately.
 	// For example, package already installed → false, SSH config matches → false.
 	if !result.Changed {
