@@ -1902,15 +1902,21 @@ func (e *Executor) repairApt(ctx context.Context) {
 func (e *Executor) repairDnf(ctx context.Context) {
 	// Complete any interrupted transactions
 	// This is similar to "dnf-automatic" leaving things half-done
-	runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last")
+	if _, err := runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last"); err != nil {
+		slog.Warn("repairDnf: history redo failed", "error", err)
+	}
 
 	// Clean up any duplicate packages
-	runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates")
+	if _, err := runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates"); err != nil {
+		slog.Warn("repairDnf: remove duplicates failed", "error", err)
+	}
 
 	// Rebuild rpm database if corrupted
 	// First try to verify, if that fails, rebuild
 	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCmd(ctx, "rpm", "--rebuilddb")
+		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
+			slog.Warn("repairDnf: rpm --rebuilddb failed", "error", err)
+		}
 	}
 }
 
@@ -1921,16 +1927,24 @@ func (e *Executor) repairDnf(ctx context.Context) {
 func (e *Executor) repairPacman(ctx context.Context) {
 	// Remove stale lock file if it exists
 	// This handles "unable to lock database" errors from interrupted operations
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck")
+	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck"); err != nil {
+		slog.Warn("repairPacman: failed to remove lock file", "error", err)
+	}
 
 	// Refresh package database to fix potential corruption
 	// Using -Syy to force refresh even if recently updated
-	runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm")
+	if _, err := runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm"); err != nil {
+		slog.Warn("repairPacman: database refresh failed", "error", err)
+	}
 
 	// Reinitialize keyring if there are signature issues
 	// This fixes "signature is unknown trust" errors
-	runSudoCmd(ctx, "pacman-key", "--init")
-	runSudoCmd(ctx, "pacman-key", "--populate", "archlinux")
+	if _, err := runSudoCmd(ctx, "pacman-key", "--init"); err != nil {
+		slog.Warn("repairPacman: pacman-key init failed", "error", err)
+	}
+	if _, err := runSudoCmd(ctx, "pacman-key", "--populate", "archlinux"); err != nil {
+		slog.Warn("repairPacman: pacman-key populate failed", "error", err)
+	}
 }
 
 // repairZypper fixes common zypper/rpm issues:
@@ -1940,20 +1954,30 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
 	// Remove stale lock files
-	runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid")
+	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid"); err != nil {
+		slog.Warn("repairZypper: failed to remove lock file", "error", err)
+	}
 
 	// Clean repository metadata cache to fix stale metadata issues
-	runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all"); err != nil {
+		slog.Warn("repairZypper: clean failed", "error", err)
+	}
 
 	// Refresh repositories to get fresh metadata
-	runSudoCmd(ctx, "zypper", "--non-interactive", "refresh")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh"); err != nil {
+		slog.Warn("repairZypper: refresh failed", "error", err)
+	}
 
 	// Verify and fix dependency issues
-	runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends"); err != nil {
+		slog.Warn("repairZypper: verify failed", "error", err)
+	}
 
 	// Rebuild rpm database if corrupted
 	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCmd(ctx, "rpm", "--rebuilddb")
+		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
+			slog.Warn("repairZypper: rpm --rebuilddb failed", "error", err)
+		}
 	}
 }
 
@@ -1962,10 +1986,14 @@ func (e *Executor) repairZypper(ctx context.Context) {
 // - Broken remotes
 func (e *Executor) repairFlatpak(ctx context.Context) {
 	// Repair any broken installations (removes partial/orphaned refs)
-	runSudoCmd(ctx, "flatpak", "repair", "--system")
+	if _, err := runSudoCmd(ctx, "flatpak", "repair", "--system"); err != nil {
+		slog.Warn("repairFlatpak: repair failed", "error", err)
+	}
 
 	// Update appstream metadata to fix stale cache issues
-	runSudoCmd(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system")
+	if _, err := runSudoCmd(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system"); err != nil {
+		slog.Warn("repairFlatpak: appstream update failed", "error", err)
+	}
 }
 
 // executeUpdate performs a system-wide package update.
