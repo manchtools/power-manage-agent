@@ -348,6 +348,19 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS
 	}
 
+	// For shell/script actions, non-zero exit codes indicate failure
+	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
+		if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
+			if result.DetectionOutput != nil && result.DetectionOutput.ExitCode != 0 {
+				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+				result.Error = fmt.Sprintf("script exited with code %d", result.DetectionOutput.ExitCode)
+			} else if result.Output != nil && result.Output.ExitCode != 0 {
+				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+				result.Error = fmt.Sprintf("script exited with code %d", result.Output.ExitCode)
+			}
+		}
+	}
+
 	return result
 }
 
