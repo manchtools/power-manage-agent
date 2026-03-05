@@ -3280,23 +3280,9 @@ func sshConfigPath(actionID string) string {
 	return fmt.Sprintf("/etc/ssh/sshd_config.d/pm-ssh-%s.conf", strings.ToLower(actionID))
 }
 
-// sshEffectiveUsers returns the merged user list, handling backward compat with the deprecated username field.
+// sshEffectiveUsers returns the user list from params.
 func sshEffectiveUsers(params *pb.SshParams) []string {
-	users := params.Users
-	// Backward compat: if deprecated username is set and not already in users, include it
-	if params.Username != "" {
-		found := false
-		for _, u := range users {
-			if u == params.Username {
-				found = true
-				break
-			}
-		}
-		if !found {
-			users = append([]string{params.Username}, users...)
-		}
-	}
-	return users
+	return params.Users
 }
 
 // executeSsh configures SSH access via an sshd_config.d drop-in file with a Match Group directive.
