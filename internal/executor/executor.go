@@ -1860,24 +1860,39 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 // - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
 	// Remove stale lock files that may be left from interrupted operations
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock-frontend")
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock")
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/apt/lists/lock")
-	runSudoCmd(ctx, "rm", "-f", "/var/cache/apt/archives/lock")
+	lockFiles := []string{
+		"/var/lib/dpkg/lock-frontend",
+		"/var/lib/dpkg/lock",
+		"/var/lib/apt/lists/lock",
+		"/var/cache/apt/archives/lock",
+	}
+	for _, lf := range lockFiles {
+		if _, err := runSudoCmd(ctx, "rm", "-f", lf); err != nil {
+			slog.Warn("repairApt: failed to remove lock file", "path", lf, "error", err)
+		}
+	}
 
-	// Fix any interrupted dpkg operations
-	// This handles "dpkg was interrupted, you must manually run 'dpkg --configure -a'"
-	runSudoCmd(ctx, "dpkg", "--configure", "-a")
+	// Fix any interrupted dpkg operations.
+	// Uses env to set DEBIAN_FRONTEND=noninteractive so kernel/grub postinst
+	// scripts don't hang waiting for debconf input. The --force-confdef and
+	// --force-confold options prevent dpkg from prompting about config files.
+	if _, err := runSudoCmd(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+		"dpkg", "--configure", "-a", "--force-confdef", "--force-confold"); err != nil {
+		slog.Warn("repairApt: dpkg --configure -a failed", "error", err)
+	}
 
 	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
-	// Without this, kernel/grub postinst scripts hang waiting for debconf input.
 	apt := pkg.NewAptWithContext(ctx)
 
 	// Update package lists to get latest dependency info
-	apt.Update()
+	if _, err := apt.Update(); err != nil {
+		slog.Warn("repairApt: apt update failed", "error", err)
+	}
 
 	// Fix broken dependencies and install missing ones
-	apt.FixBroken()
+	if _, err := apt.FixBroken(); err != nil {
+		slog.Warn("repairApt: apt fix-broken failed", "error", err)
+	}
 }
 
 // repairDnf fixes common dnf/rpm issues:
