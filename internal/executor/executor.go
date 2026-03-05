@@ -16,6 +16,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
@@ -122,6 +123,7 @@ type Executor struct {
 	pkgManager   *pkg.PackageManager
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
+	mu           sync.RWMutex // protects luksKeyStore, store, actionStore
 	luksKeyStore LuksKeyStore
 	store        *store.Store
 	actionStore  ActionStore
@@ -143,17 +145,44 @@ func NewExecutor(verifier *verify.ActionVerifier) *Executor {
 
 // SetLuksKeyStore sets the LUKS key store for stream-based key operations.
 func (e *Executor) SetLuksKeyStore(ks LuksKeyStore) {
+	e.mu.Lock()
 	e.luksKeyStore = ks
+	e.mu.Unlock()
 }
 
 // SetStore sets the agent store for LUKS state persistence.
 func (e *Executor) SetStore(s *store.Store) {
+	e.mu.Lock()
 	e.store = s
+	e.mu.Unlock()
 }
 
 // SetActionStore sets the action store for LUKS conflict resolution.
 func (e *Executor) SetActionStore(as ActionStore) {
+	e.mu.Lock()
 	e.actionStore = as
+	e.mu.Unlock()
+}
+
+// getLuksKeyStore returns the LUKS key store (thread-safe).
+func (e *Executor) getLuksKeyStore() LuksKeyStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.luksKeyStore
+}
+
+// getStore returns the agent store (thread-safe).
+func (e *Executor) getStore() *store.Store {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.store
+}
+
+// getActionStore returns the action store (thread-safe).
+func (e *Executor) getActionStore() ActionStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.actionStore
 }
 
 // Execute runs an action and returns the result.
@@ -594,7 +623,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		// Check if file already exists with correct checksum
 		if params.ChecksumSha256 != "" {
 			if content, err := os.ReadFile(resolvedPath); err == nil {
-				actualHash := hex.EncodeToString(sha256.New().Sum(content)[:])
+				h := sha256.Sum256(content)
+				actualHash := hex.EncodeToString(h[:])
 				if actualHash == params.ChecksumSha256 {
 					return &pb.CommandOutput{
 						ExitCode: 0,
@@ -3345,7 +3375,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 	content := generateSshGroupConfig(groupName, params)
 
 	// Check idempotency: file content + group membership
-	fileMatches := e.configMatchesDesired(configPath, content)
+	fileMatches := e.configMatchesDesired(ctx, configPath, content)
 	membersMatch := sudoGroupMembersMatch(groupName, users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
@@ -3469,11 +3499,11 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 }
 
 // configMatchesDesired checks if a config file already has the desired content.
-func (e *Executor) configMatchesDesired(path, desiredContent string) bool {
-	if !fileExistsWithSudo(context.Background(), path) {
+func (e *Executor) configMatchesDesired(ctx context.Context, path, desiredContent string) bool {
+	if !fileExistsWithSudo(ctx, path) {
 		return false
 	}
-	existing, err := readFileWithSudo(context.Background(), path)
+	existing, err := readFileWithSudo(ctx, path)
 	if err != nil {
 		return false
 	}
@@ -3519,7 +3549,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 	content := generateSshdGlobalConfig(params)
 
 	// Check idempotency
-	if e.configMatchesDesired(configPath, content) {
+	if e.configMatchesDesired(ctx, configPath, content) {
 		output.WriteString(fmt.Sprintf("SSHD config already up to date: %s\n", configPath))
 		return &pb.CommandOutput{
 			ExitCode: 0,

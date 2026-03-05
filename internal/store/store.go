@@ -3,7 +3,9 @@
 package store
 
 import (
+	"crypto/sha256"
 	"database/sql"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -429,10 +431,13 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 	now := time.Now()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
-	// Calculate result hash for change detection
+	// Calculate result hash for change detection (must match scheduler.detectChanges format)
 	resultHash := ""
 	if result.Output != nil {
-		resultHash = fmt.Sprintf("%d:%s", result.Output.ExitCode, result.Output.Stdout)
+		h := sha256.New()
+		h.Write([]byte(result.Output.Stdout))
+		h.Write([]byte(result.Output.Stderr))
+		resultHash = hex.EncodeToString(h.Sum(nil))
 	}
 
 	// Store the result

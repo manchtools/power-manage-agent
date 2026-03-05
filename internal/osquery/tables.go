@@ -7,12 +7,16 @@ import (
 	"errors"
 	"fmt"
 	"os/exec"
+	"regexp"
 	"strings"
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
+
+// validTableName matches only safe osquery table names (alphanumeric + underscore).
+var validTableName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
 
 var (
 	// ErrNotInstalled is returned when osquery is not installed on the system.
@@ -105,6 +109,13 @@ func (c *Client) Query(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResul
 	} else if custom, ok := tableSQL[query.Table]; ok {
 		sql = custom
 	} else {
+		if !validTableName.MatchString(query.Table) {
+			return &pb.OSQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   fmt.Sprintf("invalid table name: %q", query.Table),
+			}, nil
+		}
 		sql = fmt.Sprintf("SELECT * FROM %s", query.Table)
 	}
 
@@ -151,6 +162,9 @@ func (c *Client) QuerySQL(ctx context.Context, sql string) ([]*pb.OSQueryRow, er
 func (c *Client) QueryTable(ctx context.Context, tableName string) ([]*pb.OSQueryRow, error) {
 	sql, ok := tableSQL[tableName]
 	if !ok {
+		if !validTableName.MatchString(tableName) {
+			return nil, fmt.Errorf("invalid table name: %q", tableName)
+		}
 		sql = fmt.Sprintf("SELECT * FROM %s", tableName)
 	}
 	return c.QuerySQL(ctx, sql)

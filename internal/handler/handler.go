@@ -5,6 +5,7 @@ import (
 	"context"
 	"log/slog"
 	"strconv"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
@@ -23,8 +24,9 @@ type Handler struct {
 	osquery      *osquery.Registry // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
+	mu           sync.Mutex     // protects connectedCh and connectedSet
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
-	connectedSet bool            // tracks if connectedCh has been closed
+	connectedSet bool           // tracks if connectedCh has been closed
 }
 
 // NewHandler creates a new stream handler.
@@ -57,18 +59,23 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 	h.logger.Info("received welcome from server", "server_version", welcome.ServerVersion)
 	// Signal that connection is ready for sending messages
+	h.mu.Lock()
 	if !h.connectedSet {
 		close(h.connectedCh)
 		h.connectedSet = true
 	}
+	h.mu.Unlock()
 	return nil
 }
 
 // WaitConnected waits for the connection to be ready (welcome received).
 // Returns immediately if already connected, or blocks until connected or context is cancelled.
 func (h *Handler) WaitConnected(ctx context.Context) error {
+	h.mu.Lock()
+	ch := h.connectedCh
+	h.mu.Unlock()
 	select {
-	case <-h.connectedCh:
+	case <-ch:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -78,10 +85,12 @@ func (h *Handler) WaitConnected(ctx context.Context) error {
 // ResetConnection resets the connection state for reconnection.
 // Must be called before each new connection attempt.
 func (h *Handler) ResetConnection() {
+	h.mu.Lock()
 	if h.connectedSet {
 		h.connectedCh = make(chan struct{})
 		h.connectedSet = false
 	}
+	h.mu.Unlock()
 }
 
 // OnAction handles action dispatch from the server.

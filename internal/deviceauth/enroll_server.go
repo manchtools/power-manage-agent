@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"time"
 
 	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
@@ -21,10 +22,11 @@ const (
 
 // EnrollServer runs the enrollment service over a unix socket.
 type EnrollServer struct {
-	handler    *EnrollHandler
-	socketPath string
-	logger     *slog.Logger
-	httpServer *http.Server
+	handler      *EnrollHandler
+	socketPath   string
+	logger       *slog.Logger
+	httpServer   *http.Server
+	shutdownOnce sync.Once
 }
 
 // NewEnrollServer creates a new enrollment socket server.
@@ -78,12 +80,7 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 	// Shutdown on context cancellation
 	go func() {
 		<-ctx.Done()
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if err := s.httpServer.Shutdown(shutdownCtx); err != nil {
-			s.logger.Error("enrollment server shutdown error", "error", err)
-		}
-		os.Remove(s.socketPath)
+		s.Shutdown()
 	}()
 
 	if err := s.httpServer.Serve(listener); err != nil && err != http.ErrServerClosed {
@@ -94,10 +91,12 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 
 // Shutdown gracefully stops the enrollment server.
 func (s *EnrollServer) Shutdown() {
-	if s.httpServer != nil {
-		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		s.httpServer.Shutdown(shutdownCtx)
-		os.Remove(s.socketPath)
-	}
+	s.shutdownOnce.Do(func() {
+		if s.httpServer != nil {
+			shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			s.httpServer.Shutdown(shutdownCtx)
+			os.Remove(s.socketPath)
+		}
+	})
 }
