@@ -4,6 +4,7 @@ package handler
 import (
 	"context"
 	"log/slog"
+	"os/exec"
 	"strconv"
 	"sync"
 	"time"
@@ -263,6 +264,65 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (b
 		h.logger.Info("LUKS device key revoked", "action_id", actionID)
 	}
 	return success, errMsg
+}
+
+// OnLogQuery handles a remote journalctl log query from the server.
+// Implements sdk.LogQueryHandler.
+func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQueryResult, error) {
+	h.logger.Info("received log query", "query_id", query.QueryId, "unit", query.Unit)
+
+	args := []string{"--no-pager"}
+
+	lines := query.Lines
+	if lines <= 0 {
+		lines = 100
+	}
+	if lines > 10000 {
+		lines = 10000
+	}
+	args = append(args, "-n", strconv.Itoa(int(lines)))
+
+	if query.Unit != "" {
+		args = append(args, "-u", query.Unit)
+	}
+	if query.Since != "" {
+		args = append(args, "--since", query.Since)
+	}
+	if query.Until != "" {
+		args = append(args, "--until", query.Until)
+	}
+	if query.Priority != "" {
+		args = append(args, "-p", query.Priority)
+	}
+	if query.Grep != "" {
+		args = append(args, "--grep", query.Grep)
+	}
+	if query.Kernel {
+		args = append(args, "-k")
+	}
+
+	out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
+	if err != nil {
+		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", err)
+		return &pb.LogQueryResult{
+			QueryId: query.QueryId,
+			Success: false,
+			Error:   err.Error(),
+		}, nil
+	}
+
+	logs := string(out)
+	// Truncate to 1MB if needed (keep the tail)
+	if len(logs) > 1<<20 {
+		logs = logs[len(logs)-(1<<20):]
+	}
+
+	h.logger.Info("log query completed", "query_id", query.QueryId, "bytes", len(logs))
+	return &pb.LogQueryResult{
+		QueryId: query.QueryId,
+		Success: true,
+		Logs:    logs,
+	}, nil
 }
 
 // CollectInventory queries osquery for hardware/software inventory tables.
