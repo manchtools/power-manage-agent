@@ -28,15 +28,16 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/handler"
-	"github.com/manchtools/power-manage/agent/internal/osquery"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/setup"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/agent/internal/verify"
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 	sdk "github.com/manchtools/power-manage/sdk/go"
+	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
+	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	"github.com/manchtools/power-manage/sdk/go/verify"
 
 	"golang.org/x/term"
 )
@@ -288,7 +289,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 
 	// Generate key pair and CSR locally - private key never leaves the agent
 	logger.Debug("generating key pair and CSR")
-	csrPEM, keyPEM, err := credentials.GenerateCSR(hostname)
+	csrPEM, keyPEM, err := pmcrypto.GenerateCSR(hostname)
 	if err != nil {
 		return nil, fmt.Errorf("generate CSR: %w", err)
 	}
@@ -494,7 +495,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		}
 
 		// Generate CSR from existing private key
-		csrPEM, err := credentials.GenerateCSRFromKey(hostname, creds.PrivateKey)
+		csrPEM, err := pmcrypto.GenerateCSRFromKey(hostname, creds.PrivateKey)
 		if err != nil {
 			logger.Error("cert rotation: failed to generate CSR", "error", err)
 			select {

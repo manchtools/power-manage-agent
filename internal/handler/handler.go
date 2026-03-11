@@ -13,9 +13,9 @@ import (
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	"github.com/manchtools/power-manage/agent/internal/osquery"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
 
 // Handler implements the SDK StreamHandler interface.

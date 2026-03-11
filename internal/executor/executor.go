@@ -23,99 +23,18 @@ import (
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	"github.com/manchtools/power-manage/sdk/go/verify"
 )
-
-// resolveAndValidatePath resolves symlinks in the parent directory of the given
-// path and returns the cleaned, resolved absolute path. This prevents symlink
-// traversal attacks where a symlink could redirect writes to sensitive locations.
-func resolveAndValidatePath(path string) (string, error) {
-	clean := filepath.Clean(path)
-	if !filepath.IsAbs(clean) {
-		return "", fmt.Errorf("path must be absolute: %s", path)
-	}
-
-	// Walk up from the target file to find the first existing parent directory
-	// This handles cases where intermediate directories don't exist yet
-	dir := filepath.Dir(clean)
-	var existingParent, missingTail string
-
-	for dir != "/" && dir != "." {
-		if _, err := os.Stat(dir); err == nil {
-			existingParent = dir
-			break
-		} else if os.IsNotExist(err) {
-			// Directory doesn't exist, add to missing tail and continue up
-			missingTail = filepath.Join(filepath.Base(dir), missingTail)
-			dir = filepath.Dir(dir)
-		} else {
-			// Permission denied or other error - continue up the tree
-			missingTail = filepath.Join(filepath.Base(dir), missingTail)
-			dir = filepath.Dir(dir)
-		}
-	}
-
-	if existingParent == "" {
-		existingParent = "/"
-	}
-
-	// Resolve symlinks only in the existing portion of the path
-	resolved, err := filepath.EvalSymlinks(existingParent)
-	if err != nil {
-		// If we still can't resolve the root parent, just use clean path
-		return clean, nil
-	}
-
-	// Rebuild the full path with resolved parent + missing components + filename
-	if missingTail != "" {
-		return filepath.Join(resolved, missingTail, filepath.Base(clean)), nil
-	}
-	return filepath.Join(resolved, filepath.Base(clean)), nil
-}
 
 // validRepoName restricts repository names to safe characters only.
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-
-// validEnvVarName matches safe environment variable names (letters, digits, underscore).
-var validEnvVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// blockedEnvVars are environment variable names that must never be overridden
-// because they can hijack process execution (library injection, path manipulation).
-var blockedEnvVars = map[string]bool{
-	"LD_PRELOAD":      true,
-	"LD_LIBRARY_PATH": true,
-	"LD_AUDIT":        true,
-	"LD_DEBUG":        true,
-	"LD_PROFILE":      true,
-	"PATH":            true,
-	"IFS":             true,
-	"ENV":             true,
-	"BASH_ENV":        true,
-	"CDPATH":          true,
-	"GLOBIGNORE":      true,
-	"BASH_FUNC_":      true,
-}
-
-// isAllowedEnvVar returns true if the environment variable name is safe to set.
-func isAllowedEnvVar(name string) bool {
-	if !validEnvVarName.MatchString(name) {
-		return false
-	}
-	upper := strings.ToUpper(name)
-	if blockedEnvVars[upper] {
-		return false
-	}
-	// Block LD_* and BASH_FUNC_* prefixes
-	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "BASH_FUNC_") {
-		return false
-	}
-	return true
-}
 
 // Executor handles the execution of actions.
 type Executor struct {
@@ -613,7 +532,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	fullPath := filepath.Join(installPath, filename)
 
 	// Resolve symlinks to prevent traversal attacks
-	resolvedPath, err := resolveAndValidatePath(fullPath)
+	resolvedPath, err := sysfs.ResolveAndValidatePath(fullPath)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}
@@ -969,7 +888,7 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 	if len(params.Environment) > 0 {
 		envVars = os.Environ()
 		for k, v := range params.Environment {
-			if !isAllowedEnvVar(k) {
+			if !sysexec.IsAllowedEnvVar(k) {
 				return nil, fmt.Errorf("environment variable %q is not allowed", k)
 			}
 			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
@@ -1200,7 +1119,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 	}
 
 	// Resolve symlinks to prevent traversal attacks
-	resolvedPath, err := resolveAndValidatePath(params.Path)
+	resolvedPath, err := sysfs.ResolveAndValidatePath(params.Path)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}
@@ -1455,7 +1374,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 	}
 
 	// Resolve symlinks to prevent traversal attacks
-	cleanPath, err := resolveAndValidatePath(params.Path)
+	cleanPath, err := sysfs.ResolveAndValidatePath(params.Path)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}

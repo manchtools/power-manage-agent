@@ -15,6 +15,7 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	sdk "github.com/manchtools/power-manage/sdk/go"
+	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 )
 
 // EnrollHandler implements the Enroll and GetEnrollmentStatus RPCs
@@ -93,7 +94,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 
 	// Generate key pair and CSR locally — private key never leaves the agent
 	h.logger.Debug("generating key pair and CSR")
-	csrPEM, keyPEM, err := credentials.GenerateCSR(h.hostname)
+	csrPEM, keyPEM, err := pmcrypto.GenerateCSR(h.hostname)
 	if err != nil {
 		h.logger.Error("failed to generate CSR", "error", err)
 		return connect.NewResponse(&pm.EnrollResponse{

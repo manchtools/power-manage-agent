@@ -6,16 +6,11 @@ package credentials
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"log/slog"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -265,80 +260,4 @@ func decrypt(key, ciphertext []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
-}
-
-// GenerateCSR creates a new ECDSA P-256 key pair and returns the CSR (PEM)
-// and private key (PEM). The private key never leaves the agent.
-func GenerateCSR(hostname string) (csrPEM, keyPEM []byte, err error) {
-	// Generate ECDSA P-256 key pair
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate key pair: %w", err)
-	}
-
-	// Create CSR template
-	template := &x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName: hostname,
-		},
-		DNSNames: []string{hostname},
-	}
-
-	// Generate CSR
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create CSR: %w", err)
-	}
-
-	// Encode CSR to PEM
-	csrPEM = pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE REQUEST",
-		Bytes: csrDER,
-	})
-
-	// Encode private key to PEM
-	keyDER, err := x509.MarshalECPrivateKey(privateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal private key: %w", err)
-	}
-
-	keyPEM = pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: keyDER,
-	})
-
-	return csrPEM, keyPEM, nil
-}
-
-// GenerateCSRFromKey creates a CSR using an existing private key (PEM-encoded).
-// This is used for certificate renewal where the key pair is reused.
-func GenerateCSRFromKey(hostname string, keyPEM []byte) (csrPEM []byte, err error) {
-	keyBlock, _ := pem.Decode(keyPEM)
-	if keyBlock == nil {
-		return nil, fmt.Errorf("failed to decode key PEM")
-	}
-
-	privateKey, err := x509.ParseECPrivateKey(keyBlock.Bytes)
-	if err != nil {
-		return nil, fmt.Errorf("parse private key: %w", err)
-	}
-
-	template := &x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName: hostname,
-		},
-		DNSNames: []string{hostname},
-	}
-
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
-	if err != nil {
-		return nil, fmt.Errorf("create CSR: %w", err)
-	}
-
-	csrPEM = pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE REQUEST",
-		Bytes: csrDER,
-	})
-
-	return csrPEM, nil
 }
