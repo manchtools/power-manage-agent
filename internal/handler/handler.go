@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os/exec"
 	"strconv"
+	"strings"
 	"sync"
 	"time"
 
@@ -292,9 +293,28 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		args = append(args, "--until", query.Until)
 	}
 	if query.Priority != "" {
-		args = append(args, "-p", query.Priority)
+		// Validate priority against known values
+		switch strings.ToLower(query.Priority) {
+		case "0", "1", "2", "3", "4", "5", "6", "7",
+			"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug":
+			args = append(args, "-p", query.Priority)
+		default:
+			return &pb.LogQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   "invalid priority value",
+			}, nil
+		}
 	}
 	if query.Grep != "" {
+		// Limit grep pattern length to prevent ReDoS via crafted regex
+		if len(query.Grep) > 256 {
+			return &pb.LogQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   "grep pattern too long (max 256 characters)",
+			}, nil
+		}
 		args = append(args, "--grep", query.Grep)
 	}
 	if query.Kernel {

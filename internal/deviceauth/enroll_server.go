@@ -71,8 +71,12 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 	mux.Handle(path, handler)
 
 	s.httpServer = &http.Server{
-		Handler:     mux,
-		BaseContext: func(net.Listener) context.Context { return ctx },
+		Handler:           mux,
+		BaseContext:        func(net.Listener) context.Context { return ctx },
+		ReadHeaderTimeout: 10 * time.Second,
+		ReadTimeout:       30 * time.Second,
+		WriteTimeout:      30 * time.Second,
+		MaxHeaderBytes:    1 << 20, // 1 MB
 	}
 
 	s.logger.Info("enrollment service listening", "socket", s.socketPath)
