@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -22,7 +21,6 @@ import (
 	"time"
 
 	"connectrpc.com/connect"
-	"golang.org/x/net/http2"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
@@ -255,11 +253,6 @@ func main() {
 
 	// Create handler with scheduler integration
 	h := handler.NewHandler(logger, exec, sched, syncTrigger)
-
-	// Start local device auth socket server (for PAM/NSS)
-	if creds.ControlAddr != "" {
-		startDeviceAuthServer(ctx, creds, logger)
-	}
 
 	// Start certificate rotation goroutine
 	if creds.ControlAddr != "" {
@@ -550,54 +543,6 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		)
 		// Loop to schedule next renewal based on the new cert
 	}
-}
-
-// startDeviceAuthServer starts the local device auth socket server in a
-// background goroutine. The server exposes the DeviceAuthService over a unix
-// socket so PAM/NSS modules can authenticate users via the PM Control Server.
-func startDeviceAuthServer(ctx context.Context, creds *credentials.Credentials, logger *slog.Logger) {
-	// Build an HTTP client that can talk to the Control Server.
-	// Use mTLS if the agent has certificates, plain HTTP for dev (http://).
-	var httpClient *http.Client
-	if strings.HasPrefix(creds.ControlAddr, "http://") {
-		httpClient = &http.Client{
-			Transport: &http2.Transport{
-				AllowHTTP: true,
-				DialTLSContext: func(ctx context.Context, network, addr string, _ *tls.Config) (net.Conn, error) {
-					return (&net.Dialer{}).DialContext(ctx, network, addr)
-				},
-			},
-		}
-	} else {
-		cert, err := tls.X509KeyPair(creds.Certificate, creds.PrivateKey)
-		if err != nil {
-			logger.Error("device auth: failed to parse mTLS certs", "error", err)
-			return
-		}
-		caPool, err := x509.SystemCertPool()
-		if err != nil {
-			caPool = x509.NewCertPool()
-		}
-		caPool.AppendCertsFromPEM(creds.CACert)
-		transport := &http.Transport{
-			TLSClientConfig: &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				RootCAs:      caPool,
-				MinVersion:   tls.VersionTLS13,
-			},
-		}
-		http2.ConfigureTransport(transport)
-		httpClient = &http.Client{Transport: transport}
-	}
-
-	handler := deviceauth.NewHandler(creds.DeviceID, creds.ControlAddr, httpClient, logger)
-	server := deviceauth.NewServer(handler, deviceauth.DefaultSocketPath, logger)
-
-	go func() {
-		if err := server.Start(ctx); err != nil {
-			logger.Error("device auth server failed", "error", err)
-		}
-	}()
 }
 
 // periodicSync runs a loop that periodically syncs actions from the server.
