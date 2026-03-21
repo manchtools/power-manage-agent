@@ -33,6 +33,7 @@ import (
 	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 	sdk "github.com/manchtools/power-manage/sdk/go"
 	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
+	"github.com/manchtools/power-manage/sdk/go/logging"
 	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 	"github.com/manchtools/power-manage/sdk/go/verify"
@@ -124,7 +125,7 @@ func main() {
 	cfg := parseFlags()
 
 	// Setup logger
-	logger := setupLogger(cfg.LogLevel, cfg.LogFormat)
+	logger := logging.SetupLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
@@ -872,35 +873,6 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	result.ServerURL = fmt.Sprintf("%s://%s", scheme, parsed.Host)
 
 	return result, nil
-}
-
-func setupLogger(level, format string) *slog.Logger {
-	var logLevel slog.Level
-	switch level {
-	case "debug":
-		logLevel = slog.LevelDebug
-	case "info":
-		logLevel = slog.LevelInfo
-	case "warn":
-		logLevel = slog.LevelWarn
-	case "error":
-		logLevel = slog.LevelError
-	default:
-		logLevel = slog.LevelInfo
-	}
-
-	opts := &slog.HandlerOptions{
-		Level: logLevel,
-	}
-
-	var slogHandler slog.Handler
-	if format == "json" {
-		slogHandler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		slogHandler = slog.NewTextHandler(os.Stdout, opts)
-	}
-
-	return slog.New(slogHandler)
 }
 
 // runSetup installs the agent's sudoers configuration.
