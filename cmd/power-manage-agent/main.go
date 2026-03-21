@@ -1193,7 +1193,10 @@ func runLuksSetPassphrase(token, dataDir string) {
 	}
 	defer agentStore.Close()
 
-	recentHashes, _ := agentStore.GetLuksPassphraseHashes(result.ActionID)
+	recentHashes, err := agentStore.GetLuksPassphraseHashes(result.ActionID)
+	if err != nil {
+		slog.Warn("failed to get LUKS passphrase hashes", "action_id", result.ActionID, "error", err)
+	}
 
 	// Interactive passphrase prompt (up to 3 attempts)
 	const maxAttempts = 3
@@ -1259,7 +1262,10 @@ func runLuksSetPassphrase(token, dataDir string) {
 	}
 	defer client.Close()
 
-	hostname, _ := os.Hostname()
+	hostname, err := os.Hostname()
+	if err != nil {
+		slog.Warn("failed to get hostname", "error", err)
+	}
 	if err := client.SendHello(ctx, hostname, version); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to send hello: %v\n", err)
 		os.Exit(1)
