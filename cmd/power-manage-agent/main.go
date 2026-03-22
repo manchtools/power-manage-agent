@@ -771,7 +771,9 @@ func parseFlags() *Config {
 	var uri string
 	flag.StringVar(&uri, "uri", "", "Registration URI (power-manage://server:port?token=xxx)")
 	flag.StringVar(&cfg.Token, "token", "", "Registration token for first-time setup")
+	flag.StringVar(&cfg.Token, "t", "", "Registration token (shorthand)")
 	flag.StringVar(&cfg.ServerURL, "server", "", "Control server URL for registration")
+	flag.StringVar(&cfg.ServerURL, "s", "", "Control server URL (shorthand)")
 	flag.BoolVar(&cfg.SkipVerify, "skip-verify", false, "Skip TLS verification (development only)")
 	flag.StringVar(&cfg.DataDir, "data-dir", credentials.DefaultDataDir, "Data directory for credentials")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
