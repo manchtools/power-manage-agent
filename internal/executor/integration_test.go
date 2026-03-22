@@ -440,9 +440,11 @@ func TestIntegration_Shell(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "exit 42"}}
 		result := e.Execute(ctx, action)
-		// Shell uses runCmdStreaming which does not return error for non-zero exits.
-		// The exit code is captured in the output; the action status is SUCCESS.
-		assertSuccess(t, result)
+		// Non-zero exit codes are treated as failures for shell actions.
+		// The exit code is captured in the output.
+		if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
+			t.Errorf("expected FAILED, got %s", result.Status)
+		}
 		if result.Output == nil || result.Output.ExitCode != 42 {
 			t.Errorf("expected exit code 42, got %d", result.Output.ExitCode)
 		}
