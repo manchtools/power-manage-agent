@@ -33,28 +33,34 @@ type Handler struct {
 
 // NewHandler creates a new stream handler.
 func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.Scheduler, syncTrigger chan<- struct{}) *Handler {
-	h := &Handler{
+	return &Handler{
 		logger:      logger,
 		executor:    exec,
 		scheduler:   sched,
 		syncTrigger: syncTrigger,
 		connectedCh: make(chan struct{}),
 	}
+}
 
-	// Initialize osquery if installed (optional)
-	registry, err := osquery.NewRegistry()
-	if err != nil {
-		if err == osquery.ErrNotInstalled {
-			logger.Info("osquery not installed, query functionality disabled")
-		} else {
-			logger.Warn("failed to initialize osquery", "error", err)
-		}
-	} else {
-		h.osquery = registry
-		logger.Info("osquery initialized")
+// getOsquery returns the osquery registry, initializing it lazily on first use.
+// If osquery was not found previously, it re-checks so that osquery installed
+// after the agent started is detected without requiring a restart.
+func (h *Handler) getOsquery() *osquery.Registry {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+
+	if h.osquery != nil {
+		return h.osquery
 	}
 
-	return h
+	registry, err := osquery.NewRegistry()
+	if err != nil {
+		return nil
+	}
+
+	h.osquery = registry
+	h.logger.Info("osquery detected and initialized")
+	return registry
 }
 
 // OnWelcome handles the welcome message from the server.
@@ -195,8 +201,9 @@ func (h *Handler) OnActionRemove(ctx context.Context, actionID string) error {
 func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error) {
 	h.logger.Info("received query", "query_id", query.QueryId, "table", query.Table)
 
-	// Check if osquery is available
-	if h.osquery == nil {
+	// Check if osquery is available (lazy init — detects installs without restart)
+	oq := h.getOsquery()
+	if oq == nil {
 		h.logger.Warn("osquery not available", "query_id", query.QueryId)
 		return &pb.OSQueryResult{
 			QueryId: query.QueryId,
@@ -205,7 +212,7 @@ func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryRe
 		}, nil
 	}
 
-	result, err := h.osquery.Query(query)
+	result, err := oq.Query(query)
 	if err != nil {
 		h.logger.Error("query execution error", "query_id", query.QueryId, "error", err)
 		return &pb.OSQueryResult{
@@ -230,19 +237,20 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 	hb := &pb.Heartbeat{}
 
 	// Skip metrics collection if osquery is not available
-	if h.osquery == nil {
+	oq := h.getOsquery()
+	if oq == nil {
 		return hb
 	}
 
 	// Get uptime
-	if result, _ := h.osquery.Query(&pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(&pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
 		if sec, err := strconv.ParseInt(result.Rows[0].Data["total_seconds"], 10, 64); err == nil {
 			hb.Uptime = durationpb.New(time.Duration(sec) * time.Second)
 		}
 	}
 
 	// Get memory usage
-	if result, _ := h.osquery.Query(&pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(&pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
 		data := result.Rows[0].Data
 		total, _ := strconv.ParseInt(data["memory_total"], 10, 64)
 		free, _ := strconv.ParseInt(data["memory_free"], 10, 64)
@@ -348,7 +356,8 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 // CollectInventory queries osquery for hardware/software inventory tables.
 // Returns nil if osquery is not installed.
 func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
-	if h.osquery == nil {
+	oq := h.getOsquery()
+	if oq == nil {
 		return nil
 	}
 
@@ -375,7 +384,7 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 	var tables []*pb.InventoryTable
 
 	for _, tableName := range coreTables {
-		rows, err := h.osquery.QueryTable(tableName)
+		rows, err := oq.QueryTable(tableName)
 		if err != nil {
 			h.logger.Debug("inventory table unavailable", "table", tableName, "error", err)
 			continue
@@ -387,7 +396,7 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 	}
 
 	for _, tableName := range packageTables {
-		rows, err := h.osquery.QueryTable(tableName)
+		rows, err := oq.QueryTable(tableName)
 		if err != nil {
 			continue // expected to fail on non-matching distros
 		}
