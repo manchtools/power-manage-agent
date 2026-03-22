@@ -3,10 +3,15 @@ package main
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"flag"
 	"fmt"
 	"log/slog"
+	"math/rand/v2"
+	"net"
+	"net/http"
 	"net/url"
 	"os"
 	"os/signal"
@@ -15,17 +20,23 @@ import (
 	"text/tabwriter"
 	"time"
 
+	"connectrpc.com/connect"
+
 	"github.com/manchtools/power-manage/agent/internal/credentials"
+	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/handler"
-	"github.com/manchtools/power-manage/agent/internal/osquery"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/setup"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/agent/internal/verify"
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 	sdk "github.com/manchtools/power-manage/sdk/go"
+	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
+	"github.com/manchtools/power-manage/sdk/go/logging"
 	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
+	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	"github.com/manchtools/power-manage/sdk/go/verify"
 
 	"golang.org/x/term"
 )
@@ -38,10 +49,17 @@ const (
 	defaultSyncInterval      = 30 * time.Minute
 
 	// Exponential backoff constants for reconnection
-	initialBackoff = 1 * time.Second
-	maxBackoff     = 5 * time.Minute
-	backoffFactor  = 2.0
+	minInitialBackoff = 5 * time.Second
+	maxInitialBackoff = 10 * time.Second
+	maxBackoff        = 5 * time.Minute
+	backoffFactor     = 2.0
 )
+
+// randomBackoff returns a random duration between minInitialBackoff and maxInitialBackoff.
+func randomBackoff() time.Duration {
+	jitter := rand.Int64N(int64(maxInitialBackoff - minInitialBackoff))
+	return minInitialBackoff + time.Duration(jitter)
+}
 
 // Config holds the agent configuration.
 type Config struct {
@@ -98,13 +116,16 @@ func main() {
 		case "luks":
 			runLuks(os.Args[2:])
 			return
+		case "enroll":
+			runEnroll(os.Args[2:])
+			return
 		}
 	}
 
 	cfg := parseFlags()
 
 	// Setup logger
-	logger := setupLogger(cfg.LogLevel, cfg.LogFormat)
+	logger := logging.SetupLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
@@ -150,14 +171,8 @@ func main() {
 		if cfg.Token != "" {
 			logger.Debug("ignoring registration token - agent is already registered")
 		}
-	} else {
-		// Need to register
-		if cfg.Token == "" {
-			logger.Error("no stored credentials found, registration token required")
-			logger.Info("usage: power-manage-agent -token=<token> -server=<url>")
-			logger.Info("   or: power-manage-agent 'power-manage://server:port?token=xxx'")
-			os.Exit(1)
-		}
+	} else if cfg.Token != "" {
+		// Direct registration (backwards compatible, works with sudo)
 		if cfg.ServerURL == "" {
 			logger.Error("server URL required for registration")
 			os.Exit(1)
@@ -175,6 +190,31 @@ func main() {
 			os.Exit(1)
 		}
 		logger.Info("credentials saved", "data_dir", credStore.DataDir())
+	} else {
+		// No credentials and no token — start enrollment socket and wait
+		logger.Info("agent not enrolled, waiting for enrollment via socket",
+			"socket", deviceauth.EnrollSocketPath)
+
+		enrollCh := make(chan *credentials.Credentials, 1)
+		enrollHandler := deviceauth.NewEnrollHandler(hostname, version, credStore, logger, func(c *credentials.Credentials) {
+			enrollCh <- c
+		})
+		enrollServer := deviceauth.NewEnrollServer(enrollHandler, deviceauth.EnrollSocketPath, logger)
+
+		go func() {
+			if err := enrollServer.Start(ctx); err != nil {
+				logger.Error("enrollment server failed", "error", err)
+			}
+		}()
+
+		select {
+		case creds = <-enrollCh:
+			logger.Info("enrollment complete", "device_id", creds.DeviceID)
+			enrollServer.Shutdown()
+		case <-ctx.Done():
+			logger.Info("agent stopped while waiting for enrollment")
+			return
+		}
 	}
 
 	// Initialize the action store for offline persistence
@@ -215,6 +255,11 @@ func main() {
 	// Create handler with scheduler integration
 	h := handler.NewHandler(logger, exec, sched, syncTrigger)
 
+	// Start certificate rotation goroutine
+	if creds.ControlAddr != "" {
+		go startCertRotation(ctx, credStore, hostname, logger)
+	}
+
 	// Run the agent
 	logger.Info("starting agent",
 		"gateway", creds.GatewayAddr,
@@ -238,7 +283,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 
 	// Generate key pair and CSR locally - private key never leaves the agent
 	logger.Debug("generating key pair and CSR")
-	csrPEM, keyPEM, err := credentials.GenerateCSR(hostname)
+	csrPEM, keyPEM, err := pmcrypto.GenerateCSR(hostname)
 	if err != nil {
 		return nil, fmt.Errorf("generate CSR: %w", err)
 	}
@@ -272,6 +317,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 		Certificate: result.Certificate,
 		PrivateKey:  keyPEM, // Private key generated locally, never sent to server
 		GatewayAddr: result.GatewayURL,
+		ControlAddr: cfg.ServerURL, // Control Server URL for device auth proxy
 	}, nil
 }
 
@@ -286,7 +332,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 	firstSync := true
 
 	// Exponential backoff for reconnection
-	currentBackoff := initialBackoff
+	currentBackoff := randomBackoff()
 
 	for {
 		// Reset handler connection state for new connection
@@ -373,7 +419,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 		// Reset backoff if the connection was stable (lasted longer than the backoff interval)
 		if time.Since(connStart) > currentBackoff {
-			currentBackoff = initialBackoff
+			currentBackoff = randomBackoff()
 		}
 
 		logger.Error("connection lost, continuing with scheduled actions",
@@ -394,6 +440,109 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		if currentBackoff > maxBackoff {
 			currentBackoff = maxBackoff
 		}
+	}
+}
+
+// startCertRotation runs a background loop that renews the agent's mTLS
+// certificate before it expires. Renewal is attempted at 80% of the cert's
+// lifetime. On failure it retries every hour.
+func startCertRotation(ctx context.Context, credStore *credentials.Store, hostname string, logger *slog.Logger) {
+	const retryInterval = 1 * time.Hour
+
+	for {
+		creds, err := credStore.Load()
+		if err != nil {
+			logger.Error("cert rotation: failed to load credentials", "error", err)
+			return
+		}
+
+		// Parse current certificate to determine expiry
+		block, _ := pem.Decode(creds.Certificate)
+		if block == nil {
+			logger.Error("cert rotation: failed to decode certificate PEM")
+			return
+		}
+		cert, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
+			logger.Error("cert rotation: failed to parse certificate", "error", err)
+			return
+		}
+
+		// Calculate renewal time at 80% of lifetime
+		lifetime := cert.NotAfter.Sub(cert.NotBefore)
+		renewAt := cert.NotBefore.Add(time.Duration(float64(lifetime) * 0.8))
+		waitDuration := time.Until(renewAt)
+		if waitDuration <= 0 {
+			waitDuration = 1 * time.Minute
+		}
+
+		logger.Info("cert rotation: scheduled",
+			"not_after", cert.NotAfter,
+			"renew_at", renewAt,
+			"wait", waitDuration.String(),
+		)
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(waitDuration):
+		}
+
+		// Generate CSR from existing private key
+		csrPEM, err := pmcrypto.GenerateCSRFromKey(hostname, creds.PrivateKey)
+		if err != nil {
+			logger.Error("cert rotation: failed to generate CSR", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Build mTLS client using current (still valid) certificate
+		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+		if err != nil {
+			logger.Error("cert rotation: failed to configure mTLS", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Call RenewCertificate on the control server
+		result, err := sdk.RenewCertificate(ctx, creds.ControlAddr, csrPEM, creds.Certificate, mtlsOpt)
+		if err != nil {
+			logger.Error("cert rotation: renewal failed, will retry", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		// Update credentials on disk with new certificate (and CA cert if rotated)
+		creds.Certificate = result.Certificate
+		if len(result.CACert) > 0 {
+			creds.CACert = result.CACert
+		}
+		if err := credStore.Save(creds); err != nil {
+			logger.Error("cert rotation: failed to save new certificate", "error", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
+		}
+
+		logger.Info("cert rotation: certificate renewed successfully",
+			"not_after", result.NotAfter,
+		)
+		// Loop to schedule next renewal based on the new cert
 	}
 }
 
@@ -646,6 +795,11 @@ func parseFlags() *Config {
 	// Format: power-manage://server:port?token=xxx[&skip-verify=true]
 	if uri != "" {
 		if parsed, err := parseRegistrationURI(uri); err == nil {
+			// Try socket enrollment first (no sudo needed)
+			if trySocketEnroll(parsed) {
+				os.Exit(0)
+			}
+			// Fallback to direct registration (sudo/service mode)
 			cfg.ServerURL = parsed.ServerURL
 			cfg.Token = parsed.Token
 			cfg.SkipVerify = parsed.SkipVerify
@@ -719,35 +873,6 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	result.ServerURL = fmt.Sprintf("%s://%s", scheme, parsed.Host)
 
 	return result, nil
-}
-
-func setupLogger(level, format string) *slog.Logger {
-	var logLevel slog.Level
-	switch level {
-	case "debug":
-		logLevel = slog.LevelDebug
-	case "info":
-		logLevel = slog.LevelInfo
-	case "warn":
-		logLevel = slog.LevelWarn
-	case "error":
-		logLevel = slog.LevelError
-	default:
-		logLevel = slog.LevelInfo
-	}
-
-	opts := &slog.HandlerOptions{
-		Level: logLevel,
-	}
-
-	var slogHandler slog.Handler
-	if format == "json" {
-		slogHandler = slog.NewJSONHandler(os.Stdout, opts)
-	} else {
-		slogHandler = slog.NewTextHandler(os.Stdout, opts)
-	}
-
-	return slog.New(slogHandler)
 }
 
 // runSetup installs the agent's sudoers configuration.
@@ -1068,7 +1193,10 @@ func runLuksSetPassphrase(token, dataDir string) {
 	}
 	defer agentStore.Close()
 
-	recentHashes, _ := agentStore.GetLuksPassphraseHashes(result.ActionID)
+	recentHashes, err := agentStore.GetLuksPassphraseHashes(result.ActionID)
+	if err != nil {
+		slog.Warn("failed to get LUKS passphrase hashes", "action_id", result.ActionID, "error", err)
+	}
 
 	// Interactive passphrase prompt (up to 3 attempts)
 	const maxAttempts = 3
@@ -1134,7 +1262,10 @@ func runLuksSetPassphrase(token, dataDir string) {
 	}
 	defer client.Close()
 
-	hostname, _ := os.Hostname()
+	hostname, err := os.Hostname()
+	if err != nil {
+		slog.Warn("failed to get hostname", "error", err)
+	}
 	if err := client.SendHello(ctx, hostname, version); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to send hello: %v\n", err)
 		os.Exit(1)
@@ -1184,4 +1315,123 @@ func runLuksSetPassphrase(token, dataDir string) {
 	agentStore.AddLuksPassphraseHash(result.ActionID, sysluks.HashPassphrase(passphrase))
 
 	fmt.Println("LUKS passphrase set successfully.")
+}
+
+// runEnroll handles the "enroll" subcommand.
+// Usage: power-manage-agent enroll -server=URL -token=TOKEN
+//
+//	power-manage-agent enroll 'power-manage://server:port?token=xxx'
+func runEnroll(args []string) {
+	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
+	token := fs.String("token", "", "Registration token")
+	server := fs.String("server", "", "Control server URL")
+	skipVerify := fs.Bool("skip-verify", false, "Skip TLS verification")
+	socketPath := fs.String("socket", deviceauth.EnrollSocketPath, "Agent enrollment socket")
+	fs.Parse(args)
+
+	// Accept power-manage:// URI as positional arg
+	if fs.NArg() > 0 {
+		arg := fs.Arg(0)
+		if strings.HasPrefix(arg, "power-manage://") {
+			if parsed, err := parseRegistrationURI(arg); err == nil {
+				*server = parsed.ServerURL
+				*token = parsed.Token
+				*skipVerify = parsed.SkipVerify
+			} else {
+				fmt.Fprintf(os.Stderr, "error: %v\n", err)
+				os.Exit(1)
+			}
+		}
+	}
+
+	if *token == "" || *server == "" {
+		fmt.Fprintln(os.Stderr, "error: -server and -token are required")
+		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token=TOKEN")
+		fmt.Fprintln(os.Stderr, "   or: power-manage-agent enroll 'power-manage://server:port?token=xxx'")
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	// Connect to the enrollment socket
+	httpClient := unixSocketHTTPClient(*socketPath)
+	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+
+	// Check enrollment status first
+	status, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: cannot connect to agent enrollment socket at %s\n", *socketPath)
+		fmt.Fprintln(os.Stderr, "Is the agent service running? Check: systemctl status power-manage-agent")
+		os.Exit(1)
+	}
+
+	if status.Msg.Enrolled {
+		fmt.Printf("Agent is already enrolled (device ID: %s)\n", status.Msg.DeviceId)
+		return
+	}
+
+	// Enroll via socket
+	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
+		ServerUrl:  *server,
+		Token:      *token,
+		SkipVerify: *skipVerify,
+	}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: enrollment failed: %v\n", err)
+		os.Exit(1)
+	}
+
+	if !resp.Msg.Success {
+		fmt.Fprintf(os.Stderr, "error: enrollment failed: %s\n", resp.Msg.Error)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Enrolled successfully. Device ID: %s\n", resp.Msg.DeviceId)
+}
+
+// trySocketEnroll attempts to enroll via the agent's enrollment socket.
+// Returns true if enrollment succeeded (caller should exit).
+func trySocketEnroll(parsed *registrationURI) bool {
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	httpClient := unixSocketHTTPClient(deviceauth.EnrollSocketPath)
+	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+
+	// Check if the enrollment socket is available
+	_, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))
+	if err != nil {
+		// Socket not available — fall back to direct registration
+		return false
+	}
+
+	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
+		ServerUrl:  parsed.ServerURL,
+		Token:      parsed.Token,
+		SkipVerify: parsed.SkipVerify,
+	}))
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %v\n", err)
+		return false
+	}
+
+	if !resp.Msg.Success {
+		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %s\n", resp.Msg.Error)
+		return false
+	}
+
+	fmt.Printf("Enrolled successfully via agent socket. Device ID: %s\n", resp.Msg.DeviceId)
+	return true
+}
+
+// unixSocketHTTPClient returns an HTTP client that dials the given unix socket.
+func unixSocketHTTPClient(socketPath string) *http.Client {
+	return &http.Client{
+		Transport: &http.Transport{
+			DialContext: func(ctx context.Context, _, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, "unix", socketPath)
+			},
+		},
+	}
 }

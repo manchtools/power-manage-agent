@@ -6,8 +6,12 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"regexp"
 	"text/template"
 )
+
+// validUsername matches safe Unix usernames (lowercase, digits, underscore, dash).
+var validUsername = regexp.MustCompile(`^[a-z_][a-z0-9_-]*$`)
 
 //go:embed sudoers.tmpl
 var sudoersTmpl string
@@ -27,6 +31,9 @@ func InstallSudoers(user string) error {
 
 	if user == "" {
 		return fmt.Errorf("user name is required")
+	}
+	if !validUsername.MatchString(user) {
+		return fmt.Errorf("invalid user name: must match [a-z_][a-z0-9_-]*")
 	}
 
 	tmpl, err := template.New("sudoers").Parse(sudoersTmpl)

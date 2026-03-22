@@ -6,15 +6,11 @@ package credentials
 import (
 	"crypto/aes"
 	"crypto/cipher"
-	"crypto/ecdsa"
-	"crypto/elliptic"
 	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
 	"encoding/json"
-	"encoding/pem"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 
@@ -45,6 +41,7 @@ type Credentials struct {
 	Certificate []byte `json:"certificate"`
 	PrivateKey  []byte `json:"private_key"`
 	GatewayAddr string `json:"gateway_addr"`
+	ControlAddr string `json:"control_addr,omitempty"` // Control Server URL for device auth proxy
 }
 
 // Store manages encrypted credential storage.
@@ -148,8 +145,12 @@ func (s *Store) Delete() error {
 	credPath := filepath.Join(s.dataDir, credentialsFile)
 	saltPath := filepath.Join(s.dataDir, saltFile)
 
-	os.Remove(credPath)
-	os.Remove(saltPath)
+	if err := os.Remove(credPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove credentials file", "path", credPath, "error", err)
+	}
+	if err := os.Remove(saltPath); err != nil && !os.IsNotExist(err) {
+		slog.Warn("failed to remove salt file", "path", saltPath, "error", err)
+	}
 
 	return nil
 }
@@ -259,47 +260,4 @@ func decrypt(key, ciphertext []byte) ([]byte, error) {
 	}
 
 	return plaintext, nil
-}
-
-// GenerateCSR creates a new ECDSA P-256 key pair and returns the CSR (PEM)
-// and private key (PEM). The private key never leaves the agent.
-func GenerateCSR(hostname string) (csrPEM, keyPEM []byte, err error) {
-	// Generate ECDSA P-256 key pair
-	privateKey, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		return nil, nil, fmt.Errorf("generate key pair: %w", err)
-	}
-
-	// Create CSR template
-	template := &x509.CertificateRequest{
-		Subject: pkix.Name{
-			CommonName: hostname,
-		},
-		DNSNames: []string{hostname},
-	}
-
-	// Generate CSR
-	csrDER, err := x509.CreateCertificateRequest(rand.Reader, template, privateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("create CSR: %w", err)
-	}
-
-	// Encode CSR to PEM
-	csrPEM = pem.EncodeToMemory(&pem.Block{
-		Type:  "CERTIFICATE REQUEST",
-		Bytes: csrDER,
-	})
-
-	// Encode private key to PEM
-	keyDER, err := x509.MarshalECPrivateKey(privateKey)
-	if err != nil {
-		return nil, nil, fmt.Errorf("marshal private key: %w", err)
-	}
-
-	keyPEM = pem.EncodeToMemory(&pem.Block{
-		Type:  "EC PRIVATE KEY",
-		Bytes: keyDER,
-	})
-
-	return csrPEM, keyPEM, nil
 }

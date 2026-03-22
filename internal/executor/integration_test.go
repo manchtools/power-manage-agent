@@ -21,6 +21,8 @@ import (
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 // =============================================================================
@@ -28,7 +30,17 @@ import (
 // =============================================================================
 
 func newTestExecutor() *Executor {
-	return NewExecutor(nil)
+	e := NewExecutor(nil)
+	tmpDir, err := os.MkdirTemp("", "pm-executor-test-*")
+	if err != nil {
+		panic("failed to create temp dir: " + err.Error())
+	}
+	s, err := store.New(tmpDir)
+	if err != nil {
+		panic("failed to create test store: " + err.Error())
+	}
+	e.SetStore(s)
+	return e
 }
 
 var testActionCounter int
@@ -428,9 +440,11 @@ func TestIntegration_Shell(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "exit 42"}}
 		result := e.Execute(ctx, action)
-		// Shell uses runCmdStreaming which does not return error for non-zero exits.
-		// The exit code is captured in the output; the action status is SUCCESS.
-		assertSuccess(t, result)
+		// Non-zero exit codes are treated as failures for shell actions.
+		// The exit code is captured in the output.
+		if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
+			t.Errorf("expected FAILED, got %s", result.Status)
+		}
 		if result.Output == nil || result.Output.ExitCode != 42 {
 			t.Errorf("expected exit code 42, got %d", result.Output.ExitCode)
 		}
@@ -1132,7 +1146,7 @@ func TestIntegration_LPS(t *testing.T) {
 	ensureTestUser(t, username)
 	t.Cleanup(func() {
 		cleanupTestUser(t, username)
-		os.Remove(lpsStatePath(actionID))
+		_ = e.store.DeleteLpsState(actionID)
 	})
 
 	t.Run("InitialRotation", func(t *testing.T) {
@@ -1184,8 +1198,12 @@ func TestIntegration_LPS(t *testing.T) {
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if _, err := os.Stat(lpsStatePath(actionID)); !os.IsNotExist(err) {
-			t.Error("LPS state file still exists")
+		states, err := e.store.GetLpsState(actionID)
+		if err != nil {
+			t.Fatalf("failed to check LPS state: %v", err)
+		}
+		if len(states) > 0 {
+			t.Error("LPS state still exists after removal")
 		}
 	})
 }
@@ -2007,31 +2025,27 @@ func TestIntegration_EdgeCase_DnfStaleHistory(t *testing.T) {
 }
 
 // =============================================================================
-// Edge Case: LPS State Corruption
+// Edge Case: LPS No Prior State
 // =============================================================================
 
-func TestIntegration_EdgeCase_LpsInvalidJson(t *testing.T) {
+func TestIntegration_EdgeCase_LpsNoPriorState(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
 	actionID := "lpsedge01"
 
 	ensureTestUser(t, "pmlpsedge")
 	t.Cleanup(func() {
-		os.Remove(lpsStatePath(actionID))
+		_ = e.store.DeleteLpsState(actionID)
 		cleanupTestUser(t, "pmlpsedge")
 	})
 
-	// Write corrupted JSON to state file
-	os.MkdirAll(filepath.Dir(lpsStatePath(actionID)), 0700)
-	os.WriteFile(lpsStatePath(actionID), []byte("{invalid json!!!"), 0600)
-
-	// LPS should treat this as initial rotation — succeed and overwrite with valid state
+	// LPS should treat empty state as initial rotation
 	action := &pb.Action{
 		Id:           &pb.ActionId{Value: actionID},
 		Type:         pb.ActionType_ACTION_TYPE_LPS,
 		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
 		Params: &pb.Action_Lps{Lps: &pb.LpsParams{
-			Usernames:       []string{"pmlpsedge"},
+			Usernames:            []string{"pmlpsedge"},
 			PasswordLength:       16,
 			RotationIntervalDays: 30,
 			Complexity:           pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_ALPHANUMERIC,
@@ -2040,50 +2054,18 @@ func TestIntegration_EdgeCase_LpsInvalidJson(t *testing.T) {
 	result := e.Execute(ctx, action)
 	assertSuccess(t, result)
 
-	// Verify state file is now valid JSON
-	data, err := os.ReadFile(lpsStatePath(actionID))
+	// Verify state was persisted in SQLite
+	states, err := e.store.GetLpsState(actionID)
 	if err != nil {
-		t.Fatalf("state file not written: %v", err)
+		t.Fatalf("failed to get LPS state: %v", err)
 	}
-	if strings.HasPrefix(string(data), "{invalid") {
-		t.Error("state file still contains corrupted data")
+	if len(states) == 0 {
+		t.Error("LPS state not written after initial rotation")
 	}
-}
-
-func TestIntegration_EdgeCase_LpsMissingDirectory(t *testing.T) {
-	e := newTestExecutor()
-	ctx := context.Background()
-	actionID := "lpsedge02"
-
-	ensureTestUser(t, "pmlpsnodir")
-	t.Cleanup(func() {
-		os.Remove(lpsStatePath(actionID))
-		cleanupTestUser(t, "pmlpsnodir")
-	})
-
-	// Remove the LPS state directory entirely
-	os.RemoveAll(lpsStateDir)
-
-	action := &pb.Action{
-		Id:           &pb.ActionId{Value: actionID},
-		Type:         pb.ActionType_ACTION_TYPE_LPS,
-		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-		Params: &pb.Action_Lps{Lps: &pb.LpsParams{
-			Usernames:       []string{"pmlpsnodir"},
-			PasswordLength:       16,
-			RotationIntervalDays: 30,
-			Complexity:           pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_ALPHANUMERIC,
-		}},
-	}
-	result := e.Execute(ctx, action)
-	assertSuccess(t, result)
-
-	// Verify directory was re-created and state file exists
-	if _, err := os.Stat(lpsStateDir); err != nil {
-		t.Errorf("LPS state directory not re-created: %v", err)
-	}
-	if _, err := os.Stat(lpsStatePath(actionID)); err != nil {
-		t.Errorf("LPS state file not written: %v", err)
+	if us, ok := states["pmlpsedge"]; !ok {
+		t.Error("LPS state missing for user pmlpsedge")
+	} else if us.PasswordHash == "" {
+		t.Error("LPS password hash is empty")
 	}
 }
 

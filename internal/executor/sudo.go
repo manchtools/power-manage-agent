@@ -73,7 +73,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 	}
 
 	// Check idempotency: file content + group membership
-	fileMatches := e.configMatchesDesired(sudoersPath, content)
+	fileMatches := e.configMatchesDesired(ctx, sudoersPath, content)
 	membersMatch := sudoGroupMembersMatch(groupName, params.Users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("sudo policy already up to date: %s\n", sudoersPath))

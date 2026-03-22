@@ -4,16 +4,19 @@ package handler
 import (
 	"context"
 	"log/slog"
+	"os/exec"
 	"strconv"
+	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	"github.com/manchtools/power-manage/agent/internal/osquery"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
 
 // Handler implements the SDK StreamHandler interface.
@@ -23,8 +26,9 @@ type Handler struct {
 	osquery      *osquery.Registry // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
+	mu           sync.Mutex     // protects connectedCh and connectedSet
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
-	connectedSet bool            // tracks if connectedCh has been closed
+	connectedSet bool           // tracks if connectedCh has been closed
 }
 
 // NewHandler creates a new stream handler.
@@ -57,18 +61,23 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 	h.logger.Info("received welcome from server", "server_version", welcome.ServerVersion)
 	// Signal that connection is ready for sending messages
+	h.mu.Lock()
 	if !h.connectedSet {
 		close(h.connectedCh)
 		h.connectedSet = true
 	}
+	h.mu.Unlock()
 	return nil
 }
 
 // WaitConnected waits for the connection to be ready (welcome received).
 // Returns immediately if already connected, or blocks until connected or context is cancelled.
 func (h *Handler) WaitConnected(ctx context.Context) error {
+	h.mu.Lock()
+	ch := h.connectedCh
+	h.mu.Unlock()
 	select {
-	case <-h.connectedCh:
+	case <-ch:
 		return nil
 	case <-ctx.Done():
 		return ctx.Err()
@@ -78,10 +87,12 @@ func (h *Handler) WaitConnected(ctx context.Context) error {
 // ResetConnection resets the connection state for reconnection.
 // Must be called before each new connection attempt.
 func (h *Handler) ResetConnection() {
+	h.mu.Lock()
 	if h.connectedSet {
 		h.connectedCh = make(chan struct{})
 		h.connectedSet = false
 	}
+	h.mu.Unlock()
 }
 
 // OnAction handles action dispatch from the server.
@@ -114,8 +125,8 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 		}, nil
 	}
 
-	// Store the action for scheduled execution (skip for instant actions — they're one-shot)
-	if h.scheduler != nil && !executor.IsInstantAction(action.Type) {
+	// Store the action for scheduled execution (skip for instant and one-off actions)
+	if h.scheduler != nil && !executor.IsInstantAction(action.Type) && action.Type != pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
 		if err := h.scheduler.AddAction(action); err != nil {
 			h.logger.Error("failed to store action", "action_id", action.Id.Value, "error", err)
 		} else {
@@ -254,6 +265,84 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (b
 		h.logger.Info("LUKS device key revoked", "action_id", actionID)
 	}
 	return success, errMsg
+}
+
+// OnLogQuery handles a remote journalctl log query from the server.
+// Implements sdk.LogQueryHandler.
+func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQueryResult, error) {
+	h.logger.Info("received log query", "query_id", query.QueryId, "unit", query.Unit)
+
+	args := []string{"--no-pager"}
+
+	lines := query.Lines
+	if lines <= 0 {
+		lines = 100
+	}
+	if lines > 10000 {
+		lines = 10000
+	}
+	args = append(args, "-n", strconv.Itoa(int(lines)))
+
+	if query.Unit != "" {
+		args = append(args, "-u", query.Unit)
+	}
+	if query.Since != "" {
+		args = append(args, "--since", query.Since)
+	}
+	if query.Until != "" {
+		args = append(args, "--until", query.Until)
+	}
+	if query.Priority != "" {
+		// Validate priority against known values
+		switch strings.ToLower(query.Priority) {
+		case "0", "1", "2", "3", "4", "5", "6", "7",
+			"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug":
+			args = append(args, "-p", query.Priority)
+		default:
+			return &pb.LogQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   "invalid priority value",
+			}, nil
+		}
+	}
+	if query.Grep != "" {
+		// Limit grep pattern length to prevent ReDoS via crafted regex
+		if len(query.Grep) > 256 {
+			return &pb.LogQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   "grep pattern too long (max 256 characters)",
+			}, nil
+		}
+		args = append(args, "--grep", query.Grep)
+	}
+	if query.Kernel {
+		args = append(args, "-k")
+	}
+
+	out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
+	if err != nil {
+		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", err)
+		return &pb.LogQueryResult{
+			QueryId: query.QueryId,
+			Success: false,
+			Error:   err.Error(),
+		}, nil
+	}
+
+	logs := string(out)
+	// Truncate to 1MB if needed (keep the tail)
+	if len(logs) > 1<<20 {
+		logs = logs[len(logs)-(1<<20):]
+	}
+
+	h.logger.Info("log query completed", "query_id", query.QueryId, "bytes", len(logs))
+	return &pb.LogQueryResult{
+		QueryId: query.QueryId,
+		Success: true,
+		Logs:    logs,
+	}, nil
 }
 
 // CollectInventory queries osquery for hardware/software inventory tables.

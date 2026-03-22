@@ -16,105 +16,25 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"sync"
 	"time"
 
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/agent/internal/verify"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	"github.com/manchtools/power-manage/sdk/go/verify"
 )
-
-// resolveAndValidatePath resolves symlinks in the parent directory of the given
-// path and returns the cleaned, resolved absolute path. This prevents symlink
-// traversal attacks where a symlink could redirect writes to sensitive locations.
-func resolveAndValidatePath(path string) (string, error) {
-	clean := filepath.Clean(path)
-	if !filepath.IsAbs(clean) {
-		return "", fmt.Errorf("path must be absolute: %s", path)
-	}
-
-	// Walk up from the target file to find the first existing parent directory
-	// This handles cases where intermediate directories don't exist yet
-	dir := filepath.Dir(clean)
-	var existingParent, missingTail string
-
-	for dir != "/" && dir != "." {
-		if _, err := os.Stat(dir); err == nil {
-			existingParent = dir
-			break
-		} else if os.IsNotExist(err) {
-			// Directory doesn't exist, add to missing tail and continue up
-			missingTail = filepath.Join(filepath.Base(dir), missingTail)
-			dir = filepath.Dir(dir)
-		} else {
-			// Permission denied or other error - continue up the tree
-			missingTail = filepath.Join(filepath.Base(dir), missingTail)
-			dir = filepath.Dir(dir)
-		}
-	}
-
-	if existingParent == "" {
-		existingParent = "/"
-	}
-
-	// Resolve symlinks only in the existing portion of the path
-	resolved, err := filepath.EvalSymlinks(existingParent)
-	if err != nil {
-		// If we still can't resolve the root parent, just use clean path
-		return clean, nil
-	}
-
-	// Rebuild the full path with resolved parent + missing components + filename
-	if missingTail != "" {
-		return filepath.Join(resolved, missingTail, filepath.Base(clean)), nil
-	}
-	return filepath.Join(resolved, filepath.Base(clean)), nil
-}
 
 // validRepoName restricts repository names to safe characters only.
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-
-// validEnvVarName matches safe environment variable names (letters, digits, underscore).
-var validEnvVarName = regexp.MustCompile(`^[a-zA-Z_][a-zA-Z0-9_]*$`)
-
-// blockedEnvVars are environment variable names that must never be overridden
-// because they can hijack process execution (library injection, path manipulation).
-var blockedEnvVars = map[string]bool{
-	"LD_PRELOAD":      true,
-	"LD_LIBRARY_PATH": true,
-	"LD_AUDIT":        true,
-	"LD_DEBUG":        true,
-	"LD_PROFILE":      true,
-	"PATH":            true,
-	"IFS":             true,
-	"ENV":             true,
-	"BASH_ENV":        true,
-	"CDPATH":          true,
-	"GLOBIGNORE":      true,
-	"BASH_FUNC_":      true,
-}
-
-// isAllowedEnvVar returns true if the environment variable name is safe to set.
-func isAllowedEnvVar(name string) bool {
-	if !validEnvVarName.MatchString(name) {
-		return false
-	}
-	upper := strings.ToUpper(name)
-	if blockedEnvVars[upper] {
-		return false
-	}
-	// Block LD_* and BASH_FUNC_* prefixes
-	if strings.HasPrefix(upper, "LD_") || strings.HasPrefix(upper, "BASH_FUNC_") {
-		return false
-	}
-	return true
-}
 
 // Executor handles the execution of actions.
 type Executor struct {
@@ -122,6 +42,7 @@ type Executor struct {
 	pkgManager   *pkg.PackageManager
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
+	mu           sync.RWMutex // protects luksKeyStore, store, actionStore
 	luksKeyStore LuksKeyStore
 	store        *store.Store
 	actionStore  ActionStore
@@ -143,17 +64,44 @@ func NewExecutor(verifier *verify.ActionVerifier) *Executor {
 
 // SetLuksKeyStore sets the LUKS key store for stream-based key operations.
 func (e *Executor) SetLuksKeyStore(ks LuksKeyStore) {
+	e.mu.Lock()
 	e.luksKeyStore = ks
+	e.mu.Unlock()
 }
 
 // SetStore sets the agent store for LUKS state persistence.
 func (e *Executor) SetStore(s *store.Store) {
+	e.mu.Lock()
 	e.store = s
+	e.mu.Unlock()
 }
 
 // SetActionStore sets the action store for LUKS conflict resolution.
 func (e *Executor) SetActionStore(as ActionStore) {
+	e.mu.Lock()
 	e.actionStore = as
+	e.mu.Unlock()
+}
+
+// getLuksKeyStore returns the LUKS key store (thread-safe).
+func (e *Executor) getLuksKeyStore() LuksKeyStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.luksKeyStore
+}
+
+// getStore returns the agent store (thread-safe).
+func (e *Executor) getStore() *store.Store {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.store
+}
+
+// getActionStore returns the action store (thread-safe).
+func (e *Executor) getActionStore() ActionStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.actionStore
 }
 
 // Execute runs an action and returns the result.
@@ -230,8 +178,15 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, changed, execErr = e.executeRpm(ctx, action.GetApp(), action.DesiredState)
 		result.Changed = changed
-	case pb.ActionType_ACTION_TYPE_SHELL:
-		output, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
+	case pb.ActionType_ACTION_TYPE_SHELL, pb.ActionType_ACTION_TYPE_SCRIPT_RUN:
+		var detectionOutput *pb.CommandOutput
+		var changed bool
+		output, detectionOutput, changed, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
+		result.Changed = changed
+		result.DetectionOutput = detectionOutput
+		if action.GetShell().GetIsCompliance() {
+			result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
+		}
 	case pb.ActionType_ACTION_TYPE_SYSTEMD:
 		var changed bool
 		output, changed, execErr = e.executeSystemd(ctx, action.GetSystemd())
@@ -308,6 +263,14 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
+	case pb.ActionType_ACTION_TYPE_WIFI:
+		var changed bool
+		wifiActionID := ""
+		if action.Id != nil {
+			wifiActionID = action.Id.Value
+		}
+		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, wifiActionID)
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	default:
@@ -331,6 +294,19 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Error = execErr.Error()
 	default:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS
+	}
+
+	// For shell/script actions, non-zero exit codes indicate failure
+	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
+		if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
+			if result.DetectionOutput != nil && result.DetectionOutput.ExitCode != 0 {
+				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+				result.Error = fmt.Sprintf("script exited with code %d", result.DetectionOutput.ExitCode)
+			} else if result.Output != nil && result.Output.ExitCode != 0 {
+				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+				result.Error = fmt.Sprintf("script exited with code %d", result.Output.ExitCode)
+			}
+		}
 	}
 
 	return result
@@ -556,7 +532,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	fullPath := filepath.Join(installPath, filename)
 
 	// Resolve symlinks to prevent traversal attacks
-	resolvedPath, err := resolveAndValidatePath(fullPath)
+	resolvedPath, err := sysfs.ResolveAndValidatePath(fullPath)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}
@@ -566,7 +542,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		// Check if file already exists with correct checksum
 		if params.ChecksumSha256 != "" {
 			if content, err := os.ReadFile(resolvedPath); err == nil {
-				actualHash := hex.EncodeToString(sha256.New().Sum(content)[:])
+				h := sha256.Sum256(content)
+				actualHash := hex.EncodeToString(h[:])
 				if actualHash == params.ChecksumSha256 {
 					return &pb.CommandOutput{
 						ExitCode: 0,
@@ -777,7 +754,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
 		if err != nil {
 			// Try to fix dependencies
-			aptFixBroken(ctx)
+			pkg.NewAptWithContext(ctx).FixBroken()
 		}
 		return output, true, err
 
@@ -883,29 +860,26 @@ func (e *Executor) isRpmInstalled(pkgName string) bool {
 }
 
 func (e *Executor) executeShell(ctx context.Context, params *pb.ShellParams) (*pb.CommandOutput, error) {
-	return e.executeShellStreaming(ctx, params, nil)
+	execOutput, _, _, err := e.executeShellStreaming(ctx, params, nil)
+	return execOutput, err
 }
 
-// executeShellStreaming executes a shell script with optional output streaming.
-func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellParams, callback OutputCallback) (*pb.CommandOutput, error) {
-	if params == nil {
-		return nil, fmt.Errorf("shell params required")
-	}
-
+// runShellScript executes a single shell script string using the shared interpreter,
+// environment, sudo, and working directory settings from ShellParams.
+func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, script string, callback OutputCallback) (*pb.CommandOutput, error) {
 	interpreter := params.Interpreter
 	if interpreter == "" {
 		interpreter = "/bin/sh"
 	}
 
-	// Build command name and args
 	var name string
 	var args []string
 	if params.RunAsRoot {
 		name = "sudo"
-		args = []string{"-n", interpreter, "-c", params.Script}
+		args = []string{"-n", interpreter, "-c", script}
 	} else {
 		name = interpreter
-		args = []string{"-c", params.Script}
+		args = []string{"-c", script}
 	}
 
 	// Build environment — reject dangerous variable names that could
@@ -914,20 +888,88 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	if len(params.Environment) > 0 {
 		envVars = os.Environ()
 		for k, v := range params.Environment {
-			if !isAllowedEnvVar(k) {
+			if !sysexec.IsAllowedEnvVar(k) {
 				return nil, fmt.Errorf("environment variable %q is not allowed", k)
 			}
 			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 		}
 	}
 
-	// Use streaming execution if callback provided, otherwise fall back to standard
-	if callback != nil {
-		return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+}
+
+// executeShellStreaming executes a shell action with optional detection/execution/verification flow.
+// Returns (executionOutput, detectionOutput, changed, error).
+//
+// Flow:
+//  1. No detection_script: run script as-is (current behavior)
+//  2. Run detection_script. Exit 0 = compliant, skip execution.
+//  3. No script (detection-only): return non-compliant status
+//  4. Run script (remediation)
+//  5. Re-run detection_script to verify
+func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellParams, callback OutputCallback) (*pb.CommandOutput, *pb.CommandOutput, bool, error) {
+	if params == nil {
+		return nil, nil, false, fmt.Errorf("shell params required")
 	}
 
-	// Non-streaming fallback - use runCmdStreaming with nil callback for consistent behavior
-	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, nil)
+	// No detection script — run execution script directly (original behavior)
+	if params.DetectionScript == "" {
+		if params.Script == "" {
+			return nil, nil, false, fmt.Errorf("at least one of script or detection_script is required")
+		}
+		output, err := e.runShellScript(ctx, params, params.Script, callback)
+		return output, nil, true, err
+	}
+
+	// Compliance mode: run detection only, never execute remediation
+	if params.GetIsCompliance() {
+		e.logger.Debug("compliance mode: running detection script only")
+		detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
+		if err != nil {
+			return nil, detectionOutput, false, err
+		}
+		return nil, detectionOutput, false, nil
+	}
+
+	// Step 1: Run detection script
+	e.logger.Debug("running detection script")
+	detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
+	if err != nil {
+		return nil, detectionOutput, false, fmt.Errorf("detection script error: %w", err)
+	}
+
+	// Step 2: If detection exits 0, system is compliant — skip execution
+	if detectionOutput.ExitCode == 0 {
+		e.logger.Debug("detection script passed (exit 0), system is compliant")
+		return nil, detectionOutput, false, nil
+	}
+
+	// Step 3: No execution script (detection-only) — report non-compliant
+	if params.Script == "" {
+		e.logger.Debug("detection script failed (non-zero), no execution script — reporting non-compliant")
+		return nil, detectionOutput, false, nil
+	}
+
+	// Step 4: Run execution/remediation script
+	e.logger.Debug("detection script failed (non-zero), running remediation script")
+	execOutput, execErr := e.runShellScript(ctx, params, params.Script, callback)
+	if execErr != nil {
+		return execOutput, detectionOutput, true, execErr
+	}
+
+	// Step 5: Re-run detection script to verify remediation
+	e.logger.Debug("re-running detection script to verify remediation")
+	verifyOutput, verifyErr := e.runShellScript(ctx, params, params.DetectionScript, nil)
+	if verifyErr != nil {
+		return execOutput, verifyOutput, true, fmt.Errorf("verification detection script error: %w", verifyErr)
+	}
+
+	if verifyOutput.ExitCode != 0 {
+		return execOutput, verifyOutput, true, fmt.Errorf("remediation did not resolve the issue (detection still exits %d)", verifyOutput.ExitCode)
+	}
+
+	e.logger.Debug("verification passed, remediation successful")
+	return execOutput, verifyOutput, true, nil
 }
 
 func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams) (*pb.CommandOutput, bool, error) {
@@ -1077,7 +1119,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 	}
 
 	// Resolve symlinks to prevent traversal attacks
-	resolvedPath, err := resolveAndValidatePath(params.Path)
+	resolvedPath, err := sysfs.ResolveAndValidatePath(params.Path)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}
@@ -1332,7 +1374,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 	}
 
 	// Resolve symlinks to prevent traversal attacks
-	cleanPath, err := resolveAndValidatePath(params.Path)
+	cleanPath, err := sysfs.ResolveAndValidatePath(params.Path)
 	if err != nil {
 		return nil, false, fmt.Errorf("invalid path: %w", err)
 	}
@@ -1507,44 +1549,6 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	}
 
 	return file.Close()
-}
-
-// getAptCommand returns the preferred apt command ("apt" or "apt-get").
-// Prefers "apt" if available as it provides better progress output.
-func getAptCommand() string {
-	if _, err := exec.LookPath("apt"); err == nil {
-		return "apt"
-	}
-	return "apt-get"
-}
-
-// =============================================================================
-// APT Helper Functions
-// =============================================================================
-
-// aptUpdate runs apt update to refresh package lists.
-func aptUpdate(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "update")
-}
-
-// aptUpgrade runs apt upgrade -y to upgrade all packages.
-func aptUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "upgrade", "-y")
-}
-
-// aptDistUpgrade runs apt dist-upgrade -y for held-back packages.
-func aptDistUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "dist-upgrade", "-y")
-}
-
-// aptAutoremove runs apt autoremove -y to remove unused packages.
-func aptAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "autoremove", "-y")
-}
-
-// aptFixBroken runs apt --fix-broken install -y to repair broken dependencies.
-func aptFixBroken(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, getAptCommand(), "--fix-broken", "install", "-y")
 }
 
 // =============================================================================
@@ -1775,22 +1779,39 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 // - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
 	// Remove stale lock files that may be left from interrupted operations
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock-frontend")
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/dpkg/lock")
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/apt/lists/lock")
-	runSudoCmd(ctx, "rm", "-f", "/var/cache/apt/archives/lock")
+	lockFiles := []string{
+		"/var/lib/dpkg/lock-frontend",
+		"/var/lib/dpkg/lock",
+		"/var/lib/apt/lists/lock",
+		"/var/cache/apt/archives/lock",
+	}
+	for _, lf := range lockFiles {
+		if _, err := runSudoCmd(ctx, "rm", "-f", lf); err != nil {
+			slog.Warn("repairApt: failed to remove lock file", "path", lf, "error", err)
+		}
+	}
 
-	// Fix any interrupted dpkg operations
-	// This handles "dpkg was interrupted, you must manually run 'dpkg --configure -a'"
-	runSudoCmd(ctx, "dpkg", "--configure", "-a")
+	// Fix any interrupted dpkg operations.
+	// Uses env to set DEBIAN_FRONTEND=noninteractive so kernel/grub postinst
+	// scripts don't hang waiting for debconf input. The --force-confdef and
+	// --force-confold options prevent dpkg from prompting about config files.
+	if _, err := runSudoCmd(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
+		"dpkg", "--configure", "-a", "--force-confdef", "--force-confold"); err != nil {
+		slog.Warn("repairApt: dpkg --configure -a failed", "error", err)
+	}
+
+	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
+	apt := pkg.NewAptWithContext(ctx)
 
 	// Update package lists to get latest dependency info
-	// This is crucial for resolving dependency version mismatches
-	aptUpdate(ctx)
+	if _, err := apt.Update(); err != nil {
+		slog.Warn("repairApt: apt update failed", "error", err)
+	}
 
 	// Fix broken dependencies and install missing ones
-	// This handles "unmet dependencies" and "held broken packages" issues
-	aptFixBroken(ctx)
+	if _, err := apt.FixBroken(); err != nil {
+		slog.Warn("repairApt: apt fix-broken failed", "error", err)
+	}
 }
 
 // repairDnf fixes common dnf/rpm issues:
@@ -1800,15 +1821,21 @@ func (e *Executor) repairApt(ctx context.Context) {
 func (e *Executor) repairDnf(ctx context.Context) {
 	// Complete any interrupted transactions
 	// This is similar to "dnf-automatic" leaving things half-done
-	runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last")
+	if _, err := runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last"); err != nil {
+		slog.Warn("repairDnf: history redo failed", "error", err)
+	}
 
 	// Clean up any duplicate packages
-	runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates")
+	if _, err := runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates"); err != nil {
+		slog.Warn("repairDnf: remove duplicates failed", "error", err)
+	}
 
 	// Rebuild rpm database if corrupted
 	// First try to verify, if that fails, rebuild
 	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCmd(ctx, "rpm", "--rebuilddb")
+		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
+			slog.Warn("repairDnf: rpm --rebuilddb failed", "error", err)
+		}
 	}
 }
 
@@ -1819,16 +1846,24 @@ func (e *Executor) repairDnf(ctx context.Context) {
 func (e *Executor) repairPacman(ctx context.Context) {
 	// Remove stale lock file if it exists
 	// This handles "unable to lock database" errors from interrupted operations
-	runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck")
+	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck"); err != nil {
+		slog.Warn("repairPacman: failed to remove lock file", "error", err)
+	}
 
 	// Refresh package database to fix potential corruption
 	// Using -Syy to force refresh even if recently updated
-	runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm")
+	if _, err := runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm"); err != nil {
+		slog.Warn("repairPacman: database refresh failed", "error", err)
+	}
 
 	// Reinitialize keyring if there are signature issues
 	// This fixes "signature is unknown trust" errors
-	runSudoCmd(ctx, "pacman-key", "--init")
-	runSudoCmd(ctx, "pacman-key", "--populate", "archlinux")
+	if _, err := runSudoCmd(ctx, "pacman-key", "--init"); err != nil {
+		slog.Warn("repairPacman: pacman-key init failed", "error", err)
+	}
+	if _, err := runSudoCmd(ctx, "pacman-key", "--populate", "archlinux"); err != nil {
+		slog.Warn("repairPacman: pacman-key populate failed", "error", err)
+	}
 }
 
 // repairZypper fixes common zypper/rpm issues:
@@ -1838,20 +1873,30 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
 	// Remove stale lock files
-	runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid")
+	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid"); err != nil {
+		slog.Warn("repairZypper: failed to remove lock file", "error", err)
+	}
 
 	// Clean repository metadata cache to fix stale metadata issues
-	runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all"); err != nil {
+		slog.Warn("repairZypper: clean failed", "error", err)
+	}
 
 	// Refresh repositories to get fresh metadata
-	runSudoCmd(ctx, "zypper", "--non-interactive", "refresh")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh"); err != nil {
+		slog.Warn("repairZypper: refresh failed", "error", err)
+	}
 
 	// Verify and fix dependency issues
-	runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends")
+	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends"); err != nil {
+		slog.Warn("repairZypper: verify failed", "error", err)
+	}
 
 	// Rebuild rpm database if corrupted
 	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		runSudoCmd(ctx, "rpm", "--rebuilddb")
+		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
+			slog.Warn("repairZypper: rpm --rebuilddb failed", "error", err)
+		}
 	}
 }
 
@@ -1860,10 +1905,14 @@ func (e *Executor) repairZypper(ctx context.Context) {
 // - Broken remotes
 func (e *Executor) repairFlatpak(ctx context.Context) {
 	// Repair any broken installations (removes partial/orphaned refs)
-	runSudoCmd(ctx, "flatpak", "repair", "--system")
+	if _, err := runSudoCmd(ctx, "flatpak", "repair", "--system"); err != nil {
+		slog.Warn("repairFlatpak: repair failed", "error", err)
+	}
 
 	// Update appstream metadata to fix stale cache issues
-	runSudoCmd(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system")
+	if _, err := runSudoCmd(ctx, "flatpak", "update", "--appstream", "-y", "--noninteractive", "--system"); err != nil {
+		slog.Warn("repairFlatpak: appstream update failed", "error", err)
+	}
 }
 
 // executeUpdate performs a system-wide package update.
@@ -1931,7 +1980,8 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		if pkg.IsApt() {
-			if output, err := aptAutoremove(ctx); err == nil {
+			apt := pkg.NewAptWithContext(ctx)
+			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
@@ -1984,8 +2034,11 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 		output.WriteString("Note: security-only updates requested but unattended-upgrade not available\n")
 	}
 
+	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
+	apt := pkg.NewAptWithContext(ctx)
+
 	// Standard upgrade
-	cmdOutput, err := aptUpgrade(ctx)
+	cmdOutput, err := apt.Upgrade()
 	if cmdOutput != nil {
 		output.WriteString(cmdOutput.Stdout)
 		output.WriteString(cmdOutput.Stderr)
@@ -1993,7 +2046,7 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 
 	// Also run dist-upgrade for held-back packages (still respects holds)
 	output.WriteString("\n=== Dist-Upgrade ===\n")
-	distOutput, _ := aptDistUpgrade(ctx)
+	distOutput, _ := apt.DistUpgrade()
 	if distOutput != nil {
 		output.WriteString(distOutput.Stdout)
 		output.WriteString(distOutput.Stderr)
@@ -2302,7 +2355,8 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 
 		// Update package index only when something changed
 		if changed {
-			updateOutput, _ := aptUpdate(ctx)
+			apt := pkg.NewAptWithContext(ctx)
+			updateOutput, _ := apt.Update()
 			if updateOutput != nil {
 				output.WriteString(updateOutput.Stdout)
 			}
@@ -2864,7 +2918,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 					RotatedAt: time.Now().UTC().Format(time.RFC3339),
 					Reason:    "user_created",
 				}}
-				if rotationsJSON, err := json.Marshal(rotations); err == nil {
+				rotationsJSON, err := json.Marshal(rotations)
+				if err != nil {
+					slog.Warn("failed to marshal user creation rotations", "error", err)
+				} else {
 					metadata = map[string]string{"lps.rotations": string(rotationsJSON)}
 				}
 			}
@@ -3215,23 +3272,9 @@ func sshConfigPath(actionID string) string {
 	return fmt.Sprintf("/etc/ssh/sshd_config.d/pm-ssh-%s.conf", strings.ToLower(actionID))
 }
 
-// sshEffectiveUsers returns the merged user list, handling backward compat with the deprecated username field.
+// sshEffectiveUsers returns the user list from params.
 func sshEffectiveUsers(params *pb.SshParams) []string {
-	users := params.Users
-	// Backward compat: if deprecated username is set and not already in users, include it
-	if params.Username != "" {
-		found := false
-		for _, u := range users {
-			if u == params.Username {
-				found = true
-				break
-			}
-		}
-		if !found {
-			users = append([]string{params.Username}, users...)
-		}
-	}
-	return users
+	return params.Users
 }
 
 // executeSsh configures SSH access via an sshd_config.d drop-in file with a Match Group directive.
@@ -3294,7 +3337,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 	content := generateSshGroupConfig(groupName, params)
 
 	// Check idempotency: file content + group membership
-	fileMatches := e.configMatchesDesired(configPath, content)
+	fileMatches := e.configMatchesDesired(ctx, configPath, content)
 	membersMatch := sudoGroupMembersMatch(groupName, users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
@@ -3418,11 +3461,11 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 }
 
 // configMatchesDesired checks if a config file already has the desired content.
-func (e *Executor) configMatchesDesired(path, desiredContent string) bool {
-	if !fileExistsWithSudo(context.Background(), path) {
+func (e *Executor) configMatchesDesired(ctx context.Context, path, desiredContent string) bool {
+	if !fileExistsWithSudo(ctx, path) {
 		return false
 	}
-	existing, err := readFileWithSudo(context.Background(), path)
+	existing, err := readFileWithSudo(ctx, path)
 	if err != nil {
 		return false
 	}
@@ -3468,7 +3511,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 	content := generateSshdGlobalConfig(params)
 
 	// Check idempotency
-	if e.configMatchesDesired(configPath, content) {
+	if e.configMatchesDesired(ctx, configPath, content) {
 		output.WriteString(fmt.Sprintf("SSHD config already up to date: %s\n", configPath))
 		return &pb.CommandOutput{
 			ExitCode: 0,

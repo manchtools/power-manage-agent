@@ -26,10 +26,10 @@ func (e *Executor) executeLuks(ctx context.Context, params *pb.LuksParams, state
 	if actionID == "" {
 		return nil, false, nil, fmt.Errorf("action ID required for LUKS state tracking")
 	}
-	if e.luksKeyStore == nil {
+	if e.getLuksKeyStore() == nil {
 		return nil, false, nil, fmt.Errorf("LUKS key store not configured (no stream connection)")
 	}
-	if e.store == nil {
+	if e.getStore() == nil {
 		return nil, false, nil, fmt.Errorf("agent store not configured")
 	}
 
@@ -173,8 +173,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	existingKey, getKeyErr := e.luksKeyStore.GetKey(ctx, actionID)
 	if getKeyErr == nil && existingKey != "" {
 		e.logger.Info("LUKS: server has stored key, testing against volume",
-			"action_id", actionID, "key_len", len(existingKey),
-			"key_prefix", safePrefix(existingKey), "key_suffix", safeSuffix(existingKey))
+			"action_id", actionID, "key_len", len(existingKey))
 		ok, testErr := sysluks.TestPassphrase(ctx, devicePath, existingKey)
 		e.logger.Info("LUKS: test-passphrase result", "ok", ok, "error", testErr)
 		if testErr == nil && ok {
@@ -204,7 +203,6 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	// Add managed passphrase using PSK (both keys now valid)
 	e.logger.Info("LUKS: adding managed key using PSK",
 		"psk_len", len(params.PresharedKey),
-		"psk_prefix", safePrefix(params.PresharedKey), "psk_suffix", safeSuffix(params.PresharedKey),
 		"new_key_len", len(passphrase))
 	if err := sysluks.AddKey(ctx, devicePath, params.PresharedKey, passphrase); err != nil {
 		return fmt.Errorf("add managed key: %w", err)
@@ -377,7 +375,7 @@ func (e *Executor) revokeDeviceKeyInternal(ctx context.Context, localState *stor
 // RevokeLuksDeviceKey handles the instant action to revoke the device-bound key.
 // Called by the handler when a RevokeLuksDeviceKey stream message arrives.
 func (e *Executor) RevokeLuksDeviceKey(ctx context.Context, actionID string) (bool, string) {
-	if e.store == nil || e.luksKeyStore == nil {
+	if e.getStore() == nil || e.getLuksKeyStore() == nil {
 		return false, "LUKS key store not configured"
 	}
 
@@ -511,18 +509,3 @@ type ActionStore interface {
 	GetStoredActions() ([]*store.StoredAction, error)
 }
 
-// safePrefix returns the first 3 characters of a string for diagnostic logging.
-func safePrefix(s string) string {
-	if len(s) <= 3 {
-		return "***"
-	}
-	return s[:3] + "..."
-}
-
-// safeSuffix returns the last 3 characters of a string for diagnostic logging.
-func safeSuffix(s string) string {
-	if len(s) <= 3 {
-		return "***"
-	}
-	return "..." + s[len(s)-3:]
-}

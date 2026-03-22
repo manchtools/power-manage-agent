@@ -7,34 +7,22 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"log/slog"
 	"math/big"
-	"os"
-	"path/filepath"
 	"strings"
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 const (
-	lpsStateDir = "/var/lib/power-manage/lps"
-
 	alphanumericChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
 	complexChars      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?"
 )
-
-// lpsUserState tracks local LPS rotation state for a single user.
-type lpsUserState struct {
-	LastRotatedAt time.Time `json:"last_rotated_at"`
-	PasswordHash  string    `json:"password_hash"`
-}
-
-// lpsState tracks local LPS rotation state for all managed users in an action.
-type lpsState struct {
-	Users map[string]lpsUserState `json:"users"`
-}
 
 // lpsRotationEntry is the JSON structure reported in action result metadata.
 type lpsRotationEntry struct {
@@ -73,14 +61,11 @@ func (e *Executor) executeLps(ctx context.Context, params *pb.LpsParams, state p
 func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 
-	// Load local state
-	localState, err := loadLpsState(actionID)
+	// Load state from SQLite
+	userStates, err := e.store.GetLpsState(actionID)
 	if err != nil {
 		e.logger.Warn("failed to load LPS state, will treat as initial rotation", "action_id", actionID, "error", err)
-		localState = nil
-	}
-	if localState == nil {
-		localState = &lpsState{Users: make(map[string]lpsUserState)}
+		userStates = make(map[string]*store.LpsUserState)
 	}
 
 	charset := alphanumericChars
@@ -101,13 +86,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Get per-user state
-		var userState *lpsUserState
-		if us, ok := localState.Users[username]; ok {
-			userState = &us
-		}
+		storedState := userStates[username]
 
 		// Determine if rotation is needed
-		rotate, reason := shouldRotateLps(userState, params, username)
+		rotate, reason := shouldRotateLps(storedState, params, username)
 		if !rotate {
 			output.WriteString(fmt.Sprintf("LPS: %s — password up to date\n", username))
 			continue
@@ -133,11 +115,11 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		now := time.Now().UTC()
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
-		// Update per-user state
+		// Update per-user state in SQLite
 		hash := sha256.Sum256([]byte(password))
-		localState.Users[username] = lpsUserState{
-			LastRotatedAt: now,
-			PasswordHash:  hex.EncodeToString(hash[:]),
+		hashStr := hex.EncodeToString(hash[:])
+		if err := e.store.SetLpsUserState(actionID, username, now, hashStr); err != nil {
+			e.logger.Warn("failed to save LPS user state", "action_id", actionID, "username", username, "error", err)
 		}
 
 		rotations = append(rotations, lpsRotationEntry{
@@ -166,11 +148,6 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		output.WriteString(fmt.Sprintf("LPS: terminated sessions for %d user(s)\n", len(rotatedUsers)))
 	}
 
-	// Save updated state
-	if err := saveLpsState(actionID, localState); err != nil {
-		e.logger.Warn("failed to save LPS state", "action_id", actionID, "error", err)
-	}
-
 	// If no rotations occurred
 	if len(rotations) == 0 {
 		if anyError != nil {
@@ -186,7 +163,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	}
 
 	// Build metadata with JSON array of rotations
-	rotationsJSON, _ := json.Marshal(rotations)
+	rotationsJSON, err := json.Marshal(rotations)
+	if err != nil {
+		slog.Warn("failed to marshal LPS rotations", "error", err)
+	}
 	metadata := map[string]string{
 		"lps.rotations": string(rotationsJSON),
 	}
@@ -197,14 +177,20 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	}, true, metadata, anyError
 }
 
-// removeLpsManagement handles ABSENT state — stops managing, cleans up local state.
+// removeLpsManagement handles ABSENT state — stops managing, cleans up state.
 func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
-	statePath := lpsStatePath(actionID)
-	if _, err := os.Stat(statePath); err == nil {
-		os.Remove(statePath)
+	userStates, err := e.store.GetLpsState(actionID)
+	if err != nil {
+		e.logger.Warn("failed to check LPS state for removal", "action_id", actionID, "error", err)
+	}
+
+	if len(userStates) > 0 {
+		if err := e.store.DeleteLpsState(actionID); err != nil {
+			e.logger.Warn("failed to delete LPS state", "action_id", actionID, "error", err)
+		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
-			Stdout:   "LPS: password management stopped, local state removed\n",
+			Stdout:   "LPS: password management stopped, state removed\n",
 		}, true, nil, nil
 	}
 
@@ -215,7 +201,7 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 }
 
 // shouldRotateLps determines if a password rotation is needed for a user and returns the reason.
-func shouldRotateLps(state *lpsUserState, params *pb.LpsParams, username string) (bool, string) {
+func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username string) (bool, string) {
 	now := time.Now().UTC()
 
 	// No state = first run
@@ -329,44 +315,4 @@ func getLastAuthTime(username string) (time.Time, error) {
 	}
 
 	return time.Time{}, fmt.Errorf("could not find timestamp in last output: %q", firstLine)
-}
-
-// =============================================================================
-// LPS state file management
-// =============================================================================
-
-func lpsStatePath(actionID string) string {
-	return filepath.Join(lpsStateDir, fmt.Sprintf("lps-%s.json", strings.ToLower(actionID)))
-}
-
-func loadLpsState(actionID string) (*lpsState, error) {
-	data, err := os.ReadFile(lpsStatePath(actionID))
-	if err != nil {
-		if os.IsNotExist(err) {
-			return nil, nil
-		}
-		return nil, err
-	}
-
-	var state lpsState
-	if err := json.Unmarshal(data, &state); err != nil {
-		return nil, err
-	}
-	if state.Users == nil {
-		state.Users = make(map[string]lpsUserState)
-	}
-	return &state, nil
-}
-
-func saveLpsState(actionID string, state *lpsState) error {
-	if err := os.MkdirAll(lpsStateDir, 0700); err != nil {
-		return err
-	}
-
-	data, err := json.Marshal(state)
-	if err != nil {
-		return err
-	}
-
-	return os.WriteFile(lpsStatePath(actionID), data, 0600)
 }

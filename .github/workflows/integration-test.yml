@@ -50,7 +50,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: MANCHTOOLS/power-manage-sdk
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: main
           path: sdk
 
       - name: Build test image
@@ -81,7 +81,7 @@ jobs:
         uses: actions/checkout@v4
         with:
           repository: MANCHTOOLS/power-manage-sdk
-          ref: ${{ github.head_ref || github.ref_name }}
+          ref: main
           path: sdk
 
       - name: Build test image
