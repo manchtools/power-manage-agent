@@ -267,6 +267,12 @@ create_user() {
             --comment "Power Manage Agent Service" \
             "$SERVICE_USER"
     fi
+
+    # Grant journal read access for remote log queries
+    if getent group systemd-journal &>/dev/null; then
+        usermod -aG systemd-journal "$SERVICE_USER"
+        log_info "Added $SERVICE_USER to systemd-journal group"
+    fi
 }
 
 setup_sudo() {

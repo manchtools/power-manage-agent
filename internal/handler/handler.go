@@ -331,11 +331,15 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 
 	out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
 	if err != nil {
-		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", err)
+		errMsg := strings.TrimSpace(string(out))
+		if errMsg == "" {
+			errMsg = err.Error()
+		}
+		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", errMsg)
 		return &pb.LogQueryResult{
 			QueryId: query.QueryId,
 			Success: false,
-			Error:   err.Error(),
+			Error:   errMsg,
 		}, nil
 	}
 
