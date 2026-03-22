@@ -318,6 +318,10 @@ ExecStart=$BINARY_PATH -data-dir=$DATA_DIR -log-level=info
 Restart=always
 RestartSec=10
 
+# Runtime directory (/run/pm-agent) for enrollment socket
+RuntimeDirectory=pm-agent
+RuntimeDirectoryMode=0755
+
 # Security hardening
 NoNewPrivileges=false
 ProtectSystem=false
