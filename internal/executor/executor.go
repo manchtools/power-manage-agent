@@ -1751,10 +1751,39 @@ func (e *Executor) repairFilesystem(ctx context.Context) bool {
 	return allOk
 }
 
+// isRootReadOnly checks whether the root filesystem is mounted read-only
+// by parsing /proc/mounts.
+func isRootReadOnly() bool {
+	data, err := os.ReadFile("/proc/mounts")
+	if err != nil {
+		return false
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) >= 4 && fields[1] == "/" {
+			for _, opt := range strings.Split(fields[3], ",") {
+				if opt == "ro" {
+					return true
+				}
+			}
+		}
+	}
+	return false
+}
+
 // repairPackageManager attempts to fix common broken package manager states.
 // This handles issues like interrupted dpkg operations, broken dependencies,
 // and stale lock files that can prevent package operations from succeeding.
 func (e *Executor) repairPackageManager(ctx context.Context) {
+	// If root filesystem is read-only (e.g. disk error caused kernel to remount ro),
+	// all package operations will fail. Attempt to remount it read-write first.
+	if isRootReadOnly() {
+		slog.Warn("root filesystem is mounted read-only, attempting remount as read-write")
+		if _, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", "/"); err != nil {
+			slog.Error("failed to remount root filesystem as read-write", "error", err)
+		}
+	}
+
 	// Detect which package manager we're using and run appropriate repairs
 	if pkg.IsApt() {
 		e.repairApt(ctx)
