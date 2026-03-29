@@ -136,7 +136,7 @@ URI Parameters:
 
 | Subcommand | Description |
 |------------|-------------|
-| `enroll` | Enroll the agent via the enrollment socket (no sudo required) |
+| `enroll` | Enroll the agent via the enrollment socket (no sudo required). Supports `-s`/`-t` shorthand flags. |
 | `version` | Print agent version |
 | `setup` | Install sudoers configuration |
 | `query` | Query system information via osquery |
@@ -443,6 +443,20 @@ Only one repository type should be set per action. The matching type is determin
 | `UPDATE` | No | Run update | Run update (same) |
 | `SYSTEMD` | No | Uses `SystemdUnitState` | Uses `SystemdUnitState` |
 
+## Remote Log Queries
+
+The agent supports remote `journalctl` log queries dispatched from the web UI. The handler accepts filters for systemd unit, line count, priority level (0-7), time range, and grep pattern. Output is capped at 1 MB.
+
+The agent is added to the `systemd-journal` group during installation to enable log access without root.
+
+## Package Manager Repair
+
+Before every package operation, the agent runs automatic repair steps:
+- **Lock cleanup**: Removes stale lock files (apt, pacman, zypper)
+- **Interrupted dpkg**: Runs `dpkg --configure -a` if needed
+- **Read-only filesystem**: Detects `ro` mount via `/proc/mounts` and attempts `mount -o remount,rw /`
+- **DNF history**: Attempts `history redo` and `rpm --verifydb` for corrupted state
+
 ## Scheduling
 
 Actions can be configured with schedules for autonomous execution on the agent. The scheduler operates independently and continues running actions even when disconnected from the server. Results are stored locally and synced when connection is restored.
@@ -490,7 +504,7 @@ The agent automatically detects the system's package manager:
 
 The agent runs as a dedicated `power-manage` system user with restricted sudo access. The install script (`power-manage-agent setup`) creates:
 
-- A `power-manage` system user with `/usr/sbin/nologin` shell
+- A `power-manage` system user with `/usr/sbin/nologin` shell (added to `systemd-journal` group for log access)
 - A sudoers policy at `/etc/sudoers.d/power-manage` granting access only to specific commands
 
 The sudoers template (`internal/setup/sudoers.tmpl`) restricts access to:
@@ -541,9 +555,9 @@ journalctl -u power-manage-agent -f
 ├── certs/
 │   ├── device.crt      # Device certificate
 │   └── device.key      # Device private key
-├── lps/                 # LPS password rotation state (per-action JSON files)
+├── agent.db             # SQLite database (LPS state, execution tracking)
 ├── luks/                # LUKS encryption state (per-action SQLite databases)
-├── state.json           # Agent state
+├── state.json           # Agent state (server URL, device ID, gateway URL)
 └── results/             # Pending execution results
 ```
 
