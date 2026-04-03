@@ -42,12 +42,12 @@ jobs:
           - distro: archlinux
             dockerfile: test/Dockerfile.integration.archlinux
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: agent
 
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
           ref: main
@@ -73,12 +73,12 @@ jobs:
     name: edge-cases (privileged)
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           path: agent
 
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
           ref: main

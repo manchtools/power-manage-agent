@@ -23,10 +23,10 @@ jobs:
       matrix:
         arch: [amd64, arm64]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Checkout SDK
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
           ref: ${{ github.ref_name }}
@@ -35,7 +35,7 @@ jobs:
       - name: Rewrite SDK replace directive
         run: go mod edit -replace github.com/manchtools/power-manage/sdk=./_sdk
 
-      - uses: actions/setup-go@v5
+      - uses: actions/setup-go@v6
         with:
           go-version-file: go.mod
 
@@ -62,7 +62,7 @@ jobs:
             -o dist/power-manage-agent-linux-${{ matrix.arch }} ./cmd/power-manage-agent
 
       - name: Upload artifacts
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v5
         with:
           name: agent-${{ matrix.arch }}
           path: dist/
@@ -72,12 +72,12 @@ jobs:
     runs-on: ubuntu-latest
     needs: [build]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
       - name: Download all artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v5
         with:
           path: artifacts/
 
