@@ -25,11 +25,23 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      - name: Resolve SDK ref
+        id: sdk_ref
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${GITHUB_REF_NAME}"
+          if git ls-remote --tags https://github.com/MANCHTOOLS/power-manage-sdk.git "refs/tags/${TAG}" | grep -q .; then
+            echo "ref=${TAG}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout SDK
         uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
-          ref: ${{ github.ref_name }}
+          ref: ${{ steps.sdk_ref.outputs.ref }}
           path: _sdk
 
       - name: Rewrite SDK replace directive
