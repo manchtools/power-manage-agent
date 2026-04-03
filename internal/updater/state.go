@@ -54,24 +54,14 @@ func ReadState(dataDir string) (*State, error) {
 	return &s, nil
 }
 
-// WriteState writes the update state to disk, creating the update directory
-// if it does not exist.
+// WriteState writes the update state to disk atomically, creating the update
+// directory if it does not exist.
 func WriteState(dataDir string, state *State) error {
-	dir := updateDir(dataDir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create update dir: %w", err)
-	}
-
 	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal state: %w", err)
 	}
-
-	if err := os.WriteFile(statePath(dataDir), data, 0644); err != nil {
-		return fmt.Errorf("write state: %w", err)
-	}
-
-	return nil
+	return atomicWrite(statePath(dataDir), data)
 }
 
 // ClearState removes the state file from disk.
@@ -99,13 +89,8 @@ func ReadCooldown(dataDir string) (*Cooldown, error) {
 }
 
 // WriteCooldown writes a cooldown entry for the given version with the
-// specified duration from now.
+// specified duration from now. The write is atomic (temp file + rename).
 func WriteCooldown(dataDir, version string, duration time.Duration) error {
-	dir := updateDir(dataDir)
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return fmt.Errorf("create update dir: %w", err)
-	}
-
 	c := Cooldown{
 		Version: version,
 		Until:   time.Now().Add(duration),
@@ -115,19 +100,19 @@ func WriteCooldown(dataDir, version string, duration time.Duration) error {
 	if err != nil {
 		return fmt.Errorf("marshal cooldown: %w", err)
 	}
-
-	if err := os.WriteFile(cooldownPath(dataDir), data, 0644); err != nil {
-		return fmt.Errorf("write cooldown: %w", err)
-	}
-
-	return nil
+	return atomicWrite(cooldownPath(dataDir), data)
 }
 
 // IsCoolingDown returns true if the given version is currently in a cooldown
 // period (i.e. a recent rollback occurred for this version).
+// Returns true on read errors to conservatively prevent retrying a bad version.
 func IsCoolingDown(dataDir, version string) bool {
 	c, err := ReadCooldown(dataDir)
-	if err != nil || c == nil {
+	if err != nil {
+		// Corrupted cooldown file — assume cooling down to be safe.
+		return true
+	}
+	if c == nil {
 		return false
 	}
 
@@ -136,4 +121,37 @@ func IsCoolingDown(dataDir, version string) bool {
 	}
 
 	return time.Now().Before(c.Until)
+}
+
+// atomicWrite writes data to path via a temp file + rename to prevent
+// torn writes on crash. Creates parent directories if needed.
+func atomicWrite(path string, data []byte) error {
+	dir := filepath.Dir(path)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create dir: %w", err)
+	}
+
+	tmp, err := os.CreateTemp(dir, ".tmp-*")
+	if err != nil {
+		return fmt.Errorf("create temp file: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	if _, err := tmp.Write(data); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("write temp file: %w", err)
+	}
+
+	if err := tmp.Close(); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("close temp file: %w", err)
+	}
+
+	if err := os.Rename(tmpPath, path); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename to final path: %w", err)
+	}
+
+	return nil
 }

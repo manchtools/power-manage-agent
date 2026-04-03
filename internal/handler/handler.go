@@ -91,18 +91,20 @@ func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 	h.mu.Unlock()
 
 	// Trigger auto-update if the server provided update information (Path A).
+	// Use background context so the download survives stream disconnects.
 	if h.updateCfg != nil && welcome.LatestAgentVersion != "" && welcome.UpdateUrl != "" {
+		cfg := updater.WelcomeConfig{
+			LatestVersion:  welcome.LatestAgentVersion,
+			UpdateURL:      welcome.UpdateUrl,
+			UpdateChecksum: welcome.UpdateChecksum,
+			CurrentVersion: h.updateCfg.Version,
+			DataDir:        h.updateCfg.DataDir,
+			BinaryPath:     h.updateCfg.BinaryPath,
+			ServiceName:    h.updateCfg.ServiceName,
+			Logger:         h.logger.With("component", "updater"),
+		}
 		go func() {
-			if err := updater.HandleWelcome(ctx, updater.WelcomeConfig{
-				LatestVersion:  welcome.LatestAgentVersion,
-				UpdateURL:      welcome.UpdateUrl,
-				UpdateChecksum: welcome.UpdateChecksum,
-				CurrentVersion: h.updateCfg.Version,
-				DataDir:        h.updateCfg.DataDir,
-				BinaryPath:     h.updateCfg.BinaryPath,
-				ServiceName:    h.updateCfg.ServiceName,
-				Logger:         h.logger.With("component", "updater"),
-			}); err != nil {
+			if err := updater.HandleWelcome(context.Background(), cfg); err != nil {
 				h.logger.Warn("welcome update failed", "error", err)
 			}
 		}()

@@ -15,9 +15,9 @@ reviews:
         Agent self-update code. Check for checksum verification, rollback
         safety, and cooldown handling. Updates must never leave the agent
         in a broken state.
-tools:
-  golangci-lint:
-    enabled: true
+  tools:
+    golangci-lint:
+      enabled: true
 knowledge_base:
   learnings:
     scope: auto

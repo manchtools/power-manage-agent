@@ -15,8 +15,13 @@ import (
 // DownloadAndVerify downloads a file from url, verifies it matches the expected
 // SHA256 hex checksum, and atomically moves it to destPath.
 func DownloadAndVerify(ctx context.Context, url, checksum, destPath string) error {
-	// Create temp file in the same directory as destPath so rename is atomic.
+	// Ensure the destination directory exists (first update on a fresh agent).
 	dir := filepath.Dir(destPath)
+	if err := os.MkdirAll(dir, 0755); err != nil {
+		return fmt.Errorf("create destination dir: %w", err)
+	}
+
+	// Create temp file in the same directory as destPath so rename is atomic.
 	tmp, err := os.CreateTemp(dir, "pm-update-*.tmp")
 	if err != nil {
 		return fmt.Errorf("create temp file: %w", err)
