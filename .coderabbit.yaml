@@ -1,0 +1,26 @@
+language: en
+reviews:
+  auto_review:
+    enabled: true
+  profile: chill
+  path_instructions:
+    - path: "internal/executor/**"
+      instructions: >
+        Action executors run as the power-manage user with sudo permissions
+        for required modules. Check for command injection, path traversal,
+        and proper input validation. All external commands must go through
+        the sdk/go/sys/exec package.
+    - path: "internal/updater/**"
+      instructions: >
+        Agent self-update code. Check for checksum verification, rollback
+        safety, and cooldown handling. Updates must never leave the agent
+        in a broken state.
+  tools:
+    golangci-lint:
+      enabled: true
+knowledge_base:
+  learnings:
+    scope: auto
+  linked_repositories:
+    - repository: manchtools/power-manage-sdk
+    - repository: manchtools/power-manage-server
