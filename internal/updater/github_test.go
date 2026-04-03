@@ -7,43 +7,6 @@ import (
 	"testing"
 )
 
-func TestCheckGitHubRelease_UpdateAvailable(t *testing.T) {
-	// Mock GitHub API server returning a release with matching assets.
-	mux := http.NewServeMux()
-	mux.HandleFunc("/repos/MANCHTOOLS/power-manage-agent/releases/latest", func(w http.ResponseWriter, r *http.Request) {
-		w.Header().Set("Content-Type", "application/json")
-		w.Write([]byte(`{
-			"tag_name": "v2026.04.2",
-			"assets": [
-				{
-					"name": "power-manage-agent-linux-amd64",
-					"browser_download_url": "https://github.com/MANCHTOOLS/power-manage-agent/releases/download/v2026.04.2/power-manage-agent-linux-amd64"
-				},
-				{
-					"name": "power-manage-agent-linux-arm64",
-					"browser_download_url": "https://github.com/MANCHTOOLS/power-manage-agent/releases/download/v2026.04.2/power-manage-agent-linux-arm64"
-				},
-				{
-					"name": "SHA256SUMS",
-					"browser_download_url": "SUMS_URL"
-				}
-			]
-		}`))
-	})
-
-	server := httptest.NewServer(mux)
-	defer server.Close()
-
-	// Override the GitHub API base URL by using the test server URL as the "repo"
-	// Unfortunately, CheckGitHubRelease hardcodes the GitHub API URL.
-	// We'll test fetchChecksum separately and test the parsing logic here.
-	// For now, test that the function returns an error with invalid URL (unreachable).
-	// See TestFetchChecksum for the checksum parsing test.
-
-	// Test: same version returns empty (no update needed)
-	// This needs a real HTTP roundtrip. Let's test the fetchChecksum function instead.
-}
-
 func TestFetchChecksum_Success(t *testing.T) {
 	checksumContent := `abc123def456  power-manage-agent-linux-amd64
 789012fed345  power-manage-agent-linux-arm64
