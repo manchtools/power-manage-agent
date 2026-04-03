@@ -648,9 +648,9 @@ func sendScheduledResults(ctx context.Context, client *sdk.Client, sched *schedu
 				return
 			}
 
-			// Only send results that have changes (or are failures)
-			if !result.HasChanges {
-				logger.Debug("skipping result without changes",
+			// Skip unchanged results unless this is the first execution of the action
+			if !result.HasChanges && sched.Store().HasPriorExecution(result.ActionID) {
+				logger.Debug("skipping unchanged result (not first run)",
 					"action_id", result.ActionID,
 				)
 				continue
@@ -742,9 +742,8 @@ func syncPendingResults(ctx context.Context, sched *scheduler.Scheduler, client 
 		default:
 		}
 
-		// Skip results without changes (unless they failed)
-		if !r.HasChanges && r.Status == pm.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
-			// Mark as synced since we don't need to report no-change successes
+		// Skip unchanged successes unless this is the first execution of the action
+		if !r.HasChanges && r.Status == pm.ExecutionStatus_EXECUTION_STATUS_SUCCESS && sched.Store().HasPriorExecution(r.ActionID) {
 			if err := sched.MarkResultSynced(r.ID); err != nil {
 				logger.Warn("failed to mark result synced", "result_id", r.ID, "error", err)
 			}

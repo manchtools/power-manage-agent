@@ -59,6 +59,11 @@ func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Sche
 	}
 }
 
+// Store returns the underlying action store.
+func (s *Scheduler) Store() *store.Store {
+	return s.store
+}
+
 // Start begins the scheduler loop.
 func (s *Scheduler) Start(ctx context.Context) {
 	s.mu.Lock()
