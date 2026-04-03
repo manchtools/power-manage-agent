@@ -538,6 +538,18 @@ func (s *Store) MarkResultSynced(resultID string) error {
 	return err
 }
 
+// HasPriorExecution returns true if the action has more than one recorded execution.
+// This is used to distinguish first-run results (which should always be reported)
+// from subsequent unchanged results (which can be skipped).
+func (s *Store) HasPriorExecution(actionID string) bool {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var count int
+	err := s.db.QueryRow("SELECT COUNT(*) FROM results WHERE action_id = ?", actionID).Scan(&count)
+	return err == nil && count > 1
+}
+
 // CleanupOldResults removes synced results older than the retention period.
 func (s *Store) CleanupOldResults(retention time.Duration) error {
 	s.mu.Lock()

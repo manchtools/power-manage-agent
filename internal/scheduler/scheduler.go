@@ -59,6 +59,13 @@ func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Sche
 	}
 }
 
+// HasPriorExecution returns true if the action has been executed before.
+// Used to determine if an unchanged result should be reported (first run)
+// or skipped (subsequent runs).
+func (s *Scheduler) HasPriorExecution(actionID string) bool {
+	return s.store.HasPriorExecution(actionID)
+}
+
 // Start begins the scheduler loop.
 func (s *Scheduler) Start(ctx context.Context) {
 	s.mu.Lock()
