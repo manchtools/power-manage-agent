@@ -15,18 +15,9 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
-	"github.com/manchtools/power-manage/agent/internal/updater"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
-
-// UpdateConfig holds the configuration needed for Welcome-triggered updates.
-type UpdateConfig struct {
-	Version     string
-	DataDir     string
-	BinaryPath  string
-	ServiceName string
-}
 
 // Handler implements the SDK StreamHandler interface.
 type Handler struct {
@@ -35,7 +26,6 @@ type Handler struct {
 	osquery      *osquery.Registry // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
-	updateCfg    *UpdateConfig  // nil disables Welcome-triggered updates
 	mu           sync.Mutex     // protects connectedCh and connectedSet
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
 	connectedSet bool           // tracks if connectedCh has been closed
@@ -50,11 +40,6 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 		syncTrigger: syncTrigger,
 		connectedCh: make(chan struct{}),
 	}
-}
-
-// SetUpdateConfig configures Welcome-triggered auto-updates (Path A).
-func (h *Handler) SetUpdateConfig(cfg *UpdateConfig) {
-	h.updateCfg = cfg
 }
 
 // getOsquery returns the osquery registry, initializing it lazily on first use.
@@ -89,26 +74,6 @@ func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 		h.connectedSet = true
 	}
 	h.mu.Unlock()
-
-	// Trigger auto-update if the server provided update information (Path A).
-	// Use background context so the download survives stream disconnects.
-	if h.updateCfg != nil && welcome.LatestAgentVersion != "" && welcome.UpdateUrl != "" {
-		cfg := updater.WelcomeConfig{
-			LatestVersion:  welcome.LatestAgentVersion,
-			UpdateURL:      welcome.UpdateUrl,
-			UpdateChecksum: welcome.UpdateChecksum,
-			CurrentVersion: h.updateCfg.Version,
-			DataDir:        h.updateCfg.DataDir,
-			BinaryPath:     h.updateCfg.BinaryPath,
-			ServiceName:    h.updateCfg.ServiceName,
-			Logger:         h.logger.With("component", "updater"),
-		}
-		go func() {
-			if err := updater.HandleWelcome(context.Background(), cfg); err != nil {
-				h.logger.Warn("welcome update failed", "error", err)
-			}
-		}()
-	}
 
 	return nil
 }

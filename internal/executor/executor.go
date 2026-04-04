@@ -46,6 +46,7 @@ type Executor struct {
 	luksKeyStore LuksKeyStore
 	store        *store.Store
 	actionStore  ActionStore
+	updateCfg    *AgentUpdateConfig
 }
 
 // NewExecutor creates a new action executor.
@@ -73,6 +74,13 @@ func (e *Executor) SetLuksKeyStore(ks LuksKeyStore) {
 func (e *Executor) SetStore(s *store.Store) {
 	e.mu.Lock()
 	e.store = s
+	e.mu.Unlock()
+}
+
+// SetUpdateConfig configures the agent self-update executor.
+func (e *Executor) SetUpdateConfig(cfg *AgentUpdateConfig) {
+	e.mu.Lock()
+	e.updateCfg = cfg
 	e.mu.Unlock()
 }
 
@@ -273,6 +281,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
+	case pb.ActionType_ACTION_TYPE_AGENT_UPDATE:
+		var changed bool
+		output, changed, execErr = e.executeAgentUpdate(ctx, action.GetAgentUpdate())
+		result.Changed = changed
 	default:
 		execErr = fmt.Errorf("unsupported action type: %v", action.Type)
 	}

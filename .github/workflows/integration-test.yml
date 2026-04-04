@@ -46,11 +46,21 @@ jobs:
         with:
           path: agent
 
+      - name: Resolve SDK ref
+        id: sdk_ref
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if git ls-remote --heads https://github.com/MANCHTOOLS/power-manage-sdk.git "refs/heads/${BRANCH}" | grep -q .; then
+            echo "ref=${BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout SDK
         uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
-          ref: main
+          ref: ${{ steps.sdk_ref.outputs.ref }}
           path: sdk
 
       - name: Build test image
@@ -77,11 +87,21 @@ jobs:
         with:
           path: agent
 
+      - name: Resolve SDK ref
+        id: sdk_ref
+        run: |
+          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+          if git ls-remote --heads https://github.com/MANCHTOOLS/power-manage-sdk.git "refs/heads/${BRANCH}" | grep -q .; then
+            echo "ref=${BRANCH}" >> "$GITHUB_OUTPUT"
+          else
+            echo "ref=main" >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Checkout SDK
         uses: actions/checkout@v5
         with:
           repository: MANCHTOOLS/power-manage-sdk
-          ref: main
+          ref: ${{ steps.sdk_ref.outputs.ref }}
           path: sdk
 
       - name: Build test image

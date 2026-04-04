@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
@@ -157,6 +158,9 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 
 	s.logger.Debug("found due actions", "count", len(actions))
 
+	// Reset the per-cycle agent update dedup flag
+	executor.ResetAgentUpdateCycle()
+
 	for _, stored := range actions {
 		select {
 		case <-ctx.Done():
@@ -298,6 +302,7 @@ func (s *Scheduler) MarkResultSynced(resultID string) error {
 
 // ForceExecute immediately executes an action regardless of schedule.
 func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.ActionResult, error) {
+	executor.ResetAgentUpdateCycle()
 	stored, err := s.store.GetAction(actionID)
 	if err != nil {
 		return nil, err
@@ -329,6 +334,9 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+
+	// Reset the per-cycle agent update dedup flag for the sync batch.
+	executor.ResetAgentUpdateCycle()
 
 	s.logger.Info("syncing actions from server", "count", len(actions), "first_sync", firstSync)
 
