@@ -633,6 +633,11 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		return nil, false, fmt.Errorf("flatpak params required")
 	}
 
+	// Skip on systems without flatpak
+	if _, err := exec.LookPath("flatpak"); err != nil {
+		return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
+	}
+
 	if params.AppId == "" {
 		return nil, false, fmt.Errorf("flatpak app_id is required")
 	}
@@ -726,6 +731,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, false, fmt.Errorf("app params required")
 	}
 
+	// Skip on non-deb systems
+	if _, err := exec.LookPath("dpkg"); err != nil {
+		return &pb.CommandOutput{Stdout: "skipped: dpkg not available on this system"}, false, nil
+	}
+
 	// Extract package name from URL for checking
 	filename := filepath.Base(params.Url)
 	pkgName := strings.Split(filename, "_")[0]
@@ -801,6 +811,11 @@ func (e *Executor) isDebInstalled(pkgName string) bool {
 func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("app params required")
+	}
+
+	// Skip on non-rpm systems
+	if _, err := exec.LookPath("rpm"); err != nil {
+		return &pb.CommandOutput{Stdout: "skipped: rpm not available on this system"}, false, nil
 	}
 
 	// Extract package name from URL for checking
