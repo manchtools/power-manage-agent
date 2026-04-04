@@ -97,8 +97,9 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("checksum URL validation: %w", err)
 	}
 
-	// Step 4: Download checksum file and extract checksum for our binary
-	binaryFilename := filepath.Base(arch.BinaryUrl)
+	// Step 4: Download checksum file and extract checksum for our binary.
+	// Use url.Parse to strip query parameters (e.g. S3 presigned URLs).
+	binaryFilename := extractFilename(arch.BinaryUrl)
 	expectedChecksum, err := downloadAndExtractChecksum(ctx, e.httpClient, arch.ChecksumUrl, binaryFilename)
 	if err != nil {
 		return nil, false, fmt.Errorf("download checksum: %w", err)
@@ -174,11 +175,26 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	stdout := fmt.Sprintf("Updated from %s to %s. Restarting.", cfg.Version, newVersion)
 	e.logger.Info(stdout)
 
+	// Delay shutdown to allow the result to be recorded and sent to the server.
+	// The scheduler checks ctx.Err() after Execute returns — if we cancel
+	// immediately, the result is dropped.
 	if cfg.Shutdown != nil {
-		go cfg.Shutdown()
+		go func() {
+			time.Sleep(3 * time.Second)
+			cfg.Shutdown()
+		}()
 	}
 
 	return &pb.CommandOutput{Stdout: stdout}, true, nil
+}
+
+// extractFilename returns the filename from a URL, stripping query parameters.
+func extractFilename(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return filepath.Base(rawURL)
+	}
+	return filepath.Base(u.Path)
 }
 
 // getArchEntry returns the AgentUpdateArch for the current runtime architecture.
