@@ -6,7 +6,6 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
-	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,7 +16,6 @@ import (
 	"runtime"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
@@ -106,14 +104,14 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("download checksum: %w", err)
 	}
 
-	// Step 5: Download binary to temp file in the same directory as the target
-	// binary to ensure os.Rename works (avoids EXDEV cross-device errors).
-	targetDir := filepath.Dir(cfg.BinaryPath)
-	if err := os.MkdirAll(targetDir, 0755); err != nil {
-		return nil, false, fmt.Errorf("create target dir: %w", err)
+	// Step 5: Download binary to temp file in DataDir (agent-owned).
+	// The final install uses sudo cp since the target dir is root-owned.
+	updateDir := filepath.Join(cfg.DataDir, "update")
+	if err := os.MkdirAll(updateDir, 0755); err != nil {
+		return nil, false, fmt.Errorf("create update dir: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp(targetDir, ".agent-update-*.tmp")
+	tmpFile, err := os.CreateTemp(updateDir, "agent-update-*.tmp")
 	if err != nil {
 		return nil, false, fmt.Errorf("create temp file: %w", err)
 	}
@@ -158,10 +156,13 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
-	// Step 8: Atomically swap binary
-	if err := atomicSwap(tmpPath, cfg.BinaryPath); err != nil {
+	// Step 8: Install binary via sudo (target dir is root-owned)
+	if _, err := runSudoCmd(ctx, "cp", tmpPath, cfg.BinaryPath); err != nil {
 		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
-		return nil, false, fmt.Errorf("swap binary: %w", err)
+		return nil, false, fmt.Errorf("install binary: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "chmod", "+x", cfg.BinaryPath); err != nil {
+		e.logger.Warn("chmod after install failed", "error", err)
 	}
 
 	// Step 9: Write state.json
@@ -178,62 +179,6 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	return &pb.CommandOutput{Stdout: stdout}, true, nil
-}
-
-// atomicSwap moves src to dst. If they are on different filesystems (EXDEV),
-// it falls back to copy-to-target-dir + rename.
-func atomicSwap(src, dst string) error {
-	err := os.Rename(src, dst)
-	if err == nil {
-		return nil
-	}
-	if !errors.Is(err, syscall.EXDEV) {
-		return err
-	}
-
-	// Cross-device fallback: copy into target dir, then rename.
-	dstDir := filepath.Dir(dst)
-	tmp, err := os.CreateTemp(dstDir, ".agent-swap-*.tmp")
-	if err != nil {
-		return fmt.Errorf("create swap temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-
-	srcFile, err := os.Open(src)
-	if err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("open source: %w", err)
-	}
-
-	if _, err := io.Copy(tmp, srcFile); err != nil {
-		srcFile.Close()
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("copy to target dir: %w", err)
-	}
-	srcFile.Close()
-
-	if err := tmp.Chmod(0755); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("chmod swap temp: %w", err)
-	}
-
-	if err := tmp.Sync(); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return fmt.Errorf("fsync swap temp: %w", err)
-	}
-	tmp.Close()
-
-	if err := os.Rename(tmpPath, dst); err != nil {
-		os.Remove(tmpPath)
-		return fmt.Errorf("rename swap temp: %w", err)
-	}
-
-	os.Remove(src)
-	return nil
 }
 
 // getArchEntry returns the AgentUpdateArch for the current runtime architecture.
