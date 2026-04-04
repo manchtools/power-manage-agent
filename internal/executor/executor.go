@@ -4,6 +4,7 @@ package executor
 import (
 	"bytes"
 	"context"
+	"errors"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -635,7 +636,10 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 
 	// Skip on systems without flatpak
 	if _, err := exec.LookPath("flatpak"); err != nil {
-		return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
+		if errors.Is(err, exec.ErrNotFound) {
+			return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
+		}
+		return nil, false, fmt.Errorf("flatpak lookup: %w", err)
 	}
 
 	if params.AppId == "" {
@@ -733,7 +737,10 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 
 	// Skip on non-deb systems
 	if _, err := exec.LookPath("dpkg"); err != nil {
-		return &pb.CommandOutput{Stdout: "skipped: dpkg not available on this system"}, false, nil
+		if errors.Is(err, exec.ErrNotFound) {
+			return &pb.CommandOutput{Stdout: "skipped: dpkg not available on this system"}, false, nil
+		}
+		return nil, false, fmt.Errorf("dpkg lookup: %w", err)
 	}
 
 	// Extract package name from URL for checking
@@ -815,7 +822,10 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 
 	// Skip on non-rpm systems
 	if _, err := exec.LookPath("rpm"); err != nil {
-		return &pb.CommandOutput{Stdout: "skipped: rpm not available on this system"}, false, nil
+		if errors.Is(err, exec.ErrNotFound) {
+			return &pb.CommandOutput{Stdout: "skipped: rpm not available on this system"}, false, nil
+		}
+		return nil, false, fmt.Errorf("rpm lookup: %w", err)
 	}
 
 	// Extract package name from URL for checking
