@@ -216,15 +216,14 @@ func TestMarkAgentUpdateExecuted(t *testing.T) {
 	}
 }
 
-func TestCheckStartupUpdateState(t *testing.T) {
+func TestCheckStartupUpdateState_Success(t *testing.T) {
 	dir := t.TempDir()
 
-	// Write staged state
-	writeUpdateState(dir, "staged", "v2026.04.01")
+	// Write staged state with version matching "running" version
+	writeUpdateState(dir, "staged", "2026.04.01")
 
-	// Should clear the state after reading
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, logger)
+	CheckStartupUpdateState(dir, "/nonexistent/binary", "2026.04.01", logger)
 
 	// Verify state was cleared
 	phase, _, _ := readUpdateState(dir)
@@ -233,7 +232,44 @@ func TestCheckStartupUpdateState(t *testing.T) {
 	}
 
 	if len(logger.infos) == 0 {
-		t.Error("expected at least one info log")
+		t.Error("expected at least one info log for successful update")
+	}
+}
+
+func TestCheckStartupUpdateState_FailedUpdate(t *testing.T) {
+	dir := t.TempDir()
+
+	// Staged version doesn't match running version — update failed
+	writeUpdateState(dir, "staged", "2026.04.02")
+
+	logger := &testLogger{}
+	CheckStartupUpdateState(dir, "/nonexistent/binary", "2026.04.01", logger)
+
+	// Verify state was cleared
+	phase, _, _ := readUpdateState(dir)
+	if phase != "" {
+		t.Errorf("expected state to be cleared, got phase=%q", phase)
+	}
+
+	// Should have logged an error about version mismatch
+	if len(logger.errors) == 0 {
+		t.Error("expected error log for failed update")
+	}
+
+	// Should have written cooldown for the failed version
+	if !isCoolingDown(dir, "2026.04.02") {
+		t.Error("expected cooldown for failed version")
+	}
+}
+
+func TestCheckStartupUpdateState_NoState(t *testing.T) {
+	dir := t.TempDir()
+	logger := &testLogger{}
+	CheckStartupUpdateState(dir, "/nonexistent/binary", "2026.04.01", logger)
+
+	// No logs expected for clean startup
+	if len(logger.infos) > 0 || len(logger.warns) > 0 || len(logger.errors) > 0 {
+		t.Error("expected no logs for clean startup without state file")
 	}
 }
 
@@ -323,6 +359,7 @@ func TestExtractFilename(t *testing.T) {
 type testLogger struct {
 	infos  []string
 	warns  []string
+	errors []string
 }
 
 func (l *testLogger) Info(msg string, args ...any) {
@@ -331,4 +368,8 @@ func (l *testLogger) Info(msg string, args ...any) {
 
 func (l *testLogger) Warn(msg string, args ...any) {
 	l.warns = append(l.warns, msg)
+}
+
+func (l *testLogger) Error(msg string, args ...any) {
+	l.errors = append(l.errors, msg)
 }

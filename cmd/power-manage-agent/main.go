@@ -218,7 +218,8 @@ func main() {
 	}
 
 	// Check for completed/rolled-back update from a previous cycle.
-	executor.CheckStartupUpdateState(cfg.DataDir, logger)
+	// If a staged update failed (version mismatch), restore from backup.
+	executor.CheckStartupUpdateState(cfg.DataDir, "/usr/local/bin/power-manage-agent", version, logger)
 
 	// Initialize the action store for offline persistence
 	actionStore, err := store.New(cfg.DataDir)
