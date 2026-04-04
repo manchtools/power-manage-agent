@@ -157,13 +157,23 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
-	// Step 8: Install binary via sudo (target dir is root-owned)
-	if _, err := runSudoCmd(ctx, "cp", tmpPath, cfg.BinaryPath); err != nil {
+	// Step 8: Atomic staged install via sudo (target dir is root-owned).
+	// Copy to a sibling temp, chmod, then mv — the live binary is only
+	// replaced after the new one is fully written and executable.
+	stagePath := cfg.BinaryPath + ".new"
+	if _, err := runSudoCmd(ctx, "cp", tmpPath, stagePath); err != nil {
 		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
-		return nil, false, fmt.Errorf("install binary: %w", err)
+		return nil, false, fmt.Errorf("stage binary: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "+x", cfg.BinaryPath); err != nil {
-		e.logger.Warn("chmod after install failed", "error", err)
+	if _, err := runSudoCmd(ctx, "chmod", "+x", stagePath); err != nil {
+		runSudoCmd(ctx, "rm", "-f", stagePath)
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
+		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "mv", stagePath, cfg.BinaryPath); err != nil {
+		runSudoCmd(ctx, "rm", "-f", stagePath)
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
+		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 
 	// Step 9: Write state.json
