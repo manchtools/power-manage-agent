@@ -263,6 +263,7 @@ func main() {
 		Version:    version,
 		DataDir:    cfg.DataDir,
 		BinaryPath: "/usr/local/bin/power-manage-agent",
+		Shutdown:   cancel,
 	})
 
 	// Start certificate rotation goroutine

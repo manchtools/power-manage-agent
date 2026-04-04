@@ -79,7 +79,9 @@ func (e *Executor) SetStore(s *store.Store) {
 
 // SetUpdateConfig configures the agent self-update executor.
 func (e *Executor) SetUpdateConfig(cfg *AgentUpdateConfig) {
+	e.mu.Lock()
 	e.updateCfg = cfg
+	e.mu.Unlock()
 }
 
 // SetActionStore sets the action store for LUKS conflict resolution.

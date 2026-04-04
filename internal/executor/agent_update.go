@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -16,6 +17,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
@@ -23,9 +25,10 @@ import (
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
 type AgentUpdateConfig struct {
-	Version     string // Current running agent version
-	DataDir     string // Data directory for state/cooldown files
-	BinaryPath  string // Path to the installed agent binary (e.g., /usr/local/bin/power-manage-agent)
+	Version    string       // Current running agent version
+	DataDir    string       // Data directory for state/cooldown files
+	BinaryPath string       // Path to the installed agent binary (e.g., /usr/local/bin/power-manage-agent)
+	Shutdown   func()       // Called after a successful update to trigger graceful agent shutdown
 }
 
 // agentUpdateExecuted tracks whether an AGENT_UPDATE action already ran in the current sync cycle.
@@ -68,7 +71,7 @@ func markAgentUpdateExecuted() bool {
 //  8. Compare with running version → skip if same
 //  9. Atomically swap binary
 //  10. Write state.json with {"phase":"staged","version":"..."}
-//  11. Exit cleanly (systemd restarts with new binary)
+//  11. Signal graceful shutdown (systemd restarts with new binary)
 func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdateParams) (*pb.CommandOutput, bool, error) {
 	cfg := e.updateCfg
 	if cfg == nil {
@@ -103,23 +106,21 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("download checksum: %w", err)
 	}
 
-	// Step 5: Check cooldown — skip if this version recently failed
-	// We don't know the version yet, but we can check after download.
-
-	// Step 6: Download binary to temp file and verify SHA256
-	updateDir := filepath.Join(cfg.DataDir, "update")
-	if err := os.MkdirAll(updateDir, 0755); err != nil {
-		return nil, false, fmt.Errorf("create update dir: %w", err)
+	// Step 5: Download binary to temp file in the same directory as the target
+	// binary to ensure os.Rename works (avoids EXDEV cross-device errors).
+	targetDir := filepath.Dir(cfg.BinaryPath)
+	if err := os.MkdirAll(targetDir, 0755); err != nil {
+		return nil, false, fmt.Errorf("create target dir: %w", err)
 	}
 
-	tmpFile, err := os.CreateTemp(updateDir, "agent-update-*.tmp")
+	tmpFile, err := os.CreateTemp(targetDir, ".agent-update-*.tmp")
 	if err != nil {
 		return nil, false, fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
 	defer func() {
 		tmpFile.Close()
-		os.Remove(tmpPath) // cleanup on any failure
+		os.Remove(tmpPath) // cleanup on any failure path
 	}()
 
 	actualChecksum, err := downloadToFile(ctx, e.httpClient, arch.BinaryUrl, tmpFile)
@@ -137,13 +138,13 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("chmod: %w", err)
 	}
 
-	// Step 7: Run version command on downloaded binary
+	// Step 6: Run version command on downloaded binary
 	newVersion, err := getBinaryVersion(tmpPath)
 	if err != nil {
 		return nil, false, fmt.Errorf("version check on downloaded binary: %w", err)
 	}
 
-	// Step 8: Compare versions — skip if same
+	// Step 7: Compare versions — skip if same
 	if newVersion == cfg.Version {
 		e.logger.Info("agent is already at the latest version", "version", cfg.Version)
 		return &pb.CommandOutput{Stdout: fmt.Sprintf("Already at version %s", cfg.Version)}, false, nil
@@ -157,31 +158,82 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
-	// Step 9: Atomically swap binary
-	if err := os.Rename(tmpPath, cfg.BinaryPath); err != nil {
+	// Step 8: Atomically swap binary
+	if err := atomicSwap(tmpPath, cfg.BinaryPath); err != nil {
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
-	// chmod after rename (in case target dir has different permissions)
-	if err := os.Chmod(cfg.BinaryPath, 0755); err != nil {
-		e.logger.Warn("chmod after swap failed", "error", err)
-	}
 
-	// Step 10: Write state.json
+	// Step 9: Write state.json
 	if err := writeUpdateState(cfg.DataDir, "staged", newVersion); err != nil {
 		e.logger.Warn("failed to write update state", "error", err)
 	}
 
-	// Step 11: Exit cleanly — systemd restarts with new binary
+	// Step 10: Signal graceful shutdown — systemd restarts with new binary
 	stdout := fmt.Sprintf("Updated from %s to %s. Restarting.", cfg.Version, newVersion)
 	e.logger.Info(stdout)
 
-	// Schedule a clean exit after returning the result
-	go func() {
-		time.Sleep(1 * time.Second)
-		os.Exit(0)
-	}()
+	if cfg.Shutdown != nil {
+		go cfg.Shutdown()
+	}
 
 	return &pb.CommandOutput{Stdout: stdout}, true, nil
+}
+
+// atomicSwap moves src to dst. If they are on different filesystems (EXDEV),
+// it falls back to copy-to-target-dir + rename.
+func atomicSwap(src, dst string) error {
+	err := os.Rename(src, dst)
+	if err == nil {
+		return nil
+	}
+	if !errors.Is(err, syscall.EXDEV) {
+		return err
+	}
+
+	// Cross-device fallback: copy into target dir, then rename.
+	dstDir := filepath.Dir(dst)
+	tmp, err := os.CreateTemp(dstDir, ".agent-swap-*.tmp")
+	if err != nil {
+		return fmt.Errorf("create swap temp: %w", err)
+	}
+	tmpPath := tmp.Name()
+
+	srcFile, err := os.Open(src)
+	if err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("open source: %w", err)
+	}
+
+	if _, err := io.Copy(tmp, srcFile); err != nil {
+		srcFile.Close()
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("copy to target dir: %w", err)
+	}
+	srcFile.Close()
+
+	if err := tmp.Chmod(0755); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("chmod swap temp: %w", err)
+	}
+
+	if err := tmp.Sync(); err != nil {
+		tmp.Close()
+		os.Remove(tmpPath)
+		return fmt.Errorf("fsync swap temp: %w", err)
+	}
+	tmp.Close()
+
+	if err := os.Rename(tmpPath, dst); err != nil {
+		os.Remove(tmpPath)
+		return fmt.Errorf("rename swap temp: %w", err)
+	}
+
+	os.Remove(src)
+	return nil
 }
 
 // getArchEntry returns the AgentUpdateArch for the current runtime architecture.
@@ -264,6 +316,7 @@ func downloadAndExtractChecksum(ctx context.Context, client *http.Client, checks
 }
 
 // downloadToFile downloads a URL to a file and returns the SHA256 hex checksum.
+// Downloads are capped at maxDownloadSize (2 GiB).
 func downloadToFile(ctx context.Context, client *http.Client, downloadURL string, dst *os.File) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
 	if err != nil {
@@ -280,11 +333,21 @@ func downloadToFile(ctx context.Context, client *http.Client, downloadURL string
 		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
 	}
 
+	if resp.ContentLength > maxDownloadSize {
+		return "", fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
+	}
+
 	hasher := sha256.New()
 	w := io.MultiWriter(dst, hasher)
 
-	if _, err := io.Copy(w, resp.Body); err != nil {
+	// Cap the download at maxDownloadSize + 1 to detect overflows.
+	reader := io.LimitReader(resp.Body, maxDownloadSize+1)
+	written, err := io.Copy(w, reader)
+	if err != nil {
 		return "", fmt.Errorf("write: %w", err)
+	}
+	if written > maxDownloadSize {
+		return "", fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
 	}
 
 	return hex.EncodeToString(hasher.Sum(nil)), nil
@@ -338,7 +401,6 @@ func readUpdateState(dataDir string) (phase, version string, err error) {
 		return "", "", err
 	}
 
-	// Simple manual parse to avoid importing encoding/json for a two-field struct
 	type state struct {
 		Phase   string `json:"phase"`
 		Version string `json:"version"`
@@ -407,7 +469,6 @@ func isCoolingDown(dataDir, version string) bool {
 
 	return time.Now().Before(until)
 }
-
 
 // CheckStartupUpdateState checks for a completed or rolled-back update from a previous cycle.
 // Call this at agent startup. It logs the result and clears the state.

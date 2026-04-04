@@ -302,6 +302,7 @@ func (s *Scheduler) MarkResultSynced(resultID string) error {
 
 // ForceExecute immediately executes an action regardless of schedule.
 func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.ActionResult, error) {
+	executor.ResetAgentUpdateCycle()
 	stored, err := s.store.GetAction(actionID)
 	if err != nil {
 		return nil, err
@@ -333,6 +334,9 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 	if ctx.Err() != nil {
 		return ctx.Err()
 	}
+
+	// Reset the per-cycle agent update dedup flag for the sync batch.
+	executor.ResetAgentUpdateCycle()
 
 	s.logger.Info("syncing actions from server", "count", len(actions), "first_sync", firstSync)
 
