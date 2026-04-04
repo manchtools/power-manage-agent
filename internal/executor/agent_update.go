@@ -334,6 +334,10 @@ func getBinaryVersion(binaryPath string) (string, error) {
 	if v == "" {
 		return "", fmt.Errorf("binary returned empty version")
 	}
+	// Output may be "power-manage-agent 2026.04.04" — extract just the version.
+	if parts := strings.Fields(v); len(parts) > 1 {
+		v = parts[len(parts)-1]
+	}
 	return v, nil
 }
 
