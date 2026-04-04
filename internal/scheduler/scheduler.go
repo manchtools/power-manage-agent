@@ -12,6 +12,7 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
@@ -156,6 +157,9 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 	}
 
 	s.logger.Debug("found due actions", "count", len(actions))
+
+	// Reset the per-cycle agent update dedup flag
+	executor.ResetAgentUpdateCycle()
 
 	for _, stored := range actions {
 		select {

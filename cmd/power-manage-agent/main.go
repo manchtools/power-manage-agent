@@ -3,7 +3,6 @@ package main
 
 import (
 	"context"
-	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -16,7 +15,6 @@ import (
 	"net/url"
 	"os"
 	"os/signal"
-	"runtime"
 	"strings"
 	"syscall"
 	"text/tabwriter"
@@ -31,7 +29,6 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/setup"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/agent/internal/updater"
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 	sdk "github.com/manchtools/power-manage/sdk/go"
@@ -121,9 +118,6 @@ func main() {
 			return
 		case "enroll":
 			runEnroll(os.Args[2:])
-			return
-		case "update":
-			runUpdate(os.Args[2:])
 			return
 		}
 	}
@@ -223,49 +217,8 @@ func main() {
 		}
 	}
 
-	// Check for completed/rolled-back update from a previous cycle (Phase 4).
-	if state, err := updater.ReadState(cfg.DataDir); err != nil {
-		logger.Warn("failed to read update state", "error", err)
-	} else if state != nil {
-		switch state.Phase {
-		case "complete":
-			logger.Info("previous update completed successfully", "version", state.Version)
-		case "rolled_back":
-			logger.Warn("previous update was rolled back", "version", state.Version)
-		default:
-			logger.Warn("stale update state found, cleaning up", "phase", state.Phase)
-		}
-		updater.ClearState(cfg.DataDir)
-	}
-
-	// Startup self-heal update check (Path B): tries server first, falls back to GitHub.
-	// This runs BEFORE the main loop so a buggy agent can be recovered on reboot.
-	startupCfg := updater.StartupConfig{
-		Version:     version,
-		DataDir:     cfg.DataDir,
-		BinaryPath:  "/usr/local/bin/power-manage-agent",
-		ServiceName: "power-manage-agent",
-		ControlAddr: creds.ControlAddr,
-		Arch:        runtime.GOARCH,
-		Repo:        "MANCHTOOLS/power-manage-agent",
-		Logger:      logger.With("component", "startup-update"),
-	}
-	// Build mTLS config for server update check if we have credentials.
-	if len(creds.Certificate) > 0 && len(creds.PrivateKey) > 0 && len(creds.CACert) > 0 {
-		cert, err := tls.X509KeyPair(creds.Certificate, creds.PrivateKey)
-		if err == nil {
-			caPool := x509.NewCertPool()
-			caPool.AppendCertsFromPEM(creds.CACert)
-			startupCfg.TLSConfig = &tls.Config{
-				Certificates: []tls.Certificate{cert},
-				RootCAs:      caPool,
-				MinVersion:   tls.VersionTLS13,
-			}
-		}
-	}
-	if err := updater.StartupUpdateCheck(ctx, startupCfg); err != nil {
-		logger.Warn("startup update check failed", "error", err)
-	}
+	// Check for completed/rolled-back update from a previous cycle.
+	executor.CheckStartupUpdateState(cfg.DataDir, logger)
 
 	// Initialize the action store for offline persistence
 	actionStore, err := store.New(cfg.DataDir)
@@ -305,12 +258,11 @@ func main() {
 	// Create handler with scheduler integration
 	h := handler.NewHandler(logger, exec, sched, syncTrigger)
 
-	// Enable Welcome-triggered auto-updates (Path A).
-	h.SetUpdateConfig(&handler.UpdateConfig{
-		Version:     version,
-		DataDir:     cfg.DataDir,
-		BinaryPath:  "/usr/local/bin/power-manage-agent",
-		ServiceName: "power-manage-agent",
+	// Enable action-based agent self-update.
+	exec.SetUpdateConfig(&executor.AgentUpdateConfig{
+		Version:    version,
+		DataDir:    cfg.DataDir,
+		BinaryPath: "/usr/local/bin/power-manage-agent",
 	})
 
 	// Start certificate rotation goroutine
@@ -1482,30 +1434,6 @@ func trySocketEnroll(parsed *registrationURI) bool {
 
 	fmt.Printf("Enrolled successfully via agent socket. Device ID: %s\n", resp.Msg.DeviceId)
 	return true
-}
-
-// runUpdate handles the "update" subcommand — the self-install phase.
-// This is invoked by the transient pm-agent-update systemd service after
-// the old agent downloaded and validated the new binary.
-func runUpdate(args []string) {
-	fs := flag.NewFlagSet("update", flag.ExitOnError)
-	binaryPath := fs.String("binary-path", "/usr/local/bin/power-manage-agent", "Path to the installed agent binary")
-	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Data directory")
-	serviceName := fs.String("service-name", "power-manage-agent", "Systemd service name")
-	fs.Parse(args)
-
-	logger := logging.SetupLogger("info", "text", os.Stdout)
-
-	logger.Info("starting agent update",
-		"version", version,
-		"binary_path", *binaryPath,
-		"service_name", *serviceName,
-	)
-
-	if err := updater.RunUpdate(*binaryPath, *dataDir, *serviceName, logger); err != nil {
-		logger.Error("update failed", "error", err)
-		os.Exit(1)
-	}
 }
 
 // unixSocketHTTPClient returns an HTTP client that dials the given unix socket.
