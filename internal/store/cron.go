@@ -39,8 +39,8 @@ func nextCronTime(expr string, after time.Time) (time.Time, error) {
 		return time.Time{}, fmt.Errorf("day-of-week: %w", err)
 	}
 
-	domWild := fields[2] == "*"
-	dowWild := fields[4] == "*"
+	domWild := isFullRange(doms, 1, 31)
+	dowWild := isFullRange(dows, 0, 6)
 
 	// Start searching from one minute after the reference time
 	t := after.Truncate(time.Minute).Add(time.Minute)
@@ -147,4 +147,15 @@ func parseField(field string, min, max int) (map[int]bool, error) {
 		return nil, fmt.Errorf("empty field")
 	}
 	return set, nil
+}
+
+// isFullRange returns true if the set contains every value in [min, max].
+// Used to detect wildcard-equivalent patterns like */1 or 0-6.
+func isFullRange(set map[int]bool, min, max int) bool {
+	for i := min; i <= max; i++ {
+		if !set[i] {
+			return false
+		}
+	}
+	return true
 }

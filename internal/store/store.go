@@ -729,7 +729,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if err == nil {
 			return next
 		}
-		// Invalid cron expression — fall through to interval
+		slog.Warn("invalid cron expression, using interval fallback", "cron", schedule.Cron, "error", err)
 	}
 
 	// Use interval

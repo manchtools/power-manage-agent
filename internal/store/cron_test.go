@@ -7,7 +7,7 @@ import (
 
 func TestNextCronTime(t *testing.T) {
 	loc := time.UTC
-	ref := time.Date(2026, 4, 4, 10, 30, 0, 0, loc) // Friday 2026-04-04 10:30 UTC
+	ref := time.Date(2026, 4, 4, 10, 30, 0, 0, loc) // Saturday 2026-04-04 10:30 UTC
 
 	tests := []struct {
 		name string
