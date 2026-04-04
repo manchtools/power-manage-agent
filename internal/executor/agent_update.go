@@ -164,7 +164,8 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	// Step 8: Backup current binary for rollback.
 	backupPath := cfg.BinaryPath + ".bak"
 	if _, err := runSudoCmd(ctx, "cp", cfg.BinaryPath, backupPath); err != nil {
-		e.logger.Warn("failed to backup current binary, continuing anyway", "error", err)
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
+		return nil, false, fmt.Errorf("backup current binary: %w", err)
 	}
 
 	// Step 9: Atomic staged install via sudo (target dir is root-owned).
@@ -469,52 +470,52 @@ func CheckStartupUpdateState(dataDir, binaryPath, runningVersion string, logger 
 	Warn(string, ...any)
 	Error(string, ...any)
 }) {
+	ctx := context.Background()
+	backupPath := binaryPath + ".bak"
+
 	phase, stagedVersion, err := readUpdateState(dataDir)
 	if err != nil {
 		logger.Warn("failed to read update state", "error", err)
 		return
 	}
 	if phase == "" {
-		// No pending update — clean up any leftover backup.
-		backupPath := binaryPath + ".bak"
-		if _, err := os.Stat(backupPath); err == nil {
-			exec.Command("sudo", "rm", "-f", backupPath).Run()
-		}
+		// No pending update — leave .bak alone (may be needed if state was
+		// lost due to crash before state file was written).
 		return
 	}
-
-	defer clearUpdateState(dataDir)
 
 	switch phase {
 	case "staged":
 		if runningVersion == stagedVersion {
 			// Running the new version — update succeeded.
 			logger.Info("agent update completed successfully", "version", stagedVersion)
-			// Clean up backup.
-			backupPath := binaryPath + ".bak"
-			exec.Command("sudo", "rm", "-f", backupPath).Run()
+			// Clean up backup and state only after confirmed success.
+			clearUpdateState(dataDir)
+			runSudoCmd(ctx, "rm", "-f", backupPath)
 		} else {
 			// Running the old version — the new binary failed to start.
-			// Restore from backup if available.
 			logger.Error("agent update failed — running version does not match staged version",
 				"running", runningVersion, "staged", stagedVersion)
-			backupPath := binaryPath + ".bak"
+
 			if _, statErr := os.Stat(backupPath); statErr == nil {
 				logger.Warn("restoring previous binary from backup", "backup", backupPath)
-				if out, mvErr := exec.Command("sudo", "mv", backupPath, binaryPath).CombinedOutput(); mvErr != nil {
-					logger.Error("failed to restore backup", "error", mvErr, "output", string(out))
+				if _, mvErr := runSudoCmd(ctx, "mv", backupPath, binaryPath); mvErr != nil {
+					logger.Error("failed to restore backup", "error", mvErr)
 				} else {
 					logger.Info("backup restored successfully")
 				}
 			} else {
 				logger.Error("no backup available for rollback", "backup", backupPath)
 			}
+
 			// Write cooldown so the agent doesn't immediately retry the bad version.
 			if err := writeCooldown(dataDir, stagedVersion, 1*time.Hour); err != nil {
 				logger.Warn("failed to write cooldown after failed update", "error", err)
 			}
+			clearUpdateState(dataDir)
 		}
 	default:
 		logger.Warn("stale update state found, cleaning up", "phase", phase)
+		clearUpdateState(dataDir)
 	}
 }
