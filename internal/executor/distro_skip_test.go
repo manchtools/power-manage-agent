@@ -91,12 +91,13 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 		Url: "https://invalid.example.com/nonexistent.deb",
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
-	// Should NOT contain "skipped" — it should proceed and fail on download or install
+	// Should NOT contain "skipped" — it should proceed and fail on download/install
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("DEB executor should not skip when dpkg is available")
 	}
-	// We expect an error (download/install failure), not a skip
-	_ = err // error is expected
+	if err == nil {
+		t.Error("expected error from download/install of invalid URL, got nil")
+	}
 }
 
 // TestExecuteRpm_DoesNotSkipWhenRpmPresent verifies that the RPM executor
@@ -114,7 +115,9 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("RPM executor should not skip when rpm is available")
 	}
-	_ = err
+	if err == nil {
+		t.Error("expected error from download/install of invalid URL, got nil")
+	}
 }
 
 // TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent verifies that the Flatpak executor
@@ -125,7 +128,6 @@ func TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent(t *testing.T) {
 	}
 
 	e := NewExecutor(nil)
-	// Use a nonexistent app — it will proceed past the guard and fail on install
 	output, _, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId: "org.nonexistent.surely_does_not_exist_12345",
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
@@ -133,5 +135,7 @@ func TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent(t *testing.T) {
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("Flatpak executor should not skip when flatpak is available")
 	}
-	_ = err
+	if err == nil {
+		t.Error("expected error from install of nonexistent app, got nil")
+	}
 }
