@@ -67,9 +67,13 @@ func markAgentUpdateExecuted() bool {
 //  6. Download binary to temp file, verify SHA256
 //  7. Run ./agent.new version → extract version string
 //  8. Compare with running version → skip if same
-//  9. Atomically swap binary
-//  10. Write state.json with {"phase":"staged","version":"..."}
-//  11. Signal graceful shutdown (systemd restarts with new binary)
+//  9. Backup current binary for rollback
+//  10. Atomically swap binary (cp → chmod → mv)
+//  11. Write state.json with {"phase":"staged","version":"..."}
+//  12. Signal graceful shutdown (systemd restarts with new binary)
+//
+// On next startup, CheckStartupUpdateState verifies the update succeeded
+// (running version matches staged version). If not, it restores from backup.
 func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdateParams) (*pb.CommandOutput, bool, error) {
 	cfg := e.updateCfg
 	if cfg == nil {
@@ -157,7 +161,14 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
-	// Step 8: Atomic staged install via sudo (target dir is root-owned).
+	// Step 8: Backup current binary for rollback.
+	backupPath := cfg.BinaryPath + ".bak"
+	if _, err := runSudoCmd(ctx, "cp", cfg.BinaryPath, backupPath); err != nil {
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
+		return nil, false, fmt.Errorf("backup current binary: %w", err)
+	}
+
+	// Step 9: Atomic staged install via sudo (target dir is root-owned).
 	// Copy to a sibling temp, chmod, then mv — the live binary is only
 	// replaced after the new one is fully written and executable.
 	stagePath := cfg.BinaryPath + ".new"
@@ -176,12 +187,12 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 
-	// Step 9: Write state.json
+	// Step 10: Write state.json with version for startup verification.
 	if err := writeUpdateState(cfg.DataDir, "staged", newVersion); err != nil {
 		e.logger.Warn("failed to write update state", "error", err)
 	}
 
-	// Step 10: Signal graceful shutdown — systemd restarts with new binary
+	// Step 11: Signal graceful shutdown — systemd restarts with new binary
 	stdout := fmt.Sprintf("Updated from %s to %s. Restarting.", cfg.Version, newVersion)
 	e.logger.Info(stdout)
 
@@ -446,26 +457,65 @@ func isCoolingDown(dataDir, version string) bool {
 }
 
 // CheckStartupUpdateState checks for a completed or rolled-back update from a previous cycle.
-// Call this at agent startup. It logs the result and clears the state.
-func CheckStartupUpdateState(dataDir string, logger interface{ Info(string, ...any); Warn(string, ...any) }) {
-	phase, ver, err := readUpdateState(dataDir)
+// If state is "staged" but the running version doesn't match, the update failed —
+// restore from backup and write cooldown to prevent retry loops.
+//
+// Parameters:
+//   - dataDir: agent data directory containing update/state.json
+//   - binaryPath: path to the installed agent binary (for rollback)
+//   - runningVersion: the current binary's version string
+//   - logger: structured logger
+func CheckStartupUpdateState(dataDir, binaryPath, runningVersion string, logger interface {
+	Info(string, ...any)
+	Warn(string, ...any)
+	Error(string, ...any)
+}) {
+	ctx := context.Background()
+	backupPath := binaryPath + ".bak"
+
+	phase, stagedVersion, err := readUpdateState(dataDir)
 	if err != nil {
 		logger.Warn("failed to read update state", "error", err)
 		return
 	}
 	if phase == "" {
+		// No pending update — leave .bak alone (may be needed if state was
+		// lost due to crash before state file was written).
 		return
 	}
 
 	switch phase {
 	case "staged":
-		// We are the new binary that was staged. Mark as complete.
-		logger.Info("agent update completed successfully", "version", ver)
-	case "rolled_back":
-		logger.Warn("previous agent update was rolled back", "version", ver)
+		if runningVersion == stagedVersion {
+			// Running the new version — update succeeded.
+			logger.Info("agent update completed successfully", "version", stagedVersion)
+			// Clean up backup and state only after confirmed success.
+			clearUpdateState(dataDir)
+			runSudoCmd(ctx, "rm", "-f", backupPath)
+		} else {
+			// Running the old version — the new binary failed to start.
+			logger.Error("agent update failed — running version does not match staged version",
+				"running", runningVersion, "staged", stagedVersion)
+
+			if _, statErr := os.Stat(backupPath); statErr == nil {
+				logger.Warn("restoring previous binary from backup", "backup", backupPath)
+				if _, mvErr := runSudoCmd(ctx, "mv", backupPath, binaryPath); mvErr != nil {
+					logger.Error("failed to restore backup", "error", mvErr)
+				} else {
+					logger.Info("backup restored successfully")
+				}
+			} else {
+				logger.Error("no backup available for rollback", "backup", backupPath)
+			}
+
+			// Write cooldown so the agent doesn't immediately retry the bad version.
+			if err := writeCooldown(dataDir, stagedVersion, 1*time.Hour); err != nil {
+				logger.Warn("failed to write cooldown after failed update", "error", err)
+			}
+			clearUpdateState(dataDir)
+		}
 	default:
 		logger.Warn("stale update state found, cleaning up", "phase", phase)
+		clearUpdateState(dataDir)
 	}
-
-	clearUpdateState(dataDir)
 }

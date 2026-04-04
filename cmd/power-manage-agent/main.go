@@ -129,6 +129,10 @@ func main() {
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
+	// Check for completed/rolled-back update FIRST — before any other startup
+	// logic. If the new binary is broken, restore from backup immediately.
+	executor.CheckStartupUpdateState(cfg.DataDir, "/usr/local/bin/power-manage-agent", version, logger)
+
 	// Get hostname
 	hostname, err := os.Hostname()
 	if err != nil {
@@ -216,9 +220,6 @@ func main() {
 			return
 		}
 	}
-
-	// Check for completed/rolled-back update from a previous cycle.
-	executor.CheckStartupUpdateState(cfg.DataDir, logger)
 
 	// Initialize the action store for offline persistence
 	actionStore, err := store.New(cfg.DataDir)

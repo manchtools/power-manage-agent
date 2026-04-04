@@ -216,24 +216,81 @@ func TestMarkAgentUpdateExecuted(t *testing.T) {
 	}
 }
 
-func TestCheckStartupUpdateState(t *testing.T) {
+func TestCheckStartupUpdateState_Success(t *testing.T) {
 	dir := t.TempDir()
+	binDir := t.TempDir()
+	binaryPath := filepath.Join(binDir, "agent")
+	backupPath := binaryPath + ".bak"
 
-	// Write staged state
-	writeUpdateState(dir, "staged", "v2026.04.01")
+	os.WriteFile(binaryPath, []byte("new-binary"), 0755)
+	os.WriteFile(backupPath, []byte("old-binary"), 0755)
 
-	// Should clear the state after reading
+	writeUpdateState(dir, "staged", "2026.04.01")
+
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, logger)
+	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
 
-	// Verify state was cleared
+	// State should be cleared
 	phase, _, _ := readUpdateState(dir)
 	if phase != "" {
 		t.Errorf("expected state to be cleared, got phase=%q", phase)
 	}
 
 	if len(logger.infos) == 0 {
-		t.Error("expected at least one info log")
+		t.Error("expected at least one info log for successful update")
+	}
+}
+
+func TestCheckStartupUpdateState_FailedUpdate(t *testing.T) {
+	dir := t.TempDir()
+	binDir := t.TempDir()
+	binaryPath := filepath.Join(binDir, "agent")
+	backupPath := binaryPath + ".bak"
+
+	os.WriteFile(binaryPath, []byte("broken-binary"), 0755)
+	os.WriteFile(backupPath, []byte("good-binary"), 0755)
+
+	writeUpdateState(dir, "staged", "2026.04.02")
+
+	logger := &testLogger{}
+	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
+
+	// State should be cleared
+	phase, _, _ := readUpdateState(dir)
+	if phase != "" {
+		t.Errorf("expected state to be cleared, got phase=%q", phase)
+	}
+
+	if len(logger.errors) == 0 {
+		t.Error("expected error log for failed update")
+	}
+
+	// Should have written cooldown for the failed version
+	if !isCoolingDown(dir, "2026.04.02") {
+		t.Error("expected cooldown for failed version")
+	}
+}
+
+func TestCheckStartupUpdateState_NoState(t *testing.T) {
+	dir := t.TempDir()
+	binDir := t.TempDir()
+	binaryPath := filepath.Join(binDir, "agent")
+	backupPath := binaryPath + ".bak"
+
+	// Create a leftover backup — should NOT be deleted when there's no state
+	os.WriteFile(backupPath, []byte("backup"), 0755)
+
+	logger := &testLogger{}
+	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
+
+	// No logs expected
+	if len(logger.infos) > 0 || len(logger.warns) > 0 || len(logger.errors) > 0 {
+		t.Error("expected no logs for clean startup without state file")
+	}
+
+	// Backup must still exist — not prematurely deleted
+	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
+		t.Error("backup should not be deleted when there's no state file")
 	}
 }
 
@@ -323,6 +380,7 @@ func TestExtractFilename(t *testing.T) {
 type testLogger struct {
 	infos  []string
 	warns  []string
+	errors []string
 }
 
 func (l *testLogger) Info(msg string, args ...any) {
@@ -331,4 +389,8 @@ func (l *testLogger) Info(msg string, args ...any) {
 
 func (l *testLogger) Warn(msg string, args ...any) {
 	l.warns = append(l.warns, msg)
+}
+
+func (l *testLogger) Error(msg string, args ...any) {
+	l.errors = append(l.errors, msg)
 }
