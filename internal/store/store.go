@@ -723,14 +723,20 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		return now
 	}
 
-	// Use interval if specified (and no cron)
+	// Cron takes precedence over interval
+	if schedule.Cron != "" {
+		next, err := nextCronTime(schedule.Cron, now)
+		if err == nil {
+			return next
+		}
+		// Invalid cron expression — fall through to interval
+	}
+
+	// Use interval
 	interval := schedule.IntervalHours
 	if interval <= 0 {
 		interval = 8 // Default 8 hours
 	}
-
-	// TODO: Add cron parsing support
-	// For now, just use interval
 	if lastExecuted == nil {
 		return now
 	}
