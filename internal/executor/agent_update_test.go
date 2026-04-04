@@ -301,6 +301,24 @@ func TestGetBinaryVersion_Empty(t *testing.T) {
 	}
 }
 
+func TestExtractFilename(t *testing.T) {
+	tests := []struct {
+		url  string
+		want string
+	}{
+		{"https://github.com/org/repo/releases/latest/download/agent-linux-amd64", "agent-linux-amd64"},
+		{"https://s3.amazonaws.com/bucket/agent-linux-amd64?X-Amz-Signature=abc&token=xyz", "agent-linux-amd64"},
+		{"https://example.com/path/to/binary?v=2", "binary"},
+		{"https://example.com/binary", "binary"},
+	}
+	for _, tt := range tests {
+		got := extractFilename(tt.url)
+		if got != tt.want {
+			t.Errorf("extractFilename(%q) = %q, want %q", tt.url, got, tt.want)
+		}
+	}
+}
+
 // testLogger is a simple logger for testing.
 type testLogger struct {
 	infos  []string
