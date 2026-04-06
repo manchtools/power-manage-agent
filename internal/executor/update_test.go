@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"os/exec"
 	"strings"
 	"testing"
 
@@ -37,12 +38,16 @@ func TestHasUpdatesAvailable_Apt(t *testing.T) {
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (apt) = %v", result)
 
-	// Cross-check: apt-get -s upgrade "Inst " prefix is language-agnostic
-	out, _, _ := queryCmdOutput("apt-get", "-s", "upgrade")
+	// Cross-check: apt/apt-get -s upgrade "Inst " prefix is language-agnostic
+	aptCmd := "apt-get"
+	if _, err := exec.LookPath("apt"); err == nil {
+		aptCmd = "apt"
+	}
+	out, _, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
 	expected := strings.Contains(out, "Inst ")
 
 	if result != expected {
-		t.Errorf("hasUpdatesAvailable() = %v, but apt-get -s upgrade says updates=%v", result, expected)
+		t.Errorf("hasUpdatesAvailable() = %v, but %s -s upgrade says updates=%v", result, aptCmd, expected)
 	}
 }
 

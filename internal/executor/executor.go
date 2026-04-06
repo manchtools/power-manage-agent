@@ -1612,9 +1612,12 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 		return exitCode == 100
 	}
 	if pkg.IsApt() {
-		// apt-get -s upgrade: simulate and count lines with "Inst " prefix (language-agnostic)
-		args := []string{"-s", "upgrade"}
-		out, _, _ := queryCmdOutput("apt-get", args...)
+		// apt/apt-get -s upgrade: simulate and count lines with "Inst " prefix (language-agnostic)
+		aptCmd := "apt-get"
+		if _, err := exec.LookPath("apt"); err == nil {
+			aptCmd = "apt"
+		}
+		out, _, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
 		for _, line := range strings.Split(out, "\n") {
 			if strings.HasPrefix(line, "Inst ") {
 				return true
