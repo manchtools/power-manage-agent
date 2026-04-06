@@ -3460,35 +3460,10 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 // removeSshAccess removes the sshd_config.d file, group membership, and group.
 func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
-	changed := false
 
-	// Remove sshd config file
-	if fileExistsWithSudo(ctx, configPath) {
-		if out, err := e.requireWritableFSShort(ctx); err != nil {
-			return out, false, err
-		}
-		if err := removeFileStrict(ctx, configPath); err != nil {
-			return nil, false, fmt.Errorf("remove ssh config: %w", err)
-		}
-		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
-		changed = true
-	}
-
-	// Remove group and membership
-	if groupExists(groupName) {
-		members := getGroupMembers(groupName)
-		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
-		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
-		} else {
-			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
-			changed = true
-		}
+	changed, err := e.removeGroupWithConfig(ctx, groupName, configPath, &output)
+	if err != nil {
+		return nil, false, err
 	}
 
 	if !changed {
@@ -3569,25 +3544,10 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 	}
 
-	if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
-		return nil, false, fmt.Errorf("write sshd config: %w", err)
+	if out, err := e.writeAndValidateConfig(ctx, configPath, content, "0644", "root", "root", "sshd", "-t"); err != nil {
+		return out, false, err
 	}
 	output.WriteString(fmt.Sprintf("created SSHD config: %s\n", configPath))
-
-	// Validate config
-	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
-	if validateErr != nil {
-		// Config is invalid — remove it and report error
-		removeFileStrict(ctx, configPath)
-		errMsg := "sshd config validation failed"
-		if validateOut != nil && validateOut.Stderr != "" {
-			errMsg = strings.TrimSpace(validateOut.Stderr)
-		}
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   errMsg,
-		}, false, fmt.Errorf("sshd -t validation failed: %s", errMsg)
-	}
 
 	// Reload sshd
 	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")

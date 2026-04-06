@@ -96,27 +96,12 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 		changed = true
 	}
 
-	// Write sudoers file
+	// Write and validate sudoers file
 	if !fileMatches {
-		if err := atomicWriteFile(ctx, sudoersPath, content, "0440", "root", "root"); err != nil {
-			return nil, false, fmt.Errorf("write sudoers file: %w", err)
+		if out, err := e.writeAndValidateConfig(ctx, sudoersPath, content, "0440", "root", "root", "visudo", "-c", "-f", sudoersPath); err != nil {
+			return out, false, err
 		}
 		output.WriteString(fmt.Sprintf("wrote sudoers file: %s\n", sudoersPath))
-
-		// Validate with visudo
-		validateOut, validateErr := runSudoCmd(ctx, "visudo", "-c", "-f", sudoersPath)
-		if validateErr != nil {
-			// Config is invalid — remove it and report error
-			removeFileStrict(ctx, sudoersPath)
-			errMsg := "sudoers validation failed"
-			if validateOut != nil && validateOut.Stderr != "" {
-				errMsg = strings.TrimSpace(validateOut.Stderr)
-			}
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   errMsg,
-			}, false, fmt.Errorf("visudo validation failed: %s", errMsg)
-		}
 		changed = true
 	}
 
@@ -136,37 +121,10 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 // removeSudoPolicy removes a sudo policy: sudoers file, group membership, and group.
 func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath string, users []string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
-	changed := false
 
-	// Remove sudoers file
-	if fileExistsWithSudo(ctx, sudoersPath) {
-		if out, err := e.requireWritableFSShort(ctx); err != nil {
-			return out, false, err
-		}
-		if err := removeFileStrict(ctx, sudoersPath); err != nil {
-			return nil, false, fmt.Errorf("remove sudoers file: %w", err)
-		}
-		output.WriteString(fmt.Sprintf("removed sudoers file: %s\n", sudoersPath))
-		changed = true
-	}
-
-	// Remove users from group
-	if groupExists(groupName) {
-		members := getGroupMembers(groupName)
-		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
-
-		// Delete group
-		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
-		} else {
-			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
-			changed = true
-		}
+	changed, err := e.removeGroupWithConfig(ctx, groupName, sudoersPath, &output)
+	if err != nil {
+		return nil, false, err
 	}
 
 	if !changed {

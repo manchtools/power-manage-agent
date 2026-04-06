@@ -6,6 +6,7 @@ import (
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.
@@ -118,4 +119,73 @@ func contentChanged(ctx context.Context, filePath, desiredContent string) (bool,
 		return true, nil // file doesn't exist, content is "changed"
 	}
 	return existing != desiredContent, nil
+}
+
+// writeAndValidateConfig writes a config file atomically and validates it with an external command.
+// If validation fails, the file is removed and the validation error is returned.
+// On success, returns nil, nil.
+func (e *Executor) writeAndValidateConfig(ctx context.Context, path, content, mode, owner, group string, validateCmd string, validateArgs ...string) (*pb.CommandOutput, error) {
+	if err := atomicWriteFile(ctx, path, content, mode, owner, group); err != nil {
+		return nil, fmt.Errorf("write config file: %w", err)
+	}
+
+	validateOut, validateErr := runSudoCmd(ctx, validateCmd, validateArgs...)
+	if validateErr != nil {
+		// Config is invalid — remove it and report error
+		removeFileStrict(ctx, path)
+		errMsg := "config validation failed"
+		if validateOut != nil && validateOut.Stderr != "" {
+			errMsg = strings.TrimSpace(validateOut.Stderr)
+		}
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   errMsg,
+		}, fmt.Errorf("%s validation failed: %s", validateCmd, errMsg)
+	}
+
+	return nil, nil
+}
+
+// removeGroupWithConfig removes a managed config file and its associated group.
+// Removes all users from the group, deletes the group, and removes the config file.
+// If configPath is empty, only the group is removed.
+func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configPath string, output *strings.Builder) (bool, error) {
+	changed := false
+
+	// Remove config file if specified
+	if configPath != "" && fileExistsWithSudo(ctx, configPath) {
+		if out, err := e.requireWritableFSShort(ctx); err != nil {
+			return false, fmt.Errorf("writable fs: %w::%s", err, out.Stderr)
+		}
+		if err := removeFileStrict(ctx, configPath); err != nil {
+			return false, fmt.Errorf("remove config file %s: %w", configPath, err)
+		}
+		output.WriteString(fmt.Sprintf("removed config file: %s\n", configPath))
+		changed = true
+	}
+
+	// Remove group and membership
+	if groupExists(groupName) {
+		if !changed {
+			// Need writable FS for group operations (may not have been checked above)
+			if out, err := e.requireWritableFSShort(ctx); err != nil {
+				return false, fmt.Errorf("writable fs: %w::%s", err, out.Stderr)
+			}
+		}
+		members := getGroupMembers(groupName)
+		for _, member := range members {
+			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
+				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
+				changed = true
+			}
+		}
+		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
+		} else {
+			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
+			changed = true
+		}
+	}
+
+	return changed, nil
 }

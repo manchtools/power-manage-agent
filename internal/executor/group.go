@@ -100,26 +100,13 @@ func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.Comma
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
-		return out, false, err
+	changed, err := e.removeGroupWithConfig(ctx, groupName, "", &output)
+	if err != nil {
+		return nil, false, err
 	}
-
-	// Remove all members from group
-	members := getGroupMembers(groupName)
-	for _, member := range members {
-		if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-			output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-		}
-	}
-
-	// Delete group
-	if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-		return nil, false, fmt.Errorf("delete group %s: %v", groupName, err)
-	}
-	output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),
-	}, true, nil
+	}, changed, nil
 }
