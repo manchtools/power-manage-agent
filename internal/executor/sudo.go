@@ -83,11 +83,8 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Ensure group exists
@@ -123,35 +120,11 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 		changed = true
 	}
 
-	// Add users to group
-	for _, username := range params.Users {
-		if !userExists(username) {
-			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
-			continue
-		}
-		if !userInGroup(username, groupName) {
-			if err := addUserToGroup(ctx, username, groupName); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
-			} else {
-				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
-				changed = true
-			}
-		}
-	}
-
-	// Remove users that are no longer in the list
-	currentMembers := getGroupMembers(groupName)
-	desiredSet := make(map[string]bool, len(params.Users))
-	for _, u := range params.Users {
-		desiredSet[u] = true
-	}
-	for _, member := range currentMembers {
-		if !desiredSet[member] {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
+	// Sync group membership
+	if memberChanged, err := syncGroupMembers(ctx, groupName, params.Users, &output); err != nil {
+		return nil, false, err
+	} else if memberChanged {
+		changed = true
 	}
 
 	return &pb.CommandOutput{
@@ -167,11 +140,8 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 
 	// Remove sudoers file
 	if fileExistsWithSudo(ctx, sudoersPath) {
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFSShort(ctx); err != nil {
+			return out, false, err
 		}
 		if err := removeFileStrict(ctx, sudoersPath); err != nil {
 			return nil, false, fmt.Errorf("remove sudoers file: %w", err)

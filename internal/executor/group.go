@@ -46,11 +46,8 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Create group if it doesn't exist
@@ -70,35 +67,11 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 		changed = true
 	}
 
-	// Add missing members
-	for _, member := range params.Members {
-		if !userExists(member) {
-			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping\n", member))
-			continue
-		}
-		if !userInGroup(member, params.Name) {
-			if err := addUserToGroup(ctx, member, params.Name); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", member, err))
-			} else {
-				output.WriteString(fmt.Sprintf("added user %s to group %s\n", member, params.Name))
-				changed = true
-			}
-		}
-	}
-
-	// Remove members not in desired list
-	currentMembers := getGroupMembers(params.Name)
-	desiredSet := make(map[string]bool, len(params.Members))
-	for _, m := range params.Members {
-		desiredSet[m] = true
-	}
-	for _, member := range currentMembers {
-		if !desiredSet[member] {
-			if err := removeUserFromGroup(ctx, member, params.Name); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, params.Name))
-				changed = true
-			}
-		}
+	// Sync group membership
+	if memberChanged, err := syncGroupMembers(ctx, params.Name, params.Members, &output); err != nil {
+		return nil, false, err
+	} else if memberChanged {
+		changed = true
 	}
 
 	return &pb.CommandOutput{
@@ -127,11 +100,8 @@ func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.Comma
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Remove all members from group
