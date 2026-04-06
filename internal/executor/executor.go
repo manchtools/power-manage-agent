@@ -170,7 +170,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		output, changed, execErr = e.executePackage(ctx, action.GetPackage(), action.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_UPDATE:
-		output, execErr = e.executeUpdate(ctx, action.GetUpdate())
+		var changed bool
+		output, changed, execErr = e.executeUpdate(ctx, action.GetUpdate())
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_APP_IMAGE:
 		var changed bool
 		output, changed, execErr = e.executeAppImage(ctx, action.GetApp(), action.DesiredState)
@@ -1597,6 +1599,42 @@ func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "makecache")
 }
 
+// hasUpdatesAvailable checks if there are pending package updates.
+// When securityOnly is true, only security updates are considered.
+func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
+	if pkg.IsDnf() {
+		args := []string{"check-update"}
+		if securityOnly {
+			args = append(args, "--security")
+		}
+		_, exitCode, _ := queryCmdOutput("dnf", args...)
+		return exitCode == 100
+	}
+	if pkg.IsApt() {
+		out, exitCode, _ := queryCmdOutput("apt", "list", "--upgradable")
+		if exitCode != 0 {
+			return true // assume updates on error
+		}
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "Listing") {
+				return true
+			}
+		}
+		return false
+	}
+	if pkg.IsPacman() {
+		// pacman -Qu lists upgradable packages (exit 0 = has updates, 1 = none)
+		_, exitCode, _ := queryCmdOutput("pacman", "-Qu")
+		return exitCode == 0
+	}
+	if pkg.IsZypper() {
+		out, _, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
+		return zypperHasUpdates(out)
+	}
+	return true // assume updates for unknown package managers
+}
+
 // dnfUpgrade runs dnf upgrade. If securityOnly is true, only security updates are applied.
 func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, error) {
 	if securityOnly {
@@ -1608,6 +1646,36 @@ func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, erro
 // dnfAutoremove runs dnf autoremove -y to remove unused packages.
 func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
+}
+
+// zypperHasUpdates parses zypper list-updates output to detect pending updates.
+// Zypper outputs table rows where the status column is "v" (available) or "i" (installed).
+// The format is "v  | repo | name | ..." with variable whitespace.
+func zypperHasUpdates(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 || line[0] == '-' || line[0] == 'S' {
+			continue // skip empty, separator, and header lines
+		}
+		// Status column is the first field before "|"
+		if idx := strings.Index(line, "|"); idx > 0 {
+			status := strings.TrimSpace(line[:idx])
+			if status == "v" || status == "i" {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// dnfAutoremoveChanged returns true if dnf autoremove output indicates packages were removed.
+func dnfAutoremoveChanged(stdout string) bool {
+	return !strings.Contains(stdout, "Nothing to do")
+}
+
+// aptAutoremoveChanged returns true if apt autoremove output indicates packages were removed.
+func aptAutoremoveChanged(stdout string) bool {
+	return !strings.Contains(stdout, "0 upgraded, 0 newly installed, 0 to remove")
 }
 
 // =============================================================================
@@ -1983,9 +2051,9 @@ func (e *Executor) repairFlatpak(ctx context.Context) {
 
 // executeUpdate performs a system-wide package update.
 // It respects version pinning (apt-mark hold / dnf versionlock).
-func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, error) {
+func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, bool, error) {
 	if e.pkgManager == nil {
-		return nil, fmt.Errorf("no supported package manager found")
+		return nil, false, fmt.Errorf("no supported package manager found")
 	}
 
 	// Repair filesystem if mounted read-only (common after kernel errors)
@@ -1993,7 +2061,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		return &pb.CommandOutput{
 			ExitCode: 1,
 			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, fmt.Errorf("filesystem is read-only")
+		}, false, fmt.Errorf("filesystem is read-only")
 	}
 
 	// Repair any broken package manager state first
@@ -2001,6 +2069,14 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 
 	var allOutput strings.Builder
 	var lastErr error
+
+	securityOnly := params != nil && params.SecurityOnly
+
+	// Check if updates are available before running the upgrade.
+	updatesAvailable := e.hasUpdatesAvailable(ctx, securityOnly)
+
+	// Record pre-update reboot state to detect new reboot requirements.
+	rebootRequiredBefore := e.checkRebootRequired()
 
 	// Update package index
 	if updateResult, err := e.pkgManager.Update(); err != nil {
@@ -2017,6 +2093,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			allOutput.WriteString(updateResult.Stderr)
 		}
 		allOutput.WriteString("\n")
+	}
+
+	// Re-check after index update (new updates may now be visible)
+	if !updatesAvailable {
+		updatesAvailable = e.hasUpdatesAvailable(ctx, securityOnly)
 	}
 
 	// Perform the upgrade
@@ -2043,29 +2124,33 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}
 
 	// Autoremove if requested
+	autoremoved := false
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		if pkg.IsApt() {
 			apt := pkg.NewAptWithContext(ctx)
 			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
+				autoremoved = aptAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		} else if pkg.IsDnf() {
 			if output, err := dnfAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
+				autoremoved = dnfAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		}
 	}
 
-	// Check if reboot is required
-	rebootRequired := e.checkRebootRequired()
-	if rebootRequired {
+	// Check if this run created a new reboot requirement.
+	rebootRequiredAfter := e.checkRebootRequired()
+	newRebootRequired := rebootRequiredAfter && !rebootRequiredBefore
+	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
-		if params != nil && params.RebootIfRequired {
+		if newRebootRequired && params != nil && params.RebootIfRequired {
 			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
 			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
@@ -2077,10 +2162,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		exitCode = 1
 	}
 
+	changed := updatesAvailable || autoremoved || newRebootRequired
 	return &pb.CommandOutput{
 		ExitCode: exitCode,
 		Stdout:   allOutput.String(),
-	}, lastErr
+	}, changed, lastErr
 }
 
 // executeAptUpgrade performs apt-specific upgrade.
