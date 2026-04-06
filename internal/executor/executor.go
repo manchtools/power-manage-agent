@@ -1600,9 +1600,10 @@ func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
 }
 
 // hasUpdatesAvailable checks if there are pending package updates.
-// When securityOnly is true, only security updates are considered.
+// Uses exit codes and structured queries — language-agnostic.
 func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
 	if pkg.IsDnf() {
+		// dnf check-update: exit 100 = updates available, 0 = none (language-agnostic)
 		args := []string{"check-update"}
 		if securityOnly {
 			args = append(args, "--security")
@@ -1611,28 +1612,62 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 		return exitCode == 100
 	}
 	if pkg.IsApt() {
-		out, exitCode, _ := queryCmdOutput("apt", "list", "--upgradable")
-		if exitCode != 0 {
-			return true // assume updates on error
+		// apt/apt-get -s upgrade: simulate and count lines with "Inst " prefix (language-agnostic)
+		aptCmd := "apt-get"
+		if _, err := exec.LookPath("apt"); err == nil {
+			aptCmd = "apt"
 		}
+		out, _, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
 		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if line != "" && !strings.HasPrefix(line, "Listing") {
+			if strings.HasPrefix(line, "Inst ") {
 				return true
 			}
 		}
 		return false
 	}
 	if pkg.IsPacman() {
-		// pacman -Qu lists upgradable packages (exit 0 = has updates, 1 = none)
+		// pacman -Qu: exit 0 = updates available, 1 = none (language-agnostic)
 		_, exitCode, _ := queryCmdOutput("pacman", "-Qu")
 		return exitCode == 0
 	}
 	if pkg.IsZypper() {
-		out, _, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
-		return zypperHasUpdates(out)
+		// zypper: exit 100 = updates available, 0 = none
+		_, exitCode, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
+		return exitCode == 100
 	}
 	return true // assume updates for unknown package managers
+}
+
+// installedPackageCount returns the number of installed packages (language-agnostic).
+func installedPackageCount() int {
+	if pkg.IsDnf() || pkg.IsZypper() {
+		out, exitCode, _ := queryCmdOutput("rpm", "-qa", "--qf", "x\n")
+		if exitCode != 0 {
+			return -1
+		}
+		return strings.Count(out, "x\n")
+	}
+	if pkg.IsApt() {
+		out, exitCode, _ := queryCmdOutput("dpkg-query", "-f", "x\n", "-W")
+		if exitCode != 0 {
+			return -1
+		}
+		return strings.Count(out, "x\n")
+	}
+	if pkg.IsPacman() {
+		out, exitCode, _ := queryCmdOutput("pacman", "-Qq")
+		if exitCode != 0 {
+			return -1
+		}
+		count := 0
+		for _, line := range strings.Split(out, "\n") {
+			if strings.TrimSpace(line) != "" {
+				count++
+			}
+		}
+		return count
+	}
+	return -1
 }
 
 // dnfUpgrade runs dnf upgrade. If securityOnly is true, only security updates are applied.
@@ -1648,35 +1683,6 @@ func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
 }
 
-// zypperHasUpdates parses zypper list-updates output to detect pending updates.
-// Zypper outputs table rows where the status column is "v" (available) or "i" (installed).
-// The format is "v  | repo | name | ..." with variable whitespace.
-func zypperHasUpdates(output string) bool {
-	for _, line := range strings.Split(output, "\n") {
-		line = strings.TrimSpace(line)
-		if len(line) == 0 || line[0] == '-' || line[0] == 'S' {
-			continue // skip empty, separator, and header lines
-		}
-		// Status column is the first field before "|"
-		if idx := strings.Index(line, "|"); idx > 0 {
-			status := strings.TrimSpace(line[:idx])
-			if status == "v" || status == "i" {
-				return true
-			}
-		}
-	}
-	return false
-}
-
-// dnfAutoremoveChanged returns true if dnf autoremove output indicates packages were removed.
-func dnfAutoremoveChanged(stdout string) bool {
-	return !strings.Contains(stdout, "Nothing to do")
-}
-
-// aptAutoremoveChanged returns true if apt autoremove output indicates packages were removed.
-func aptAutoremoveChanged(stdout string) bool {
-	return !strings.Contains(stdout, "0 upgraded, 0 newly installed, 0 to remove")
-}
 
 // =============================================================================
 // Zypper Helper Functions
@@ -2123,26 +2129,27 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		}
 	}
 
-	// Autoremove if requested
+	// Autoremove if requested — use package count comparison (language-agnostic)
 	autoremoved := false
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
+		countBefore := installedPackageCount()
 		if pkg.IsApt() {
 			apt := pkg.NewAptWithContext(ctx)
 			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
-				autoremoved = aptAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		} else if pkg.IsDnf() {
 			if output, err := dnfAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
-				autoremoved = dnfAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		}
+		countAfter := installedPackageCount()
+		autoremoved = countBefore > 0 && countAfter > 0 && countBefore != countAfter
 	}
 
 	// Check if this run created a new reboot requirement.
