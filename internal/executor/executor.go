@@ -1656,6 +1656,16 @@ func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
 }
 
+// dnfAutoremoveChanged returns true if dnf autoremove output indicates packages were removed.
+func dnfAutoremoveChanged(stdout string) bool {
+	return !strings.Contains(stdout, "Nothing to do")
+}
+
+// aptAutoremoveChanged returns true if apt autoremove output indicates packages were removed.
+func aptAutoremoveChanged(stdout string) bool {
+	return !strings.Contains(stdout, "0 upgraded, 0 newly installed, 0 to remove")
+}
+
 // =============================================================================
 // Zypper Helper Functions
 // =============================================================================
@@ -2109,14 +2119,14 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			apt := pkg.NewAptWithContext(ctx)
 			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
-				autoremoved = !strings.Contains(output.Stdout, "0 upgraded, 0 newly installed, 0 to remove")
+				autoremoved = aptAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		} else if pkg.IsDnf() {
 			if output, err := dnfAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
-				autoremoved = !strings.Contains(output.Stdout, "Nothing to do")
+				autoremoved = dnfAutoremoveChanged(output.Stdout)
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}

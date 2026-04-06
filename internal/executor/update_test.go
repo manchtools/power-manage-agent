@@ -2,26 +2,24 @@ package executor
 
 import (
 	"context"
-	"os/exec"
 	"strings"
 	"testing"
+
+	"github.com/manchtools/power-manage/sdk/go/pkg"
 )
 
 // TestHasUpdatesAvailable_Dnf tests the dnf check-update path on Fedora systems.
 func TestHasUpdatesAvailable_Dnf(t *testing.T) {
-	if _, err := exec.LookPath("dnf"); err != nil {
-		t.Skip("dnf not available on this system")
+	if !pkg.IsDnf() {
+		t.Skip("not a dnf-based system")
 	}
 
 	e := NewExecutor(nil)
-	// Just verify it doesn't panic/crash — the actual result depends on system state
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (dnf) = %v", result)
 
 	// Cross-check with dnf check-update exit code
-	cmd := exec.Command("dnf", "check-update")
-	cmd.Run()
-	exitCode := cmd.ProcessState.ExitCode()
+	_, exitCode, _ := queryCmdOutput("dnf", "check-update")
 	expected := exitCode == 100
 
 	if result != expected {
@@ -31,21 +29,39 @@ func TestHasUpdatesAvailable_Dnf(t *testing.T) {
 
 // TestHasUpdatesAvailable_Apt tests the apt list --upgradable path on Debian systems.
 func TestHasUpdatesAvailable_Apt(t *testing.T) {
-	if _, err := exec.LookPath("apt"); err != nil {
-		t.Skip("apt not available on this system")
-	}
-	// Only run on actual apt-based systems (Fedora has apt but it's not the primary PM)
-	if _, err := exec.LookPath("dpkg"); err != nil {
-		t.Skip("not a dpkg-based system")
+	if !pkg.IsApt() {
+		t.Skip("not an apt-based system")
 	}
 
 	e := NewExecutor(nil)
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (apt) = %v", result)
+
+	// Cross-check with apt list --upgradable
+	out, _, _ := queryCmdOutput("apt", "list", "--upgradable")
+	expected := false
+	for _, line := range splitLines(out) {
+		if line != "" && line != "Listing..." {
+			expected = true
+			break
+		}
+	}
+
+	if result != expected {
+		t.Errorf("hasUpdatesAvailable() = %v, but apt list --upgradable says updates=%v", result, expected)
+	}
 }
 
-// TestAutoremoveChangedDetection_Dnf tests parsing of dnf autoremove output.
-func TestAutoremoveChangedDetection_Dnf(t *testing.T) {
+func splitLines(s string) []string {
+	var lines []string
+	for _, l := range strings.Split(s, "\n") {
+		lines = append(lines, strings.TrimSpace(l))
+	}
+	return lines
+}
+
+// TestDnfAutoremoveChanged tests parsing of dnf autoremove output.
+func TestDnfAutoremoveChanged(t *testing.T) {
 	tests := []struct {
 		name    string
 		stdout  string
@@ -65,16 +81,15 @@ func TestAutoremoveChangedDetection_Dnf(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			changed := !strings.Contains(tt.stdout, "Nothing to do")
-			if changed != tt.changed {
-				t.Errorf("expected changed=%v for output %q", tt.changed, tt.stdout)
+			if dnfAutoremoveChanged(tt.stdout) != tt.changed {
+				t.Errorf("dnfAutoremoveChanged() = %v, want %v", !tt.changed, tt.changed)
 			}
 		})
 	}
 }
 
-// TestAutoremoveChangedDetection_Apt tests parsing of apt autoremove output.
-func TestAutoremoveChangedDetection_Apt(t *testing.T) {
+// TestAptAutoremoveChanged tests parsing of apt autoremove output.
+func TestAptAutoremoveChanged(t *testing.T) {
 	tests := []struct {
 		name    string
 		stdout  string
@@ -94,9 +109,8 @@ func TestAutoremoveChangedDetection_Apt(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			changed := !strings.Contains(tt.stdout, "0 upgraded, 0 newly installed, 0 to remove")
-			if changed != tt.changed {
-				t.Errorf("expected changed=%v for output %q", tt.changed, tt.stdout)
+			if aptAutoremoveChanged(tt.stdout) != tt.changed {
+				t.Errorf("aptAutoremoveChanged() = %v, want %v", !tt.changed, tt.changed)
 			}
 		})
 	}
