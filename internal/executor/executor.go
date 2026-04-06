@@ -1600,11 +1600,14 @@ func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
 }
 
 // hasUpdatesAvailable checks if there are pending package updates.
-// dnf check-update returns exit code 100 if updates are available, 0 if none.
-// apt: checks if `apt list --upgradable` produces any output beyond the header.
-func (e *Executor) hasUpdatesAvailable(ctx context.Context) bool {
+// When securityOnly is true, only security updates are considered.
+func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
 	if pkg.IsDnf() {
-		_, exitCode, _ := queryCmdOutput("dnf", "check-update")
+		args := []string{"check-update"}
+		if securityOnly {
+			args = append(args, "--security")
+		}
+		_, exitCode, _ := queryCmdOutput("dnf", args...)
 		return exitCode == 100
 	}
 	if pkg.IsApt() {
@@ -1612,10 +1615,26 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context) bool {
 		if exitCode != 0 {
 			return true // assume updates on error
 		}
-		// apt outputs a header line "Listing..." even when no updates
 		for _, line := range strings.Split(out, "\n") {
 			line = strings.TrimSpace(line)
 			if line != "" && !strings.HasPrefix(line, "Listing") {
+				return true
+			}
+		}
+		return false
+	}
+	if pkg.IsPacman() {
+		// pacman -Qu lists upgradable packages (exit 0 = has updates, 1 = none)
+		_, exitCode, _ := queryCmdOutput("pacman", "-Qu")
+		return exitCode == 0
+	}
+	if pkg.IsZypper() {
+		// zypper list-updates returns 0 with output if updates available
+		out, _, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
+		// Output contains a table — if there's content beyond the header, updates exist
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if strings.HasPrefix(line, "v |") || strings.HasPrefix(line, "i |") {
 				return true
 			}
 		}
@@ -2029,8 +2048,13 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	var allOutput strings.Builder
 	var lastErr error
 
+	securityOnly := params != nil && params.SecurityOnly
+
 	// Check if updates are available before running the upgrade.
-	updatesAvailable := e.hasUpdatesAvailable(ctx)
+	updatesAvailable := e.hasUpdatesAvailable(ctx, securityOnly)
+
+	// Record pre-update reboot state to detect new reboot requirements.
+	rebootRequiredBefore := e.checkRebootRequired()
 
 	// Update package index
 	if updateResult, err := e.pkgManager.Update(); err != nil {
@@ -2051,7 +2075,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 
 	// Re-check after index update (new updates may now be visible)
 	if !updatesAvailable {
-		updatesAvailable = e.hasUpdatesAvailable(ctx)
+		updatesAvailable = e.hasUpdatesAvailable(ctx, securityOnly)
 	}
 
 	// Perform the upgrade
@@ -2099,11 +2123,12 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		}
 	}
 
-	// Check if reboot is required
-	rebootRequired := e.checkRebootRequired()
-	if rebootRequired {
+	// Check if this run created a new reboot requirement.
+	rebootRequiredAfter := e.checkRebootRequired()
+	newRebootRequired := rebootRequiredAfter && !rebootRequiredBefore
+	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
-		if params != nil && params.RebootIfRequired {
+		if newRebootRequired && params != nil && params.RebootIfRequired {
 			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
 			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
@@ -2115,7 +2140,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		exitCode = 1
 	}
 
-	changed := updatesAvailable || autoremoved || rebootRequired
+	changed := updatesAvailable || autoremoved || newRebootRequired
 	return &pb.CommandOutput{
 		ExitCode: exitCode,
 		Stdout:   allOutput.String(),
