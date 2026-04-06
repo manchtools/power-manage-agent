@@ -170,7 +170,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		output, changed, execErr = e.executePackage(ctx, action.GetPackage(), action.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_UPDATE:
-		output, execErr = e.executeUpdate(ctx, action.GetUpdate())
+		var changed bool
+		output, changed, execErr = e.executeUpdate(ctx, action.GetUpdate())
+		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_APP_IMAGE:
 		var changed bool
 		output, changed, execErr = e.executeAppImage(ctx, action.GetApp(), action.DesiredState)
@@ -1597,6 +1599,31 @@ func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "makecache")
 }
 
+// hasUpdatesAvailable checks if there are pending package updates.
+// dnf check-update returns exit code 100 if updates are available, 0 if none.
+// apt: checks if `apt list --upgradable` produces any output beyond the header.
+func (e *Executor) hasUpdatesAvailable(ctx context.Context) bool {
+	if pkg.IsDnf() {
+		_, exitCode, _ := queryCmdOutput("dnf", "check-update")
+		return exitCode == 100
+	}
+	if pkg.IsApt() {
+		out, exitCode, _ := queryCmdOutput("apt", "list", "--upgradable")
+		if exitCode != 0 {
+			return true // assume updates on error
+		}
+		// apt outputs a header line "Listing..." even when no updates
+		for _, line := range strings.Split(out, "\n") {
+			line = strings.TrimSpace(line)
+			if line != "" && !strings.HasPrefix(line, "Listing") {
+				return true
+			}
+		}
+		return false
+	}
+	return true // assume updates for unknown package managers
+}
+
 // dnfUpgrade runs dnf upgrade. If securityOnly is true, only security updates are applied.
 func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, error) {
 	if securityOnly {
@@ -1983,9 +2010,9 @@ func (e *Executor) repairFlatpak(ctx context.Context) {
 
 // executeUpdate performs a system-wide package update.
 // It respects version pinning (apt-mark hold / dnf versionlock).
-func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, error) {
+func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, bool, error) {
 	if e.pkgManager == nil {
-		return nil, fmt.Errorf("no supported package manager found")
+		return nil, false, fmt.Errorf("no supported package manager found")
 	}
 
 	// Repair filesystem if mounted read-only (common after kernel errors)
@@ -1993,7 +2020,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		return &pb.CommandOutput{
 			ExitCode: 1,
 			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, fmt.Errorf("filesystem is read-only")
+		}, false, fmt.Errorf("filesystem is read-only")
 	}
 
 	// Repair any broken package manager state first
@@ -2001,6 +2028,9 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 
 	var allOutput strings.Builder
 	var lastErr error
+
+	// Check if updates are available before running the upgrade.
+	updatesAvailable := e.hasUpdatesAvailable(ctx)
 
 	// Update package index
 	if updateResult, err := e.pkgManager.Update(); err != nil {
@@ -2017,6 +2047,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			allOutput.WriteString(updateResult.Stderr)
 		}
 		allOutput.WriteString("\n")
+	}
+
+	// Re-check after index update (new updates may now be visible)
+	if !updatesAvailable {
+		updatesAvailable = e.hasUpdatesAvailable(ctx)
 	}
 
 	// Perform the upgrade
@@ -2043,18 +2078,21 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}
 
 	// Autoremove if requested
+	autoremoved := false
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		if pkg.IsApt() {
 			apt := pkg.NewAptWithContext(ctx)
 			if output, err := apt.Autoremove(); err == nil {
 				allOutput.WriteString(output.Stdout)
+				autoremoved = !strings.Contains(output.Stdout, "0 upgraded, 0 newly installed, 0 to remove")
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
 		} else if pkg.IsDnf() {
 			if output, err := dnfAutoremove(ctx); err == nil {
 				allOutput.WriteString(output.Stdout)
+				autoremoved = !strings.Contains(output.Stdout, "Nothing to do")
 			} else if output != nil {
 				allOutput.WriteString(output.Stderr)
 			}
@@ -2077,10 +2115,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		exitCode = 1
 	}
 
+	changed := updatesAvailable || autoremoved || rebootRequired
 	return &pb.CommandOutput{
 		ExitCode: exitCode,
 		Stdout:   allOutput.String(),
-	}, lastErr
+	}, changed, lastErr
 }
 
 // executeAptUpgrade performs apt-specific upgrade.
