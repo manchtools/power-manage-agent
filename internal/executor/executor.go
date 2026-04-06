@@ -1629,16 +1629,8 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 		return exitCode == 0
 	}
 	if pkg.IsZypper() {
-		// zypper list-updates returns 0 with output if updates available
 		out, _, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
-		// Output contains a table — if there's content beyond the header, updates exist
-		for _, line := range strings.Split(out, "\n") {
-			line = strings.TrimSpace(line)
-			if strings.HasPrefix(line, "v |") || strings.HasPrefix(line, "i |") {
-				return true
-			}
-		}
-		return false
+		return zypperHasUpdates(out)
 	}
 	return true // assume updates for unknown package managers
 }
@@ -1654,6 +1646,26 @@ func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, erro
 // dnfAutoremove runs dnf autoremove -y to remove unused packages.
 func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
+}
+
+// zypperHasUpdates parses zypper list-updates output to detect pending updates.
+// Zypper outputs table rows where the status column is "v" (available) or "i" (installed).
+// The format is "v  | repo | name | ..." with variable whitespace.
+func zypperHasUpdates(output string) bool {
+	for _, line := range strings.Split(output, "\n") {
+		line = strings.TrimSpace(line)
+		if len(line) == 0 || line[0] == '-' || line[0] == 'S' {
+			continue // skip empty, separator, and header lines
+		}
+		// Status column is the first field before "|"
+		if idx := strings.Index(line, "|"); idx > 0 {
+			status := strings.TrimSpace(line[:idx])
+			if status == "v" || status == "i" {
+				return true
+			}
+		}
+	}
+	return false
 }
 
 // dnfAutoremoveChanged returns true if dnf autoremove output indicates packages were removed.

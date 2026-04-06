@@ -115,3 +115,84 @@ func TestAptAutoremoveChanged(t *testing.T) {
 		})
 	}
 }
+
+// TestHasUpdatesAvailable_Pacman tests the pacman -Qu path on Arch systems.
+func TestHasUpdatesAvailable_Pacman(t *testing.T) {
+	if !pkg.IsPacman() {
+		t.Skip("not a pacman-based system")
+	}
+
+	e := NewExecutor(nil)
+	result := e.hasUpdatesAvailable(context.Background(), false)
+	t.Logf("hasUpdatesAvailable (pacman) = %v", result)
+
+	// Cross-check with pacman -Qu exit code (0 = updates, 1 = none)
+	_, exitCode, _ := queryCmdOutput("pacman", "-Qu")
+	expected := exitCode == 0
+
+	if result != expected {
+		t.Errorf("hasUpdatesAvailable() = %v, but pacman -Qu exit code = %d (expected updates=%v)", result, exitCode, expected)
+	}
+}
+
+// TestHasUpdatesAvailable_Zypper tests the zypper list-updates path on openSUSE systems.
+func TestHasUpdatesAvailable_Zypper(t *testing.T) {
+	if !pkg.IsZypper() {
+		t.Skip("not a zypper-based system")
+	}
+
+	e := NewExecutor(nil)
+	result := e.hasUpdatesAvailable(context.Background(), false)
+	t.Logf("hasUpdatesAvailable (zypper) = %v", result)
+}
+
+// TestZypperHasUpdates tests parsing of zypper list-updates output.
+func TestZypperHasUpdates(t *testing.T) {
+	tests := []struct {
+		name   string
+		output string
+		want   bool
+	}{
+		{
+			name:   "no updates",
+			output: "Loading repository data...\nReading installed packages...\nNo updates found.\n",
+			want:   false,
+		},
+		{
+			name:   "empty output",
+			output: "",
+			want:   false,
+		},
+		{
+			name: "updates available",
+			output: `Loading repository data...
+Reading installed packages...
+
+S  | Repository | Name     | Current Version | Available Version | Arch
+---+------------+----------+-----------------+-------------------+-------
+v  | update     | libzypp  | 17.31.8-1       | 17.31.9-1         | x86_64
+v  | update     | zypper   | 1.14.59-1       | 1.14.60-1         | x86_64
+`,
+			want: true,
+		},
+		{
+			name: "installed updates",
+			output: `Loading repository data...
+Reading installed packages...
+
+S  | Repository | Name     | Current Version | Available Version | Arch
+---+------------+----------+-----------------+-------------------+-------
+i  | update     | kernel   | 6.7.1-1         | 6.7.2-1           | x86_64
+`,
+			want: true,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if zypperHasUpdates(tt.output) != tt.want {
+				t.Errorf("zypperHasUpdates() = %v, want %v", !tt.want, tt.want)
+			}
+		})
+	}
+}
