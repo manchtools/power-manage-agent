@@ -47,7 +47,10 @@ func TestHasUpdatesAvailable_Apt(t *testing.T) {
 	if _, err := exec.LookPath("apt"); err == nil {
 		aptCmd = "apt"
 	}
-	out, _, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
+	out, exitCode, err := queryCmdOutput(aptCmd, "-s", "upgrade")
+	if err != nil && exitCode != 0 {
+		t.Fatalf("%s -s upgrade failed with exit %d: %v", aptCmd, exitCode, err)
+	}
 	expected := strings.Contains(out, "Inst ")
 
 	if result != expected {
