@@ -124,7 +124,8 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 
 	changed, err := e.removeGroupWithConfig(ctx, groupName, sudoersPath, &output)
 	if err != nil {
-		return nil, false, err
+		// Group deletion failure is non-fatal for sudo (sudoers file removal is the important part)
+		output.WriteString(fmt.Sprintf("warning: %v\n", err))
 	}
 
 	if !changed {

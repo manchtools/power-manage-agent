@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
@@ -101,7 +102,9 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 	}
 	for _, member := range currentMembers {
 		if !desiredSet[member] {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to remove user %s from group %s: %v\n", member, groupName, err))
+			} else {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
@@ -132,7 +135,9 @@ func (e *Executor) writeAndValidateConfig(ctx context.Context, path, content, mo
 	validateOut, validateErr := runSudoCmd(ctx, validateCmd, validateArgs...)
 	if validateErr != nil {
 		// Config is invalid — remove it and report error
-		removeFileStrict(ctx, path)
+		if rmErr := removeFileStrict(ctx, path); rmErr != nil {
+			slog.Warn("failed to remove invalid config after validation failure", "path", path, "error", rmErr)
+		}
 		errMsg := "config validation failed"
 		if validateOut != nil && validateOut.Stderr != "" {
 			errMsg = strings.TrimSpace(validateOut.Stderr)
@@ -154,8 +159,8 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 
 	// Remove config file if specified
 	if configPath != "" && fileExistsWithSudo(ctx, configPath) {
-		if out, err := e.requireWritableFSShort(ctx); err != nil {
-			return false, fmt.Errorf("writable fs: %w::%s", err, out.Stderr)
+		if _, err := e.requireWritableFSShort(ctx); err != nil {
+			return false, fmt.Errorf("writable fs: %w", err)
 		}
 		if err := removeFileStrict(ctx, configPath); err != nil {
 			return false, fmt.Errorf("remove config file %s: %w", configPath, err)
@@ -168,8 +173,8 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 	if groupExists(groupName) {
 		if !changed {
 			// Need writable FS for group operations (may not have been checked above)
-			if out, err := e.requireWritableFSShort(ctx); err != nil {
-				return false, fmt.Errorf("writable fs: %w::%s", err, out.Stderr)
+			if _, err := e.requireWritableFSShort(ctx); err != nil {
+				return false, fmt.Errorf("writable fs: %w", err)
 			}
 		}
 		members := getGroupMembers(groupName)
@@ -180,11 +185,10 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 			}
 		}
 		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
-		} else {
-			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
-			changed = true
+			return changed, fmt.Errorf("delete group %s: %w", groupName, err)
 		}
+		output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
+		changed = true
 	}
 
 	return changed, nil
