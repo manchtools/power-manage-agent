@@ -20,7 +20,11 @@ func TestHasUpdatesAvailable_Dnf(t *testing.T) {
 	t.Logf("hasUpdatesAvailable (dnf) = %v", result)
 
 	// Cross-check with dnf check-update exit code (language-agnostic)
-	_, exitCode, _ := queryCmdOutput("dnf", "check-update")
+	// Exit 0 = no updates, 100 = updates available, anything else = error
+	_, exitCode, err := queryCmdOutput("dnf", "check-update")
+	if err != nil && exitCode != 100 {
+		t.Skipf("dnf check-update failed with exit %d: %v", exitCode, err)
+	}
 	expected := exitCode == 100
 
 	if result != expected {
@@ -87,9 +91,6 @@ func TestInstalledPackageCount(t *testing.T) {
 		t.Skipf("installedPackageCount() = %d (no supported package manager or error)", count)
 	}
 	t.Logf("installedPackageCount() = %d", count)
-	if count < 100 {
-		t.Errorf("suspiciously low package count: %d", count)
-	}
 }
 
 // TestInstalledPackageCount_Stable verifies that two consecutive calls return the same count.

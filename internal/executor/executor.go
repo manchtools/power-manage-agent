@@ -1640,7 +1640,7 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 
 // installedPackageCount returns the number of installed packages (language-agnostic).
 func installedPackageCount() int {
-	if pkg.IsDnf() {
+	if pkg.IsDnf() || pkg.IsZypper() {
 		out, exitCode, _ := queryCmdOutput("rpm", "-qa", "--qf", "x\n")
 		if exitCode != 0 {
 			return -1
