@@ -3463,7 +3463,11 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 
 	changed, err := e.removeGroupWithConfig(ctx, groupName, configPath, &output)
 	if err != nil {
-		// Group deletion failure is non-fatal for SSH (config removal is the important part)
+		if !changed {
+			// Config file removal failed — fatal
+			return nil, false, err
+		}
+		// Config removed but group deletion failed — non-fatal warning
 		output.WriteString(fmt.Sprintf("warning: %v\n", err))
 	}
 
