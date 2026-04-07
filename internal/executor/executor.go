@@ -3446,7 +3446,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Sync group membership
 	if memberChanged, err := syncGroupMembers(ctx, groupName, users, &output); err != nil {
-		return nil, false, err
+		return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: err.Error()}, changed, err
 	} else if memberChanged {
 		changed = true
 	}

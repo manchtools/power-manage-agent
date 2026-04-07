@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"regexp"
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
@@ -65,11 +66,18 @@ func (e *Executor) requireWritableFSMinimal(ctx context.Context) (*pb.CommandOut
 }
 
 // getActionID extracts the action ID string from an action, returning "" if nil.
+// validActionIDChars matches only safe characters for action IDs (ULIDs: uppercase alphanumeric).
+var validActionIDRegex = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
 func getActionID(action *pb.Action) string {
 	if action == nil || action.Id == nil {
 		return ""
 	}
-	return action.Id.Value
+	id := action.Id.Value
+	if id == "" || len(id) > 64 || !validActionIDRegex.MatchString(id) {
+		return ""
+	}
+	return id
 }
 
 // syncGroupMembers adds missing users and removes users no longer in the desired list
