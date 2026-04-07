@@ -339,147 +339,129 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	// Determine the package name for the current package manager
 	pkgName := e.getPackageNameForManager(params)
 	if pkgName == "" {
-		// No package name for this manager - skip silently with success
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   "skipped: no package name configured for this package manager",
 		}, false, nil
 	}
 
-	var result *pkg.CommandResult
-	var err error
-
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		// Check if package is already installed with correct version
-		isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
-		if isInstalled {
-			// Check version if specified
-			if params.Version != "" {
-				installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
-				if installedVersion == params.Version {
-					// Version matches, check if we need to pin
-					if params.Pin {
-						changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
-						if pinErr != nil {
-							return &pb.CommandOutput{
-								ExitCode: 1,
-								Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
-							}, false, pinErr
-						}
-						if changed {
-							return &pb.CommandOutput{
-								ExitCode: 0,
-								Stdout:   fmt.Sprintf("package %s version %s was already installed, pinned", pkgName, params.Version),
-							}, true, nil
-						}
-						return &pb.CommandOutput{
-							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s version %s is already installed and pinned", pkgName, params.Version),
-						}, false, nil
-					}
-					return &pb.CommandOutput{
-						ExitCode: 0,
-						Stdout:   fmt.Sprintf("package %s version %s is already installed", pkgName, params.Version),
-					}, false, nil
-				}
-				// Version mismatch, need to install specific version
-			} else {
-				// No specific version requested, package is installed
-				if params.Pin {
-					changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
-					if pinErr != nil {
-						return &pb.CommandOutput{
-							ExitCode: 1,
-							Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
-						}, false, pinErr
-					}
-					if changed {
-						return &pb.CommandOutput{
-							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s was already installed, pinned", pkgName),
-						}, true, nil
-					}
-					return &pb.CommandOutput{
-						ExitCode: 0,
-						Stdout:   fmt.Sprintf("package %s is already installed and pinned", pkgName),
-					}, false, nil
-				}
-				return &pb.CommandOutput{
-					ExitCode: 0,
-					Stdout:   fmt.Sprintf("package %s is already installed", pkgName),
-				}, false, nil
-			}
-		}
-
-		// Repair filesystem if mounted read-only (common after kernel errors)
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
-		}
-
-		// Repair any broken package manager state before proceeding
-		e.repairPackageManager(ctx)
-
-		// Update package index first to avoid stale package references
-		if _, updateErr := e.pkgManager.Update(); updateErr != nil {
-			e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
-		}
-
-		// Install the package
-		if params.Version != "" || params.AllowDowngrade {
-			result, err = e.pkgManager.Install(pkgName).
-				Version(params.Version).
-				AllowDowngrade().
-				Run()
-		} else {
-			result, err = e.pkgManager.Install(pkgName).Run()
-		}
-
-		// Pin if requested
-		if err == nil && params.Pin {
-			if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
-				result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
-			}
-		}
-
+		return e.ensurePackagePresent(ctx, params, pkgName)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// Check if package is already not installed
-		isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
-		if !isInstalled {
-			return &pb.CommandOutput{
-				ExitCode: 0,
-				Stdout:   fmt.Sprintf("package %s is already not installed", pkgName),
-			}, false, nil
-		}
-
-		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
-		}
-
-		// Repair any broken package manager state before proceeding
-		e.repairPackageManager(ctx)
-
-		// Unpin first if it was pinned (ignore errors)
-		e.ensurePackageUnpinned(pkgName)
-		result, err = e.pkgManager.Remove(pkgName).Run()
-
+		return e.ensurePackageAbsent(ctx, params, pkgName)
 	default:
 		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
+}
 
-	if err != nil {
-		if result == nil {
+// ensurePackagePresent installs a package (with optional version and pin) if not already satisfied.
+func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+
+	// If installed, check if version and pin are already satisfied
+	if isInstalled {
+		if out, changed, done := e.checkPackageVersionAndPin(ctx, params, pkgName); done {
+			return out, changed, nil
+		}
+		// Version mismatch — fall through to install specific version
+	}
+
+	// Prepare filesystem and package manager
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, false, fmt.Errorf("filesystem is read-only")
+	}
+	e.repairPackageManager(ctx)
+
+	if _, updateErr := e.pkgManager.Update(); updateErr != nil {
+		e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
+	}
+
+	// Install
+	var result *pkg.CommandResult
+	var err error
+	if params.Version != "" || params.AllowDowngrade {
+		result, err = e.pkgManager.Install(pkgName).
+			Version(params.Version).
+			AllowDowngrade().
+			Run()
+	} else {
+		result, err = e.pkgManager.Install(pkgName).Run()
+	}
+
+	if err == nil && params.Pin {
+		if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
+			result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
+		}
+	}
+
+	return packageResult(result, err)
+}
+
+// checkPackageVersionAndPin checks if an already-installed package satisfies the
+// desired version and pin state. Returns (output, changed, true) if satisfied
+// or (nil, false, false) if the package needs reinstallation.
+func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, bool) {
+	if params.Version != "" {
+		installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
+		if installedVersion != params.Version {
+			return nil, false, false // version mismatch, needs install
+		}
+	}
+
+	// Version matches (or no version required). Check pin.
+	if params.Pin {
+		changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
+		if pinErr != nil {
 			return &pb.CommandOutput{
 				ExitCode: 1,
-				Stderr:   err.Error(),
-			}, false, err
+				Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
+			}, false, true
+		}
+		msg := fmt.Sprintf("package %s is already installed and pinned", pkgName)
+		if changed {
+			msg = fmt.Sprintf("package %s was already installed, pinned", pkgName)
+		}
+		return &pb.CommandOutput{ExitCode: 0, Stdout: msg}, changed, true
+	}
+
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   fmt.Sprintf("package %s is already installed", pkgName),
+	}, false, true
+}
+
+// ensurePackageAbsent removes a package if installed.
+func (e *Executor) ensurePackageAbsent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+	if !isInstalled {
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   fmt.Sprintf("package %s is already not installed", pkgName),
+		}, false, nil
+	}
+
+	if !e.repairFilesystem(ctx) {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
+		}, false, fmt.Errorf("filesystem is read-only")
+	}
+	e.repairPackageManager(ctx)
+
+	e.ensurePackageUnpinned(pkgName)
+	result, err := e.pkgManager.Remove(pkgName).Run()
+	return packageResult(result, err)
+}
+
+// packageResult converts a pkg.CommandResult into the standard executor return tuple.
+func packageResult(result *pkg.CommandResult, err error) (*pb.CommandOutput, bool, error) {
+	if err != nil {
+		if result == nil {
+			return &pb.CommandOutput{ExitCode: 1, Stderr: err.Error()}, false, err
 		}
 		return &pb.CommandOutput{
 			ExitCode: int32(result.ExitCode),
@@ -487,7 +469,6 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 			Stderr:   result.Stderr,
 		}, false, err
 	}
-
 	return &pb.CommandOutput{
 		ExitCode: int32(result.ExitCode),
 		Stdout:   result.Stdout,
