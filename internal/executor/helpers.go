@@ -82,9 +82,11 @@ func getActionID(action *pb.Action) string {
 
 // syncGroupMembers adds missing users and removes users no longer in the desired list
 // for the given group. It logs warnings for non-existent users.
-// Returns (changed bool, error).
+// Returns (changed bool, error). The error is non-nil if any membership operation
+// failed, even if some operations succeeded (changed may still be true).
 func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []string, output *strings.Builder) (bool, error) {
 	changed := false
+	var errs []string
 
 	// Add missing members
 	for _, username := range desiredUsers {
@@ -94,7 +96,9 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 		}
 		if !userInGroup(username, groupName) {
 			if err := addUserToGroup(ctx, username, groupName); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
+				msg := fmt.Sprintf("failed to add user %s to group %s: %v", username, groupName, err)
+				output.WriteString(fmt.Sprintf("warning: %s\n", msg))
+				errs = append(errs, msg)
 			} else {
 				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
 				changed = true
@@ -111,7 +115,9 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 	for _, member := range currentMembers {
 		if !desiredSet[member] {
 			if err := removeUserFromGroup(ctx, member, groupName); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to remove user %s from group %s: %v\n", member, groupName, err))
+				msg := fmt.Sprintf("failed to remove user %s from group %s: %v", member, groupName, err)
+				output.WriteString(fmt.Sprintf("warning: %s\n", msg))
+				errs = append(errs, msg)
 			} else {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
@@ -119,15 +125,24 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 		}
 	}
 
+	if len(errs) > 0 {
+		return changed, fmt.Errorf("group membership errors: %s", strings.Join(errs, "; "))
+	}
 	return changed, nil
 }
 
 // contentChanged checks if a file's content differs from the desired content.
 // Returns true if the file doesn't exist or its content differs.
+// Note: readFileWithSudo returns ("", nil) for missing files, so err here
+// indicates a real I/O or permission error.
 func contentChanged(ctx context.Context, filePath, desiredContent string) (bool, error) {
 	existing, err := readFileWithSudo(ctx, filePath)
 	if err != nil {
-		return true, nil // file doesn't exist, content is "changed"
+		return false, fmt.Errorf("read %s: %w", filePath, err)
+	}
+	// Empty string means file doesn't exist (readFileWithSudo returns "" for not-found)
+	if existing == "" {
+		return true, nil
 	}
 	return existing != desiredContent, nil
 }
@@ -187,7 +202,9 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 		}
 		members := getGroupMembers(groupName)
 		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to remove user %s from group %s: %v\n", member, groupName, err))
+			} else {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}

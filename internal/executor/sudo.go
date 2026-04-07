@@ -107,7 +107,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 
 	// Sync group membership
 	if memberChanged, err := syncGroupMembers(ctx, groupName, params.Users, &output); err != nil {
-		return nil, false, err
+		return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: err.Error()}, memberChanged, err
 	} else if memberChanged {
 		changed = true
 	}

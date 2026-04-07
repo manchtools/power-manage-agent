@@ -69,7 +69,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 
 	// Sync group membership
 	if memberChanged, err := syncGroupMembers(ctx, params.Name, params.Members, &output); err != nil {
-		return nil, false, err
+		return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: err.Error()}, memberChanged, err
 	} else if memberChanged {
 		changed = true
 	}
