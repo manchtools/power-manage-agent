@@ -3522,7 +3522,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		changed = true
 	}
 
-	// Write sshd config file
+	// Write sshd config file with validation
 	if !fileMatches {
 		// Ensure /etc/ssh/sshd_config.d exists
 		if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
@@ -3531,8 +3531,24 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
 			return nil, false, fmt.Errorf("write ssh config: %w", err)
 		}
+		// Validate with sshd -t (tests full config including drop-ins)
+		if _, err := runSudoCmd(ctx, "sshd", "-t"); err != nil {
+			// Invalid config — remove it to avoid breaking sshd
+			removeFileStrict(ctx, configPath)
+			return &pb.CommandOutput{
+				ExitCode: 1,
+				Stderr:   "sshd config validation failed after writing drop-in",
+			}, false, fmt.Errorf("sshd -t validation failed: %w", err)
+		}
 		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
 		changed = true
+
+		// Reload sshd to apply the new config
+		if _, err := runSudoCmd(ctx, "systemctl", "reload", "sshd"); err != nil {
+			output.WriteString(fmt.Sprintf("warning: failed to reload sshd: %v\n", err))
+		} else {
+			output.WriteString("reloaded sshd\n")
+		}
 	}
 
 	// Add users to group
