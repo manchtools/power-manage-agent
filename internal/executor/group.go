@@ -46,7 +46,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
+	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, err
 	}
 

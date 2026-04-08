@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"regexp"
@@ -12,33 +13,7 @@ import (
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.
-var errReadOnlyFS = fmt.Errorf("filesystem is read-only")
-
-// readOnlyFSOutput returns a CommandOutput for read-only filesystem failures
-// with the full diagnostic message.
-func readOnlyFSOutput() *pb.CommandOutput {
-	return &pb.CommandOutput{
-		ExitCode: 1,
-		Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-	}
-}
-
-// readOnlyFSOutputShort returns a CommandOutput for read-only filesystem failures
-// with a shorter message (used by some handlers).
-func readOnlyFSOutputShort() *pb.CommandOutput {
-	return &pb.CommandOutput{
-		ExitCode: 1,
-		Stderr:   "filesystem is read-only and could not be remounted",
-	}
-}
-
-// readOnlyFSOutputMinimal returns a CommandOutput with the minimal read-only message.
-func readOnlyFSOutputMinimal() *pb.CommandOutput {
-	return &pb.CommandOutput{
-		ExitCode: 1,
-		Stderr:   "filesystem is read-only",
-	}
-}
+var errReadOnlyFS = errors.New("filesystem is read-only")
 
 // requireWritableFS checks if the filesystem is writable and attempts repair if not.
 // Returns nil, nil if writable. Returns (output, error) if repair failed.
@@ -46,28 +21,16 @@ func (e *Executor) requireWritableFS(ctx context.Context) (*pb.CommandOutput, er
 	if e.repairFilesystem(ctx) {
 		return nil, nil
 	}
-	return readOnlyFSOutput(), errReadOnlyFS
+	return &pb.CommandOutput{
+		ExitCode: 1,
+		Stderr:   "filesystem is read-only and could not be remounted",
+	}, errReadOnlyFS
 }
 
-// requireWritableFSShort is like requireWritableFS but uses a shorter error message.
-func (e *Executor) requireWritableFSShort(ctx context.Context) (*pb.CommandOutput, error) {
-	if e.repairFilesystem(ctx) {
-		return nil, nil
-	}
-	return readOnlyFSOutputShort(), errReadOnlyFS
-}
-
-// requireWritableFSMinimal is like requireWritableFS but uses a minimal error message.
-func (e *Executor) requireWritableFSMinimal(ctx context.Context) (*pb.CommandOutput, error) {
-	if e.repairFilesystem(ctx) {
-		return nil, nil
-	}
-	return readOnlyFSOutputMinimal(), errReadOnlyFS
-}
-
-// getActionID extracts the action ID string from an action, returning "" if nil.
-// validActionIDChars matches only safe characters for action IDs (ULIDs: uppercase alphanumeric).
+// validActionIDRegex matches only safe alphanumeric characters for action IDs.
 var validActionIDRegex = regexp.MustCompile(`^[A-Za-z0-9]+$`)
+
+// getActionID extracts the action ID string from an action, returning "" if nil or invalid.
 
 func getActionID(action *pb.Action) string {
 	if action == nil || action.Id == nil {
@@ -131,21 +94,6 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 	return changed, nil
 }
 
-// contentChanged checks if a file's content differs from the desired content.
-// Returns true if the file doesn't exist or its content differs.
-// Note: readFileWithSudo returns ("", nil) for missing files, so err here
-// indicates a real I/O or permission error.
-func contentChanged(ctx context.Context, filePath, desiredContent string) (bool, error) {
-	existing, err := readFileWithSudo(ctx, filePath)
-	if err != nil {
-		return false, fmt.Errorf("read %s: %w", filePath, err)
-	}
-	// Empty string means file doesn't exist (readFileWithSudo returns "" for not-found)
-	if existing == "" {
-		return true, nil
-	}
-	return existing != desiredContent, nil
-}
 
 // writeAndValidateConfig writes a config file atomically and validates it with an external command.
 // If validation fails, the file is removed and the validation error is returned.
@@ -182,7 +130,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 
 	// Remove config file if specified
 	if configPath != "" && fileExistsWithSudo(ctx, configPath) {
-		if _, err := e.requireWritableFSShort(ctx); err != nil {
+		if _, err := e.requireWritableFS(ctx); err != nil {
 			return false, fmt.Errorf("writable fs: %w", err)
 		}
 		if err := removeFileStrict(ctx, configPath); err != nil {
@@ -196,7 +144,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 	if groupExists(groupName) {
 		if !changed {
 			// Need writable FS for group operations (may not have been checked above)
-			if _, err := e.requireWritableFSShort(ctx); err != nil {
+			if _, err := e.requireWritableFS(ctx); err != nil {
 				return false, fmt.Errorf("writable fs: %w", err)
 			}
 		}

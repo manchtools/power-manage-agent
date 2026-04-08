@@ -291,7 +291,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
-		result.Error = fmt.Sprintf("action timed out after %d seconds", action.TimeoutSeconds)
+		result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
 	case ctx.Err() == context.Canceled:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"
@@ -360,6 +360,8 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 		e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
 	}
 
+	// Version and AllowDowngrade are independent — setting a version does NOT
+	// imply downgrade permission. Callers must explicitly set AllowDowngrade.
 	builder := e.pkgManager.Install(pkgName)
 	if params.Version != "" {
 		builder = builder.Version(params.Version)
@@ -561,7 +563,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
 		}
 
@@ -652,7 +654,7 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
 		}
 
@@ -735,7 +737,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
 		}
 
@@ -810,7 +812,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
 		}
 
@@ -3353,23 +3355,6 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	return true, nil
 }
 
-// validateSshdConfig runs sshd -t to validate the full config (including drop-ins).
-// If validation fails, the given config file is removed and an error is returned.
-func validateSshdConfig(ctx context.Context, configPath string) (*pb.CommandOutput, error) {
-	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
-	if validateErr != nil {
-		if rmErr := removeFileStrict(ctx, configPath); rmErr != nil {
-			slog.Warn("failed to remove invalid sshd config after validation failure", "path", configPath, "error", rmErr)
-		}
-		errMsg := "sshd config validation failed"
-		if validateOut != nil && validateOut.Stderr != "" {
-			errMsg = strings.TrimSpace(validateOut.Stderr)
-		}
-		return &pb.CommandOutput{ExitCode: 1, Stderr: errMsg}, fmt.Errorf("sshd -t validation failed: %s", errMsg)
-	}
-	return nil, nil
-}
-
 // reloadSshd reloads the sshd service, falling back to the "ssh" service name
 // for Debian/Ubuntu. Writes the result to output.
 func reloadSshd(ctx context.Context, output *strings.Builder) {
@@ -3477,7 +3462,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
+	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, err
 	}
 
@@ -3496,10 +3481,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
 			return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 		}
-		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
-			return nil, false, fmt.Errorf("write ssh config: %w", err)
-		}
-		if out, err := validateSshdConfig(ctx, configPath); err != nil {
+		if out, err := e.writeAndValidateConfig(ctx, configPath, content, "0644", "root", "root", "sshd", "-t"); err != nil {
 			return out, false, err
 		}
 		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
@@ -3606,7 +3588,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
+	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, err
 	}
 
@@ -3640,7 +3622,7 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
+	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, err
 	}
 

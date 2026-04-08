@@ -655,13 +655,14 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	}
 
 	// Cron takes precedence over interval.
-	// Cron expressions run in the device's local timezone, so we parse
-	// with local time and convert to UTC for storage.
+	// Cron expressions run in the device's local timezone, so we use
+	// local time as input and convert the result to UTC for storage.
 	if schedule.Cron != "" {
 		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 		sched, err := parser.Parse(schedule.Cron)
 		if err == nil {
-			return sched.Next(time.Now()).UTC()
+			localNow := now.Local()
+			return sched.Next(localNow).UTC()
 		}
 		slog.Warn("invalid cron expression, using interval fallback", "cron", schedule.Cron, "error", err)
 	}

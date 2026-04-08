@@ -83,7 +83,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 		}, false, nil
 	}
 
-	if out, err := e.requireWritableFSShort(ctx); err != nil {
+	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, err
 	}
 
@@ -119,7 +119,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 }
 
 // removeSudoPolicy removes a sudo policy: sudoers file, group membership, and group.
-func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath string, users []string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath string, _ []string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 
 	changed, err := e.removeGroupWithConfig(ctx, groupName, sudoersPath, &output)
