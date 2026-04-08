@@ -138,10 +138,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 
 	// Verify action signature before execution (skip for instant actions — they have no params to sign)
 	if e.verifier != nil && !isInstantAction(action.Type) {
-		actionID := ""
-		if action.Id != nil {
-			actionID = action.Id.Value
-		}
+		actionID := getActionID(action)
 		verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature)
 		if verifyErr != nil {
 			// Shell scripts and sudo policies: hard reject unsigned/tampered actions
@@ -228,36 +225,20 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSH:
 		var changed bool
-		sshActionID := ""
-		if action.Id != nil {
-			sshActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, sshActionID)
+		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSHD:
 		var changed bool
-		sshdActionID := ""
-		if action.Id != nil {
-			sshdActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, sshdActionID)
+		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SUDO:
 		var changed bool
-		sudoActionID := ""
-		if action.Id != nil {
-			sudoActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, sudoActionID)
+		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_LPS:
 		var changed bool
 		var metadata map[string]string
-		lpsActionID := ""
-		if action.Id != nil {
-			lpsActionID = action.Id.Value
-		}
-		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, lpsActionID)
+		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
@@ -265,22 +246,14 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	case pb.ActionType_ACTION_TYPE_LUKS:
 		var changed bool
 		var metadata map[string]string
-		luksActionID := ""
-		if action.Id != nil {
-			luksActionID = action.Id.Value
-		}
-		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, luksActionID)
+		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
 	case pb.ActionType_ACTION_TYPE_WIFI:
 		var changed bool
-		wifiActionID := ""
-		if action.Id != nil {
-			wifiActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, wifiActionID)
+		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
@@ -413,11 +386,8 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 		}
 
 		// Repair filesystem if mounted read-only (common after kernel errors)
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Repair any broken package manager state before proceeding
@@ -456,11 +426,8 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Repair any broken package manager state before proceeding
@@ -575,11 +542,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create directory
@@ -612,11 +576,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+			return out, false, err
 		}
 
 		if err := os.Remove(resolvedPath); err != nil {
@@ -673,11 +634,8 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Install the flatpak application
@@ -709,11 +667,8 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Remove pin first if it exists
@@ -762,11 +717,8 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Download to temp file
@@ -798,11 +750,8 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+			return out, false, err
 		}
 
 		output, err := runSudoCmd(ctx, "dpkg", "-r", pkgName)
@@ -847,11 +796,8 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Download to temp file
@@ -879,11 +825,8 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFSMinimal(ctx); err != nil {
+			return out, false, err
 		}
 
 		output, err := runSudoCmd(ctx, "rpm", "-e", pkgName)
@@ -1053,11 +996,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 
 		if needsUpdate {
 			// Repair filesystem if mounted read-only
-			if !e.repairFilesystem(ctx) {
-				return &pb.CommandOutput{
-					ExitCode: 1,
-					Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-				}, false, fmt.Errorf("filesystem is read-only")
+			if out, err := e.requireWritableFS(ctx); err != nil {
+				return out, false, err
 			}
 
 			// Write unit file using sudo tee
@@ -1174,11 +1114,8 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create parent directories using sudo
@@ -1234,11 +1171,8 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// For managed block mode, remove only the specified content block from the file
@@ -1429,11 +1363,8 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create directory with permissions (handles mkdir, chmod, and chown)
@@ -1461,11 +1392,8 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Remove directory (use -r for recursive removal if it has contents)
@@ -1789,7 +1717,7 @@ func (e *Executor) ensurePackagePinned(ctx context.Context, pkgName string) (boo
 
 	// Repair filesystem if needed before writing
 	if !e.repairFilesystem(ctx) {
-		return false, fmt.Errorf("filesystem is read-only")
+		return false, errReadOnlyFS
 	}
 
 	return e.pinPackage(pkgName)
@@ -2063,11 +1991,8 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}
 
 	// Repair filesystem if mounted read-only (common after kernel errors)
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Repair any broken package manager state first
@@ -2256,11 +2181,8 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	}
 
 	// Repair filesystem if mounted read-only
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	if !validRepoName.MatchString(params.Name) {
@@ -2916,11 +2838,8 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	}
 
 	// Repair filesystem if mounted read-only
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, nil, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, nil, err
 	}
 
 	switch state {
@@ -3506,11 +3425,8 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Ensure group exists
@@ -3535,35 +3451,11 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		changed = true
 	}
 
-	// Add users to group
-	for _, username := range users {
-		if !userExists(username) {
-			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
-			continue
-		}
-		if !userInGroup(username, groupName) {
-			if err := addUserToGroup(ctx, username, groupName); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
-			} else {
-				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
-				changed = true
-			}
-		}
-	}
-
-	// Remove users that are no longer in the list
-	currentMembers := getGroupMembers(groupName)
-	desiredSet := make(map[string]bool, len(users))
-	for _, u := range users {
-		desiredSet[u] = true
-	}
-	for _, member := range currentMembers {
-		if !desiredSet[member] {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
+	// Sync group membership
+	if memberChanged, err := syncGroupMembers(ctx, groupName, users, &output); err != nil {
+		return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: err.Error()}, changed, err
+	} else if memberChanged {
+		changed = true
 	}
 
 	return &pb.CommandOutput{
@@ -3575,38 +3467,15 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 // removeSshAccess removes the sshd_config.d file, group membership, and group.
 func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
-	changed := false
 
-	// Remove sshd config file
-	if fileExistsWithSudo(ctx, configPath) {
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted",
-			}, false, fmt.Errorf("filesystem is read-only")
+	changed, err := e.removeGroupWithConfig(ctx, groupName, configPath, &output)
+	if err != nil {
+		if !changed {
+			// Config file removal failed — fatal
+			return nil, false, err
 		}
-		if err := removeFileStrict(ctx, configPath); err != nil {
-			return nil, false, fmt.Errorf("remove ssh config: %w", err)
-		}
-		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
-		changed = true
-	}
-
-	// Remove group and membership
-	if groupExists(groupName) {
-		members := getGroupMembers(groupName)
-		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
-		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
-		} else {
-			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
-			changed = true
-		}
+		// Config removed but group deletion failed — non-fatal warning
+		output.WriteString(fmt.Sprintf("warning: %v\n", err))
 	}
 
 	if !changed {
@@ -3678,11 +3547,8 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Ensure /etc/ssh/sshd_config.d exists
@@ -3690,25 +3556,10 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 	}
 
-	if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
-		return nil, false, fmt.Errorf("write sshd config: %w", err)
+	if out, err := e.writeAndValidateConfig(ctx, configPath, content, "0644", "root", "root", "sshd", "-t"); err != nil {
+		return out, false, err
 	}
 	output.WriteString(fmt.Sprintf("created SSHD config: %s\n", configPath))
-
-	// Validate config
-	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
-	if validateErr != nil {
-		// Config is invalid — remove it and report error
-		removeFileStrict(ctx, configPath)
-		errMsg := "sshd config validation failed"
-		if validateOut != nil && validateOut.Stderr != "" {
-			errMsg = strings.TrimSpace(validateOut.Stderr)
-		}
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   errMsg,
-		}, false, fmt.Errorf("sshd -t validation failed: %s", errMsg)
-	}
 
 	// Reload sshd
 	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
@@ -3743,11 +3594,8 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFSShort(ctx); err != nil {
+		return out, false, err
 	}
 
 	if err := removeFileStrict(ctx, configPath); err != nil {
