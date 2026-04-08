@@ -381,16 +381,14 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 	}
 
 	// Install
-	var result *pkg.CommandResult
-	var err error
-	if params.Version != "" || params.AllowDowngrade {
-		result, err = e.pkgManager.Install(pkgName).
-			Version(params.Version).
-			AllowDowngrade().
-			Run()
-	} else {
-		result, err = e.pkgManager.Install(pkgName).Run()
+	builder := e.pkgManager.Install(pkgName)
+	if params.Version != "" {
+		builder = builder.Version(params.Version)
 	}
+	if params.AllowDowngrade {
+		builder = builder.AllowDowngrade()
+	}
+	result, err := builder.Run()
 
 	if err == nil && params.Pin {
 		if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
