@@ -16,10 +16,12 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pressly/goose/v3"
 	_ "modernc.org/sqlite"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/agent/internal/store/migrations"
 )
 
 // Store manages persistent storage for actions and execution results.
@@ -76,161 +78,22 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("enable WAL mode: %w", err)
 	}
 
-	store := &Store{db: db}
-	if err := store.migrate(dataDir); err != nil {
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
 		db.Close()
-		return nil, fmt.Errorf("migrate database: %w", err)
+		return nil, fmt.Errorf("set goose dialect: %w", err)
 	}
+	if err := goose.Up(db, "."); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("run migrations: %w", err)
+	}
+
+	store := &Store{db: db}
+
+	// Migrate legacy LPS JSON files into SQLite (one-time, idempotent).
+	store.migrateLpsJsonFiles(dataDir)
 
 	return store, nil
-}
-
-// currentSchemaVersion is the latest schema version. Increment when adding migrations.
-const currentSchemaVersion = 3
-
-// migrate creates or updates the database schema using PRAGMA user_version for tracking.
-func (s *Store) migrate(dataDir string) error {
-	var version int
-	if err := s.db.QueryRow("PRAGMA user_version").Scan(&version); err != nil {
-		return fmt.Errorf("read schema version: %w", err)
-	}
-
-	if version < 1 {
-		if err := s.migrateV1(); err != nil {
-			return fmt.Errorf("migration v1: %w", err)
-		}
-	}
-	if version < 2 {
-		if err := s.migrateV2(); err != nil {
-			return fmt.Errorf("migration v2: %w", err)
-		}
-	}
-	if version < 3 {
-		if err := s.migrateV3(dataDir); err != nil {
-			return fmt.Errorf("migration v3: %w", err)
-		}
-	}
-
-	if version < currentSchemaVersion {
-		if _, err := s.db.Exec(fmt.Sprintf("PRAGMA user_version = %d", currentSchemaVersion)); err != nil {
-			return fmt.Errorf("set schema version: %w", err)
-		}
-		slog.Info("database migrated", "from_version", version, "to_version", currentSchemaVersion)
-	}
-
-	return nil
-}
-
-// hasColumn checks if a table has a specific column using PRAGMA table_info.
-func (s *Store) hasColumn(table, column string) bool {
-	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
-	if err != nil {
-		return false
-	}
-	defer rows.Close()
-	for rows.Next() {
-		var cid int
-		var name, typ string
-		var notNull, pk int
-		var dflt sql.NullString
-		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
-			return false
-		}
-		if name == column {
-			return true
-		}
-	}
-	return false
-}
-
-// migrateV1 creates the core actions and results tables.
-func (s *Store) migrateV1() error {
-	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS actions (
-			id TEXT PRIMARY KEY,
-			action_json TEXT NOT NULL,
-			assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-			last_executed_at DATETIME,
-			next_execute_at DATETIME NOT NULL,
-			last_result_hash TEXT DEFAULT '',
-			desired_state INTEGER NOT NULL DEFAULT 0
-		);
-
-		CREATE TABLE IF NOT EXISTS results (
-			id TEXT PRIMARY KEY,
-			action_id TEXT NOT NULL,
-			executed_at DATETIME NOT NULL,
-			status INTEGER NOT NULL,
-			error TEXT DEFAULT '',
-			output_json TEXT,
-			duration_ms INTEGER NOT NULL DEFAULT 0,
-			has_changes BOOLEAN NOT NULL DEFAULT 0,
-			synced BOOLEAN NOT NULL DEFAULT 0,
-			FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_actions_next_execute ON actions(next_execute_at);
-		CREATE INDEX IF NOT EXISTS idx_results_synced ON results(synced) WHERE synced = 0;
-		CREATE INDEX IF NOT EXISTS idx_results_action ON results(action_id);
-	`)
-	return err
-}
-
-// migrateV2 adds LUKS state tables and the desired_state column for existing databases.
-func (s *Store) migrateV2() error {
-	// Add desired_state column for databases created before v1 included it.
-	if !s.hasColumn("actions", "desired_state") {
-		if _, err := s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0"); err != nil {
-			return err
-		}
-	}
-
-	_, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS luks_state (
-			action_id TEXT PRIMARY KEY,
-			device_path TEXT NOT NULL DEFAULT '',
-			ownership_taken BOOLEAN NOT NULL DEFAULT FALSE,
-			device_key_type TEXT NOT NULL DEFAULT 'none',
-			last_rotated_at TEXT NOT NULL DEFAULT ''
-		);
-
-		CREATE TABLE IF NOT EXISTS luks_user_passphrase_history (
-			id INTEGER PRIMARY KEY AUTOINCREMENT,
-			action_id TEXT NOT NULL,
-			passphrase_hash TEXT NOT NULL,
-			created_at TEXT NOT NULL DEFAULT (datetime('now'))
-		);
-
-		CREATE INDEX IF NOT EXISTS idx_luks_passphrase_history_action ON luks_user_passphrase_history(action_id);
-	`)
-	return err
-}
-
-// migrateV3 adds LPS state table and LUKS last_rotated_at column, migrates legacy LPS JSON files.
-func (s *Store) migrateV3(dataDir string) error {
-	// Add last_rotated_at for databases created before v2 included it.
-	if !s.hasColumn("luks_state", "last_rotated_at") {
-		if _, err := s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''"); err != nil {
-			return err
-		}
-	}
-
-	if _, err := s.db.Exec(`
-		CREATE TABLE IF NOT EXISTS lps_state (
-			action_id TEXT NOT NULL,
-			username TEXT NOT NULL,
-			last_rotated_at TEXT NOT NULL DEFAULT '',
-			password_hash TEXT NOT NULL DEFAULT '',
-			PRIMARY KEY (action_id, username)
-		);
-	`); err != nil {
-		return err
-	}
-
-	// Migrate legacy LPS JSON files into SQLite.
-	s.migrateLpsJsonFiles(dataDir)
-
-	return nil
 }
 
 // migrateLpsJsonFiles imports legacy /var/lib/power-manage/lps/lps-*.json files
