@@ -361,8 +361,8 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 
 	// If installed, check if version and pin are already satisfied
 	if isInstalled {
-		if out, changed, done := e.checkPackageVersionAndPin(ctx, params, pkgName); done {
-			return out, changed, nil
+		if out, changed, err := e.checkPackageVersionAndPin(ctx, params, pkgName); out != nil {
+			return out, changed, err
 		}
 		// Version mismatch — fall through to install specific version
 	}
@@ -402,14 +402,17 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 }
 
 // checkPackageVersionAndPin checks if an already-installed package satisfies the
-// desired version and pin state. Returns (output, changed, true) if satisfied
-// or (nil, false, false) if the package needs reinstallation.
-func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, bool) {
+// desired version and pin state. Returns (output, changed, error) when the check
+// is conclusive (output != nil). Returns (nil, false, nil) when the version
+// doesn't match and the package needs reinstallation.
+func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	versionStr := ""
 	if params.Version != "" {
 		installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
 		if installedVersion != params.Version {
-			return nil, false, false // version mismatch, needs install
+			return nil, false, nil // version mismatch, needs install
 		}
+		versionStr = " version " + params.Version
 	}
 
 	// Version matches (or no version required). Check pin.
@@ -419,23 +422,23 @@ func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.Pac
 			return &pb.CommandOutput{
 				ExitCode: 1,
 				Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
-			}, false, true
+			}, false, pinErr
 		}
-		msg := fmt.Sprintf("package %s is already installed and pinned", pkgName)
+		msg := fmt.Sprintf("package %s%s is already installed and pinned", pkgName, versionStr)
 		if changed {
-			msg = fmt.Sprintf("package %s was already installed, pinned", pkgName)
+			msg = fmt.Sprintf("package %s%s was already installed, pinned", pkgName, versionStr)
 		}
-		return &pb.CommandOutput{ExitCode: 0, Stdout: msg}, changed, true
+		return &pb.CommandOutput{ExitCode: 0, Stdout: msg}, changed, nil
 	}
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
-		Stdout:   fmt.Sprintf("package %s is already installed", pkgName),
-	}, false, true
+		Stdout:   fmt.Sprintf("package %s%s is already installed", pkgName, versionStr),
+	}, false, nil
 }
 
 // ensurePackageAbsent removes a package if installed.
-func (e *Executor) ensurePackageAbsent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
 	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
 	if !isInstalled {
 		return &pb.CommandOutput{
