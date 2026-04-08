@@ -78,6 +78,11 @@ func New(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("enable WAL mode: %w", err)
 	}
+	// Enable foreign key enforcement (OFF by default in SQLite)
+	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
 
 	goose.SetBaseFS(migrations.FS)
 	if err := goose.SetDialect("sqlite3"); err != nil {

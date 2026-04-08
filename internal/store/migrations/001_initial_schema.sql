@@ -32,14 +32,16 @@ CREATE TABLE IF NOT EXISTS luks_state (
     device_path TEXT NOT NULL DEFAULT '',
     ownership_taken BOOLEAN NOT NULL DEFAULT FALSE,
     device_key_type TEXT NOT NULL DEFAULT 'none',
-    last_rotated_at TEXT NOT NULL DEFAULT ''
+    last_rotated_at TEXT NOT NULL DEFAULT '',
+    FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE
 );
 
 CREATE TABLE IF NOT EXISTS luks_user_passphrase_history (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     action_id TEXT NOT NULL,
     passphrase_hash TEXT NOT NULL,
-    created_at TEXT NOT NULL DEFAULT (datetime('now'))
+    created_at TEXT NOT NULL DEFAULT (datetime('now')),
+    FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE
 );
 
 CREATE INDEX IF NOT EXISTS idx_luks_passphrase_history_action ON luks_user_passphrase_history(action_id);
@@ -49,7 +51,8 @@ CREATE TABLE IF NOT EXISTS lps_state (
     username TEXT NOT NULL,
     last_rotated_at TEXT NOT NULL DEFAULT '',
     password_hash TEXT NOT NULL DEFAULT '',
-    PRIMARY KEY (action_id, username)
+    PRIMARY KEY (action_id, username),
+    FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE
 );
 
 -- +goose Down
