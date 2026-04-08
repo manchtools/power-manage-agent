@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/pressly/goose/v3"
+	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
 	"google.golang.org/protobuf/encoding/protojson"
 
@@ -649,12 +650,13 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	}
 
 	// Cron takes precedence over interval.
-	// Cron expressions run in the device's local timezone, so we pass
-	// local time to the parser and convert the result to UTC for storage.
+	// Cron expressions run in the device's local timezone, so we parse
+	// with local time and convert to UTC for storage.
 	if schedule.Cron != "" {
-		next, err := nextCronTime(schedule.Cron, time.Now())
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		sched, err := parser.Parse(schedule.Cron)
 		if err == nil {
-			return next.UTC()
+			return sched.Next(time.Now()).UTC()
 		}
 		slog.Warn("invalid cron expression, using interval fallback", "cron", schedule.Cron, "error", err)
 	}
