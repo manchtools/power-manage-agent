@@ -3421,7 +3421,9 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 func validateSshdConfig(ctx context.Context, configPath string) (*pb.CommandOutput, error) {
 	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
 	if validateErr != nil {
-		removeFileStrict(ctx, configPath)
+		if rmErr := removeFileStrict(ctx, configPath); rmErr != nil {
+			slog.Warn("failed to remove invalid sshd config after validation failure", "path", configPath, "error", rmErr)
+		}
 		errMsg := "sshd config validation failed"
 		if validateOut != nil && validateOut.Stderr != "" {
 			errMsg = strings.TrimSpace(validateOut.Stderr)
@@ -3626,13 +3628,16 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 		}
 		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
 		changed = true
+		reloadSshd(ctx, &output)
 	}
 
 	// Remove group and membership
 	if groupExists(groupName) {
 		members := getGroupMembers(groupName)
 		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
+			if err := removeUserFromGroup(ctx, member, groupName); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to remove user %s from group %s: %v\n", member, groupName, err))
+			} else {
 				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
 				changed = true
 			}
