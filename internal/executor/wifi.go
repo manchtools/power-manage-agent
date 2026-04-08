@@ -263,7 +263,7 @@ func (e *Executor) modifyWifi(ctx context.Context, params *pb.WifiParams, conNam
 // writeWifiCerts writes EAP-TLS certificate files to disk.
 func (e *Executor) writeWifiCerts(actionID string, params *pb.WifiParams) error {
 	certDir := wifiCertPath(actionID)
-	if err := os.MkdirAll(certDir, 0755); err != nil {
+	if err := os.MkdirAll(certDir, 0750); err != nil {
 		return fmt.Errorf("create cert directory: %w", err)
 	}
 
@@ -271,8 +271,8 @@ func (e *Executor) writeWifiCerts(actionID string, params *pb.WifiParams) error 
 		content string
 		mode    os.FileMode
 	}{
-		"ca.pem":         {content: params.CaCert, mode: 0644},
-		"client.pem":     {content: params.ClientCert, mode: 0644},
+		"ca.pem":         {content: params.CaCert, mode: 0640},
+		"client.pem":     {content: params.ClientCert, mode: 0640},
 		"client-key.pem": {content: params.ClientKey, mode: 0600},
 	}
 

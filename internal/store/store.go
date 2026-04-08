@@ -363,9 +363,9 @@ func (s *Store) GetDueActions() ([]*StoredAction, error) {
 	rows, err := s.db.Query(`
 		SELECT id, action_json, assigned_at, last_executed_at, next_execute_at, last_result_hash
 		FROM actions
-		WHERE next_execute_at <= CURRENT_TIMESTAMP
+		WHERE next_execute_at <= ?
 		ORDER BY next_execute_at ASC
-	`)
+	`, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -740,8 +740,9 @@ func (s *Store) GetAllActionIDs() ([]string, error) {
 }
 
 // calculateNextExecute determines when an action should next be executed.
+// All returned times are in UTC to ensure correct SQLite comparisons.
 func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time, runImmediately bool) time.Time {
-	now := time.Now()
+	now := time.Now().UTC()
 
 	// Run immediately if requested and never executed
 	if runImmediately && lastExecuted == nil {
@@ -755,7 +756,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.Add(8 * time.Hour)
+		return lastExecuted.UTC().Add(8 * time.Hour)
 	}
 
 	// Check for run_on_assign
@@ -763,11 +764,13 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		return now
 	}
 
-	// Cron takes precedence over interval
+	// Cron takes precedence over interval.
+	// Cron expressions run in the device's local timezone, so we pass
+	// local time to the parser and convert the result to UTC for storage.
 	if schedule.Cron != "" {
-		next, err := nextCronTime(schedule.Cron, now)
+		next, err := nextCronTime(schedule.Cron, time.Now())
 		if err == nil {
-			return next
+			return next.UTC()
 		}
 		slog.Warn("invalid cron expression, using interval fallback", "cron", schedule.Cron, "error", err)
 	}
@@ -780,7 +783,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.Add(time.Duration(interval) * time.Hour)
+	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
 }
 
 // =============================================================================

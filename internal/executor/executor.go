@@ -37,6 +37,20 @@ import (
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// maxScriptSize is the maximum allowed size for shell scripts (1 MiB).
+const maxScriptSize = 1 << 20
+
+// maxFileContentSize is the maximum allowed size for file content (10 MiB).
+const maxFileContentSize = 10 << 20
+
+// defaultScriptTimeout is applied when no timeout is specified for script actions.
+const defaultScriptTimeout int32 = 3600
+
+// containsNewline returns true if s contains \n or \r.
+func containsNewline(s string) bool {
+	return strings.ContainsAny(s, "\n\r")
+}
+
 // Executor handles the execution of actions.
 type Executor struct {
 	httpClient   *http.Client
@@ -129,10 +143,14 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		Changed:  true, // Default to true; scheduler may override based on output comparison
 	}
 
-	// Apply timeout if specified
-	if action.TimeoutSeconds > 0 {
+	// Apply timeout. Default to 1 hour for script actions to prevent infinite loops.
+	timeout := action.TimeoutSeconds
+	if timeout <= 0 && (action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN) {
+		timeout = defaultScriptTimeout
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(action.TimeoutSeconds)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
 
@@ -860,6 +878,12 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	if params == nil {
 		return nil, nil, false, fmt.Errorf("shell params required")
 	}
+	if len(params.Script) > maxScriptSize {
+		return nil, nil, false, fmt.Errorf("script exceeds maximum size (%d bytes)", maxScriptSize)
+	}
+	if len(params.DetectionScript) > maxScriptSize {
+		return nil, nil, false, fmt.Errorf("detection script exceeds maximum size (%d bytes)", maxScriptSize)
+	}
 
 	// No detection script — run execution script directly (original behavior)
 	if params.DetectionScript == "" {
@@ -1062,6 +1086,9 @@ func (e *Executor) isUnitActive(unitName string) bool {
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("file params required")
+	}
+	if len(params.Content) > maxFileContentSize {
+		return nil, false, fmt.Errorf("file content exceeds maximum size (%d bytes)", maxFileContentSize)
 	}
 
 	// Resolve symlinks to prevent traversal attacks
@@ -2159,6 +2186,20 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
 	}
 
+	// Validate that repo URLs/descriptions don't contain newlines (config injection)
+	if params.Apt != nil && containsNewline(params.Apt.Url) {
+		return nil, false, fmt.Errorf("APT repository URL contains newlines")
+	}
+	if params.Dnf != nil && (containsNewline(params.Dnf.Baseurl) || containsNewline(params.Dnf.Description)) {
+		return nil, false, fmt.Errorf("DNF repository URL or description contains newlines")
+	}
+	if params.Pacman != nil && containsNewline(params.Pacman.Server) {
+		return nil, false, fmt.Errorf("Pacman server URL contains newlines")
+	}
+	if params.Zypper != nil && (containsNewline(params.Zypper.Url) || containsNewline(params.Zypper.Description)) {
+		return nil, false, fmt.Errorf("Zypper repository URL or description contains newlines")
+	}
+
 	// Detect package manager and execute the appropriate configuration
 	// Repository actions always report changed=true since they write config files
 	switch {
@@ -2802,6 +2843,16 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 	// Validate username format (prevent injection)
 	if !sysuser.IsValidName(params.Username) {
 		return nil, false, nil, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
+	}
+
+	// Validate home directory if specified
+	if params.HomeDir != "" {
+		if !filepath.IsAbs(params.HomeDir) {
+			return nil, false, nil, fmt.Errorf("home directory must be an absolute path")
+		}
+		if isProtectedPath(params.HomeDir) {
+			return nil, false, nil, fmt.Errorf("home directory %q is a protected system path", params.HomeDir)
+		}
 	}
 
 	// Repair filesystem if mounted read-only
