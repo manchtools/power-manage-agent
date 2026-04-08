@@ -121,6 +121,28 @@ func (s *Store) migrate(dataDir string) error {
 	return nil
 }
 
+// hasColumn checks if a table has a specific column using PRAGMA table_info.
+func (s *Store) hasColumn(table, column string) bool {
+	rows, err := s.db.Query(fmt.Sprintf("PRAGMA table_info(%s)", table))
+	if err != nil {
+		return false
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var cid int
+		var name, typ string
+		var notNull, pk int
+		var dflt sql.NullString
+		if err := rows.Scan(&cid, &name, &typ, &notNull, &dflt, &pk); err != nil {
+			return false
+		}
+		if name == column {
+			return true
+		}
+	}
+	return false
+}
+
 // migrateV1 creates the core actions and results tables.
 func (s *Store) migrateV1() error {
 	_, err := s.db.Exec(`
@@ -157,9 +179,8 @@ func (s *Store) migrateV1() error {
 // migrateV2 adds LUKS state tables and the desired_state column for existing databases.
 func (s *Store) migrateV2() error {
 	// Add desired_state column for databases created before v1 included it.
-	// ALTER TABLE ADD COLUMN is a no-op error if the column already exists.
-	if _, err := s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0"); err != nil {
-		if !strings.Contains(err.Error(), "duplicate column") {
+	if !s.hasColumn("actions", "desired_state") {
+		if _, err := s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0"); err != nil {
 			return err
 		}
 	}
@@ -188,8 +209,8 @@ func (s *Store) migrateV2() error {
 // migrateV3 adds LPS state table and LUKS last_rotated_at column, migrates legacy LPS JSON files.
 func (s *Store) migrateV3(dataDir string) error {
 	// Add last_rotated_at for databases created before v2 included it.
-	if _, err := s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''"); err != nil {
-		if !strings.Contains(err.Error(), "duplicate column") {
+	if !s.hasColumn("luks_state", "last_rotated_at") {
+		if _, err := s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''"); err != nil {
 			return err
 		}
 	}
