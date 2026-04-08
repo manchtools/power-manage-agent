@@ -3335,6 +3335,40 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	return true, nil
 }
 
+// validateSshdConfig runs sshd -t to validate the full config (including drop-ins).
+// If validation fails, the given config file is removed and an error is returned.
+func validateSshdConfig(ctx context.Context, configPath string) (*pb.CommandOutput, error) {
+	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
+	if validateErr != nil {
+		if rmErr := removeFileStrict(ctx, configPath); rmErr != nil {
+			slog.Warn("failed to remove invalid sshd config after validation failure", "path", configPath, "error", rmErr)
+		}
+		errMsg := "sshd config validation failed"
+		if validateOut != nil && validateOut.Stderr != "" {
+			errMsg = strings.TrimSpace(validateOut.Stderr)
+		}
+		return &pb.CommandOutput{ExitCode: 1, Stderr: errMsg}, fmt.Errorf("sshd -t validation failed: %s", errMsg)
+	}
+	return nil, nil
+}
+
+// reloadSshd reloads the sshd service, falling back to the "ssh" service name
+// for Debian/Ubuntu. Writes the result to output.
+func reloadSshd(ctx context.Context, output *strings.Builder) {
+	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
+	if reloadErr != nil {
+		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	}
+	if reloadErr != nil {
+		output.WriteString("warning: failed to reload sshd\n")
+		if reloadOut != nil && reloadOut.Stderr != "" {
+			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
+		}
+	} else {
+		output.WriteString("reloaded sshd\n")
+	}
+}
+
 // sshGroupName creates a valid Linux group name from the action ID for SSH access.
 // Linux group names: max 32 chars. pm-ssh- (7 chars) + up to 25 chars of action ID.
 func sshGroupName(actionID string) string {
@@ -3438,7 +3472,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		changed = true
 	}
 
-	// Write sshd config file
+	// Write sshd config file with validation
 	if !fileMatches {
 		// Ensure /etc/ssh/sshd_config.d exists
 		if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
@@ -3447,8 +3481,12 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
 			return nil, false, fmt.Errorf("write ssh config: %w", err)
 		}
+		if out, err := validateSshdConfig(ctx, configPath); err != nil {
+			return out, false, err
+		}
 		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
 		changed = true
+		reloadSshd(ctx, &output)
 	}
 
 	// Sync group membership
@@ -3471,11 +3509,14 @@ func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath st
 	changed, err := e.removeGroupWithConfig(ctx, groupName, configPath, &output)
 	if err != nil {
 		if !changed {
-			// Config file removal failed — fatal
 			return nil, false, err
 		}
-		// Config removed but group deletion failed — non-fatal warning
 		output.WriteString(fmt.Sprintf("warning: %v\n", err))
+	}
+
+	// Reload sshd after removing the config drop-in
+	if changed {
+		reloadSshd(ctx, &output)
 	}
 
 	if !changed {
@@ -3561,20 +3602,7 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 	}
 	output.WriteString(fmt.Sprintf("created SSHD config: %s\n", configPath))
 
-	// Reload sshd
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		// Try ssh.service as fallback (some distros use ssh instead of sshd)
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
-	}
-	if reloadErr != nil {
-		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
-	} else {
-		output.WriteString("reloaded sshd\n")
-	}
+	reloadSshd(ctx, &output)
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
@@ -3602,20 +3630,7 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 		return nil, false, fmt.Errorf("remove sshd config: %w", err)
 	}
 	output.WriteString(fmt.Sprintf("removed SSHD config: %s\n", configPath))
-
-	// Reload sshd
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
-	}
-	if reloadErr != nil {
-		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
-	} else {
-		output.WriteString("reloaded sshd\n")
-	}
+	reloadSshd(ctx, &output)
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
