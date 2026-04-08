@@ -3532,20 +3532,29 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 			return nil, false, fmt.Errorf("write ssh config: %w", err)
 		}
 		// Validate with sshd -t (tests full config including drop-ins)
-		if _, err := runSudoCmd(ctx, "sshd", "-t"); err != nil {
+		validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
+		if validateErr != nil {
 			// Invalid config — remove it to avoid breaking sshd
 			removeFileStrict(ctx, configPath)
+			errMsg := "sshd config validation failed"
+			if validateOut != nil && validateOut.Stderr != "" {
+				errMsg = strings.TrimSpace(validateOut.Stderr)
+			}
 			return &pb.CommandOutput{
 				ExitCode: 1,
-				Stderr:   "sshd config validation failed after writing drop-in",
-			}, false, fmt.Errorf("sshd -t validation failed: %w", err)
+				Stderr:   errMsg,
+			}, false, fmt.Errorf("sshd -t validation failed: %s", errMsg)
 		}
 		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
 		changed = true
 
-		// Reload sshd to apply the new config
+		// Reload sshd to apply the new config (try "sshd" then "ssh" for Debian/Ubuntu)
 		if _, err := runSudoCmd(ctx, "systemctl", "reload", "sshd"); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to reload sshd: %v\n", err))
+			if _, err := runSudoCmd(ctx, "systemctl", "reload", "ssh"); err != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to reload sshd/ssh: %v\n", err))
+			} else {
+				output.WriteString("reloaded ssh\n")
+			}
 		} else {
 			output.WriteString("reloaded sshd\n")
 		}
