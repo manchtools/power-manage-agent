@@ -307,10 +307,12 @@ install_systemd_service() {
     local restrict_realtime="false"
     local systemd_ver
     systemd_ver=$(systemctl --version 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i+0==$i){print $i; exit}}')
-    if [[ -n "$systemd_ver" ]] && [[ "$systemd_ver" -ge 257 ]]; then
-        restrict_realtime="true"
-    elif [[ -z "$systemd_ver" ]]; then
+    if [[ -z "$systemd_ver" ]]; then
         log_warn "Could not detect systemd version, disabling RestrictRealtime as a precaution"
+    elif ! [[ "$systemd_ver" =~ ^[0-9]+$ ]]; then
+        log_warn "Unexpected systemd version format '$systemd_ver', disabling RestrictRealtime as a precaution"
+    elif [[ "$systemd_ver" -ge 257 ]]; then
+        restrict_realtime="true"
     fi
 
     cat > "$service_file" << EOF
