@@ -188,8 +188,15 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	// Step 10: Write state.json with version for startup verification.
+	// This must succeed before shutdown — otherwise the new binary starts
+	// without a state marker and may trigger a false rollback.
 	if err := writeUpdateState(cfg.DataDir, "staged", newVersion); err != nil {
-		e.logger.Warn("failed to write update state", "error", err)
+		e.logger.Error("failed to write update state, rolling back binary", "error", err)
+		if _, mvErr := runSudoCmd(ctx, "mv", backupPath, cfg.BinaryPath); mvErr != nil {
+			e.logger.Error("rollback failed, system may be in inconsistent state", "error", mvErr)
+		}
+		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
+		return nil, false, fmt.Errorf("write update state: %w", err)
 	}
 
 	// Step 11: Signal graceful shutdown — systemd restarts with new binary

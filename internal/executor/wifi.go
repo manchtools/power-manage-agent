@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
@@ -51,7 +52,9 @@ func (e *Executor) removeWifi(ctx context.Context, conName, actionID string) (*p
 		output.WriteString(fmt.Sprintf("connection %s does not exist, nothing to remove\n", conName))
 		// Also clean up cert dir if it exists
 		certDir := wifiCertPath(actionID)
-		os.RemoveAll(certDir)
+		if err := os.RemoveAll(certDir); err != nil {
+			slog.Warn("failed to remove wifi cert directory", "path", certDir, "error", err)
+		}
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
 	}
 
@@ -68,8 +71,11 @@ func (e *Executor) removeWifi(ctx context.Context, conName, actionID string) (*p
 	// Remove certificate directory
 	certDir := wifiCertPath(actionID)
 	if _, err := os.Stat(certDir); err == nil {
-		os.RemoveAll(certDir)
-		output.WriteString(fmt.Sprintf("removed certificate directory %s\n", certDir))
+		if rmErr := os.RemoveAll(certDir); rmErr != nil {
+			slog.Warn("failed to remove wifi cert directory", "path", certDir, "error", rmErr)
+		} else {
+			output.WriteString(fmt.Sprintf("removed certificate directory %s\n", certDir))
+		}
 	}
 
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
@@ -263,7 +269,7 @@ func (e *Executor) modifyWifi(ctx context.Context, params *pb.WifiParams, conNam
 // writeWifiCerts writes EAP-TLS certificate files to disk.
 func (e *Executor) writeWifiCerts(actionID string, params *pb.WifiParams) error {
 	certDir := wifiCertPath(actionID)
-	if err := os.MkdirAll(certDir, 0755); err != nil {
+	if err := os.MkdirAll(certDir, 0750); err != nil {
 		return fmt.Errorf("create cert directory: %w", err)
 	}
 
@@ -271,8 +277,8 @@ func (e *Executor) writeWifiCerts(actionID string, params *pb.WifiParams) error 
 		content string
 		mode    os.FileMode
 	}{
-		"ca.pem":         {content: params.CaCert, mode: 0644},
-		"client.pem":     {content: params.ClientCert, mode: 0644},
+		"ca.pem":         {content: params.CaCert, mode: 0640},
+		"client.pem":     {content: params.ClientCert, mode: 0640},
 		"client-key.pem": {content: params.ClientKey, mode: 0600},
 	}
 

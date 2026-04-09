@@ -37,6 +37,20 @@ import (
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// maxScriptSize is the maximum allowed size for shell scripts (1 MiB).
+const maxScriptSize = 1 << 20
+
+// maxFileContentSize is the maximum allowed size for file content (10 MiB).
+const maxFileContentSize = 10 << 20
+
+// defaultScriptTimeout is applied when no timeout is specified for script actions.
+const defaultScriptTimeout int32 = 3600
+
+// containsNewline returns true if s contains \n or \r.
+func containsNewline(s string) bool {
+	return strings.ContainsAny(s, "\n\r")
+}
+
 // Executor handles the execution of actions.
 type Executor struct {
 	httpClient   *http.Client
@@ -129,19 +143,20 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		Changed:  true, // Default to true; scheduler may override based on output comparison
 	}
 
-	// Apply timeout if specified
-	if action.TimeoutSeconds > 0 {
+	// Apply timeout. Default to 1 hour for script actions to prevent infinite loops.
+	timeout := action.TimeoutSeconds
+	if timeout <= 0 && (action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN) {
+		timeout = defaultScriptTimeout
+	}
+	if timeout > 0 {
 		var cancel context.CancelFunc
-		ctx, cancel = context.WithTimeout(ctx, time.Duration(action.TimeoutSeconds)*time.Second)
+		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
 		defer cancel()
 	}
 
 	// Verify action signature before execution (skip for instant actions — they have no params to sign)
 	if e.verifier != nil && !isInstantAction(action.Type) {
-		actionID := ""
-		if action.Id != nil {
-			actionID = action.Id.Value
-		}
+		actionID := getActionID(action)
 		verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature)
 		if verifyErr != nil {
 			// Shell scripts and sudo policies: hard reject unsigned/tampered actions
@@ -228,36 +243,20 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSH:
 		var changed bool
-		sshActionID := ""
-		if action.Id != nil {
-			sshActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, sshActionID)
+		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSHD:
 		var changed bool
-		sshdActionID := ""
-		if action.Id != nil {
-			sshdActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, sshdActionID)
+		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SUDO:
 		var changed bool
-		sudoActionID := ""
-		if action.Id != nil {
-			sudoActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, sudoActionID)
+		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_LPS:
 		var changed bool
 		var metadata map[string]string
-		lpsActionID := ""
-		if action.Id != nil {
-			lpsActionID = action.Id.Value
-		}
-		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, lpsActionID)
+		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
@@ -265,22 +264,14 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	case pb.ActionType_ACTION_TYPE_LUKS:
 		var changed bool
 		var metadata map[string]string
-		luksActionID := ""
-		if action.Id != nil {
-			luksActionID = action.Id.Value
-		}
-		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, luksActionID)
+		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
 	case pb.ActionType_ACTION_TYPE_WIFI:
 		var changed bool
-		wifiActionID := ""
-		if action.Id != nil {
-			wifiActionID = action.Id.Value
-		}
-		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, wifiActionID)
+		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
@@ -300,7 +291,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	switch {
 	case ctx.Err() == context.DeadlineExceeded:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
-		result.Error = fmt.Sprintf("action timed out after %d seconds", action.TimeoutSeconds)
+		result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
 	case ctx.Err() == context.Canceled:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"
@@ -331,155 +322,119 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	if params == nil {
 		return nil, false, fmt.Errorf("package params required")
 	}
-
 	if e.pkgManager == nil {
 		return nil, false, fmt.Errorf("no supported package manager found")
 	}
-
-	// Determine the package name for the current package manager
 	pkgName := e.getPackageNameForManager(params)
 	if pkgName == "" {
-		// No package name for this manager - skip silently with success
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   "skipped: no package name configured for this package manager",
 		}, false, nil
 	}
-
-	var result *pkg.CommandResult
-	var err error
-
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		// Check if package is already installed with correct version
-		isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
-		if isInstalled {
-			// Check version if specified
-			if params.Version != "" {
-				installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
-				if installedVersion == params.Version {
-					// Version matches, check if we need to pin
-					if params.Pin {
-						changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
-						if pinErr != nil {
-							return &pb.CommandOutput{
-								ExitCode: 1,
-								Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
-							}, false, pinErr
-						}
-						if changed {
-							return &pb.CommandOutput{
-								ExitCode: 0,
-								Stdout:   fmt.Sprintf("package %s version %s was already installed, pinned", pkgName, params.Version),
-							}, true, nil
-						}
-						return &pb.CommandOutput{
-							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s version %s is already installed and pinned", pkgName, params.Version),
-						}, false, nil
-					}
-					return &pb.CommandOutput{
-						ExitCode: 0,
-						Stdout:   fmt.Sprintf("package %s version %s is already installed", pkgName, params.Version),
-					}, false, nil
-				}
-				// Version mismatch, need to install specific version
-			} else {
-				// No specific version requested, package is installed
-				if params.Pin {
-					changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
-					if pinErr != nil {
-						return &pb.CommandOutput{
-							ExitCode: 1,
-							Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
-						}, false, pinErr
-					}
-					if changed {
-						return &pb.CommandOutput{
-							ExitCode: 0,
-							Stdout:   fmt.Sprintf("package %s was already installed, pinned", pkgName),
-						}, true, nil
-					}
-					return &pb.CommandOutput{
-						ExitCode: 0,
-						Stdout:   fmt.Sprintf("package %s is already installed and pinned", pkgName),
-					}, false, nil
-				}
-				return &pb.CommandOutput{
-					ExitCode: 0,
-					Stdout:   fmt.Sprintf("package %s is already installed", pkgName),
-				}, false, nil
-			}
-		}
-
-		// Repair filesystem if mounted read-only (common after kernel errors)
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
-		}
-
-		// Repair any broken package manager state before proceeding
-		e.repairPackageManager(ctx)
-
-		// Update package index first to avoid stale package references
-		if _, updateErr := e.pkgManager.Update(); updateErr != nil {
-			e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
-		}
-
-		// Install the package
-		if params.Version != "" || params.AllowDowngrade {
-			result, err = e.pkgManager.Install(pkgName).
-				Version(params.Version).
-				AllowDowngrade().
-				Run()
-		} else {
-			result, err = e.pkgManager.Install(pkgName).Run()
-		}
-
-		// Pin if requested
-		if err == nil && params.Pin {
-			if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
-				result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
-			}
-		}
-
+		return e.ensurePackagePresent(ctx, params, pkgName)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// Check if package is already not installed
-		isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
-		if !isInstalled {
-			return &pb.CommandOutput{
-				ExitCode: 0,
-				Stdout:   fmt.Sprintf("package %s is already not installed", pkgName),
-			}, false, nil
-		}
-
-		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
-		}
-
-		// Repair any broken package manager state before proceeding
-		e.repairPackageManager(ctx)
-
-		// Unpin first if it was pinned (ignore errors)
-		e.ensurePackageUnpinned(pkgName)
-		result, err = e.pkgManager.Remove(pkgName).Run()
-
+		return e.ensurePackageAbsent(ctx, params, pkgName)
 	default:
 		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
+}
 
-	if err != nil {
-		if result == nil {
+// ensurePackagePresent installs a package (with optional version and pin) if not already satisfied.
+func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+	if isInstalled {
+		if out, changed, err := e.checkPackageVersionAndPin(ctx, params, pkgName); out != nil {
+			return out, changed, err
+		}
+	}
+
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
+	}
+	e.repairPackageManager(ctx)
+
+	if _, updateErr := e.pkgManager.Update(); updateErr != nil {
+		e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
+	}
+
+	// Version and AllowDowngrade are independent — setting a version does NOT
+	// imply downgrade permission. Callers must explicitly set AllowDowngrade.
+	builder := e.pkgManager.Install(pkgName)
+	if params.Version != "" {
+		builder = builder.Version(params.Version)
+	}
+	if params.AllowDowngrade {
+		builder = builder.AllowDowngrade()
+	}
+	result, err := builder.Run()
+
+	if err == nil && params.Pin {
+		if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
+			result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
+		}
+	}
+	return packageResult(result, err)
+}
+
+// checkPackageVersionAndPin checks if an already-installed package satisfies the
+// desired version and pin state. Returns (output, changed, error) when the check
+// is conclusive (output != nil). Returns (nil, false, nil) when the version
+// doesn't match and the package needs reinstallation.
+func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	versionStr := ""
+	if params.Version != "" {
+		installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
+		if installedVersion != params.Version {
+			return nil, false, nil
+		}
+		versionStr = " version " + params.Version
+	}
+	if params.Pin {
+		changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
+		if pinErr != nil {
 			return &pb.CommandOutput{
 				ExitCode: 1,
-				Stderr:   err.Error(),
-			}, false, err
+				Stderr:   fmt.Sprintf("failed to pin package: %v", pinErr),
+			}, false, pinErr
+		}
+		msg := fmt.Sprintf("package %s%s is already installed and pinned", pkgName, versionStr)
+		if changed {
+			msg = fmt.Sprintf("package %s%s was already installed, pinned", pkgName, versionStr)
+		}
+		return &pb.CommandOutput{ExitCode: 0, Stdout: msg}, changed, nil
+	}
+	return &pb.CommandOutput{
+		ExitCode: 0,
+		Stdout:   fmt.Sprintf("package %s%s is already installed", pkgName, versionStr),
+	}, false, nil
+}
+
+// ensurePackageAbsent removes a package if installed.
+func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+	if !isInstalled {
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   fmt.Sprintf("package %s is already not installed", pkgName),
+		}, false, nil
+	}
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
+	}
+	e.repairPackageManager(ctx)
+	e.ensurePackageUnpinned(pkgName)
+	result, err := e.pkgManager.Remove(pkgName).Run()
+	return packageResult(result, err)
+}
+
+// packageResult converts a pkg.CommandResult into the standard executor return tuple.
+func packageResult(result *pkg.CommandResult, err error) (*pb.CommandOutput, bool, error) {
+	if err != nil {
+		if result == nil {
+			return &pb.CommandOutput{ExitCode: 1, Stderr: err.Error()}, false, err
 		}
 		return &pb.CommandOutput{
 			ExitCode: int32(result.ExitCode),
@@ -487,7 +442,6 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 			Stderr:   result.Stderr,
 		}, false, err
 	}
-
 	return &pb.CommandOutput{
 		ExitCode: int32(result.ExitCode),
 		Stdout:   result.Stdout,
@@ -575,11 +529,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create directory
@@ -612,11 +563,8 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		if err := os.Remove(resolvedPath); err != nil {
@@ -673,11 +621,8 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Install the flatpak application
@@ -709,11 +654,8 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Remove pin first if it exists
@@ -762,11 +704,8 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Download to temp file
@@ -798,11 +737,8 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		output, err := runSudoCmd(ctx, "dpkg", "-r", pkgName)
@@ -847,11 +783,8 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Download to temp file
@@ -879,11 +812,8 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		output, err := runSudoCmd(ctx, "rpm", "-e", pkgName)
@@ -949,6 +879,12 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellParams, callback OutputCallback) (*pb.CommandOutput, *pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, nil, false, fmt.Errorf("shell params required")
+	}
+	if len(params.Script) > maxScriptSize {
+		return nil, nil, false, fmt.Errorf("script exceeds maximum size (%d bytes)", maxScriptSize)
+	}
+	if len(params.DetectionScript) > maxScriptSize {
+		return nil, nil, false, fmt.Errorf("detection script exceeds maximum size (%d bytes)", maxScriptSize)
 	}
 
 	// No detection script — run execution script directly (original behavior)
@@ -1053,11 +989,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 
 		if needsUpdate {
 			// Repair filesystem if mounted read-only
-			if !e.repairFilesystem(ctx) {
-				return &pb.CommandOutput{
-					ExitCode: 1,
-					Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-				}, false, fmt.Errorf("filesystem is read-only")
+			if out, err := e.requireWritableFS(ctx); err != nil {
+				return out, false, err
 			}
 
 			// Write unit file using sudo tee
@@ -1156,6 +1089,9 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 	if params == nil {
 		return nil, false, fmt.Errorf("file params required")
 	}
+	if len(params.Content) > maxFileContentSize {
+		return nil, false, fmt.Errorf("file content exceeds maximum size (%d bytes)", maxFileContentSize)
+	}
 
 	// Resolve symlinks to prevent traversal attacks
 	resolvedPath, err := sysfs.ResolveAndValidatePath(params.Path)
@@ -1174,11 +1110,8 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create parent directories using sudo
@@ -1234,11 +1167,8 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// For managed block mode, remove only the specified content block from the file
@@ -1429,11 +1359,8 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Create directory with permissions (handles mkdir, chmod, and chown)
@@ -1461,11 +1388,8 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Repair filesystem if mounted read-only
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-			}, false, fmt.Errorf("filesystem is read-only")
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
 		}
 
 		// Remove directory (use -r for recursive removal if it has contents)
@@ -1789,7 +1713,7 @@ func (e *Executor) ensurePackagePinned(ctx context.Context, pkgName string) (boo
 
 	// Repair filesystem if needed before writing
 	if !e.repairFilesystem(ctx) {
-		return false, fmt.Errorf("filesystem is read-only")
+		return false, errReadOnlyFS
 	}
 
 	return e.pinPackage(pkgName)
@@ -2063,11 +1987,8 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}
 
 	// Repair filesystem if mounted read-only (common after kernel errors)
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Repair any broken package manager state first
@@ -2256,11 +2177,8 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	}
 
 	// Repair filesystem if mounted read-only
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	if !validRepoName.MatchString(params.Name) {
@@ -2268,6 +2186,20 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	}
 	if len(params.Name) > 128 {
 		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
+	}
+
+	// Validate that repo URLs/descriptions don't contain newlines (config injection)
+	if params.Apt != nil && containsNewline(params.Apt.Url) {
+		return nil, false, fmt.Errorf("APT repository URL contains newlines")
+	}
+	if params.Dnf != nil && (containsNewline(params.Dnf.Baseurl) || containsNewline(params.Dnf.Description)) {
+		return nil, false, fmt.Errorf("DNF repository URL or description contains newlines")
+	}
+	if params.Pacman != nil && containsNewline(params.Pacman.Server) {
+		return nil, false, fmt.Errorf("Pacman server URL contains newlines")
+	}
+	if params.Zypper != nil && (containsNewline(params.Zypper.Url) || containsNewline(params.Zypper.Description)) {
+		return nil, false, fmt.Errorf("Zypper repository URL or description contains newlines")
 	}
 
 	// Detect package manager and execute the appropriate configuration
@@ -2915,12 +2847,19 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 		return nil, false, nil, fmt.Errorf("invalid username: must be 1-32 alphanumeric characters, starting with a letter")
 	}
 
+	// Validate home directory if specified
+	if params.HomeDir != "" {
+		if !filepath.IsAbs(params.HomeDir) {
+			return nil, false, nil, fmt.Errorf("home directory must be an absolute path")
+		}
+		if isProtectedPath(params.HomeDir) {
+			return nil, false, nil, fmt.Errorf("home directory %q is a protected system path", params.HomeDir)
+		}
+	}
+
 	// Repair filesystem if mounted read-only
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted - system may need reboot and fsck",
-		}, false, nil, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, nil, err
 	}
 
 	switch state {
@@ -3416,6 +3355,23 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	return true, nil
 }
 
+// reloadSshd reloads the sshd service, falling back to the "ssh" service name
+// for Debian/Ubuntu. Writes the result to output.
+func reloadSshd(ctx context.Context, output *strings.Builder) {
+	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
+	if reloadErr != nil {
+		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	}
+	if reloadErr != nil {
+		output.WriteString("warning: failed to reload sshd\n")
+		if reloadOut != nil && reloadOut.Stderr != "" {
+			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
+		}
+	} else {
+		output.WriteString("reloaded sshd\n")
+	}
+}
+
 // sshGroupName creates a valid Linux group name from the action ID for SSH access.
 // Linux group names: max 32 chars. pm-ssh- (7 chars) + up to 25 chars of action ID.
 func sshGroupName(actionID string) string {
@@ -3506,11 +3462,8 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Ensure group exists
@@ -3522,48 +3475,25 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 		changed = true
 	}
 
-	// Write sshd config file
+	// Write sshd config file with validation
 	if !fileMatches {
 		// Ensure /etc/ssh/sshd_config.d exists
 		if err := createDirectory(ctx, "/etc/ssh/sshd_config.d", true); err != nil {
 			return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 		}
-		if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
-			return nil, false, fmt.Errorf("write ssh config: %w", err)
+		if out, err := e.writeAndValidateConfig(ctx, configPath, content, "0644", "root", "root", "sshd", "-t"); err != nil {
+			return out, false, err
 		}
 		output.WriteString(fmt.Sprintf("wrote SSH config: %s\n", configPath))
 		changed = true
+		reloadSshd(ctx, &output)
 	}
 
-	// Add users to group
-	for _, username := range users {
-		if !userExists(username) {
-			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
-			continue
-		}
-		if !userInGroup(username, groupName) {
-			if err := addUserToGroup(ctx, username, groupName); err != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to add user %s to group: %v\n", username, err))
-			} else {
-				output.WriteString(fmt.Sprintf("added user %s to group %s\n", username, groupName))
-				changed = true
-			}
-		}
-	}
-
-	// Remove users that are no longer in the list
-	currentMembers := getGroupMembers(groupName)
-	desiredSet := make(map[string]bool, len(users))
-	for _, u := range users {
-		desiredSet[u] = true
-	}
-	for _, member := range currentMembers {
-		if !desiredSet[member] {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
+	// Sync group membership
+	if memberChanged, err := syncGroupMembers(ctx, groupName, users, &output); err != nil {
+		return &pb.CommandOutput{ExitCode: 1, Stdout: output.String(), Stderr: err.Error()}, changed, err
+	} else if memberChanged {
+		changed = true
 	}
 
 	return &pb.CommandOutput{
@@ -3575,38 +3505,18 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 // removeSshAccess removes the sshd_config.d file, group membership, and group.
 func (e *Executor) removeSshAccess(ctx context.Context, groupName, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
-	changed := false
 
-	// Remove sshd config file
-	if fileExistsWithSudo(ctx, configPath) {
-		if !e.repairFilesystem(ctx) {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   "filesystem is read-only and could not be remounted",
-			}, false, fmt.Errorf("filesystem is read-only")
+	changed, err := e.removeGroupWithConfig(ctx, groupName, configPath, &output)
+	if err != nil {
+		if !changed {
+			return nil, false, err
 		}
-		if err := removeFileStrict(ctx, configPath); err != nil {
-			return nil, false, fmt.Errorf("remove ssh config: %w", err)
-		}
-		output.WriteString(fmt.Sprintf("removed SSH config: %s\n", configPath))
-		changed = true
+		output.WriteString(fmt.Sprintf("warning: %v\n", err))
 	}
 
-	// Remove group and membership
-	if groupExists(groupName) {
-		members := getGroupMembers(groupName)
-		for _, member := range members {
-			if err := removeUserFromGroup(ctx, member, groupName); err == nil {
-				output.WriteString(fmt.Sprintf("removed user %s from group %s\n", member, groupName))
-				changed = true
-			}
-		}
-		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to delete group %s: %v\n", groupName, err))
-		} else {
-			output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))
-			changed = true
-		}
+	// Reload sshd after removing the config drop-in
+	if changed {
+		reloadSshd(ctx, &output)
 	}
 
 	if !changed {
@@ -3678,11 +3588,8 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Ensure /etc/ssh/sshd_config.d exists
@@ -3690,40 +3597,12 @@ func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, c
 		return nil, false, fmt.Errorf("create sshd_config.d: %w", err)
 	}
 
-	if err := atomicWriteFile(ctx, configPath, content, "0644", "root", "root"); err != nil {
-		return nil, false, fmt.Errorf("write sshd config: %w", err)
+	if out, err := e.writeAndValidateConfig(ctx, configPath, content, "0644", "root", "root", "sshd", "-t"); err != nil {
+		return out, false, err
 	}
 	output.WriteString(fmt.Sprintf("created SSHD config: %s\n", configPath))
 
-	// Validate config
-	validateOut, validateErr := runSudoCmd(ctx, "sshd", "-t")
-	if validateErr != nil {
-		// Config is invalid — remove it and report error
-		removeFileStrict(ctx, configPath)
-		errMsg := "sshd config validation failed"
-		if validateOut != nil && validateOut.Stderr != "" {
-			errMsg = strings.TrimSpace(validateOut.Stderr)
-		}
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   errMsg,
-		}, false, fmt.Errorf("sshd -t validation failed: %s", errMsg)
-	}
-
-	// Reload sshd
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		// Try ssh.service as fallback (some distros use ssh instead of sshd)
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
-	}
-	if reloadErr != nil {
-		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
-	} else {
-		output.WriteString("reloaded sshd\n")
-	}
+	reloadSshd(ctx, &output)
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
@@ -3743,31 +3622,15 @@ func (e *Executor) removeSshdConfig(ctx context.Context, configPath string) (*pb
 		}, false, nil
 	}
 
-	if !e.repairFilesystem(ctx) {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "filesystem is read-only and could not be remounted",
-		}, false, fmt.Errorf("filesystem is read-only")
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	if err := removeFileStrict(ctx, configPath); err != nil {
 		return nil, false, fmt.Errorf("remove sshd config: %w", err)
 	}
 	output.WriteString(fmt.Sprintf("removed SSHD config: %s\n", configPath))
-
-	// Reload sshd
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
-	}
-	if reloadErr != nil {
-		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
-	} else {
-		output.WriteString("reloaded sshd\n")
-	}
+	reloadSshd(ctx, &output)
 
 	return &pb.CommandOutput{
 		ExitCode: 0,

@@ -16,10 +16,13 @@ import (
 	"sync"
 	"time"
 
+	"github.com/pressly/goose/v3"
+	"github.com/robfig/cron/v3"
 	_ "modernc.org/sqlite"
 	"google.golang.org/protobuf/encoding/protojson"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/agent/internal/store/migrations"
 )
 
 // Store manages persistent storage for actions and execution results.
@@ -75,101 +78,28 @@ func New(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("enable WAL mode: %w", err)
 	}
+	// Enable foreign key enforcement (OFF by default in SQLite)
+	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("enable foreign keys: %w", err)
+	}
+
+	goose.SetBaseFS(migrations.FS)
+	if err := goose.SetDialect("sqlite3"); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("set goose dialect: %w", err)
+	}
+	if err := goose.Up(db, "."); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("run migrations: %w", err)
+	}
 
 	store := &Store{db: db}
-	if err := store.migrate(dataDir); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("migrate database: %w", err)
-	}
+
+	// Migrate legacy LPS JSON files into SQLite (one-time, idempotent).
+	store.migrateLpsJsonFiles(dataDir)
 
 	return store, nil
-}
-
-// migrate creates or updates the database schema.
-func (s *Store) migrate(dataDir string) error {
-	schema := `
-	CREATE TABLE IF NOT EXISTS actions (
-		id TEXT PRIMARY KEY,
-		action_json TEXT NOT NULL,
-		assigned_at DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
-		last_executed_at DATETIME,
-		next_execute_at DATETIME NOT NULL,
-		last_result_hash TEXT DEFAULT ''
-	);
-
-	CREATE TABLE IF NOT EXISTS results (
-		id TEXT PRIMARY KEY,
-		action_id TEXT NOT NULL,
-		executed_at DATETIME NOT NULL,
-		status INTEGER NOT NULL,
-		error TEXT DEFAULT '',
-		output_json TEXT,
-		duration_ms INTEGER NOT NULL DEFAULT 0,
-		has_changes BOOLEAN NOT NULL DEFAULT 0,
-		synced BOOLEAN NOT NULL DEFAULT 0,
-		FOREIGN KEY (action_id) REFERENCES actions(id) ON DELETE CASCADE
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_actions_next_execute ON actions(next_execute_at);
-	CREATE INDEX IF NOT EXISTS idx_results_synced ON results(synced) WHERE synced = 0;
-	CREATE INDEX IF NOT EXISTS idx_results_action ON results(action_id);
-	`
-
-	if _, err := s.db.Exec(schema); err != nil {
-		return err
-	}
-
-	// Add desired_state column if it doesn't exist (migration)
-	if _, err := s.db.Exec("ALTER TABLE actions ADD COLUMN desired_state INTEGER NOT NULL DEFAULT 0"); err != nil {
-		slog.Debug("migration: desired_state column may already exist", "error", err)
-	}
-
-	// LUKS state tables
-	luksSchema := `
-	CREATE TABLE IF NOT EXISTS luks_state (
-		action_id TEXT PRIMARY KEY,
-		device_path TEXT NOT NULL DEFAULT '',
-		ownership_taken BOOLEAN NOT NULL DEFAULT FALSE,
-		device_key_type TEXT NOT NULL DEFAULT 'none',
-		last_rotated_at TEXT NOT NULL DEFAULT ''
-	);
-
-	CREATE TABLE IF NOT EXISTS luks_user_passphrase_history (
-		id INTEGER PRIMARY KEY AUTOINCREMENT,
-		action_id TEXT NOT NULL,
-		passphrase_hash TEXT NOT NULL,
-		created_at TEXT NOT NULL DEFAULT (datetime('now'))
-	);
-
-	CREATE INDEX IF NOT EXISTS idx_luks_passphrase_history_action ON luks_user_passphrase_history(action_id);
-	`
-	if _, err := s.db.Exec(luksSchema); err != nil {
-		return err
-	}
-
-	// Add last_rotated_at column if it doesn't exist (migration for pre-existing tables)
-	if _, err := s.db.Exec("ALTER TABLE luks_state ADD COLUMN last_rotated_at TEXT NOT NULL DEFAULT ''"); err != nil {
-		slog.Debug("migration: last_rotated_at column may already exist", "error", err)
-	}
-
-	// LPS state table
-	lpsSchema := `
-	CREATE TABLE IF NOT EXISTS lps_state (
-		action_id TEXT NOT NULL,
-		username TEXT NOT NULL,
-		last_rotated_at TEXT NOT NULL DEFAULT '',
-		password_hash TEXT NOT NULL DEFAULT '',
-		PRIMARY KEY (action_id, username)
-	);
-	`
-	if _, err := s.db.Exec(lpsSchema); err != nil {
-		return err
-	}
-
-	// Migrate legacy LPS JSON files into SQLite.
-	s.migrateLpsJsonFiles(dataDir)
-
-	return nil
 }
 
 // migrateLpsJsonFiles imports legacy /var/lib/power-manage/lps/lps-*.json files
@@ -323,9 +253,9 @@ func (s *Store) GetDueActions() ([]*StoredAction, error) {
 	rows, err := s.db.Query(`
 		SELECT id, action_json, assigned_at, last_executed_at, next_execute_at, last_result_hash
 		FROM actions
-		WHERE next_execute_at <= CURRENT_TIMESTAMP
+		WHERE next_execute_at <= ?
 		ORDER BY next_execute_at ASC
-	`)
+	`, time.Now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -700,8 +630,9 @@ func (s *Store) GetAllActionIDs() ([]string, error) {
 }
 
 // calculateNextExecute determines when an action should next be executed.
+// All returned times are in UTC to ensure correct SQLite comparisons.
 func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time, runImmediately bool) time.Time {
-	now := time.Now()
+	now := time.Now().UTC()
 
 	// Run immediately if requested and never executed
 	if runImmediately && lastExecuted == nil {
@@ -715,7 +646,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.Add(8 * time.Hour)
+		return lastExecuted.UTC().Add(8 * time.Hour)
 	}
 
 	// Check for run_on_assign
@@ -723,11 +654,15 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		return now
 	}
 
-	// Cron takes precedence over interval
+	// Cron takes precedence over interval.
+	// Cron expressions run in the device's local timezone, so we use
+	// local time as input and convert the result to UTC for storage.
 	if schedule.Cron != "" {
-		next, err := nextCronTime(schedule.Cron, now)
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		sched, err := parser.Parse(schedule.Cron)
 		if err == nil {
-			return next
+			localNow := now.Local()
+			return sched.Next(localNow).UTC()
 		}
 		slog.Warn("invalid cron expression, using interval fallback", "cron", schedule.Cron, "error", err)
 	}
@@ -740,7 +675,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.Add(time.Duration(interval) * time.Hour)
+	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
 }
 
 // =============================================================================
