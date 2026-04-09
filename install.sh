@@ -329,14 +329,17 @@ RuntimeDirectory=pm-agent
 RuntimeDirectoryMode=0755
 
 # Security hardening
+# Note: RestrictRealtime and ProtectControlGroups are intentionally disabled.
+# On systemd 252 (Debian Bookworm), these directives install seccomp filters
+# that set no_new_privs, preventing the agent from calling sudo.
 NoNewPrivileges=false
 ProtectSystem=false
 ProtectHome=false
 PrivateTmp=false
 ProtectKernelTunables=false
 ProtectKernelModules=false
-ProtectControlGroups=true
-RestrictRealtime=true
+ProtectControlGroups=false
+RestrictRealtime=false
 RestrictSUIDSGID=false
 
 # Allow network access
