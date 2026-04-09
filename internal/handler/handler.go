@@ -16,6 +16,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/sys/inventory"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
 
@@ -359,15 +360,139 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 	}, nil
 }
 
-// CollectInventory queries osquery for hardware/software inventory tables.
-// Returns nil if osquery is not installed.
+// CollectInventory gathers device inventory from two sources:
+// 1. SDK inventory package — always available, provides baseline system info
+// 2. osquery — optional, provides richer data (packages, USB, PCI, etc.)
+//
+// When both are available, osquery tables override the SDK baseline for tables
+// that exist in both (system_info, os_version, block_devices, interface_details).
 func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
+	// Phase 1: Collect baseline from SDK (always available, no dependencies)
+	tables := h.collectBaselineInventory(ctx)
+
+	// Phase 2: Supplement/override with osquery if available
 	oq := h.getOsquery()
-	if oq == nil {
+	if oq != nil {
+		h.supplementWithOsquery(oq, tables)
+	}
+
+	if len(tables) == 0 {
 		return nil
 	}
 
-	// Core inventory tables (always collected)
+	// Convert map to slice for proto
+	result := make([]*pb.InventoryTable, 0, len(tables))
+	for _, t := range tables {
+		result = append(result, t)
+	}
+
+	h.logger.Info("inventory collected", "tables", len(result), "osquery", oq != nil)
+	return &pb.DeviceInventory{Tables: result}
+}
+
+// collectBaselineInventory uses the SDK inventory package to gather basic
+// system information without osquery. Returns tables in osquery-compatible format.
+func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.InventoryTable {
+	tables := make(map[string]*pb.InventoryTable)
+
+	// system_info + kernel_info (single GetSystemInfo call)
+	if sysInfo, err := inventory.GetSystemInfo(ctx); err == nil {
+		tables["system_info"] = &pb.InventoryTable{
+			TableName: "system_info",
+			Rows: []*pb.OSQueryRow{{Data: map[string]string{
+				"hostname":          sysInfo.Hostname,
+				"cpu_brand":         sysInfo.CPUModel,
+				"cpu_logical_cores": strconv.Itoa(sysInfo.CPUCores),
+				"physical_memory":   strconv.FormatInt(sysInfo.MemoryTotalMB*1024*1024, 10),
+			}}},
+		}
+		if sysInfo.KernelVersion != "" {
+			tables["kernel_info"] = &pb.InventoryTable{
+				TableName: "kernel_info",
+				Rows: []*pb.OSQueryRow{{Data: map[string]string{
+					"version": sysInfo.KernelVersion,
+				}}},
+			}
+		}
+	} else {
+		h.logger.Debug("baseline system_info unavailable", "error", err)
+	}
+
+	// os_version
+	if osInfo, err := inventory.GetOSInfo(); err == nil {
+		tables["os_version"] = &pb.InventoryTable{
+			TableName: "os_version",
+			Rows: []*pb.OSQueryRow{{Data: map[string]string{
+				"name":     osInfo.Name,
+				"version":  osInfo.Version,
+				"platform": osInfo.ID,
+				"arch":     osInfo.Arch,
+			}}},
+		}
+	} else {
+		h.logger.Debug("baseline os_version unavailable", "error", err)
+	}
+
+	// block_devices
+	if disks, err := inventory.GetDisks(ctx); err == nil {
+		var rows []*pb.OSQueryRow
+		for _, d := range disks {
+			rows = append(rows, &pb.OSQueryRow{Data: map[string]string{
+				"name":  d.Device,
+				"size":  d.Size,
+				"type":  d.Type,
+				"label": d.Mount,
+			}})
+		}
+		if len(rows) > 0 {
+			tables["block_devices"] = &pb.InventoryTable{
+				TableName: "block_devices",
+				Rows:      rows,
+			}
+		}
+	} else {
+		h.logger.Debug("baseline block_devices unavailable", "error", err)
+	}
+
+	// interface_details + interface_addresses
+	if ifaces, err := inventory.GetNetworkInterfaces(ctx); err == nil {
+		var detailRows, addrRows []*pb.OSQueryRow
+		for _, iface := range ifaces {
+			detailRows = append(detailRows, &pb.OSQueryRow{Data: map[string]string{
+				"interface": iface.Name,
+				"mac":       iface.MAC,
+				"type":      "",
+			}})
+			for _, addr := range iface.Addresses {
+				addrRows = append(addrRows, &pb.OSQueryRow{Data: map[string]string{
+					"interface": iface.Name,
+					"address":   addr,
+				}})
+			}
+		}
+		if len(detailRows) > 0 {
+			tables["interface_details"] = &pb.InventoryTable{
+				TableName: "interface_details",
+				Rows:      detailRows,
+			}
+		}
+		if len(addrRows) > 0 {
+			tables["interface_addresses"] = &pb.InventoryTable{
+				TableName: "interface_addresses",
+				Rows:      addrRows,
+			}
+		}
+	} else {
+		h.logger.Debug("baseline network interfaces unavailable", "error", err)
+	}
+
+	return tables
+}
+
+// supplementWithOsquery queries osquery for richer inventory data and overrides
+// baseline tables where osquery provides the same data.
+func (h *Handler) supplementWithOsquery(oq *osquery.Registry, baseline map[string]*pb.InventoryTable) {
+	// osquery tables that override baseline
 	coreTables := []string{
 		"system_info",
 		"os_version",
@@ -380,44 +505,37 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 		"memory_info",
 	}
 
-	// Package tables (best-effort — skip if unavailable)
+	// Package tables (best-effort)
 	packageTables := []string{
 		"deb_packages",
 		"rpm_packages",
 		"python_packages",
 	}
 
-	var tables []*pb.InventoryTable
-
 	for _, tableName := range coreTables {
 		rows, err := oq.QueryTable(tableName)
 		if err != nil {
-			h.logger.Debug("inventory table unavailable", "table", tableName, "error", err)
+			h.logger.Debug("osquery table unavailable", "table", tableName, "error", err)
 			continue
 		}
-		tables = append(tables, &pb.InventoryTable{
+		// Override baseline with richer osquery data
+		baseline[tableName] = &pb.InventoryTable{
 			TableName: tableName,
 			Rows:      rows,
-		})
+		}
 	}
 
 	for _, tableName := range packageTables {
 		rows, err := oq.QueryTable(tableName)
 		if err != nil {
-			continue // expected to fail on non-matching distros
+			continue
 		}
-		tables = append(tables, &pb.InventoryTable{
+		baseline[tableName] = &pb.InventoryTable{
 			TableName: tableName,
 			Rows:      rows,
-		})
+		}
 	}
 
-	if len(tables) == 0 {
-		return nil
-	}
-
-	h.logger.Info("inventory collected", "tables", len(tables))
-	return &pb.DeviceInventory{Tables: tables}
 }
 
 // Executor returns the executor for direct use.
