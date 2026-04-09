@@ -306,7 +306,7 @@ install_systemd_service() {
     # sudo. systemd 257+ (Trixie) does not have this issue.
     local restrict_realtime="false"
     local systemd_ver
-    systemd_ver=$(systemctl --version 2>/dev/null | head -1 | grep -oP '\d+' | head -1)
+    systemd_ver=$(systemctl --version 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i+0==$i){print $i; exit}}')
     if [[ -n "$systemd_ver" ]] && [[ "$systemd_ver" -ge 257 ]]; then
         restrict_realtime="true"
     elif [[ -z "$systemd_ver" ]]; then
