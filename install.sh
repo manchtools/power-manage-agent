@@ -300,6 +300,21 @@ install_systemd_service() {
 
     log_info "Installing systemd service..."
 
+    # Detect systemd version to conditionally enable RestrictRealtime.
+    # systemd <257 (Debian Bookworm 252) implements RestrictRealtime via a
+    # seccomp filter that sets no_new_privs, preventing the agent from using
+    # sudo. systemd 257+ (Trixie) does not have this issue.
+    local restrict_realtime="false"
+    local systemd_ver
+    systemd_ver=$(systemctl --version 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i+0==$i){print $i; exit}}')
+    if [[ -z "$systemd_ver" ]]; then
+        log_warn "Could not detect systemd version, disabling RestrictRealtime as a precaution"
+    elif ! [[ "$systemd_ver" =~ ^[0-9]+$ ]]; then
+        log_warn "Unexpected systemd version format '$systemd_ver', disabling RestrictRealtime as a precaution"
+    elif [[ "$systemd_ver" -ge 257 ]]; then
+        restrict_realtime="true"
+    fi
+
     cat > "$service_file" << EOF
 [Unit]
 Description=Power Manage Agent
@@ -336,7 +351,7 @@ PrivateTmp=false
 ProtectKernelTunables=false
 ProtectKernelModules=false
 ProtectControlGroups=true
-RestrictRealtime=true
+RestrictRealtime=$restrict_realtime
 RestrictSUIDSGID=false
 
 # Allow network access
