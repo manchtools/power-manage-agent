@@ -518,10 +518,12 @@ func (h *Handler) supplementWithOsquery(oq *osquery.Registry, baseline map[strin
 			h.logger.Debug("osquery table unavailable", "table", tableName, "error", err)
 			continue
 		}
-		// Override baseline with richer osquery data
-		baseline[tableName] = &pb.InventoryTable{
-			TableName: tableName,
-			Rows:      rows,
+		// Only override baseline if osquery returned data
+		if len(rows) > 0 {
+			baseline[tableName] = &pb.InventoryTable{
+				TableName: tableName,
+				Rows:      rows,
+			}
 		}
 	}
 
@@ -530,9 +532,11 @@ func (h *Handler) supplementWithOsquery(oq *osquery.Registry, baseline map[strin
 		if err != nil {
 			continue
 		}
-		baseline[tableName] = &pb.InventoryTable{
-			TableName: tableName,
-			Rows:      rows,
+		if len(rows) > 0 {
+			baseline[tableName] = &pb.InventoryTable{
+				TableName: tableName,
+				Rows:      rows,
+			}
 		}
 	}
 
