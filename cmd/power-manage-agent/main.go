@@ -379,6 +379,12 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		// Wire LUKS key store to the current client for this connection session
 		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
 
+		// Wire the terminal sender so the handler's terminal session
+		// goroutines can push TerminalOutput / TerminalStateChange
+		// frames back via the SDK Client. The first call also starts
+		// the idle-session sweeper goroutine.
+		h.SetTerminalSender(client)
+
 		// Start stream in background (opens connection, heartbeats, receives)
 		streamDone := make(chan error, 1)
 		go func() {
