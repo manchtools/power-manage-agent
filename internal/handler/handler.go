@@ -27,9 +27,21 @@ type Handler struct {
 	osquery      *osquery.Registry // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
-	mu           sync.Mutex     // protects connectedCh and connectedSet
+	mu           sync.Mutex     // protects connectedCh, connectedSet and the terminal* fields below
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
 	connectedSet bool           // tracks if connectedCh has been closed
+
+	// Remote terminal session state. terminals is the live registry,
+	// guarded by mu. terminalSender is the SDK Client (or any
+	// TerminalSender) injected at startup via SetTerminalSender; it
+	// must be set before the SDK dispatch loop delivers the first
+	// TerminalStart message. The sweeper goroutine is started lazily
+	// on the first SetTerminalSender call.
+	terminalSender         TerminalSender
+	terminals              map[string]*terminalSession
+	terminalLimit          int
+	terminalIdleTimeout    time.Duration
+	terminalSweeperStarted bool
 }
 
 // NewHandler creates a new stream handler.
