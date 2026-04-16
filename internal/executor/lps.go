@@ -2,13 +2,11 @@ package executor
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"strings"
 	"time"
 
@@ -17,11 +15,6 @@ import (
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
-)
-
-const (
-	alphanumericChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	complexChars      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?"
 )
 
 // lpsRotationEntry is the JSON structure reported in action result metadata.
@@ -68,10 +61,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		userStates = make(map[string]*store.LpsUserState)
 	}
 
-	charset := alphanumericChars
-	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
-		charset = complexChars
-	}
+	complex := params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX
 
 	var rotations []lpsRotationEntry
 	var rotatedUsers []string
@@ -95,8 +85,16 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			continue
 		}
 
-		// Generate new password
-		password, err := generatePassword(int(params.PasswordLength), charset)
+		// Generate new password. Clamp the length to the SDK's accepted
+		// range so out-of-bounds proto values don't fail the rotation.
+		length := int(params.PasswordLength)
+		if length < sysuser.MinPasswordLength {
+			length = sysuser.MinPasswordLength
+		}
+		if length > sysuser.MaxPasswordLength {
+			length = sysuser.MaxPasswordLength
+		}
+		password, err := sysuser.GeneratePassword(length, complex)
 		if err != nil {
 			anyError = fmt.Errorf("generate password for %s: %w", username, err)
 			output.WriteString(fmt.Sprintf("LPS: %s — failed to generate password: %v\n", username, err))
@@ -239,29 +237,6 @@ func killUserSessions(ctx context.Context, username string) {
 	runSudoCmd(ctx, "pkill", "-KILL", "-u", username)
 	// Brief wait for processes to fully exit
 	time.Sleep(500 * time.Millisecond)
-}
-
-// generatePassword creates a cryptographically random password from the given character set.
-func generatePassword(length int, charset string) (string, error) {
-	if length < 8 {
-		length = 8
-	}
-	if length > 128 {
-		length = 128
-	}
-
-	result := make([]byte, length)
-	charsetLen := big.NewInt(int64(len(charset)))
-
-	for i := range result {
-		idx, err := rand.Int(rand.Reader, charsetLen)
-		if err != nil {
-			return "", fmt.Errorf("crypto/rand: %w", err)
-		}
-		result[i] = charset[idx.Int64()]
-	}
-
-	return string(result), nil
 }
 
 // getLastAuthTime returns the most recent login time for a user by parsing `last -1 -F <username>`.
