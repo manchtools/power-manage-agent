@@ -560,47 +560,35 @@ journalctl -u power-manage-agent -f
 ├── luks/                # LUKS encryption state (per-action SQLite databases)
 ├── state.json           # Agent state (server URL, device ID, gateway URL)
 ├── update/              # Auto-update working directory
-│   ├── agent.new        # Downloaded new binary (during update)
-│   ├── agent.backup     # Backup of current binary (during update)
-│   ├── state.json       # Update phase tracking (complete/rolled_back)
-│   └── cooldown.json    # Version cooldown after failed update (1 hour)
+│   └── agent-update-*.tmp  # Downloaded new binary (during update, deleted after self-test)
 └── results/             # Pending execution results
 ```
 
 ## Auto-Update
 
-The agent supports server-controlled automatic updates with two complementary paths:
-
-### Path A: Server-Controlled (Welcome-triggered)
-
-During normal operation, the gateway sends a Welcome message containing the latest agent version, download URL, and SHA256 checksum. If the agent detects a newer version, it downloads the binary, verifies the checksum, validates it by running `agent.new version`, and launches a transient systemd service (`pm-agent-update.service`) to perform the self-install.
-
-This path respects the admin's "Auto-update agents" toggle in server settings.
-
-### Path B: Startup Self-Heal
-
-On every startup (before the main loop), the agent checks for updates. It first queries the **control server** via `GetAutoUpdateInfo` (5s timeout, uses mTLS credentials), and if the server is unreachable, falls back to **GitHub Releases** directly. This ensures a buggy agent can be recovered on reboot even when server infrastructure is down.
-
-The startup check never blocks boot — any failure is logged as a warning and the agent continues normally.
+The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload contains architecture-specific binary URLs and SHA256SUMS URLs.
 
 ### Update Process
 
-1. Download new binary to `/var/lib/power-manage/update/agent.new`
-2. Verify SHA256 checksum
-3. Validate by running `agent.new version`
-4. Write transient systemd service (`pm-agent-update.service`)
-5. New binary runs the `update` subcommand in its own cgroup:
-   - Stop the agent service
-   - Backup current binary
-   - Install new binary
-   - Start the agent service
-   - Health check (poll `systemctl is-active` every 2s for 30s)
-   - If healthy: write `state.json` with `complete`, clean up
-   - If unhealthy: restore backup, restart, write 1-hour cooldown, clean up
+1. Download SHA256SUMS file, extract checksum for this binary's filename
+2. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp`, verify SHA256
+3. Run `./agent-new version` to extract the new version string, compare with running — skip if same
+4. Run `./agent-new self-test` as a subprocess (60s timeout). The self-test:
+   - Loads stored credentials
+   - Establishes an mTLS connection to the gateway
+   - Sends `Hello`, waits for `Welcome` (proves bidirectional stream)
+   - Calls `SyncActions` (proves unary RPC works)
+   - Exits 0 on success, 1 on any failure
+5. If the self-test exits 0: atomically swap the live binary (`cp → chmod → mv`) and trigger graceful shutdown. Systemd restarts with the new binary.
+6. If the self-test fails: report the action as `EXECUTION_STATUS_FAILED` and leave the live binary untouched.
 
-### Cooldown & Rollback
+### Validate-before-swap
 
-If an update fails health checks, the agent rolls back to the previous binary and writes a cooldown entry. The same version will be skipped for 1 hour to prevent update loops. On next startup, the agent reads `state.json` to log the outcome of the previous update cycle.
+The old binary is **never replaced** until the new binary proves it can connect, sync, and handle the protocol. There is no backup/rollback mechanism — there's nothing to roll back because the swap only happens after validation.
+
+### Retry behavior
+
+Failed updates have **no cooldown**. If an admin schedules `AGENT_UPDATE` every 30 minutes and the target version is broken (self-test fails), the agent re-downloads and re-validates every cycle until a fixed release is published. Retry frequency is governed entirely by the admin's action schedule — the agent does not impose its own throttling. The old binary remains on disk, untouched, until a version passes its self-test.
 
 ## Systemd Service
 
