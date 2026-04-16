@@ -1002,8 +1002,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 			changed = true
 
 			// Reload systemd
-			if _, err := runSudoCmd(ctx, "systemctl", "daemon-reload"); err != nil {
-				return nil, changed, fmt.Errorf("daemon-reload failed")
+			if err := syssystemd.DaemonReload(ctx); err != nil {
+				return nil, changed, fmt.Errorf("daemon-reload failed: %w", err)
 			}
 			output.WriteString("reloaded systemd daemon\n")
 		}
@@ -1016,13 +1016,13 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		if e.isUnitMasked(params.UnitName) {
 			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
 		}
-		if _, err := runSudoCmd(ctx, "systemctl", "enable", params.UnitName); err != nil {
-			return nil, changed, fmt.Errorf("enable: %v", err)
+		if err := syssystemd.Enable(ctx, params.UnitName); err != nil {
+			return nil, changed, fmt.Errorf("enable: %w", err)
 		}
 		output.WriteString("enabled unit\n")
 		changed = true
 	} else if !params.Enable && isEnabled {
-		if _, err := runSudoCmd(ctx, "systemctl", "disable", params.UnitName); err != nil {
+		if err := syssystemd.Disable(ctx, params.UnitName); err != nil {
 			// Ignore errors for disable (unit might not exist)
 			output.WriteString("disable failed (unit may not exist)\n")
 		} else {
@@ -1036,8 +1036,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	switch params.DesiredState {
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STARTED:
 		if !isActive {
-			if _, err := runSudoCmd(ctx, "systemctl", "start", params.UnitName); err != nil {
-				return nil, changed, fmt.Errorf("start: %v", err)
+			if err := syssystemd.Start(ctx, params.UnitName); err != nil {
+				return nil, changed, fmt.Errorf("start: %w", err)
 			}
 			output.WriteString("started unit\n")
 			changed = true
@@ -1046,8 +1046,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STOPPED:
 		if isActive {
-			if _, err := runSudoCmd(ctx, "systemctl", "stop", params.UnitName); err != nil {
-				return nil, changed, fmt.Errorf("stop: %v", err)
+			if err := syssystemd.Stop(ctx, params.UnitName); err != nil {
+				return nil, changed, fmt.Errorf("stop: %w", err)
 			}
 			output.WriteString("stopped unit\n")
 			changed = true
@@ -1056,8 +1056,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_RESTARTED:
 		// Restart always runs (not idempotent by design)
-		if _, err := runSudoCmd(ctx, "systemctl", "restart", params.UnitName); err != nil {
-			return nil, changed, fmt.Errorf("restart: %v", err)
+		if err := syssystemd.Restart(ctx, params.UnitName); err != nil {
+			return nil, changed, fmt.Errorf("restart: %w", err)
 		}
 		output.WriteString("restarted unit\n")
 		changed = true
