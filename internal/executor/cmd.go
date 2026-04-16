@@ -85,3 +85,17 @@ func formatCmdError(err error, output *pb.CommandOutput) string {
 	}
 	return err.Error()
 }
+
+// stderrSuffix returns " (<stderr>)" if the result has stderr content, or "".
+// Used to enrich human-readable error messages with the underlying command's
+// stderr — important for surfacing things like "user 'foo' already exists".
+func stderrSuffix(r *sysexec.Result) string {
+	if r == nil {
+		return ""
+	}
+	stderr := strings.TrimSpace(r.Stderr)
+	if stderr == "" {
+		return ""
+	}
+	return " (" + stderr + ")"
+}

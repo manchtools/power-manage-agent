@@ -312,7 +312,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortStopped()
 		return nil
 	}
-	if err := sysuser.Modify(sessionCtx, req.TtyUser, "-s", terminalActivatedShell); err != nil {
+	if _, err := sysuser.Modify(sessionCtx, req.TtyUser, "-s", terminalActivatedShell); err != nil {
 		abortFail(fmt.Sprintf("activate shell: %v", err))
 		return nil
 	}
@@ -345,7 +345,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortFail("temp home is not a regular directory")
 		return nil
 	}
-	if err := sysuser.ChownRecursive(sessionCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
+	if _, err := sysuser.ChownRecursive(sessionCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
 		abortFail(fmt.Sprintf("chown temp home: %v", err))
 		return nil
 	}
@@ -659,7 +659,7 @@ func (h *Handler) anySessionForUserExcept(ttyUser, exceptSessionID string) bool 
 // Best-effort: a failure here is logged but does not block the rest
 // of the cleanup.
 func (h *Handler) deactivateShell(ctx context.Context, ttyUser string) {
-	if err := sysuser.Modify(ctx, ttyUser, "-s", terminalDeactivatedShell); err != nil {
+	if _, err := sysuser.Modify(ctx, ttyUser, "-s", terminalDeactivatedShell); err != nil {
 		h.logger.Warn("failed to revert tty user shell",
 			"tty_user", ttyUser, "error", err)
 	}

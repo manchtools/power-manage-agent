@@ -102,9 +102,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Set the password
-		if err := sysuser.SetPassword(ctx, username, password); err != nil {
+		if result, err := sysuser.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
-			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v%s\n", username, err, stderrSuffix(result)))
 			continue
 		}
 
