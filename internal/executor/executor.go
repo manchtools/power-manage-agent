@@ -2960,14 +2960,11 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-c", params.Comment)
 	}
 
-	// Add username as last argument
-	args = append(args, params.Username)
-
-	// Create the user
-	cmdOutput, err := runSudoCmd(ctx, "useradd", args...)
+	// Create the user via SDK
+	result, err := sysuser.Create(ctx, params.Username, args...)
 	if err != nil {
-		if cmdOutput != nil {
-			output.WriteString(cmdOutput.Stderr)
+		if result != nil {
+			output.WriteString(result.Stderr)
 		}
 		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, nil, fmt.Errorf("failed to create user: %w", err)
 	}
@@ -2975,10 +2972,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// If home directory already existed, fix ownership
 	if homeExists && createHome {
-		if chownOutput, chownErr := runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
+		if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, params.Username); chownErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
-			if chownOutput != nil {
-				output.WriteString(chownOutput.Stderr)
+			if chownResult != nil {
+				output.WriteString(chownResult.Stderr)
 			}
 		} else {
 			output.WriteString(fmt.Sprintf("fixed ownership of existing home directory: %s\n", homeDir))
@@ -2992,15 +2989,15 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
 		} else {
-			// Set password using chpasswd
-			if chpasswdOutput, chpasswdErr := runSudoCmdWithStdin(ctx, strings.NewReader(fmt.Sprintf("%s:%s", params.Username, tempPassword)), "chpasswd"); chpasswdErr != nil {
+			// Set password
+			if chpasswdResult, chpasswdErr := sysuser.SetPassword(ctx, params.Username, tempPassword); chpasswdErr != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to set temporary password: %v\n", chpasswdErr))
-				if chpasswdOutput != nil {
-					output.WriteString(chpasswdOutput.Stderr)
+				if chpasswdResult != nil {
+					output.WriteString(chpasswdResult.Stderr)
 				}
 			} else {
 				// Force password change on first login
-				if _, chageErr := runSudoCmd(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
+				if _, chageErr := sysuser.ExpirePassword(ctx, params.Username); chageErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
 				}
 				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
@@ -3031,10 +3028,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// Handle disabled state (lock the account)
 	if params.Disabled {
-		if lockOutput, lockErr := runSudoCmd(ctx, "usermod", "-L", params.Username); lockErr != nil {
+		if lockResult, lockErr := sysuser.Lock(ctx, params.Username); lockErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
-			if lockOutput != nil {
-				output.WriteString(lockOutput.Stderr)
+			if lockResult != nil {
+				output.WriteString(lockResult.Stderr)
 			}
 		} else {
 			output.WriteString("account locked (disabled)\n")
@@ -3102,11 +3099,10 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 
 	// Apply usermod if we have changes
 	if len(args) > 0 {
-		args = append(args, params.Username)
-		cmdOutput, err := runSudoCmd(ctx, "usermod", args...)
+		result, err := sysuser.Modify(ctx, params.Username, args...)
 		if err != nil {
-			if cmdOutput != nil {
-				output.WriteString(cmdOutput.Stderr)
+			if result != nil {
+				output.WriteString(result.Stderr)
 			}
 			return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, false, fmt.Errorf("failed to update user: %w", err)
 		}
@@ -3131,7 +3127,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
 			} else {
 				runSudoCmd(ctx, "cp", "-a", "/etc/skel/.", homeDir)
-				runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir)
+				sysuser.ChownRecursive(ctx, homeDir, params.Username, params.Username)
 				runSudoCmd(ctx, "chmod", "0700", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
 				changed = true
@@ -3143,20 +3139,20 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	desiredLocked := params.Disabled
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
-			if lockOutput, err := runSudoCmd(ctx, "usermod", "-L", params.Username); err != nil {
+			if lockResult, err := sysuser.Lock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
-				if lockOutput != nil {
-					output.WriteString(lockOutput.Stderr)
+				if lockResult != nil {
+					output.WriteString(lockResult.Stderr)
 				}
 			} else {
 				output.WriteString("account locked (disabled)\n")
 				changed = true
 			}
 		} else {
-			if unlockOutput, err := runSudoCmd(ctx, "usermod", "-U", params.Username); err != nil {
+			if unlockResult, err := sysuser.Unlock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to unlock user: %v\n", err))
-				if unlockOutput != nil {
-					output.WriteString(unlockOutput.Stderr)
+				if unlockResult != nil {
+					output.WriteString(unlockResult.Stderr)
 				}
 			} else {
 				output.WriteString("account unlocked\n")
@@ -3212,18 +3208,18 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	removeAccountsServiceFile(ctx, username)
 
 	// Remove user and their home directory
-	output, err := runSudoCmd(ctx, "userdel", "-r", username)
+	result, err := sysuser.Delete(ctx, username, true)
 	if err != nil {
 		// If home directory doesn't exist, userdel -r may still succeed
 		// but report an error. Check if user is actually removed.
-		if !userExists(username) {
+		if !sysuser.Exists(username) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("removed user: %s (home directory may not have existed)\n", username),
 			}, true, nil
 		}
-		if output != nil {
-			return &pb.CommandOutput{ExitCode: 1, Stderr: output.Stderr}, false, fmt.Errorf("failed to remove user: %w", err)
+		if result != nil {
+			return &pb.CommandOutput{ExitCode: 1, Stderr: result.Stderr}, false, fmt.Errorf("failed to remove user: %w", err)
 		}
 		return nil, false, fmt.Errorf("failed to remove user: %w", err)
 	}
