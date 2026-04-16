@@ -141,7 +141,8 @@ URI Parameters:
 | `setup` | Install sudoers configuration |
 | `query` | Query system information via osquery |
 | `luks` | LUKS passphrase management |
-| `update` | Self-install phase for auto-updates (invoked by transient systemd service, not manually) |
+| `tty` | Manage the device-local remote terminal toggle (`enable` / `disable` / `status`) |
+| `self-test` | Connectivity probe used by the self-update flow to validate a new binary before installing |
 
 ## Configuration
 
@@ -539,6 +540,37 @@ The agent prevents actions from modifying its own infrastructure:
 ### Enrollment Rate Limiting
 
 The enrollment socket limits enrollment attempts to 5 per minute using a sliding window. This prevents brute-force token guessing via the local socket.
+
+### Remote Terminal (TTY) — Device-Authoritative Toggle
+
+Remote terminal sessions are **disabled by default** on every device. Before a server can open a PTY on the device, a local admin must explicitly enable the toggle. The server cannot bypass this — any remote action that tries to flip the flag still runs on the device and goes through the same CLI surface that requires local privileges.
+
+**Commands:**
+
+```bash
+sudo power-manage-agent tty enable      # allow remote terminals on this device
+sudo power-manage-agent tty disable     # revoke access; existing sessions must be closed separately
+power-manage-agent tty status           # prints "enabled" or "disabled"; exit 0 / 1
+```
+
+**How it works:**
+
+- State lives in the agent's SQLite database (`tty.enabled` key in the `settings` table)
+- Default is **disabled** — fresh installs and upgrades must explicitly enable
+- The `power-manage` user owns the data directory, so the CLI must run as that user (via `sudo` or equivalent privilege escalation)
+- The terminal handler fails-closed: if the flag is missing, the store is unreachable, or any read error occurs, sessions are refused
+- The rejection message sent to the server is intentionally opaque (`terminal sessions are disabled on this device`) — it never distinguishes "disabled" from other failure modes
+- No agent restart is required; the check runs at every `TerminalStart` request
+
+**Fleet detection:**
+
+The toggle is queryable from the server via a compliance shell action:
+
+```bash
+power-manage-agent tty status
+```
+
+Exit code 0 = enabled, 1 = disabled. Combined with `is_compliance=true` + `compliance_expected_output=enabled` (or `disabled`), admins can report on fleet-wide TTY state without a new action type.
 
 ## Logging
 

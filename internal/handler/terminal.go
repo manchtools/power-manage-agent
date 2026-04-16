@@ -186,6 +186,34 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		return nil
 	}
 
+	// Device-authoritative TTY gate. The toggle lives in the agent's
+	// SQLite database and defaults to off. Only the power-manage user
+	// (via the CLI) or root can flip it — the server cannot bypass
+	// this by pushing an action because the action still runs on the
+	// device and goes through the same CLI surface.
+	//
+	// Fail-closed: a nil store or any read error means the gate is
+	// closed, never the other way around. This runs before the user
+	// lookup so a disabled device does zero syscalls on each rejected
+	// request and the error message doesn't leak whether the pm-tty-*
+	// user happens to exist.
+	if h.store == nil {
+		logger.Warn("terminal start rejected: no store wired for tty gate")
+		h.failTerminalStart(ctx, sender, req.SessionId, "terminal sessions are disabled on this device")
+		return nil
+	}
+	enabled, err := h.store.IsTTYEnabled()
+	if err != nil {
+		logger.Warn("failed to read tty toggle state; refusing session", "error", err)
+		h.failTerminalStart(ctx, sender, req.SessionId, "terminal sessions are disabled on this device")
+		return nil
+	}
+	if !enabled {
+		logger.Info("terminal start rejected: tty disabled on device")
+		h.failTerminalStart(ctx, sender, req.SessionId, "terminal sessions are disabled on this device")
+		return nil
+	}
+
 	// Verify the TTY user actually exists and is not locked. This is
 	// the dedicated pm-tty-* account; failure here means the control
 	// server's TerminalAccess provisioning hasn't run on this device

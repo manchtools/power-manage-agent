@@ -817,3 +817,41 @@ func (s *Store) DeleteLpsState(actionID string) error {
 	_, err := s.db.Exec("DELETE FROM lps_state WHERE action_id = ?", actionID)
 	return err
 }
+
+// =============================================================================
+// Settings
+// =============================================================================
+
+// GetSetting returns the value of a setting, or empty string if unset.
+func (s *Store) GetSetting(key string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var value string
+	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return value, err
+}
+
+// SetSetting stores a setting, overwriting any existing value for the key.
+func (s *Store) SetSetting(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	return err
+}
+
+// DeleteSetting removes a setting.
+func (s *Store) DeleteSetting(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM settings WHERE key = ?", key)
+	return err
+}

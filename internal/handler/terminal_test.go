@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
@@ -44,9 +45,26 @@ func (f *fakeSender) lastState() *pb.TerminalStateChange {
 
 func newTestHandler(t *testing.T) (*Handler, *fakeSender) {
 	t.Helper()
+	// Default to a TTY-enabled store so existing tests exercise the
+	// full start path without being blocked by the toggle gate. Tests
+	// that want to exercise the gate itself use newTestHandlerWithTTY.
+	return newTestHandlerWithTTY(t, true)
+}
+
+func newTestHandlerWithTTY(t *testing.T, ttyEnabled bool) (*Handler, *fakeSender) {
+	t.Helper()
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("new store: %v", err)
+	}
+	t.Cleanup(func() { st.Close() })
+	if err := st.SetTTYEnabled(ttyEnabled); err != nil {
+		t.Fatalf("set tty toggle: %v", err)
+	}
 	h := &Handler{
 		logger:      slog.Default(),
 		connectedCh: make(chan struct{}),
+		store:       st,
 	}
 	sender := &fakeSender{}
 	h.SetTerminalSender(sender)
@@ -271,6 +289,68 @@ func TestTerminal_Start_RejectsNonPrefixedUsername(t *testing.T) {
 	// limit check still has room.
 	if got := len(h.terminals); got != 0 {
 		t.Errorf("registry should be empty, got %d entries", got)
+	}
+}
+
+// OnTerminalStart must reject all sessions when the device-local TTY
+// toggle is off. The rejection uses an opaque error message so the
+// server cannot distinguish "disabled" from other failure modes.
+func TestTerminal_Start_RejectsWhenTTYDisabled(t *testing.T) {
+	h, sender := newTestHandlerWithTTY(t, false)
+	err := h.OnTerminalStart(context.Background(), &pb.TerminalStart{
+		SessionId: "01ABC",
+		TtyUser:   "pm-tty-test",
+		Cols:      80,
+		Rows:      24,
+	})
+	if err != nil {
+		t.Fatalf("OnTerminalStart returned %v", err)
+	}
+	last := sender.lastState()
+	if last == nil {
+		t.Fatal("expected STATE_ERROR when TTY is disabled")
+	}
+	if last.State != pb.TerminalSessionState_TERMINAL_SESSION_STATE_ERROR {
+		t.Errorf("state = %v, want ERROR", last.State)
+	}
+	if !strings.Contains(last.Error, "disabled on this device") {
+		t.Errorf("error = %q, want opaque disabled message", last.Error)
+	}
+	if got := len(h.terminals); got != 0 {
+		t.Errorf("registry should be empty, got %d entries", got)
+	}
+}
+
+// A handler constructed without a store must fail-closed — any
+// TerminalStart request is rejected. This protects against a wiring
+// regression where the handler is created before the store.
+func TestTerminal_Start_RejectsWhenStoreMissing(t *testing.T) {
+	h := &Handler{
+		logger:      slog.Default(),
+		connectedCh: make(chan struct{}),
+		// intentionally no store
+	}
+	sender := &fakeSender{}
+	h.SetTerminalSender(sender)
+
+	err := h.OnTerminalStart(context.Background(), &pb.TerminalStart{
+		SessionId: "01ABC",
+		TtyUser:   "pm-tty-test",
+		Cols:      80,
+		Rows:      24,
+	})
+	if err != nil {
+		t.Fatalf("OnTerminalStart returned %v", err)
+	}
+	last := sender.lastState()
+	if last == nil {
+		t.Fatal("expected STATE_ERROR when store is missing")
+	}
+	if last.State != pb.TerminalSessionState_TERMINAL_SESSION_STATE_ERROR {
+		t.Errorf("state = %v, want ERROR", last.State)
+	}
+	if !strings.Contains(last.Error, "disabled on this device") {
+		t.Errorf("error = %q, want opaque disabled message", last.Error)
 	}
 }
 

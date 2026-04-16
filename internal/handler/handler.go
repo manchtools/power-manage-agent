@@ -15,6 +15,7 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
+	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/sys/inventory"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
@@ -26,6 +27,7 @@ type Handler struct {
 	executor     *executor.Executor
 	osquery      *osquery.Registry // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
+	store        *store.Store
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
 	mu           sync.Mutex     // protects connectedCh, connectedSet and the terminal* fields below
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
@@ -45,11 +47,12 @@ type Handler struct {
 }
 
 // NewHandler creates a new stream handler.
-func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.Scheduler, syncTrigger chan<- struct{}) *Handler {
+func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.Scheduler, st *store.Store, syncTrigger chan<- struct{}) *Handler {
 	return &Handler{
 		logger:      logger,
 		executor:    exec,
 		scheduler:   sched,
+		store:       st,
 		syncTrigger: syncTrigger,
 		connectedCh: make(chan struct{}),
 	}

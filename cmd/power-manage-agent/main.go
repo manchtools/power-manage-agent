@@ -121,6 +121,8 @@ func main() {
 			return
 		case "self-test":
 			os.Exit(runSelfTest(os.Args[2:]))
+		case "tty":
+			os.Exit(runTTY(os.Args[2:]))
 		}
 	}
 
@@ -258,7 +260,7 @@ func main() {
 	syncTrigger := make(chan struct{}, 1)
 
 	// Create handler with scheduler integration
-	h := handler.NewHandler(logger, exec, sched, syncTrigger)
+	h := handler.NewHandler(logger, exec, sched, actionStore, syncTrigger)
 
 	// Enable action-based agent self-update.
 	exec.SetUpdateConfig(&executor.AgentUpdateConfig{
@@ -1428,6 +1430,85 @@ func runSelfTest(args []string) int {
 
 	logger.Info("self-test: all checks passed")
 	return 0
+}
+
+// runTTY manages the device-local TTY enable/disable toggle.
+// Usage:
+//
+//	power-manage-agent tty enable
+//	power-manage-agent tty disable
+//	power-manage-agent tty status
+//
+// The toggle is stored in the agent's SQLite database. The CLI must be
+// run as the power-manage user (the owner of the agent's data dir) or
+// as root via sudo — a regular user cannot escalate into the toggle
+// without first escalating to one of those identities.
+func runTTY(args []string) int {
+	fs := flag.NewFlagSet("tty", flag.ExitOnError)
+	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Agent data directory")
+
+	if len(args) == 0 {
+		printTTYUsage()
+		return 1
+	}
+
+	sub := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		return 1
+	}
+
+	switch sub {
+	case "-h", "--help", "help":
+		printTTYUsage()
+		return 0
+	case "enable", "disable", "status":
+		// handled below
+	default:
+		fmt.Fprintf(os.Stderr, "unknown tty subcommand: %s\n", sub)
+		printTTYUsage()
+		return 1
+	}
+
+	st, err := store.New(*dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: open agent store: %v\n", err)
+		return 1
+	}
+	defer st.Close()
+
+	switch sub {
+	case "enable":
+		if err := st.SetTTYEnabled(true); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Println("TTY enabled.")
+		return 0
+	case "disable":
+		if err := st.SetTTYEnabled(false); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Println("TTY disabled.")
+		return 0
+	case "status":
+		enabled, err := st.IsTTYEnabled()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		if enabled {
+			fmt.Println("enabled")
+			return 0
+		}
+		fmt.Println("disabled")
+		return 1
+	}
+	return 1
+}
+
+func printTTYUsage() {
+	fmt.Fprintln(os.Stderr, "usage: power-manage-agent tty {enable|disable|status} [--data-dir=PATH]")
 }
 
 // runEnroll handles the "enroll" subcommand.
