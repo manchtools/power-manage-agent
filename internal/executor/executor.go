@@ -28,6 +28,7 @@ import (
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
+	sysreboot "github.com/manchtools/power-manage/sdk/go/sys/reboot"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 	"github.com/manchtools/power-manage/sdk/go/verify"
@@ -2821,15 +2822,10 @@ func IsInstantAction(t pb.ActionType) bool {
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
 	sysnotify.NotifyAll(ctx, "System Reboot", "This system will reboot in 5 minutes. Please save your work.")
 
-	output, err := runSudoCmd(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
-	if err != nil {
-		return output, fmt.Errorf("failed to schedule reboot: %w", err)
+	if err := sysreboot.Schedule(ctx, "+5", "Power Manage: scheduled reboot"); err != nil {
+		return nil, fmt.Errorf("failed to schedule reboot: %w", err)
 	}
-	if output == nil {
-		output = &pb.CommandOutput{}
-	}
-	output.Stdout = "Reboot scheduled in 5 minutes\n" + output.Stdout
-	return output, nil
+	return &pb.CommandOutput{Stdout: "Reboot scheduled in 5 minutes\n"}, nil
 }
 
 // executeUser manages user accounts (create, update, disable, remove).
