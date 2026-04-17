@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,6 +18,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
@@ -169,21 +169,25 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	defer selfTestCancel()
 
 	e.logger.Info("running self-test on new binary", "path", tmpPath)
-	selfTestCmd := exec.CommandContext(selfTestCtx, tmpPath, "self-test",
+	selfTestResult, selfTestErr := sysexec.Run(selfTestCtx, tmpPath, "self-test",
 		"--data-dir="+cfg.DataDir,
 		"--timeout=55s",
 	)
-	selfTestOut, selfTestErr := selfTestCmd.CombinedOutput()
 	if selfTestErr != nil {
+		var combined string
+		if selfTestResult != nil {
+			combined = strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
+		}
 		e.logger.Error("self-test failed, keeping current binary",
 			"error", selfTestErr,
-			"output", string(selfTestOut))
-		return &pb.CommandOutput{
+			"output", combined)
+		out := &pb.CommandOutput{
 			Stdout: fmt.Sprintf("Self-test failed for version %s: %v", newVersion, selfTestErr),
-			Stderr: string(selfTestOut),
-		}, false, fmt.Errorf("self-test failed: %w", selfTestErr)
+			Stderr: combined,
+		}
+		return out, false, fmt.Errorf("self-test failed: %w", selfTestErr)
 	}
-	e.logger.Info("self-test passed", "output", string(selfTestOut))
+	e.logger.Info("self-test passed", "output", selfTestResult.Stdout)
 
 	// Step 9: Self-test passed — swap the binary. The old binary is
 	// still running in memory, so this is safe. Use atomic
@@ -345,11 +349,13 @@ func downloadToFile(ctx context.Context, client *http.Client, downloadURL string
 
 // getBinaryVersion runs the binary with "version" subcommand and returns the trimmed output.
 func getBinaryVersion(binaryPath string) (string, error) {
-	out, err := exec.Command(binaryPath, "version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := sysexec.Run(ctx, binaryPath, "version")
 	if err != nil {
 		return "", fmt.Errorf("run %s version: %w", binaryPath, err)
 	}
-	v := strings.TrimSpace(string(out))
+	v := strings.TrimSpace(result.Stdout)
 	if v == "" {
 		return "", fmt.Errorf("binary returned empty version")
 	}
