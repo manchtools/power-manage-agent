@@ -1469,6 +1469,25 @@ func runTTY(args []string) int {
 		return 1
 	}
 
+	// Device-authoritative guard for mutating subcommands. `enable`/`disable`
+	// must be invoked by a human with root privileges attached to a real
+	// terminal. Without this gate the server could flip the flag remotely
+	// by dispatching `ACTION_TYPE_SHELL { script: "power-manage-agent tty enable" }` —
+	// that shell runs as the power-manage user which owns the SQLite DB,
+	// so it would otherwise succeed. Status stays readable without a
+	// terminal so operators can `if power-manage-agent tty status` in
+	// shell scripts.
+	if sub == "enable" || sub == "disable" {
+		if os.Geteuid() != 0 {
+			fmt.Fprintf(os.Stderr, "Error: tty %s must be run as root (try: sudo power-manage-agent tty %s)\n", sub, sub)
+			return 1
+		}
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			fmt.Fprintf(os.Stderr, "Error: tty %s must be run interactively from a local terminal\n", sub)
+			return 1
+		}
+	}
+
 	st, err := store.New(*dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: open agent store: %v\n", err)
