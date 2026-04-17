@@ -604,8 +604,8 @@ The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedul
 
 1. Download SHA256SUMS file, extract checksum for this binary's filename
 2. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp`, verify SHA256
-3. Run `./agent-new version` to extract the new version string, compare with running — skip if same
-4. Run `./agent-new self-test` as a subprocess (60s timeout). The self-test:
+3. Run `<tmpPath> version` on the staged binary to extract the new version string, compare with running — skip if same
+4. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
    - Establishes an mTLS connection to the gateway
    - Sends `Hello`, waits for `Welcome` (proves bidirectional stream)

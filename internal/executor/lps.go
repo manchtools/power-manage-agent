@@ -61,6 +61,15 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		userStates = make(map[string]*store.LpsUserState)
 	}
 
+	// Map the complexity enum to the SDK's boolean flag. COMPLEX enables
+	// special characters; ALPHANUMERIC uses letters and digits only.
+	// UNSPECIFIED falls back to ALPHANUMERIC for compatibility with older
+	// server versions that didn't set the field — logged so operators can
+	// spot misconfigured policies.
+	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_UNSPECIFIED {
+		e.logger.Warn("LPS policy has no complexity set, defaulting to alphanumeric",
+			"action_id", actionID)
+	}
 	complex := params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX
 
 	var rotations []lpsRotationEntry
@@ -87,12 +96,19 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 		// Generate new password. Clamp the length to the SDK's accepted
 		// range so out-of-bounds proto values don't fail the rotation.
-		length := int(params.PasswordLength)
+		requested := int(params.PasswordLength)
+		length := requested
 		if length < sysuser.MinPasswordLength {
 			length = sysuser.MinPasswordLength
 		}
 		if length > sysuser.MaxPasswordLength {
 			length = sysuser.MaxPasswordLength
+		}
+		if length != requested {
+			e.logger.Warn("LPS password length clamped to SDK bounds",
+				"action_id", actionID, "username", username,
+				"requested", requested, "effective", length,
+				"min", sysuser.MinPasswordLength, "max", sysuser.MaxPasswordLength)
 		}
 		password, err := sysuser.GeneratePassword(length, complex)
 		if err != nil {
