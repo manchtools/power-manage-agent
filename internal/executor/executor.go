@@ -2857,6 +2857,21 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 
 // createOrUpdateUser creates a new user or updates an existing one.
 // Returns the command output, whether changes were made, metadata, and any error.
+// homeGroupFor returns the group name/id to use when repairing home
+// directory ownership for a user. Preference order mirrors the group
+// selection used at user creation time: explicit numeric GID (accepted
+// by `chown` as a number), named primary group, else fall back to the
+// username (matches the default "useradd creates matching group" case).
+func homeGroupFor(params *pb.UserParams) string {
+	if params.Gid > 0 {
+		return fmt.Sprintf("%d", params.Gid)
+	}
+	if params.PrimaryGroup != "" {
+		return params.PrimaryGroup
+	}
+	return params.Username
+}
+
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists := userExists(params.Username)
@@ -2957,7 +2972,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// If home directory already existed, fix ownership
 	if homeExists && createHome {
-		if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, params.Username); chownErr != nil {
+		if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
 			if chownResult != nil {
 				output.WriteString(chownResult.Stderr)
@@ -3112,7 +3127,12 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
 			} else {
 				runSudoCmd(ctx, "cp", "-a", "/etc/skel/.", homeDir)
-				sysuser.ChownRecursive(ctx, homeDir, params.Username, params.Username)
+				if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
+					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
+					if chownResult != nil {
+						output.WriteString(chownResult.Stderr)
+					}
+				}
 				runSudoCmd(ctx, "chmod", "0700", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
 				changed = true
