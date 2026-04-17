@@ -156,19 +156,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	}
 
 	// Verify action signature before execution (skip for instant actions — they have no params to sign)
-	if e.verifier != nil && !isInstantAction(action.Type) {
+	if e.verifier != nil && !IsInstantAction(action.Type) {
 		actionID := getActionID(action)
-		verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature)
-		if verifyErr != nil {
-			// Shell scripts and sudo policies: hard reject unsigned/tampered actions
-			if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SUDO || action.Type == pb.ActionType_ACTION_TYPE_LPS {
-				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-				result.Error = fmt.Sprintf("refusing to execute unsigned/tampered shell script: %v", verifyErr)
-				result.CompletedAt = timestamppb.Now()
-				result.DurationMs = time.Since(start).Milliseconds()
-				return result
-			}
-			// All other types: also hard reject unsigned/tampered actions
+		if verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature); verifyErr != nil {
 			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
 			result.CompletedAt = timestamppb.Now()
@@ -2808,14 +2798,9 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 	}
 }
 
-// isInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
-func isInstantAction(t pb.ActionType) bool {
-	return t == pb.ActionType_ACTION_TYPE_REBOOT || t == pb.ActionType_ACTION_TYPE_SYNC
-}
-
-// IsInstantAction is the exported version for use by the handler.
+// IsInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
 func IsInstantAction(t pb.ActionType) bool {
-	return isInstantAction(t)
+	return t == pb.ActionType_ACTION_TYPE_REBOOT || t == pb.ActionType_ACTION_TYPE_SYNC
 }
 
 // executeReboot schedules a system reboot in 5 minutes.
