@@ -1502,7 +1502,15 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 		}
 	}
 
-	return file.Close()
+	if err := file.Close(); err != nil {
+		// A late Close() error (fsync failure on a full disk, network
+		// FS hiccup) means the on-disk file is potentially partial.
+		// Remove it so the next run re-downloads instead of silently
+		// treating a truncated file as a valid artifact.
+		os.Remove(dest)
+		return fmt.Errorf("close downloaded file %s: %w", dest, err)
+	}
+	return nil
 }
 
 // =============================================================================
