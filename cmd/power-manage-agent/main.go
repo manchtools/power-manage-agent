@@ -1350,7 +1350,16 @@ func runLuksSetPassphrase(token, dataDir string) {
 //  4. Calls SyncActions (proves unary RPC works)
 //
 // Does NOT start the scheduler, open the enrollment socket, execute actions,
-// or modify any state. Read-only connectivity check.
+// or modify any local state. Read-only connectivity check.
+//
+// Session-conflict caveat: the self-test connects with the same device identity
+// as the live agent, and the gateway's connection manager closes any existing
+// stream on re-register (see server internal/connection/manager.go Register).
+// Consequence: the live agent briefly disconnects during the self-test and
+// reconnects when the subprocess exits — typically 3-5 seconds of offline
+// time. This is an accepted tradeoff; removing it would require either an
+// ephemeral self-test identity (signed by the CA on demand) or a dedicated
+// server endpoint that bypasses the registry.
 func runSelfTest(args []string) int {
 	fs := flag.NewFlagSet("self-test", flag.ExitOnError)
 	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Agent data directory")
