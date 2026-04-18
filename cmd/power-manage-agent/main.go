@@ -119,6 +119,10 @@ func main() {
 		case "enroll":
 			runEnroll(os.Args[2:])
 			return
+		case "self-test":
+			os.Exit(runSelfTest(os.Args[2:]))
+		case "tty":
+			os.Exit(runTTY(os.Args[2:]))
 		}
 	}
 
@@ -129,9 +133,8 @@ func main() {
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
-	// Check for completed/rolled-back update FIRST — before any other startup
-	// logic. If the new binary is broken, restore from backup immediately.
-	executor.CheckStartupUpdateState(cfg.DataDir, "/usr/local/bin/power-manage-agent", version, logger)
+	// Clean up stale update state from a previous cycle (if any).
+	executor.CheckStartupUpdateState(cfg.DataDir, logger)
 
 	// Get hostname
 	hostname, err := os.Hostname()
@@ -257,7 +260,7 @@ func main() {
 	syncTrigger := make(chan struct{}, 1)
 
 	// Create handler with scheduler integration
-	h := handler.NewHandler(logger, exec, sched, syncTrigger)
+	h := handler.NewHandler(logger, exec, sched, actionStore, syncTrigger)
 
 	// Enable action-based agent self-update.
 	exec.SetUpdateConfig(&executor.AgentUpdateConfig{
@@ -1334,6 +1337,206 @@ func runLuksSetPassphrase(token, dataDir string) {
 	agentStore.AddLuksPassphraseHash(result.ActionID, sysluks.HashPassphrase(passphrase))
 
 	fmt.Println("LUKS passphrase set successfully.")
+}
+
+// runSelfTest runs a minimal connectivity probe to validate that this binary
+// can function as the agent. Called by the old binary during self-update to
+// verify the new binary before swapping it in. Exits 0 on success, 1 on failure.
+//
+// The probe:
+//  1. Loads credentials from the data directory
+//  2. Establishes an mTLS connection to the gateway
+//  3. Sends Hello, waits for Welcome (proves bidirectional stream)
+//  4. Calls SyncActions (proves unary RPC works)
+//
+// Does NOT start the scheduler, open the enrollment socket, execute actions,
+// or modify any local state. Read-only connectivity check.
+//
+// Session-conflict caveat: the self-test connects with the same device identity
+// as the live agent, and the gateway's connection manager closes any existing
+// stream on re-register (see server internal/connection/manager.go Register).
+// Consequence: the live agent briefly disconnects during the self-test and
+// reconnects when the subprocess exits — typically 3-5 seconds of offline
+// time. This is an accepted tradeoff; removing it would require either an
+// ephemeral self-test identity (signed by the CA on demand) or a dedicated
+// server endpoint that bypasses the registry.
+func runSelfTest(args []string) int {
+	fs := flag.NewFlagSet("self-test", flag.ExitOnError)
+	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Agent data directory")
+	timeout := fs.Duration("timeout", 60*time.Second, "Self-test timeout")
+	fs.Parse(args)
+
+	logger := logging.SetupLogger("info", "text", os.Stderr)
+
+	ctx, cancel := context.WithTimeout(context.Background(), *timeout)
+	defer cancel()
+
+	// Step 1: Load credentials
+	credStore := credentials.NewStore(*dataDir)
+	if !credStore.Exists() {
+		logger.Error("self-test: no credentials found", "data_dir", *dataDir)
+		return 1
+	}
+	creds, err := credStore.Load()
+	if err != nil {
+		logger.Error("self-test: failed to load credentials", "error", err)
+		return 1
+	}
+	logger.Info("self-test: credentials loaded", "device_id", creds.DeviceID)
+
+	// Step 2: Create mTLS client
+	var client *sdk.Client
+	if strings.HasPrefix(creds.GatewayAddr, "http://") {
+		client = sdk.NewClient(creds.GatewayAddr,
+			sdk.WithH2C(),
+			sdk.WithAuth(creds.DeviceID, ""),
+		)
+	} else {
+		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+		if err != nil {
+			logger.Error("self-test: failed to configure mTLS", "error", err)
+			return 1
+		}
+		client = sdk.NewClient(creds.GatewayAddr,
+			mtlsOpt,
+			sdk.WithAuth(creds.DeviceID, ""),
+		)
+	}
+
+	// Step 3: Connect and send Hello, wait for Welcome
+	if err := client.Connect(ctx); err != nil {
+		logger.Error("self-test: failed to connect to gateway", "error", err)
+		return 1
+	}
+	defer client.Close()
+
+	hostname, _ := os.Hostname()
+	if err := client.SendHello(ctx, hostname, version); err != nil {
+		logger.Error("self-test: failed to send hello", "error", err)
+		return 1
+	}
+
+	// Wait for Welcome message (proves bidirectional stream works)
+	msg, err := client.Receive(ctx)
+	if err != nil {
+		logger.Error("self-test: failed to receive welcome", "error", err)
+		return 1
+	}
+	if msg.GetWelcome() == nil {
+		logger.Error("self-test: expected welcome message, got something else")
+		return 1
+	}
+	logger.Info("self-test: stream connected, welcome received",
+		"server_version", msg.GetWelcome().ServerVersion)
+
+	// Step 4: Call SyncActions (proves unary RPC path works)
+	_, err = client.SyncActions(ctx)
+	if err != nil {
+		logger.Error("self-test: sync actions failed", "error", err)
+		return 1
+	}
+	logger.Info("self-test: sync actions succeeded")
+
+	logger.Info("self-test: all checks passed")
+	return 0
+}
+
+// runTTY manages the device-local TTY enable/disable toggle.
+// Usage:
+//
+//	power-manage-agent tty enable
+//	power-manage-agent tty disable
+//	power-manage-agent tty status
+//
+// The toggle is stored in the agent's SQLite database. The CLI must be
+// run as the power-manage user (the owner of the agent's data dir) or
+// as root via sudo — a regular user cannot escalate into the toggle
+// without first escalating to one of those identities.
+func runTTY(args []string) int {
+	fs := flag.NewFlagSet("tty", flag.ExitOnError)
+	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Agent data directory")
+
+	if len(args) == 0 {
+		printTTYUsage()
+		return 1
+	}
+
+	sub := args[0]
+	if err := fs.Parse(args[1:]); err != nil {
+		return 1
+	}
+
+	switch sub {
+	case "-h", "--help", "help":
+		printTTYUsage()
+		return 0
+	case "enable", "disable", "status":
+		// handled below
+	default:
+		fmt.Fprintf(os.Stderr, "unknown tty subcommand: %s\n", sub)
+		printTTYUsage()
+		return 1
+	}
+
+	// Device-authoritative guard for mutating subcommands. `enable`/`disable`
+	// must be invoked by a human with root privileges attached to a real
+	// terminal. Without this gate the server could flip the flag remotely
+	// by dispatching `ACTION_TYPE_SHELL { script: "power-manage-agent tty enable" }` —
+	// that shell runs as the power-manage user which owns the SQLite DB,
+	// so it would otherwise succeed. Status stays readable without a
+	// terminal so operators can `if power-manage-agent tty status` in
+	// shell scripts.
+	if sub == "enable" || sub == "disable" {
+		if os.Geteuid() != 0 {
+			fmt.Fprintf(os.Stderr, "Error: tty %s must be run as root (try: sudo power-manage-agent tty %s)\n", sub, sub)
+			return 1
+		}
+		if !term.IsTerminal(int(os.Stdin.Fd())) {
+			fmt.Fprintf(os.Stderr, "Error: tty %s must be run interactively from a local terminal\n", sub)
+			return 1
+		}
+	}
+
+	st, err := store.New(*dataDir)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: open agent store: %v\n", err)
+		return 1
+	}
+	defer st.Close()
+
+	switch sub {
+	case "enable":
+		if err := st.SetTTYEnabled(true); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Println("TTY enabled.")
+		return 0
+	case "disable":
+		if err := st.SetTTYEnabled(false); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		fmt.Println("TTY disabled.")
+		return 0
+	case "status":
+		enabled, err := st.IsTTYEnabled()
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			return 1
+		}
+		if enabled {
+			fmt.Println("enabled")
+			return 0
+		}
+		fmt.Println("disabled")
+		return 1
+	}
+	return 1
+}
+
+func printTTYUsage() {
+	fmt.Fprintln(os.Stderr, "usage: power-manage-agent tty {enable|disable|status} [--data-dir=PATH]")
 }
 
 // runEnroll handles the "enroll" subcommand.

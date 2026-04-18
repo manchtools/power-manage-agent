@@ -2,13 +2,11 @@ package executor
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"math/big"
 	"strings"
 	"time"
 
@@ -17,11 +15,6 @@ import (
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
-)
-
-const (
-	alphanumericChars = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-	complexChars      = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789!@#$%^&*()-_=+[]{}|;:,.<>?"
 )
 
 // lpsRotationEntry is the JSON structure reported in action result metadata.
@@ -68,10 +61,16 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		userStates = make(map[string]*store.LpsUserState)
 	}
 
-	charset := alphanumericChars
-	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
-		charset = complexChars
+	// Map the complexity enum to the SDK's boolean flag. COMPLEX enables
+	// special characters; ALPHANUMERIC uses letters and digits only.
+	// UNSPECIFIED falls back to ALPHANUMERIC for compatibility with older
+	// server versions that didn't set the field — logged so operators can
+	// spot misconfigured policies.
+	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_UNSPECIFIED {
+		e.logger.Warn("LPS policy has no complexity set, defaulting to alphanumeric",
+			"action_id", actionID)
 	}
+	complex := params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX
 
 	var rotations []lpsRotationEntry
 	var rotatedUsers []string
@@ -95,8 +94,23 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			continue
 		}
 
-		// Generate new password
-		password, err := generatePassword(int(params.PasswordLength), charset)
+		// Generate new password. Clamp the length to the SDK's accepted
+		// range so out-of-bounds proto values don't fail the rotation.
+		requested := int(params.PasswordLength)
+		length := requested
+		if length < sysuser.MinPasswordLength {
+			length = sysuser.MinPasswordLength
+		}
+		if length > sysuser.MaxPasswordLength {
+			length = sysuser.MaxPasswordLength
+		}
+		if length != requested {
+			e.logger.Warn("LPS password length clamped to SDK bounds",
+				"action_id", actionID, "username", username,
+				"requested", requested, "effective", length,
+				"min", sysuser.MinPasswordLength, "max", sysuser.MaxPasswordLength)
+		}
+		password, err := sysuser.GeneratePassword(length, complex)
 		if err != nil {
 			anyError = fmt.Errorf("generate password for %s: %w", username, err)
 			output.WriteString(fmt.Sprintf("LPS: %s — failed to generate password: %v\n", username, err))
@@ -104,9 +118,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Set the password
-		if err := sysuser.SetPassword(ctx, username, password); err != nil {
+		if result, err := sysuser.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
-			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v%s\n", username, err, stderrSuffix(result)))
 			continue
 		}
 
@@ -239,29 +253,6 @@ func killUserSessions(ctx context.Context, username string) {
 	runSudoCmd(ctx, "pkill", "-KILL", "-u", username)
 	// Brief wait for processes to fully exit
 	time.Sleep(500 * time.Millisecond)
-}
-
-// generatePassword creates a cryptographically random password from the given character set.
-func generatePassword(length int, charset string) (string, error) {
-	if length < 8 {
-		length = 8
-	}
-	if length > 128 {
-		length = 128
-	}
-
-	result := make([]byte, length)
-	charsetLen := big.NewInt(int64(len(charset)))
-
-	for i := range result {
-		idx, err := rand.Int(rand.Reader, charsetLen)
-		if err != nil {
-			return "", fmt.Errorf("crypto/rand: %w", err)
-		}
-		result[i] = charset[idx.Int64()]
-	}
-
-	return string(result), nil
 }
 
 // getLastAuthTime returns the most recent login time for a user by parsing `last -1 -F <username>`.

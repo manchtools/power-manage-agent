@@ -2,12 +2,15 @@
 package setup
 
 import (
+	"context"
 	_ "embed"
 	"fmt"
 	"os"
-	"os/exec"
 	"regexp"
 	"text/template"
+	"time"
+
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
 
 // validUsername matches safe Unix usernames (lowercase, digits, underscore, dash).
@@ -60,9 +63,17 @@ func InstallSudoers(user string) error {
 		return fmt.Errorf("close temp sudoers file: %w", err)
 	}
 
+	// Short deadline on these: visudo/chown are millisecond-scale but
+	// should never hang if something is wrong with the host.
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+
 	// Validate syntax with visudo
-	if err := exec.Command("visudo", "-c", "-f", tmpFile).Run(); err != nil {
+	if result, err := sysexec.Run(ctx, "visudo", "-c", "-f", tmpFile); err != nil {
 		os.Remove(tmpFile)
+		if result != nil && result.Stderr != "" {
+			return fmt.Errorf("sudoers validation failed: %w: %s", err, result.Stderr)
+		}
 		return fmt.Errorf("sudoers validation failed: %w", err)
 	}
 
@@ -73,7 +84,10 @@ func InstallSudoers(user string) error {
 	}
 
 	// Ensure correct ownership
-	if err := exec.Command("chown", "root:root", dest).Run(); err != nil {
+	if result, err := sysexec.Run(ctx, "chown", "root:root", dest); err != nil {
+		if result != nil && result.Stderr != "" {
+			return fmt.Errorf("set sudoers ownership: %w: %s", err, result.Stderr)
+		}
 		return fmt.Errorf("set sudoers ownership: %w", err)
 	}
 

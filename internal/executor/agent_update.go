@@ -11,7 +11,6 @@ import (
 	"net/http"
 	"net/url"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -19,12 +18,13 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
 type AgentUpdateConfig struct {
 	Version    string       // Current running agent version
-	DataDir    string       // Data directory for state/cooldown files
+	DataDir    string       // Data directory for update staging
 	BinaryPath string       // Path to the installed agent binary (e.g., /usr/local/bin/power-manage-agent)
 	Shutdown   func()       // Called after a successful update to trigger graceful agent shutdown
 }
@@ -65,15 +65,21 @@ func markAgentUpdateExecuted() bool {
 //  4. Validate URLs are HTTPS
 //  5. Download checksum file, extract checksum for binary filename
 //  6. Download binary to temp file, verify SHA256
-//  7. Run ./agent.new version → extract version string
+//  7. Run ./agent-new version → extract version string
 //  8. Compare with running version → skip if same
-//  9. Backup current binary for rollback
+//  9. Run ./agent-new self-test → subprocess validates connectivity
+//     (credentials load, mTLS, stream, SyncActions). If it fails,
+//     the old binary stays untouched.
 //  10. Atomically swap binary (cp → chmod → mv)
-//  11. Write state.json with {"phase":"staged","version":"..."}
-//  12. Signal graceful shutdown (systemd restarts with new binary)
+//  11. Signal graceful shutdown (systemd restarts with new binary)
 //
-// On next startup, CheckStartupUpdateState verifies the update succeeded
-// (running version matches staged version). If not, it restores from backup.
+// Retry behavior: if the self-test fails, the update is reported as
+// EXECUTION_STATUS_FAILED and the old binary continues running. There is no
+// cooldown between retries — if the admin schedules AGENT_UPDATE to run
+// every 30 minutes and the target version is broken, the agent will
+// re-download and re-test it every 30 minutes until a fixed release is
+// published. This is an intentional trade-off: retry frequency is governed
+// entirely by the admin's schedule, the old binary is never replaced.
 func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdateParams) (*pb.CommandOutput, bool, error) {
 	cfg := e.updateCfg
 	if cfg == nil {
@@ -153,59 +159,58 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return &pb.CommandOutput{Stdout: fmt.Sprintf("Already at version %s", cfg.Version)}, false, nil
 	}
 
-	// Check cooldown for this specific version
-	if isCoolingDown(cfg.DataDir, newVersion) {
-		e.logger.Warn("version is in cooldown period, skipping", "version", newVersion)
-		return &pb.CommandOutput{Stdout: fmt.Sprintf("Version %s is in cooldown (recent failure), skipping", newVersion)}, false, nil
-	}
-
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
-	// Step 8: Backup current binary for rollback.
-	backupPath := cfg.BinaryPath + ".bak"
-	if _, err := runSudoCmd(ctx, "cp", cfg.BinaryPath, backupPath); err != nil {
-		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
-		return nil, false, fmt.Errorf("backup current binary: %w", err)
-	}
+	// Step 8: Run the new binary in self-test mode. This validates
+	// connectivity (mTLS, stream, SyncActions) WITHOUT replacing the
+	// live binary. If the self-test fails, the old binary continues
+	// running unchanged. See the function doc comment for retry semantics.
+	selfTestCtx, selfTestCancel := context.WithTimeout(ctx, 60*time.Second)
+	defer selfTestCancel()
 
-	// Step 9: Atomic staged install via sudo (target dir is root-owned).
-	// Copy to a sibling temp, chmod, then mv — the live binary is only
-	// replaced after the new one is fully written and executable.
+	e.logger.Info("running self-test on new binary", "path", tmpPath)
+	selfTestResult, selfTestErr := sysexec.Run(selfTestCtx, tmpPath, "self-test",
+		"--data-dir="+cfg.DataDir,
+		"--timeout=55s",
+	)
+	if selfTestErr != nil {
+		var combined string
+		if selfTestResult != nil {
+			combined = strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
+		}
+		e.logger.Error("self-test failed, keeping current binary",
+			"error", selfTestErr,
+			"output", combined)
+		out := &pb.CommandOutput{
+			Stdout: fmt.Sprintf("Self-test failed for version %s: %v", newVersion, selfTestErr),
+			Stderr: combined,
+		}
+		return out, false, fmt.Errorf("self-test failed: %w", selfTestErr)
+	}
+	e.logger.Info("self-test passed", "output", selfTestResult.Stdout)
+
+	// Step 9: Self-test passed — swap the binary. The old binary is
+	// still running in memory, so this is safe. Use atomic
+	// cp → chmod → mv so the live path is only updated after the
+	// new file is fully written and executable.
 	stagePath := cfg.BinaryPath + ".new"
 	if _, err := runSudoCmd(ctx, "cp", tmpPath, stagePath); err != nil {
-		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
 		return nil, false, fmt.Errorf("stage binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "+x", stagePath); err != nil {
 		runSudoCmd(ctx, "rm", "-f", stagePath)
-		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
 		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "mv", stagePath, cfg.BinaryPath); err != nil {
 		runSudoCmd(ctx, "rm", "-f", stagePath)
-		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 
-	// Step 10: Write state.json with version for startup verification.
-	// This must succeed before shutdown — otherwise the new binary starts
-	// without a state marker and may trigger a false rollback.
-	if err := writeUpdateState(cfg.DataDir, "staged", newVersion); err != nil {
-		e.logger.Error("failed to write update state, rolling back binary", "error", err)
-		if _, mvErr := runSudoCmd(ctx, "mv", backupPath, cfg.BinaryPath); mvErr != nil {
-			e.logger.Error("rollback failed, system may be in inconsistent state", "error", mvErr)
-		}
-		writeCooldown(cfg.DataDir, newVersion, 1*time.Hour)
-		return nil, false, fmt.Errorf("write update state: %w", err)
-	}
-
-	// Step 11: Signal graceful shutdown — systemd restarts with new binary
+	// Step 10: Signal graceful shutdown — systemd restarts with new binary
 	stdout := fmt.Sprintf("Updated from %s to %s. Restarting.", cfg.Version, newVersion)
 	e.logger.Info(stdout)
 
 	// Delay shutdown to allow the result to be recorded and sent to the server.
-	// The scheduler checks ctx.Err() after Execute returns — if we cancel
-	// immediately, the result is dropped.
 	if cfg.Shutdown != nil {
 		go func() {
 			time.Sleep(3 * time.Second)
@@ -344,11 +349,13 @@ func downloadToFile(ctx context.Context, client *http.Client, downloadURL string
 
 // getBinaryVersion runs the binary with "version" subcommand and returns the trimmed output.
 func getBinaryVersion(binaryPath string) (string, error) {
-	out, err := exec.Command(binaryPath, "version").Output()
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	result, err := sysexec.Run(ctx, binaryPath, "version")
 	if err != nil {
 		return "", fmt.Errorf("run %s version: %w", binaryPath, err)
 	}
-	v := strings.TrimSpace(string(out))
+	v := strings.TrimSpace(result.Stdout)
 	if v == "" {
 		return "", fmt.Errorf("binary returned empty version")
 	}
@@ -410,119 +417,26 @@ func clearUpdateState(dataDir string) {
 	os.Remove(filepath.Join(dataDir, "update", "state.json"))
 }
 
-// writeCooldown writes a cooldown entry for a failed version.
-func writeCooldown(dataDir, version string, duration time.Duration) error {
-	dir := filepath.Join(dataDir, "update")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
 
-	data := fmt.Sprintf(`{"version":%q,"until":%q}`, version, time.Now().Add(duration).Format(time.RFC3339))
-
-	tmp, err := os.CreateTemp(dir, ".cooldown-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-
-	if _, err := tmp.WriteString(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	tmp.Close()
-
-	return os.Rename(tmpPath, filepath.Join(dir, "cooldown.json"))
-}
-
-// isCoolingDown checks if a version is in cooldown (recent failure).
-func isCoolingDown(dataDir, version string) bool {
-	data, err := os.ReadFile(filepath.Join(dataDir, "update", "cooldown.json"))
-	if err != nil {
-		return false
-	}
-
-	type cooldown struct {
-		Version string `json:"version"`
-		Until   string `json:"until"`
-	}
-	var c cooldown
-	if err := json.Unmarshal(data, &c); err != nil {
-		return true // corrupted → be conservative
-	}
-
-	if c.Version != version {
-		return false
-	}
-
-	until, err := time.Parse(time.RFC3339, c.Until)
-	if err != nil {
-		return true
-	}
-
-	return time.Now().Before(until)
-}
-
-// CheckStartupUpdateState checks for a completed or rolled-back update from a previous cycle.
-// If state is "staged" but the running version doesn't match, the update failed —
-// restore from backup and write cooldown to prevent retry loops.
+// CheckStartupUpdateState cleans up stale update state from a previous cycle.
+// With the self-test approach, updates are validated before swapping the binary,
+// so there is no rollback logic needed at startup. This function only cleans up
+// state files left behind by interrupted updates.
 //
 // Parameters:
 //   - dataDir: agent data directory containing update/state.json
-//   - binaryPath: path to the installed agent binary (for rollback)
-//   - runningVersion: the current binary's version string
 //   - logger: structured logger
-func CheckStartupUpdateState(dataDir, binaryPath, runningVersion string, logger interface {
+func CheckStartupUpdateState(dataDir string, logger interface {
 	Info(string, ...any)
 	Warn(string, ...any)
-	Error(string, ...any)
 }) {
-	ctx := context.Background()
-	backupPath := binaryPath + ".bak"
-
-	phase, stagedVersion, err := readUpdateState(dataDir)
+	phase, _, err := readUpdateState(dataDir)
 	if err != nil {
 		logger.Warn("failed to read update state", "error", err)
 		return
 	}
-	if phase == "" {
-		// No pending update — leave .bak alone (may be needed if state was
-		// lost due to crash before state file was written).
-		return
-	}
-
-	switch phase {
-	case "staged":
-		if runningVersion == stagedVersion {
-			// Running the new version — update succeeded.
-			logger.Info("agent update completed successfully", "version", stagedVersion)
-			// Clean up backup and state only after confirmed success.
-			clearUpdateState(dataDir)
-			runSudoCmd(ctx, "rm", "-f", backupPath)
-		} else {
-			// Running the old version — the new binary failed to start.
-			logger.Error("agent update failed — running version does not match staged version",
-				"running", runningVersion, "staged", stagedVersion)
-
-			if _, statErr := os.Stat(backupPath); statErr == nil {
-				logger.Warn("restoring previous binary from backup", "backup", backupPath)
-				if _, mvErr := runSudoCmd(ctx, "mv", backupPath, binaryPath); mvErr != nil {
-					logger.Error("failed to restore backup", "error", mvErr)
-				} else {
-					logger.Info("backup restored successfully")
-				}
-			} else {
-				logger.Error("no backup available for rollback", "backup", backupPath)
-			}
-
-			// Write cooldown so the agent doesn't immediately retry the bad version.
-			if err := writeCooldown(dataDir, stagedVersion, 1*time.Hour); err != nil {
-				logger.Warn("failed to write cooldown after failed update", "error", err)
-			}
-			clearUpdateState(dataDir)
-		}
-	default:
-		logger.Warn("stale update state found, cleaning up", "phase", phase)
+	if phase != "" {
+		logger.Info("cleaning up stale update state", "phase", phase)
 		clearUpdateState(dataDir)
 	}
 }

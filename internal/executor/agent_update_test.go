@@ -8,9 +8,10 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
-	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
@@ -156,45 +157,6 @@ func TestClearUpdateState(t *testing.T) {
 	}
 }
 
-func TestCooldown(t *testing.T) {
-	dir := t.TempDir()
-
-	// No cooldown file → not cooling down
-	if isCoolingDown(dir, "v1.0") {
-		t.Error("expected no cooldown initially")
-	}
-
-	// Write cooldown for v1.0
-	err := writeCooldown(dir, "v1.0", 1*time.Hour)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	// Same version → cooling down
-	if !isCoolingDown(dir, "v1.0") {
-		t.Error("expected v1.0 to be cooling down")
-	}
-
-	// Different version → not cooling down
-	if isCoolingDown(dir, "v2.0") {
-		t.Error("expected v2.0 to not be cooling down")
-	}
-}
-
-func TestCooldown_Expired(t *testing.T) {
-	dir := t.TempDir()
-
-	// Write cooldown that expired 1 second ago
-	err := writeCooldown(dir, "v1.0", -1*time.Second)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	if isCoolingDown(dir, "v1.0") {
-		t.Error("expected expired cooldown to not be active")
-	}
-}
-
 func TestMarkAgentUpdateExecuted(t *testing.T) {
 	// Reset first
 	ResetAgentUpdateCycle()
@@ -216,19 +178,12 @@ func TestMarkAgentUpdateExecuted(t *testing.T) {
 	}
 }
 
-func TestCheckStartupUpdateState_Success(t *testing.T) {
+func TestCheckStartupUpdateState_CleansStaleState(t *testing.T) {
 	dir := t.TempDir()
-	binDir := t.TempDir()
-	binaryPath := filepath.Join(binDir, "agent")
-	backupPath := binaryPath + ".bak"
-
-	os.WriteFile(binaryPath, []byte("new-binary"), 0755)
-	os.WriteFile(backupPath, []byte("old-binary"), 0755)
-
 	writeUpdateState(dir, "staged", "2026.04.01")
 
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
+	CheckStartupUpdateState(dir, logger)
 
 	// State should be cleared
 	phase, _, _ := readUpdateState(dir)
@@ -237,60 +192,19 @@ func TestCheckStartupUpdateState_Success(t *testing.T) {
 	}
 
 	if len(logger.infos) == 0 {
-		t.Error("expected at least one info log for successful update")
-	}
-}
-
-func TestCheckStartupUpdateState_FailedUpdate(t *testing.T) {
-	dir := t.TempDir()
-	binDir := t.TempDir()
-	binaryPath := filepath.Join(binDir, "agent")
-	backupPath := binaryPath + ".bak"
-
-	os.WriteFile(binaryPath, []byte("broken-binary"), 0755)
-	os.WriteFile(backupPath, []byte("good-binary"), 0755)
-
-	writeUpdateState(dir, "staged", "2026.04.02")
-
-	logger := &testLogger{}
-	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
-
-	// State should be cleared
-	phase, _, _ := readUpdateState(dir)
-	if phase != "" {
-		t.Errorf("expected state to be cleared, got phase=%q", phase)
-	}
-
-	if len(logger.errors) == 0 {
-		t.Error("expected error log for failed update")
-	}
-
-	// Should have written cooldown for the failed version
-	if !isCoolingDown(dir, "2026.04.02") {
-		t.Error("expected cooldown for failed version")
+		t.Error("expected info log for stale state cleanup")
 	}
 }
 
 func TestCheckStartupUpdateState_NoState(t *testing.T) {
 	dir := t.TempDir()
-	binDir := t.TempDir()
-	binaryPath := filepath.Join(binDir, "agent")
-	backupPath := binaryPath + ".bak"
-
-	// Create a leftover backup — should NOT be deleted when there's no state
-	os.WriteFile(backupPath, []byte("backup"), 0755)
 
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, binaryPath, "2026.04.01", logger)
+	CheckStartupUpdateState(dir, logger)
 
 	// No logs expected
-	if len(logger.infos) > 0 || len(logger.warns) > 0 || len(logger.errors) > 0 {
+	if len(logger.infos) > 0 || len(logger.warns) > 0 {
 		t.Error("expected no logs for clean startup without state file")
-	}
-
-	// Backup must still exist — not prematurely deleted
-	if _, err := os.Stat(backupPath); os.IsNotExist(err) {
-		t.Error("backup should not be deleted when there's no state file")
 	}
 }
 
@@ -373,6 +287,38 @@ func TestExtractFilename(t *testing.T) {
 		if got != tt.want {
 			t.Errorf("extractFilename(%q) = %q, want %q", tt.url, got, tt.want)
 		}
+	}
+}
+
+func TestSelfTestScript_ExitCode(t *testing.T) {
+	// Test that a shell script returning exit 0 vs exit 1 is correctly detected.
+	// This validates the exec.CommandContext pattern used in executeAgentUpdate.
+	dir := t.TempDir()
+
+	// Create a "binary" that exits 0
+	successScript := filepath.Join(dir, "success")
+	os.WriteFile(successScript, []byte("#!/bin/sh\nexit 0\n"), 0755)
+
+	// Create a "binary" that exits 1
+	failScript := filepath.Join(dir, "fail")
+	os.WriteFile(failScript, []byte("#!/bin/sh\necho 'connection failed' >&2\nexit 1\n"), 0755)
+
+	ctx := context.Background()
+
+	// Success case
+	cmd := exec.CommandContext(ctx, successScript)
+	if err := cmd.Run(); err != nil {
+		t.Errorf("expected exit 0 script to succeed, got: %v", err)
+	}
+
+	// Failure case
+	cmd = exec.CommandContext(ctx, failScript)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		t.Error("expected exit 1 script to fail")
+	}
+	if !strings.Contains(string(out), "connection failed") {
+		t.Errorf("expected error output, got: %s", string(out))
 	}
 }
 

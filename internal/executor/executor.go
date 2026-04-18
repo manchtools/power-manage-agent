@@ -28,6 +28,7 @@ import (
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
+	sysreboot "github.com/manchtools/power-manage/sdk/go/sys/reboot"
 	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 	"github.com/manchtools/power-manage/sdk/go/verify"
@@ -155,19 +156,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	}
 
 	// Verify action signature before execution (skip for instant actions — they have no params to sign)
-	if e.verifier != nil && !isInstantAction(action.Type) {
+	if e.verifier != nil && !IsInstantAction(action.Type) {
 		actionID := getActionID(action)
-		verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature)
-		if verifyErr != nil {
-			// Shell scripts and sudo policies: hard reject unsigned/tampered actions
-			if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SUDO || action.Type == pb.ActionType_ACTION_TYPE_LPS {
-				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-				result.Error = fmt.Sprintf("refusing to execute unsigned/tampered shell script: %v", verifyErr)
-				result.CompletedAt = timestamppb.Now()
-				result.DurationMs = time.Since(start).Milliseconds()
-				return result
-			}
-			// All other types: also hard reject unsigned/tampered actions
+		if verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature); verifyErr != nil {
 			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
 			result.CompletedAt = timestamppb.Now()
@@ -1001,8 +992,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 			changed = true
 
 			// Reload systemd
-			if _, err := runSudoCmd(ctx, "systemctl", "daemon-reload"); err != nil {
-				return nil, changed, fmt.Errorf("daemon-reload failed")
+			if err := syssystemd.DaemonReload(ctx); err != nil {
+				return nil, changed, fmt.Errorf("daemon-reload failed: %w", err)
 			}
 			output.WriteString("reloaded systemd daemon\n")
 		}
@@ -1015,13 +1006,13 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		if e.isUnitMasked(params.UnitName) {
 			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
 		}
-		if _, err := runSudoCmd(ctx, "systemctl", "enable", params.UnitName); err != nil {
-			return nil, changed, fmt.Errorf("enable: %v", err)
+		if err := syssystemd.Enable(ctx, params.UnitName); err != nil {
+			return nil, changed, fmt.Errorf("enable: %w", err)
 		}
 		output.WriteString("enabled unit\n")
 		changed = true
 	} else if !params.Enable && isEnabled {
-		if _, err := runSudoCmd(ctx, "systemctl", "disable", params.UnitName); err != nil {
+		if err := syssystemd.Disable(ctx, params.UnitName); err != nil {
 			// Ignore errors for disable (unit might not exist)
 			output.WriteString("disable failed (unit may not exist)\n")
 		} else {
@@ -1035,8 +1026,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	switch params.DesiredState {
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STARTED:
 		if !isActive {
-			if _, err := runSudoCmd(ctx, "systemctl", "start", params.UnitName); err != nil {
-				return nil, changed, fmt.Errorf("start: %v", err)
+			if err := syssystemd.Start(ctx, params.UnitName); err != nil {
+				return nil, changed, fmt.Errorf("start: %w", err)
 			}
 			output.WriteString("started unit\n")
 			changed = true
@@ -1045,8 +1036,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STOPPED:
 		if isActive {
-			if _, err := runSudoCmd(ctx, "systemctl", "stop", params.UnitName); err != nil {
-				return nil, changed, fmt.Errorf("stop: %v", err)
+			if err := syssystemd.Stop(ctx, params.UnitName); err != nil {
+				return nil, changed, fmt.Errorf("stop: %w", err)
 			}
 			output.WriteString("stopped unit\n")
 			changed = true
@@ -1055,8 +1046,8 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		}
 	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_RESTARTED:
 		// Restart always runs (not idempotent by design)
-		if _, err := runSudoCmd(ctx, "systemctl", "restart", params.UnitName); err != nil {
-			return nil, changed, fmt.Errorf("restart: %v", err)
+		if err := syssystemd.Restart(ctx, params.UnitName); err != nil {
+			return nil, changed, fmt.Errorf("restart: %w", err)
 		}
 		output.WriteString("restarted unit\n")
 		changed = true
@@ -2807,29 +2798,19 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 	}
 }
 
-// isInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
-func isInstantAction(t pb.ActionType) bool {
-	return t == pb.ActionType_ACTION_TYPE_REBOOT || t == pb.ActionType_ACTION_TYPE_SYNC
-}
-
-// IsInstantAction is the exported version for use by the handler.
+// IsInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
 func IsInstantAction(t pb.ActionType) bool {
-	return isInstantAction(t)
+	return t == pb.ActionType_ACTION_TYPE_REBOOT || t == pb.ActionType_ACTION_TYPE_SYNC
 }
 
 // executeReboot schedules a system reboot in 5 minutes.
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
 	sysnotify.NotifyAll(ctx, "System Reboot", "This system will reboot in 5 minutes. Please save your work.")
 
-	output, err := runSudoCmd(ctx, "shutdown", "-r", "+5", "Power Manage: scheduled reboot")
-	if err != nil {
-		return output, fmt.Errorf("failed to schedule reboot: %w", err)
+	if err := sysreboot.Schedule(ctx, "+5", "Power Manage: scheduled reboot"); err != nil {
+		return nil, fmt.Errorf("failed to schedule reboot: %w", err)
 	}
-	if output == nil {
-		output = &pb.CommandOutput{}
-	}
-	output.Stdout = "Reboot scheduled in 5 minutes\n" + output.Stdout
-	return output, nil
+	return &pb.CommandOutput{Stdout: "Reboot scheduled in 5 minutes\n"}, nil
 }
 
 // executeUser manages user accounts (create, update, disable, remove).
@@ -2876,6 +2857,21 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 
 // createOrUpdateUser creates a new user or updates an existing one.
 // Returns the command output, whether changes were made, metadata, and any error.
+// homeGroupFor returns the group name/id to use when repairing home
+// directory ownership for a user. Preference order mirrors the group
+// selection used at user creation time: explicit numeric GID (accepted
+// by `chown` as a number), named primary group, else fall back to the
+// username (matches the default "useradd creates matching group" case).
+func homeGroupFor(params *pb.UserParams) string {
+	if params.Gid > 0 {
+		return fmt.Sprintf("%d", params.Gid)
+	}
+	if params.PrimaryGroup != "" {
+		return params.PrimaryGroup
+	}
+	return params.Username
+}
+
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists := userExists(params.Username)
@@ -2964,14 +2960,11 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-c", params.Comment)
 	}
 
-	// Add username as last argument
-	args = append(args, params.Username)
-
-	// Create the user
-	cmdOutput, err := runSudoCmd(ctx, "useradd", args...)
+	// Create the user via SDK
+	result, err := sysuser.Create(ctx, params.Username, args...)
 	if err != nil {
-		if cmdOutput != nil {
-			output.WriteString(cmdOutput.Stderr)
+		if result != nil {
+			output.WriteString(result.Stderr)
 		}
 		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, nil, fmt.Errorf("failed to create user: %w", err)
 	}
@@ -2979,10 +2972,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// If home directory already existed, fix ownership
 	if homeExists && createHome {
-		if chownOutput, chownErr := runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir); chownErr != nil {
+		if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
-			if chownOutput != nil {
-				output.WriteString(chownOutput.Stderr)
+			if chownResult != nil {
+				output.WriteString(chownResult.Stderr)
 			}
 		} else {
 			output.WriteString(fmt.Sprintf("fixed ownership of existing home directory: %s\n", homeDir))
@@ -2996,15 +2989,15 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
 		} else {
-			// Set password using chpasswd
-			if chpasswdOutput, chpasswdErr := runSudoCmdWithStdin(ctx, strings.NewReader(fmt.Sprintf("%s:%s", params.Username, tempPassword)), "chpasswd"); chpasswdErr != nil {
+			// Set password
+			if chpasswdResult, chpasswdErr := sysuser.SetPassword(ctx, params.Username, tempPassword); chpasswdErr != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to set temporary password: %v\n", chpasswdErr))
-				if chpasswdOutput != nil {
-					output.WriteString(chpasswdOutput.Stderr)
+				if chpasswdResult != nil {
+					output.WriteString(chpasswdResult.Stderr)
 				}
 			} else {
 				// Force password change on first login
-				if _, chageErr := runSudoCmd(ctx, "chage", "-d", "0", params.Username); chageErr != nil {
+				if _, chageErr := sysuser.ExpirePassword(ctx, params.Username); chageErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
 				}
 				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
@@ -3035,10 +3028,10 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// Handle disabled state (lock the account)
 	if params.Disabled {
-		if lockOutput, lockErr := runSudoCmd(ctx, "usermod", "-L", params.Username); lockErr != nil {
+		if lockResult, lockErr := sysuser.Lock(ctx, params.Username); lockErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
-			if lockOutput != nil {
-				output.WriteString(lockOutput.Stderr)
+			if lockResult != nil {
+				output.WriteString(lockResult.Stderr)
 			}
 		} else {
 			output.WriteString("account locked (disabled)\n")
@@ -3106,11 +3099,10 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 
 	// Apply usermod if we have changes
 	if len(args) > 0 {
-		args = append(args, params.Username)
-		cmdOutput, err := runSudoCmd(ctx, "usermod", args...)
+		result, err := sysuser.Modify(ctx, params.Username, args...)
 		if err != nil {
-			if cmdOutput != nil {
-				output.WriteString(cmdOutput.Stderr)
+			if result != nil {
+				output.WriteString(result.Stderr)
 			}
 			return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, false, fmt.Errorf("failed to update user: %w", err)
 		}
@@ -3135,7 +3127,12 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
 			} else {
 				runSudoCmd(ctx, "cp", "-a", "/etc/skel/.", homeDir)
-				runSudoCmd(ctx, "chown", "-R", params.Username+":"+params.Username, homeDir)
+				if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
+					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
+					if chownResult != nil {
+						output.WriteString(chownResult.Stderr)
+					}
+				}
 				runSudoCmd(ctx, "chmod", "0700", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
 				changed = true
@@ -3147,20 +3144,20 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	desiredLocked := params.Disabled
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
-			if lockOutput, err := runSudoCmd(ctx, "usermod", "-L", params.Username); err != nil {
+			if lockResult, err := sysuser.Lock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
-				if lockOutput != nil {
-					output.WriteString(lockOutput.Stderr)
+				if lockResult != nil {
+					output.WriteString(lockResult.Stderr)
 				}
 			} else {
 				output.WriteString("account locked (disabled)\n")
 				changed = true
 			}
 		} else {
-			if unlockOutput, err := runSudoCmd(ctx, "usermod", "-U", params.Username); err != nil {
+			if unlockResult, err := sysuser.Unlock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to unlock user: %v\n", err))
-				if unlockOutput != nil {
-					output.WriteString(unlockOutput.Stderr)
+				if unlockResult != nil {
+					output.WriteString(unlockResult.Stderr)
 				}
 			} else {
 				output.WriteString("account unlocked\n")
@@ -3216,18 +3213,18 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	removeAccountsServiceFile(ctx, username)
 
 	// Remove user and their home directory
-	output, err := runSudoCmd(ctx, "userdel", "-r", username)
+	result, err := sysuser.Delete(ctx, username, true)
 	if err != nil {
 		// If home directory doesn't exist, userdel -r may still succeed
 		// but report an error. Check if user is actually removed.
-		if !userExists(username) {
+		if !sysuser.Exists(username) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("removed user: %s (home directory may not have existed)\n", username),
 			}, true, nil
 		}
-		if output != nil {
-			return &pb.CommandOutput{ExitCode: 1, Stderr: output.Stderr}, false, fmt.Errorf("failed to remove user: %w", err)
+		if result != nil {
+			return &pb.CommandOutput{ExitCode: 1, Stderr: result.Stderr}, false, fmt.Errorf("failed to remove user: %w", err)
 		}
 		return nil, false, fmt.Errorf("failed to remove user: %w", err)
 	}
@@ -3330,8 +3327,12 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
-	// Set ownership and permissions on .ssh directory
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+	// Set ownership and permissions on .ssh directory. Use the configured
+	// primary group (same preference order as home-directory repair) so
+	// users created with Gid / PrimaryGroup don't end up with the wrong
+	// group on .ssh and fail authorized_keys writes.
+	ownership := params.Username + ":" + homeGroupFor(params)
+	if _, err := runSudoCmd(ctx, "chown", ownership, sshDir); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
@@ -3344,7 +3345,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	}
 
 	// Set ownership and permissions on authorized_keys
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
+	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {

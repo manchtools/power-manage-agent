@@ -12,7 +12,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strings"
 	"sync"
 	"time"
 
@@ -94,75 +93,7 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	store := &Store{db: db}
-
-	// Migrate legacy LPS JSON files into SQLite (one-time, idempotent).
-	store.migrateLpsJsonFiles(dataDir)
-
-	return store, nil
-}
-
-// migrateLpsJsonFiles imports legacy /var/lib/power-manage/lps/lps-*.json files
-// into the lps_state table and removes the files afterwards.
-func (s *Store) migrateLpsJsonFiles(dataDir string) {
-	lpsDir := filepath.Join(dataDir, "lps")
-	entries, err := os.ReadDir(lpsDir)
-	if err != nil {
-		return // directory doesn't exist — nothing to migrate
-	}
-
-	type legacyUserState struct {
-		LastRotatedAt time.Time `json:"last_rotated_at"`
-		PasswordHash  string    `json:"password_hash"`
-	}
-	type legacyState struct {
-		Users map[string]legacyUserState `json:"users"`
-	}
-
-	migrated := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasPrefix(name, "lps-") || !strings.HasSuffix(name, ".json") {
-			continue
-		}
-
-		actionID := strings.ToUpper(strings.TrimSuffix(strings.TrimPrefix(name, "lps-"), ".json"))
-		filePath := filepath.Join(lpsDir, name)
-
-		data, err := os.ReadFile(filePath)
-		if err != nil {
-			slog.Warn("migration: failed to read LPS JSON file", "path", filePath, "error", err)
-			continue
-		}
-
-		var state legacyState
-		if err := json.Unmarshal(data, &state); err != nil {
-			slog.Warn("migration: failed to parse LPS JSON file", "path", filePath, "error", err)
-			continue
-		}
-
-		for username, us := range state.Users {
-			_, err := s.db.Exec(`
-				INSERT OR IGNORE INTO lps_state (action_id, username, last_rotated_at, password_hash)
-				VALUES (?, ?, ?, ?)
-			`, actionID, username, us.LastRotatedAt.UTC().Format(time.RFC3339), us.PasswordHash)
-			if err != nil {
-				slog.Warn("migration: failed to insert LPS state", "action_id", actionID, "username", username, "error", err)
-			}
-		}
-
-		if err := os.Remove(filePath); err != nil {
-			slog.Warn("migration: failed to remove LPS JSON file", "path", filePath, "error", err)
-		} else {
-			migrated++
-		}
-	}
-
-	if migrated > 0 {
-		slog.Info("migration: migrated LPS state from JSON files to SQLite", "count", migrated)
-		// Remove empty lps directory
-		os.Remove(lpsDir)
-	}
+	return &Store{db: db}, nil
 }
 
 // Close closes the database connection.
@@ -884,5 +815,43 @@ func (s *Store) DeleteLpsState(actionID string) error {
 	defer s.mu.Unlock()
 
 	_, err := s.db.Exec("DELETE FROM lps_state WHERE action_id = ?", actionID)
+	return err
+}
+
+// =============================================================================
+// Settings
+// =============================================================================
+
+// GetSetting returns the value of a setting, or empty string if unset.
+func (s *Store) GetSetting(key string) (string, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var value string
+	err := s.db.QueryRow("SELECT value FROM settings WHERE key = ?", key).Scan(&value)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", nil
+	}
+	return value, err
+}
+
+// SetSetting stores a setting, overwriting any existing value for the key.
+func (s *Store) SetSetting(key, value string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec(`
+		INSERT INTO settings (key, value) VALUES (?, ?)
+		ON CONFLICT(key) DO UPDATE SET value = excluded.value
+	`, key, value)
+	return err
+}
+
+// DeleteSetting removes a setting.
+func (s *Store) DeleteSetting(key string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	_, err := s.db.Exec("DELETE FROM settings WHERE key = ?", key)
 	return err
 }
