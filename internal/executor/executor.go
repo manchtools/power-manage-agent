@@ -3327,8 +3327,12 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
-	// Set ownership and permissions on .ssh directory
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, sshDir); err != nil {
+	// Set ownership and permissions on .ssh directory. Use the configured
+	// primary group (same preference order as home-directory repair) so
+	// users created with Gid / PrimaryGroup don't end up with the wrong
+	// group on .ssh and fail authorized_keys writes.
+	ownership := params.Username + ":" + homeGroupFor(params)
+	if _, err := runSudoCmd(ctx, "chown", ownership, sshDir); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
@@ -3341,7 +3345,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	}
 
 	// Set ownership and permissions on authorized_keys
-	if _, err := runSudoCmd(ctx, "chown", params.Username+":"+params.Username, authKeysFile); err != nil {
+	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
