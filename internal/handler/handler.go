@@ -4,7 +4,6 @@ package handler
 import (
 	"context"
 	"log/slog"
-	"os/exec"
 	"strconv"
 	"strings"
 	"sync"
@@ -17,6 +16,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	"github.com/manchtools/power-manage/sdk/go/sys/inventory"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
@@ -347,9 +347,14 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		args = append(args, "-k")
 	}
 
-	out, err := exec.CommandContext(ctx, "journalctl", args...).CombinedOutput()
+	result, err := sysexec.Run(ctx, "journalctl", args...)
 	if err != nil {
-		errMsg := strings.TrimSpace(string(out))
+		// journalctl's human-readable failure message is on stderr;
+		// surface that to the caller rather than the bare Go error.
+		errMsg := ""
+		if result != nil {
+			errMsg = strings.TrimSpace(result.Stderr)
+		}
 		if errMsg == "" {
 			errMsg = err.Error()
 		}
@@ -361,7 +366,7 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		}, nil
 	}
 
-	logs := string(out)
+	logs := result.Stdout
 	// Truncate to 1MB if needed (keep the tail)
 	if len(logs) > 1<<20 {
 		logs = logs[len(logs)-(1<<20):]
