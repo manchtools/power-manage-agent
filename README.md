@@ -654,6 +654,42 @@ sudo systemctl enable power-manage-agent
 
 ## Development
 
+### SDK versioning
+
+The agent pins a specific SDK tag via `go.mod`'s replace directive:
+
+```
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.1.0
+```
+
+The replace maps the monorepo-style import path (`github.com/manchtools/power-manage/sdk`) to the actual polyrepo URL (`github.com/manchtools/power-manage-sdk`). `go build` fetches the exact tagged version from GitHub — SDK `main` can move freely without breaking agent builds. When the agent is ready to consume a newer SDK:
+
+```bash
+cd agent
+go get github.com/manchtools/power-manage-sdk@v0.2.0   # or any tag / commit SHA
+go mod tidy
+```
+
+The SDK is still pre-v1.0.0, so minor bumps (`v0.1.0` → `v0.2.0`) may carry breaking API changes. Expect each bump PR to carry the matching migration in the same commit.
+
+### Working on SDK + agent together
+
+For cross-cutting changes, point the agent at a local SDK checkout via a `go.work` at the workspace root (the directory that contains both `agent/` and `sdk/` checkouts). `go.work` overrides any `replace` directive and fetched module versions.
+
+```bash
+# At the workspace root (NOT committed — each dev manages their own):
+cat > go.work <<'EOF'
+go 1.25
+
+use (
+    ./sdk
+    ./agent
+)
+EOF
+```
+
+Remove it, or rename it to `go.work.off`, when you want `go build` back to using the pinned SDK.
+
 ### Building
 
 ```bash
