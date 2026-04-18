@@ -5,7 +5,7 @@ go 1.25
 require (
 	connectrpc.com/connect v1.18.1
 	github.com/go-playground/validator/v10 v10.30.1
-	github.com/manchtools/power-manage/sdk v0.0.0
+	github.com/manchtools/power-manage/sdk v0.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
@@ -14,6 +14,14 @@ require (
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.44.3
 )
+
+// The SDK import path differs from the actual GitHub repo URL
+// (monorepo-style import path, polyrepo actual layout). Map it here
+// so every `go build` uses a specific, pinned SDK commit rather than
+// whatever happens to be in a local ../sdk checkout. Developers who
+// want to iterate against a local SDK override this with a per-dev
+// go.work at their workspace root — see agent/README.md for setup.
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.1.0
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
@@ -43,5 +51,3 @@ require (
 	modernc.org/mathutil v1.7.1 // indirect
 	modernc.org/memory v1.11.0 // indirect
 )
-
-replace github.com/manchtools/power-manage/sdk => ../sdk

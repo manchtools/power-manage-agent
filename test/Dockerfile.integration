@@ -28,12 +28,11 @@ RUN mkdir -p /run/sshd
 
 WORKDIR /workspace
 
-# Copy only the modules needed for agent tests (avoids server/, web/, .git)
-COPY sdk/ ./sdk/
+# Copy only the agent module; go.mod's replace directive points at a
+# pinned SDK pseudo-version fetched from GitHub at build time. Cross-
+# cutting SDK/agent development happens locally via a per-dev go.work
+# at the workspace root — see agent/README.md.
 COPY agent/ ./agent/
-
-# Create a trimmed go.work (excludes server which isn't needed for agent tests)
-RUN printf 'go 1.25\n\nuse (\n\t./sdk\n\t./agent\n)\n' > go.work
 
 # Pre-download dependencies and install gotestsum for clear failure reporting
 RUN cd agent && go mod download
