@@ -73,7 +73,7 @@ func TestShouldRevertOnUnassign(t *testing.T) {
 	revertible := []pb.ActionType{
 		pb.ActionType_ACTION_TYPE_SSH,
 		pb.ActionType_ACTION_TYPE_SSHD,
-		pb.ActionType_ACTION_TYPE_SUDO,
+		pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 		pb.ActionType_ACTION_TYPE_LPS,
 		pb.ActionType_ACTION_TYPE_USER,
 		pb.ActionType_ACTION_TYPE_GROUP,
@@ -88,7 +88,7 @@ func TestShouldRevertOnUnassign(t *testing.T) {
 		pb.ActionType_ACTION_TYPE_PACKAGE,
 		pb.ActionType_ACTION_TYPE_SHELL,
 		pb.ActionType_ACTION_TYPE_FILE,
-		pb.ActionType_ACTION_TYPE_SYSTEMD,
+		pb.ActionType_ACTION_TYPE_SERVICE,
 		pb.ActionType_ACTION_TYPE_APP_IMAGE,
 		pb.ActionType_ACTION_TYPE_FLATPAK,
 		pb.ActionType_ACTION_TYPE_REPOSITORY,
@@ -194,7 +194,7 @@ func TestRemoveAction_AllPolicyTypes(t *testing.T) {
 	}{
 		{"SSH", pb.ActionType_ACTION_TYPE_SSH},
 		{"SSHD", pb.ActionType_ACTION_TYPE_SSHD},
-		{"Sudo", pb.ActionType_ACTION_TYPE_SUDO},
+		{"Sudo", pb.ActionType_ACTION_TYPE_ADMIN_POLICY},
 		{"LPS", pb.ActionType_ACTION_TYPE_LPS},
 	}
 
@@ -235,7 +235,7 @@ func TestRemoveAction_OriginalNotMutated(t *testing.T) {
 	sched, mock := newTestScheduler(t)
 	ctx := context.Background()
 
-	action := makeTestAction("sudo-001", pb.ActionType_ACTION_TYPE_SUDO, pb.DesiredState_DESIRED_STATE_PRESENT)
+	action := makeTestAction("sudo-001", pb.ActionType_ACTION_TYPE_ADMIN_POLICY, pb.DesiredState_DESIRED_STATE_PRESENT)
 	if err := sched.AddAction(action); err != nil {
 		t.Fatal(err)
 	}
@@ -331,7 +331,7 @@ func TestSyncActions_MultiplePolicyActionsReverted(t *testing.T) {
 	actions := []*pb.Action{
 		makeTestAction("a-ssh", pb.ActionType_ACTION_TYPE_SSH, pb.DesiredState_DESIRED_STATE_PRESENT),
 		makeTestAction("a-sshd", pb.ActionType_ACTION_TYPE_SSHD, pb.DesiredState_DESIRED_STATE_PRESENT),
-		makeTestAction("a-sudo", pb.ActionType_ACTION_TYPE_SUDO, pb.DesiredState_DESIRED_STATE_PRESENT),
+		makeTestAction("a-sudo", pb.ActionType_ACTION_TYPE_ADMIN_POLICY, pb.DesiredState_DESIRED_STATE_PRESENT),
 		makeTestAction("a-lps", pb.ActionType_ACTION_TYPE_LPS, pb.DesiredState_DESIRED_STATE_PRESENT),
 		makeTestAction("a-pkg", pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT),
 	}
@@ -357,7 +357,7 @@ func TestSyncActions_MultiplePolicyActionsReverted(t *testing.T) {
 	expectedReverts := []pb.ActionType{
 		pb.ActionType_ACTION_TYPE_SSH,
 		pb.ActionType_ACTION_TYPE_SSHD,
-		pb.ActionType_ACTION_TYPE_SUDO,
+		pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 		pb.ActionType_ACTION_TYPE_LPS,
 	}
 	for _, at := range expectedReverts {
@@ -379,11 +379,11 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	// Assign a sudo action with parameters
 	sudoAction := &pb.Action{
 		Id:           &pb.ActionId{Value: "sudo-params"},
-		Type:         pb.ActionType_ACTION_TYPE_SUDO,
+		Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-		Params: &pb.Action_Sudo{
-			Sudo: &pb.SudoParams{
-				AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+		Params: &pb.Action_AdminPolicy{
+			AdminPolicy: &pb.AdminPolicyParams{
+				AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 				Users:       []string{"alice"},
 			},
 		},
@@ -411,10 +411,10 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	}
 
 	// Verify the reverted action preserves the original type and parameters
-	if revertCall.Type != pb.ActionType_ACTION_TYPE_SUDO {
+	if revertCall.Type != pb.ActionType_ACTION_TYPE_ADMIN_POLICY {
 		t.Errorf("expected SUDO type, got %s", revertCall.Type)
 	}
-	sudo := revertCall.GetSudo()
+	sudo := revertCall.GetAdminPolicy()
 	if sudo == nil {
 		t.Fatal("expected sudo parameters to be preserved in revert call")
 	}

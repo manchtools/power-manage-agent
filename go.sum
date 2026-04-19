@@ -30,8 +30,8 @@ github.com/hashicorp/golang-lru/v2 v2.0.7 h1:a+bsQ5rvGLjzHuww6tVxozPZFVghXaHOwFs
 github.com/hashicorp/golang-lru/v2 v2.0.7/go.mod h1:QeFd9opnmA6QUJc5vARoKUSoFhyfM2/ZepoAG6RGpeM=
 github.com/leodido/go-urn v1.4.0 h1:WT9HwE9SGECu3lg4d/dIA+jxlljEa1/ffXKmRjqdmIQ=
 github.com/leodido/go-urn v1.4.0/go.mod h1:bvxc+MVxLKB4z00jd1z+Dvzr47oO32F/QSNjSBOlFxI=
-github.com/manchtools/power-manage-sdk v0.1.1-0.20260418095439-7209ded0c948 h1:vHDKLAwc7huCSCShhfhYg8KziGsAhOPUuSxtD0bABg8=
-github.com/manchtools/power-manage-sdk v0.1.1-0.20260418095439-7209ded0c948/go.mod h1:HvI/R+FSMZMC4vwuL0Mnf2gcqXyIGJwEK8D7SLY+vh0=
+github.com/manchtools/power-manage-sdk v0.2.0 h1:M28+5EmjAI33xmeLEAYkw2/9XAQT7t744iP76L+HC9c=
+github.com/manchtools/power-manage-sdk v0.2.0/go.mod h1:HvI/R+FSMZMC4vwuL0Mnf2gcqXyIGJwEK8D7SLY+vh0=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mfridman/interpolate v0.0.2 h1:pnuTK7MQIxxFz1Gr+rjSIx9u7qVjf5VOoM/u6BbAxPY=

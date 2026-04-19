@@ -34,8 +34,10 @@ import (
 	sdk "github.com/manchtools/power-manage/sdk/go"
 	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 	"github.com/manchtools/power-manage/sdk/go/logging"
-	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
+	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	sysservice "github.com/manchtools/power-manage/sdk/go/sys/service"
 	"github.com/manchtools/power-manage/sdk/go/verify"
 
 	"golang.org/x/term"
@@ -59,6 +61,67 @@ const (
 func randomBackoff() time.Duration {
 	jitter := rand.Int64N(int64(maxInitialBackoff - minInitialBackoff))
 	return minInitialBackoff + time.Duration(jitter)
+}
+
+// applyBackendOverrides maps POWER_MANAGE_* env vars onto the SDK's
+// pluggable backend selectors. Called once at startup before any
+// privileged helper runs. Unknown or empty values leave the SDK
+// default in place (sudo / systemd / luks).
+func applyBackendOverrides(logger *slog.Logger) {
+	// Privilege-escalation tool. sudo remains the default because
+	// every mainstream Linux distro ships it; doas is for OpenBSD-
+	// style setups and some BSD-influenced Linux deployments.
+	switch strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND")) {
+	case "doas":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
+		logger.Info("privilege backend set", "backend", "doas")
+	case "sudo", "":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		logger.Info("privilege backend set", "backend", "sudo")
+	default:
+		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo",
+			"value", os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+	}
+
+	// Service manager. Only systemd has a concrete implementation
+	// today; the other backends are scaffolded so the agent picks
+	// up support as the SDK adds it.
+	switch strings.ToLower(os.Getenv("POWER_MANAGE_SERVICE_BACKEND")) {
+	case "openrc":
+		sysservice.SetServiceBackend(sysservice.ServiceBackendOpenRC)
+		logger.Info("service backend set", "backend", "openrc")
+	case "runit":
+		sysservice.SetServiceBackend(sysservice.ServiceBackendRunit)
+		logger.Info("service backend set", "backend", "runit")
+	case "s6":
+		sysservice.SetServiceBackend(sysservice.ServiceBackendS6)
+		logger.Info("service backend set", "backend", "s6")
+	case "systemd", "":
+		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
+		logger.Info("service backend set", "backend", "systemd")
+	default:
+		logger.Warn("unknown POWER_MANAGE_SERVICE_BACKEND, staying on systemd",
+			"value", os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
+		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
+	}
+
+	// Disk-encryption tooling. Only LUKS is implemented today.
+	switch strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND")) {
+	case "geli":
+		sysenc.SetBackend(sysenc.BackendGELI)
+		logger.Info("encryption backend set", "backend", "geli")
+	case "cgd":
+		sysenc.SetBackend(sysenc.BackendCGD)
+		logger.Info("encryption backend set", "backend", "cgd")
+	case "luks", "":
+		sysenc.SetBackend(sysenc.BackendLUKS)
+		logger.Info("encryption backend set", "backend", "luks")
+	default:
+		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks",
+			"value", os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND"))
+		sysenc.SetBackend(sysenc.BackendLUKS)
+	}
 }
 
 // Config holds the agent configuration.
@@ -132,6 +195,13 @@ func main() {
 	logger := logging.SetupLogger(cfg.LogLevel, cfg.LogFormat, os.Stdout)
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
+
+	// Select SDK pluggable backends BEFORE any privileged call fires.
+	// Defaults stay at sudo / systemd / luks so every existing
+	// Linux-systemd-sudo deployment continues working with no
+	// configuration; operators on OpenBSD-style doas or OpenRC-flavoured
+	// systems flip the backend once via env var.
+	applyBackendOverrides(logger)
 
 	// Clean up stale update state from a previous cycle (if any).
 	executor.CheckStartupUpdateState(cfg.DataDir, logger)
@@ -1192,14 +1262,14 @@ func runLuksSetPassphrase(token, dataDir string) {
 	}
 
 	// Map proto complexity to SDK complexity
-	var complexity sysluks.Complexity
+	var complexity sysenc.Complexity
 	switch result.Complexity {
 	case pm.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_ALPHANUMERIC:
-		complexity = sysluks.ComplexityAlphanumeric
+		complexity = sysenc.ComplexityAlphanumeric
 	case pm.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX:
-		complexity = sysluks.ComplexityComplex
+		complexity = sysenc.ComplexityComplex
 	default:
-		complexity = sysluks.ComplexityNone
+		complexity = sysenc.ComplexityNone
 	}
 
 	minLength := int(result.MinLength)
@@ -1253,7 +1323,7 @@ func runLuksSetPassphrase(token, dataDir string) {
 		candidate := string(pw1)
 
 		// Validate complexity
-		if validationErr := sysluks.ValidatePassphrase(candidate, minLength, complexity); validationErr != "" {
+		if validationErr := sysenc.ValidatePassphrase(candidate, minLength, complexity); validationErr != "" {
 			if remaining > 0 {
 				fmt.Printf("%s %d attempt(s) remaining.\n", validationErr, remaining)
 			}
@@ -1261,7 +1331,7 @@ func runLuksSetPassphrase(token, dataDir string) {
 		}
 
 		// Check reuse
-		if sysluks.IsRecentlyUsed(candidate, recentHashes) {
+		if sysenc.IsRecentlyUsed(candidate, recentHashes) {
 			if remaining > 0 {
 				fmt.Printf("This passphrase was used recently. Choose a different one. %d attempt(s) remaining.\n", remaining)
 			}
@@ -1311,12 +1381,12 @@ func runLuksSetPassphrase(token, dataDir string) {
 		fmt.Println("Revoking current device-bound key...")
 		switch localState.DeviceKeyType {
 		case "tpm":
-			if err := sysluks.WipeTPM(ctx, devicePath, managedKey); err != nil {
+			if err := sysenc.WipeTPM(ctx, devicePath, managedKey); err != nil {
 				fmt.Fprintf(os.Stderr, "error: failed to wipe TPM key: %v\n", err)
 				os.Exit(1)
 			}
 		case "user_passphrase":
-			if err := sysluks.KillSlot(ctx, devicePath, 7, managedKey); err != nil {
+			if err := sysenc.KillSlot(ctx, devicePath, 7, managedKey); err != nil {
 				fmt.Fprintf(os.Stderr, "error: failed to remove existing passphrase: %v\n", err)
 				os.Exit(1)
 			}
@@ -1325,7 +1395,7 @@ func runLuksSetPassphrase(token, dataDir string) {
 
 	// Add user passphrase to slot 7
 	fmt.Println("Setting LUKS passphrase...")
-	if err := sysluks.AddKeyToSlot(ctx, devicePath, 7, managedKey, passphrase); err != nil {
+	if err := sysenc.AddKeyToSlot(ctx, devicePath, 7, managedKey, passphrase); err != nil {
 		fmt.Fprintf(os.Stderr, "error: failed to set passphrase: %v\nManaged key may have been rotated.\n", err)
 		os.Exit(1)
 	}
@@ -1334,7 +1404,7 @@ func runLuksSetPassphrase(token, dataDir string) {
 	agentStore.SetLuksDeviceKeyType(result.ActionID, "user_passphrase")
 
 	// Store passphrase hash for reuse prevention (keeps last 3)
-	agentStore.AddLuksPassphraseHash(result.ActionID, sysluks.HashPassphrase(passphrase))
+	agentStore.AddLuksPassphraseHash(result.ActionID, sysenc.HashPassphrase(passphrase))
 
 	fmt.Println("LUKS passphrase set successfully.")
 }

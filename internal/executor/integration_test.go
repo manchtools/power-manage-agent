@@ -883,10 +883,10 @@ func TestIntegration_Sudo(t *testing.T) {
 	t.Run("SetupFullAccess", func(t *testing.T) {
 		action := &pb.Action{
 			Id:           &pb.ActionId{Value: actionID},
-			Type:         pb.ActionType_ACTION_TYPE_SUDO,
+			Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 			DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-			Params: &pb.Action_Sudo{Sudo: &pb.SudoParams{
-				AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+			Params: &pb.Action_AdminPolicy{AdminPolicy: &pb.AdminPolicyParams{
+				AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 				Users:       []string{"pmsudouser"},
 			}},
 		}
@@ -908,10 +908,10 @@ func TestIntegration_Sudo(t *testing.T) {
 	t.Run("SetupIdempotent", func(t *testing.T) {
 		action := &pb.Action{
 			Id:           &pb.ActionId{Value: actionID},
-			Type:         pb.ActionType_ACTION_TYPE_SUDO,
+			Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 			DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-			Params: &pb.Action_Sudo{Sudo: &pb.SudoParams{
-				AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+			Params: &pb.Action_AdminPolicy{AdminPolicy: &pb.AdminPolicyParams{
+				AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 				Users:       []string{"pmsudouser"},
 			}},
 		}
@@ -923,10 +923,10 @@ func TestIntegration_Sudo(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := &pb.Action{
 			Id:           &pb.ActionId{Value: actionID},
-			Type:         pb.ActionType_ACTION_TYPE_SUDO,
+			Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 			DesiredState: pb.DesiredState_DESIRED_STATE_ABSENT,
-			Params: &pb.Action_Sudo{Sudo: &pb.SudoParams{
-				AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+			Params: &pb.Action_AdminPolicy{AdminPolicy: &pb.AdminPolicyParams{
+				AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 				Users:       []string{"pmsudouser"},
 			}},
 		}
@@ -1095,10 +1095,10 @@ func TestIntegration_Systemd(t *testing.T) {
 	ctx := context.Background()
 
 	t.Run("ProtectAgent", func(t *testing.T) {
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_SYSTEMD, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Systemd{Systemd: &pb.SystemdParams{
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_SERVICE, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_Service{Service: &pb.ServiceParams{
 			UnitName:     "power-manage-agent",
-			DesiredState: pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STOPPED,
+			DesiredState: pb.ServiceUnitState_SERVICE_UNIT_STATE_STOPPED,
 		}}
 		result := e.Execute(ctx, action)
 		assertFailed(t, result)
@@ -1118,8 +1118,8 @@ WantedBy=multi-user.target
 		unitPath := "/etc/systemd/system/" + unitName
 		t.Cleanup(func() { sudoRemove(unitPath) })
 
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_SYSTEMD, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Systemd{Systemd: &pb.SystemdParams{
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_SERVICE, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_Service{Service: &pb.ServiceParams{
 			UnitName:    unitName,
 			UnitContent: unitContent,
 		}}
@@ -2103,10 +2103,10 @@ func TestIntegration_EdgeCase_MissingSudoersDir(t *testing.T) {
 
 	action := &pb.Action{
 		Id:           &pb.ActionId{Value: actionID},
-		Type:         pb.ActionType_ACTION_TYPE_SUDO,
+		Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-		Params: &pb.Action_Sudo{Sudo: &pb.SudoParams{
-			AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+		Params: &pb.Action_AdminPolicy{AdminPolicy: &pb.AdminPolicyParams{
+			AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 			Users:       []string{"pmsudoedge"},
 		}},
 	}
@@ -2329,10 +2329,10 @@ func TestIntegration_EdgeCase_NilParams(t *testing.T) {
 		{"DEB", pb.ActionType_ACTION_TYPE_DEB},
 		{"User", pb.ActionType_ACTION_TYPE_USER},
 		{"Group", pb.ActionType_ACTION_TYPE_GROUP},
-		{"Sudo", pb.ActionType_ACTION_TYPE_SUDO},
+		{"Sudo", pb.ActionType_ACTION_TYPE_ADMIN_POLICY},
 		{"SSH", pb.ActionType_ACTION_TYPE_SSH},
 		{"SSHD", pb.ActionType_ACTION_TYPE_SSHD},
-		{"Systemd", pb.ActionType_ACTION_TYPE_SYSTEMD},
+		{"Systemd", pb.ActionType_ACTION_TYPE_SERVICE},
 		{"Repository", pb.ActionType_ACTION_TYPE_REPOSITORY},
 	}
 
@@ -3033,10 +3033,10 @@ func TestIntegration_EdgeCase_BrokenSudoersFile(t *testing.T) {
 	// The executor should still be able to write its own valid sudoers file
 	action := &pb.Action{
 		Id:           &pb.ActionId{Value: actionID},
-		Type:         pb.ActionType_ACTION_TYPE_SUDO,
+		Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
 		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
-		Params: &pb.Action_Sudo{Sudo: &pb.SudoParams{
-			AccessLevel: pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL,
+		Params: &pb.Action_AdminPolicy{AdminPolicy: &pb.AdminPolicyParams{
+			AccessLevel: pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL,
 			Users:       []string{"pmedgesudo"},
 		}},
 	}
@@ -3234,8 +3234,8 @@ func TestIntegration_EdgeCase_SystemdInvalidUnit(t *testing.T) {
 
 	t.Run("InvalidSyntax", func(t *testing.T) {
 		// Unit file with completely invalid content
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_SYSTEMD, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Systemd{Systemd: &pb.SystemdParams{
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_SERVICE, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_Service{Service: &pb.ServiceParams{
 			UnitName:    unitName,
 			UnitContent: "THIS IS NOT VALID SYSTEMD UNIT CONTENT\n[[[invalid\n",
 		}}
@@ -3253,8 +3253,8 @@ func TestIntegration_EdgeCase_SystemdInvalidUnit(t *testing.T) {
 
 	t.Run("EmptyUnitContent", func(t *testing.T) {
 		// Empty unit content — executor should still write it
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_SYSTEMD, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Systemd{Systemd: &pb.SystemdParams{
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_SERVICE, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_Service{Service: &pb.ServiceParams{
 			UnitName:    unitName,
 			UnitContent: "",
 		}}
