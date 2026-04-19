@@ -29,7 +29,7 @@ import (
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	sysreboot "github.com/manchtools/power-manage/sdk/go/sys/reboot"
-	syssystemd "github.com/manchtools/power-manage/sdk/go/sys/systemd"
+	sysservice "github.com/manchtools/power-manage/sdk/go/sys/service"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 	"github.com/manchtools/power-manage/sdk/go/verify"
 )
@@ -204,9 +204,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		if action.GetShell().GetIsCompliance() {
 			result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
 		}
-	case pb.ActionType_ACTION_TYPE_SYSTEMD:
+	case pb.ActionType_ACTION_TYPE_SERVICE:
 		var changed bool
-		output, changed, execErr = e.executeSystemd(ctx, action.GetSystemd())
+		output, changed, execErr = e.executeSystemd(ctx, action.GetService())
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_FILE:
 		var changed bool
@@ -240,9 +240,9 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		var changed bool
 		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, getActionID(action))
 		result.Changed = changed
-	case pb.ActionType_ACTION_TYPE_SUDO:
+	case pb.ActionType_ACTION_TYPE_ADMIN_POLICY:
 		var changed bool
-		output, changed, execErr = e.executeSudo(ctx, action.GetSudo(), action.DesiredState, getActionID(action))
+		output, changed, execErr = e.executeSudo(ctx, action.GetAdminPolicy(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_LPS:
 		var changed bool
@@ -252,10 +252,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
-	case pb.ActionType_ACTION_TYPE_LUKS:
+	case pb.ActionType_ACTION_TYPE_ENCRYPTION:
 		var changed bool
 		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetLuks(), action.DesiredState, getActionID(action))
+		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetEncryption(), action.DesiredState, getActionID(action))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
@@ -938,7 +938,7 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	return execOutput, verifyOutput, true, nil
 }
 
-func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams) (*pb.CommandOutput, bool, error) {
+func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("systemd params required")
 	}
@@ -992,7 +992,7 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 			changed = true
 
 			// Reload systemd
-			if err := syssystemd.DaemonReload(ctx); err != nil {
+			if err := sysservice.DaemonReload(ctx); err != nil {
 				return nil, changed, fmt.Errorf("daemon-reload failed: %w", err)
 			}
 			output.WriteString("reloaded systemd daemon\n")
@@ -1006,13 +1006,13 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		if e.isUnitMasked(params.UnitName) {
 			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
 		}
-		if err := syssystemd.Enable(ctx, params.UnitName); err != nil {
+		if err := sysservice.Enable(ctx, params.UnitName); err != nil {
 			return nil, changed, fmt.Errorf("enable: %w", err)
 		}
 		output.WriteString("enabled unit\n")
 		changed = true
 	} else if !params.Enable && isEnabled {
-		if err := syssystemd.Disable(ctx, params.UnitName); err != nil {
+		if err := sysservice.Disable(ctx, params.UnitName); err != nil {
 			// Ignore errors for disable (unit might not exist)
 			output.WriteString("disable failed (unit may not exist)\n")
 		} else {
@@ -1024,9 +1024,9 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	// Handle running state
 	isActive := e.isUnitActive(params.UnitName)
 	switch params.DesiredState {
-	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STARTED:
+	case pb.ServiceUnitState_SERVICE_UNIT_STATE_STARTED:
 		if !isActive {
-			if err := syssystemd.Start(ctx, params.UnitName); err != nil {
+			if err := sysservice.Start(ctx, params.UnitName); err != nil {
 				return nil, changed, fmt.Errorf("start: %w", err)
 			}
 			output.WriteString("started unit\n")
@@ -1034,9 +1034,9 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		} else {
 			output.WriteString("unit is already running\n")
 		}
-	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_STOPPED:
+	case pb.ServiceUnitState_SERVICE_UNIT_STATE_STOPPED:
 		if isActive {
-			if err := syssystemd.Stop(ctx, params.UnitName); err != nil {
+			if err := sysservice.Stop(ctx, params.UnitName); err != nil {
 				return nil, changed, fmt.Errorf("stop: %w", err)
 			}
 			output.WriteString("stopped unit\n")
@@ -1044,9 +1044,9 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 		} else {
 			output.WriteString("unit is already stopped\n")
 		}
-	case pb.SystemdUnitState_SYSTEMD_UNIT_STATE_RESTARTED:
+	case pb.ServiceUnitState_SERVICE_UNIT_STATE_RESTARTED:
 		// Restart always runs (not idempotent by design)
-		if err := syssystemd.Restart(ctx, params.UnitName); err != nil {
+		if err := sysservice.Restart(ctx, params.UnitName); err != nil {
 			return nil, changed, fmt.Errorf("restart: %w", err)
 		}
 		output.WriteString("restarted unit\n")
@@ -1060,20 +1060,26 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.SystemdParams)
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, changed, nil
 }
 
-// isUnitEnabled checks if a systemd unit is enabled or in a state where
-// enabling is not needed (static, indirect, generated units).
+// isUnitEnabled checks if a systemd unit is enabled. The SDK's
+// sysservice.IsEnabled returns (bool, error); callers of this agent
+// helper just want the bool. Any error is logged at the call path
+// that matters (status reporting) rather than here — treating an
+// error as "not enabled" keeps the previous behaviour.
 func (e *Executor) isUnitEnabled(unitName string) bool {
-	return syssystemd.IsEnabled(unitName)
+	enabled, _ := sysservice.IsEnabled(unitName)
+	return enabled
 }
 
 // isUnitMasked checks if a systemd unit is masked.
 func (e *Executor) isUnitMasked(unitName string) bool {
-	return syssystemd.IsMasked(unitName)
+	masked, _ := sysservice.IsMasked(unitName)
+	return masked
 }
 
 // isUnitActive checks if a systemd unit is currently active (running).
 func (e *Executor) isUnitActive(unitName string) bool {
-	return syssystemd.IsActive(unitName)
+	active, _ := sysservice.IsActive(unitName)
+	return active
 }
 
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {

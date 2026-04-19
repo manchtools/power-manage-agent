@@ -47,13 +47,13 @@ func runCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...
 
 // runSudoCmd wraps a command with sudo for privileged operations.
 func runSudoCmd(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := sysexec.Sudo(ctx, name, args...)
+	r, err := sysexec.Privileged(ctx, name, args...)
 	return toOutput(r), err
 }
 
 // runSudoCmdWithStdin wraps a command with sudo and provides stdin input.
 func runSudoCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := sysexec.SudoWithStdin(ctx, stdin, name, args...)
+	r, err := sysexec.PrivilegedWithStdin(ctx, stdin, name, args...)
 	return toOutput(r), err
 }
 

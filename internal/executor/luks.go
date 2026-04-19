@@ -7,7 +7,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysluks "github.com/manchtools/power-manage/sdk/go/sys/luks"
+	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
@@ -19,7 +19,7 @@ type LuksKeyStore interface {
 }
 
 // executeLuks manages LUKS disk encryption.
-func (e *Executor) executeLuks(ctx context.Context, params *pb.LuksParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	if params == nil {
 		return nil, false, nil, fmt.Errorf("luks params required")
 	}
@@ -59,7 +59,7 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 }
 
 // setupLuks handles PRESENT state — detect volume, check conflicts, take ownership, rotate, reconcile device key.
-func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 
 	// Load local state
@@ -70,7 +70,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 	if localState != nil && localState.OwnershipTaken && localState.DevicePath != "" {
 		// Subsequent run — use stored device path
 		devicePath = localState.DevicePath
-		isLuks, err := sysluks.IsLuks(ctx, devicePath)
+		isLuks, err := sysenc.IsLuks(ctx, devicePath)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to check LUKS status: %w", err)
 		}
@@ -80,10 +80,10 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 		output.WriteString(fmt.Sprintf("LUKS: managing volume %s\n", devicePath))
 	} else {
 		// First run — detect volume by PSK
-		vol, err := sysluks.DetectVolumeByKey(ctx, params.PresharedKey)
+		vol, err := sysenc.DetectVolumeByKey(ctx, params.PresharedKey)
 		if err != nil {
 			// Fall back to heuristic detection (PSK may have been removed by a partial prior run)
-			vol, err = sysluks.DetectVolume(ctx)
+			vol, err = sysenc.DetectVolume(ctx)
 			if err != nil {
 				return nil, false, nil, fmt.Errorf("no LUKS-encrypted volumes detected on this device")
 			}
@@ -168,13 +168,13 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.LuksParams, actionI
 // Server-confirmed: the old key is only removed after the server confirms receipt of the new key.
 // If the server already has a working key (e.g. from a previous run with lost local state),
 // ownership is recovered without re-using the PSK.
-func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, actionID, devicePath string) error {
+func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParams, actionID, devicePath string) error {
 	// Recovery: check if server already has a key for this action (state loss recovery).
 	existingKey, getKeyErr := e.luksKeyStore.GetKey(ctx, actionID)
 	if getKeyErr == nil && existingKey != "" {
 		e.logger.Info("LUKS: server has stored key, testing against volume",
 			"action_id", actionID, "key_len", len(existingKey))
-		ok, testErr := sysluks.TestPassphrase(ctx, devicePath, existingKey)
+		ok, testErr := sysenc.TestPassphrase(ctx, devicePath, existingKey)
 		e.logger.Info("LUKS: test-passphrase result", "ok", ok, "error", testErr)
 		if testErr == nil && ok {
 			e.logger.Info("LUKS: recovered ownership from server-stored key", "action_id", actionID)
@@ -195,7 +195,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	}
 
 	// Generate managed passphrase
-	passphrase, err := sysluks.GeneratePassphrase(minWords)
+	passphrase, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return fmt.Errorf("generate passphrase: %w", err)
 	}
@@ -204,14 +204,14 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	e.logger.Info("LUKS: adding managed key using PSK",
 		"psk_len", len(params.PresharedKey),
 		"new_key_len", len(passphrase))
-	if err := sysluks.AddKey(ctx, devicePath, params.PresharedKey, passphrase); err != nil {
+	if err := sysenc.AddKey(ctx, devicePath, params.PresharedKey, passphrase); err != nil {
 		return fmt.Errorf("add managed key: %w", err)
 	}
 
 	// Store on server — must succeed before removing PSK
 	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, passphrase, "initial"); err != nil {
 		// Rollback: remove the managed key we just added
-		sysluks.RemoveKey(ctx, devicePath, passphrase)
+		sysenc.RemoveKey(ctx, devicePath, passphrase)
 		return fmt.Errorf("store key on server: %w", err)
 	}
 
@@ -223,7 +223,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 	}
 
 	// Verified — now safe to remove PSK
-	if err := sysluks.RemoveKey(ctx, devicePath, params.PresharedKey); err != nil {
+	if err := sysenc.RemoveKey(ctx, devicePath, params.PresharedKey); err != nil {
 		e.logger.Warn("failed to remove PSK after ownership (both keys work)", "error", err)
 	}
 
@@ -232,7 +232,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.LuksParams, act
 }
 
 // checkAndRotate checks if a rotation is due and rotates the managed passphrase if needed.
-func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
+func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
 	// Check if rotation interval has elapsed
 	if params.RotationIntervalDays > 0 {
 		// No previous rotation recorded — set the timestamp and skip.
@@ -258,20 +258,20 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, lo
 	}
 
 	// Generate new passphrase
-	newPassphrase, err := sysluks.GeneratePassphrase(minWords)
+	newPassphrase, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return false, fmt.Errorf("generate passphrase: %w", err)
 	}
 
 	// Add new key using old key (both valid)
-	if err := sysluks.AddKey(ctx, devicePath, currentKey, newPassphrase); err != nil {
+	if err := sysenc.AddKey(ctx, devicePath, currentKey, newPassphrase); err != nil {
 		return false, fmt.Errorf("add new key: %w", err)
 	}
 
 	// Store on server — must succeed before removing old key
 	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, newPassphrase, "scheduled"); err != nil {
 		// Rollback: remove the new key we just added
-		sysluks.RemoveKey(ctx, devicePath, newPassphrase)
+		sysenc.RemoveKey(ctx, devicePath, newPassphrase)
 		return false, fmt.Errorf("store new key on server: %w", err)
 	}
 
@@ -282,7 +282,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, lo
 	}
 
 	// Verified — now safe to remove old key
-	if err := sysluks.RemoveKey(ctx, devicePath, currentKey); err != nil {
+	if err := sysenc.RemoveKey(ctx, devicePath, currentKey); err != nil {
 		e.logger.Warn("failed to remove old key after rotation (both keys work)", "error", err)
 	}
 
@@ -295,13 +295,13 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.LuksParams, lo
 }
 
 // reconcileDeviceKey ensures LUKS slot 7 matches the desired device_bound_key_type.
-func (e *Executor) reconcileDeviceKey(ctx context.Context, params *pb.LuksParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
+func (e *Executor) reconcileDeviceKey(ctx context.Context, params *pb.EncryptionParams, localState *store.LuksState, actionID, devicePath string) (bool, error) {
 	currentType := localState.DeviceKeyType
 	desiredType := "none"
 	switch params.DeviceBoundKeyType {
-	case pb.LuksDeviceBoundKeyType_LUKS_DEVICE_BOUND_KEY_TYPE_TPM:
+	case pb.EncryptionDeviceBoundKeyType_ENCRYPTION_DEVICE_BOUND_KEY_TYPE_TPM:
 		desiredType = "tpm"
-	case pb.LuksDeviceBoundKeyType_LUKS_DEVICE_BOUND_KEY_TYPE_USER_PASSPHRASE:
+	case pb.EncryptionDeviceBoundKeyType_ENCRYPTION_DEVICE_BOUND_KEY_TYPE_USER_PASSPHRASE:
 		desiredType = "user_passphrase"
 	}
 
@@ -329,7 +329,7 @@ func (e *Executor) reconcileDeviceKey(ctx context.Context, params *pb.LuksParams
 
 // enrollTpm enrolls a TPM2 key for the LUKS volume.
 func (e *Executor) enrollTpm(ctx context.Context, actionID, devicePath string) error {
-	hasTPM, err := sysluks.HasTPM2(ctx)
+	hasTPM, err := sysenc.HasTPM2(ctx)
 	if err != nil {
 		return fmt.Errorf("check TPM2: %w", err)
 	}
@@ -342,7 +342,7 @@ func (e *Executor) enrollTpm(ctx context.Context, actionID, devicePath string) e
 		return fmt.Errorf("get managed key: %w", err)
 	}
 
-	if err := sysluks.EnrollTPM(ctx, devicePath, managedKey); err != nil {
+	if err := sysenc.EnrollTPM(ctx, devicePath, managedKey); err != nil {
 		return err
 	}
 
@@ -358,11 +358,11 @@ func (e *Executor) revokeDeviceKeyInternal(ctx context.Context, localState *stor
 
 	switch localState.DeviceKeyType {
 	case "tpm":
-		if err := sysluks.WipeTPM(ctx, localState.DevicePath, managedKey); err != nil {
+		if err := sysenc.WipeTPM(ctx, localState.DevicePath, managedKey); err != nil {
 			return err
 		}
 	case "user_passphrase":
-		if err := sysluks.KillSlot(ctx, localState.DevicePath, 7, managedKey); err != nil {
+		if err := sysenc.KillSlot(ctx, localState.DevicePath, 7, managedKey); err != nil {
 			return err
 		}
 	case "none":
@@ -413,13 +413,13 @@ func (e *Executor) resolveLuksConflict(actionID string) (string, error) {
 
 	var candidates []luksCandidate
 	for _, sa := range stored {
-		if sa.Action.Type != pb.ActionType_ACTION_TYPE_LUKS {
+		if sa.Action.Type != pb.ActionType_ACTION_TYPE_ENCRYPTION {
 			continue
 		}
 		if sa.Action.DesiredState == pb.DesiredState_DESIRED_STATE_ABSENT {
 			continue
 		}
-		params := sa.Action.GetLuks()
+		params := sa.Action.GetEncryption()
 		if params == nil {
 			continue
 		}
@@ -491,7 +491,7 @@ func (e *Executor) verifyKeyRoundTrip(ctx context.Context, actionID, devicePath,
 		}
 
 		// Defense-in-depth: verify the key actually unlocks the volume.
-		ok, testErr := sysluks.TestPassphrase(ctx, devicePath, storedKey)
+		ok, testErr := sysenc.TestPassphrase(ctx, devicePath, storedKey)
 		if testErr != nil || !ok {
 			return fmt.Errorf("server-stored key does not unlock volume (test_ok=%v, err=%v)", ok, testErr)
 		}

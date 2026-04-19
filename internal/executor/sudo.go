@@ -25,7 +25,7 @@ func sudoersFilePath(actionID string) string {
 }
 
 // executeSudo manages sudoers policies via /etc/sudoers.d/ drop-in files.
-func (e *Executor) executeSudo(ctx context.Context, params *pb.SudoParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) executeSudo(ctx context.Context, params *pb.AdminPolicyParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("sudo params required")
 	}
@@ -45,7 +45,7 @@ func (e *Executor) executeSudo(ctx context.Context, params *pb.SudoParams, state
 }
 
 // setupSudoPolicy creates or updates a sudo policy: group, sudoers file, and user membership.
-func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, groupName, sudoersPath string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyParams, groupName, sudoersPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	changed := false
 
@@ -59,11 +59,11 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.SudoParams, g
 	// Generate sudoers content
 	var content string
 	switch params.AccessLevel {
-	case pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_FULL:
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL:
 		content = generateFullSudoConfig(groupName)
-	case pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_LIMITED:
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_LIMITED:
 		content = generateLimitedSudoConfig(groupName)
-	case pb.SudoAccessLevel_SUDO_ACCESS_LEVEL_CUSTOM:
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_CUSTOM:
 		if params.CustomConfig == "" {
 			return nil, false, fmt.Errorf("custom_config is required when access_level is CUSTOM")
 		}
