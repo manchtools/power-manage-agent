@@ -940,7 +940,7 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 
 func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams) (*pb.CommandOutput, bool, error) {
 	if params == nil {
-		return nil, false, fmt.Errorf("systemd params required")
+		return nil, false, fmt.Errorf("service params required")
 	}
 
 	// Never allow managing the agent's own service

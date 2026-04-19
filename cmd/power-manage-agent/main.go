@@ -77,9 +77,11 @@ func applyBackendOverrides(logger *slog.Logger) {
 		logger.Info("privilege backend set", "backend", "doas")
 	case "sudo", "":
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		logger.Info("privilege backend set", "backend", "sudo")
 	default:
 		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo",
 			"value", os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
 	}
 
 	// Service manager. Only systemd has a concrete implementation
@@ -97,9 +99,11 @@ func applyBackendOverrides(logger *slog.Logger) {
 		logger.Info("service backend set", "backend", "s6")
 	case "systemd", "":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
+		logger.Info("service backend set", "backend", "systemd")
 	default:
 		logger.Warn("unknown POWER_MANAGE_SERVICE_BACKEND, staying on systemd",
 			"value", os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
+		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
 	}
 
 	// Disk-encryption tooling. Only LUKS is implemented today.
@@ -112,9 +116,11 @@ func applyBackendOverrides(logger *slog.Logger) {
 		logger.Info("encryption backend set", "backend", "cgd")
 	case "luks", "":
 		sysenc.SetBackend(sysenc.BackendLUKS)
+		logger.Info("encryption backend set", "backend", "luks")
 	default:
 		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks",
 			"value", os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND"))
+		sysenc.SetBackend(sysenc.BackendLUKS)
 	}
 }
 
