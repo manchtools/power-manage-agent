@@ -50,11 +50,16 @@ func TestVerifyDoasIncludeIn(t *testing.T) {
 		{"missing main conf", nil, true},
 		{"empty main conf", ptr(""), true},
 		{"only comment line", ptr("# commented include\n"), true},
+		{"unrelated sibling drop-in", ptr(`include "/etc/doas.d/other.conf"` + "\n"), true},
 		{"unrelated includes", ptr(`include "/etc/other.d/foo.conf"` + "\n"), true},
 		{"direct include of fragment", ptr(`include "` + fragment + `"` + "\n"), false},
+		{"unquoted direct include", ptr("include " + fragment + "\n"), false},
 		{"glob include of drop-in dir", ptr(`include "/etc/doas.d/*.conf"` + "\n"), false},
+		{"glob with non-matching pattern", ptr(`include "/etc/doas.d/other-*.conf"` + "\n"), true},
 		{"include with extra whitespace", ptr("   include \"" + fragment + "\"\n"), false},
 		{"include after other rules", ptr("permit nopass admin as root\ninclude \"/etc/doas.d/*.conf\"\n"), false},
+		{"include with inline comment", ptr(`include "/etc/doas.d/*.conf" # agent drop-ins` + "\n"), false},
+		{"included keyword does not match", ptr("included rule\n"), true},
 	}
 
 	for _, tc := range cases {

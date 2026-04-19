@@ -6,6 +6,7 @@ import (
 	_ "embed"
 	"fmt"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"text/template"
@@ -104,11 +105,12 @@ func InstallSudoers(user string) error {
 }
 
 // InstallDoas renders the embedded doas template and installs it to
-// /etc/doas.d/<user>.conf. The file is validated with `doas -C` before
-// installation, and the caller is warned (non-fatally) if
-// /etc/doas.conf doesn't already include the drop-in directory — doas
-// has no implicit conf.d scan, so without the include directive the
-// drop-in is inert.
+// /etc/doas.d/<user>.conf. Ordering matters for the failure mode: the
+// /etc/doas.conf include check runs BEFORE the temp-file rename, so a
+// misconfigured main conf causes setup to abort without leaving an
+// inert root-permit fragment on disk. The fragment is also validated
+// with `doas -C` before the include check so a syntax error is
+// surfaced first (more useful signal to the operator).
 //
 // Must be run as root.
 func InstallDoas(user string) error {
@@ -168,6 +170,16 @@ func InstallDoas(user string) error {
 		return fmt.Errorf("doas validation failed: %w", err)
 	}
 
+	// Include-directive check runs BEFORE the rename. doas has no
+	// implicit conf.d scan, so a drop-in that /etc/doas.conf doesn't
+	// explicitly load is inert but still grants no-password root on
+	// paper — fail hard rather than installing a silent
+	// misconfiguration.
+	if err := verifyDoasIncludeIn("/etc/doas.conf", dest); err != nil {
+		os.Remove(tmpFile)
+		return err
+	}
+
 	if err := os.Rename(tmpFile, dest); err != nil {
 		os.Remove(tmpFile)
 		return fmt.Errorf("install doas file: %w", err)
@@ -180,22 +192,16 @@ func InstallDoas(user string) error {
 		return fmt.Errorf("set doas ownership: %w", err)
 	}
 
-	// Verify /etc/doas.conf includes the drop-in. doas does not scan
-	// conf.d by default, so without this the drop-in is inert and the
-	// agent will hit permission-denied on its first privileged call.
-	// Fail hard rather than installing a silent misconfiguration.
-	if err := verifyDoasIncludeIn("/etc/doas.conf", dest); err != nil {
-		return err
-	}
-
 	return nil
 }
 
 // verifyDoasIncludeIn checks that mainConf has an `include` directive
-// pointing at fragmentPath (or the containing directory via glob).
-// Returns an error with remediation text when no such directive is
-// present. Missing mainConf is also an error — a doas install with no
-// main config is a misconfiguration on its own.
+// that would load fragmentPath. Accepts either an exact-path include
+// or a glob (filepath.Match semantics) that matches the fragment.
+// Unrelated includes of sibling drop-ins (e.g. `include
+// "/etc/doas.d/other.conf"` when the fragment is power-manage.conf)
+// do NOT satisfy the check — they'd pass a naive substring match but
+// still leave the agent's rule unloaded.
 //
 // Takes the main-conf path as a parameter so tests can point at a
 // fixture without touching the host's /etc/doas.conf; production
@@ -204,18 +210,64 @@ func verifyDoasIncludeIn(mainConf, fragmentPath string) error {
 	data, err := os.ReadFile(mainConf)
 	if err != nil {
 		if os.IsNotExist(err) {
-			return fmt.Errorf("%s does not exist; create it with an `include \"%s\"` line (or `include \"/etc/doas.d/*.conf\"`) or the agent's rule will be ignored", mainConf, fragmentPath)
+			return fmt.Errorf("%s does not exist; create it with an `include \"%s\"` line or the agent's rule will be ignored", mainConf, fragmentPath)
 		}
 		return fmt.Errorf("read %s: %w", mainConf, err)
 	}
 	for _, line := range strings.Split(string(data), "\n") {
-		trimmed := strings.TrimSpace(line)
-		if !strings.HasPrefix(trimmed, "include") {
+		pattern, ok := parseDoasInclude(line)
+		if !ok {
 			continue
 		}
-		if strings.Contains(trimmed, fragmentPath) || strings.Contains(trimmed, "/etc/doas.d/") {
+		// Exact path match wins — the common operator setup is
+		// `include "/etc/doas.d/power-manage.conf"`.
+		if pattern == fragmentPath {
+			return nil
+		}
+		// Otherwise try the pattern as a glob. Forks of doas that
+		// honor glob (some opendoas builds) will load the fragment if
+		// its name matches; we accept the same shapes so setup
+		// doesn't refuse a valid config. filepath.Match returning an
+		// error means the pattern is malformed — ignore it and
+		// continue, treating it as "doesn't match".
+		if match, err := filepath.Match(pattern, fragmentPath); err == nil && match {
 			return nil
 		}
 	}
-	return fmt.Errorf("%s has no `include` directive for the agent's drop-in; add `include \"%s\"` (or `include \"/etc/doas.d/*.conf\"`) so doas actually loads the rule", mainConf, fragmentPath)
+	return fmt.Errorf("%s has no `include` directive that loads %s; add `include \"%s\"` so doas actually loads the rule", mainConf, fragmentPath, fragmentPath)
+}
+
+// parseDoasInclude extracts the path argument from a doas `include`
+// directive, returning (path, true) on success. Supports both quoted
+// ("include \"/etc/doas.d/power-manage.conf\"") and unquoted
+// ("include /etc/doas.d/power-manage.conf") forms, with arbitrary
+// leading whitespace and optional inline comments after the path.
+// Lines that aren't include directives return ("", false).
+func parseDoasInclude(line string) (string, bool) {
+	trimmed := strings.TrimSpace(line)
+	if !strings.HasPrefix(trimmed, "include") {
+		return "", false
+	}
+	// Need a word-boundary after "include" — "included" or
+	// "includeall" must not match.
+	rest := trimmed[len("include"):]
+	if rest == "" || (rest[0] != ' ' && rest[0] != '\t') {
+		return "", false
+	}
+	rest = strings.TrimSpace(rest)
+	if rest == "" {
+		return "", false
+	}
+	// Drop an inline `#` comment past the path, if any.
+	if i := strings.Index(rest, "#"); i >= 0 {
+		rest = strings.TrimSpace(rest[:i])
+	}
+	// Strip surrounding quotes. doas.conf(5) accepts both forms.
+	if len(rest) >= 2 && rest[0] == '"' && rest[len(rest)-1] == '"' {
+		rest = rest[1 : len(rest)-1]
+	}
+	if rest == "" {
+		return "", false
+	}
+	return rest, true
 }
