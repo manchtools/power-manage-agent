@@ -5,7 +5,7 @@ go 1.25
 require (
 	connectrpc.com/connect v1.18.1
 	github.com/go-playground/validator/v10 v10.30.1
-	github.com/manchtools/power-manage/sdk v0.2.0
+	github.com/manchtools/power-manage/sdk v0.2.1
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
@@ -21,7 +21,7 @@ require (
 // whatever happens to be in a local ../sdk checkout. Developers who
 // want to iterate against a local SDK override this with a per-dev
 // go.work at their workspace root — see agent/README.md for setup.
-replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.2.0
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.2.1
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
