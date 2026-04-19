@@ -75,6 +75,8 @@ func TestShouldRevertOnUnassign(t *testing.T) {
 		pb.ActionType_ACTION_TYPE_SSHD,
 		pb.ActionType_ACTION_TYPE_SUDO,
 		pb.ActionType_ACTION_TYPE_LPS,
+		pb.ActionType_ACTION_TYPE_USER,
+		pb.ActionType_ACTION_TYPE_GROUP,
 	}
 	for _, at := range revertible {
 		if !shouldRevertOnUnassign(at) {
@@ -87,7 +89,6 @@ func TestShouldRevertOnUnassign(t *testing.T) {
 		pb.ActionType_ACTION_TYPE_SHELL,
 		pb.ActionType_ACTION_TYPE_FILE,
 		pb.ActionType_ACTION_TYPE_SYSTEMD,
-		pb.ActionType_ACTION_TYPE_USER,
 		pb.ActionType_ACTION_TYPE_APP_IMAGE,
 		pb.ActionType_ACTION_TYPE_FLATPAK,
 		pb.ActionType_ACTION_TYPE_REPOSITORY,

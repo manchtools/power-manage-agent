@@ -428,13 +428,18 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 }
 
 // shouldRevertOnUnassign returns true for action types whose effects should
-// be cleaned up when the action is unassigned from a device.
+// be cleaned up when the action is unassigned from a device. USER and GROUP
+// join the policy-style reverters because a user or group created by an
+// assignment should not outlive it — leaving the account on disk after a
+// scope change is an access-leak.
 func shouldRevertOnUnassign(actionType pb.ActionType) bool {
 	switch actionType {
 	case pb.ActionType_ACTION_TYPE_SSH,
 		pb.ActionType_ACTION_TYPE_SSHD,
 		pb.ActionType_ACTION_TYPE_SUDO,
-		pb.ActionType_ACTION_TYPE_LPS:
+		pb.ActionType_ACTION_TYPE_LPS,
+		pb.ActionType_ACTION_TYPE_USER,
+		pb.ActionType_ACTION_TYPE_GROUP:
 		return true
 	default:
 		return false
