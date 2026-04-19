@@ -14,6 +14,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	osexec "os/exec"
 	"os/signal"
 	"strings"
 	"syscall"
@@ -63,65 +64,112 @@ func randomBackoff() time.Duration {
 	return minInitialBackoff + time.Duration(jitter)
 }
 
-// applyBackendOverrides maps POWER_MANAGE_* env vars onto the SDK's
-// pluggable backend selectors. Called once at startup before any
-// privileged helper runs. Unknown or empty values leave the SDK
-// default in place (sudo / systemd / luks).
-func applyBackendOverrides(logger *slog.Logger) {
+// applyBackendOverrides maps the backend strings resolved by
+// parseFlags() onto the SDK's pluggable backend selectors. Called once
+// at startup before any privileged helper runs. Unknown or empty
+// values fall through to the default (sudo / systemd / luks) and the
+// function pins the SDK explicitly rather than relying on zero-value
+// state, so an unknown value is still deterministic.
+//
+// Returns an error if the selected backend's required binary isn't on
+// PATH (e.g. POWER_MANAGE_PRIVILEGE_BACKEND=doas on a host with no
+// doas installed). Fail-fast at startup is cheaper than debugging a
+// "permission denied" on the first privileged call hours later.
+func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 	// Privilege-escalation tool. sudo remains the default because
 	// every mainstream Linux distro ships it; doas is for OpenBSD-
 	// style setups and some BSD-influenced Linux deployments.
-	switch strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND")) {
+	var privilegeTool string
+	switch cfg.PrivilegeBackend {
 	case "doas":
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
-		logger.Info("privilege backend set", "backend", "doas")
+		privilegeTool = "doas"
 	case "sudo", "":
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
-		logger.Info("privilege backend set", "backend", "sudo")
+		privilegeTool = "sudo"
 	default:
 		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo",
-			"value", os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
+			"value", cfg.PrivilegeBackend)
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		privilegeTool = "sudo"
 	}
+	if _, err := osexec.LookPath(privilegeTool); err != nil {
+		return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
+			privilegeTool, privilegeTool, err)
+	}
+	logger.Info("privilege backend set", "backend", privilegeTool)
 
 	// Service manager. Only systemd has a concrete implementation
 	// today; the other backends are scaffolded so the agent picks
 	// up support as the SDK adds it.
-	switch strings.ToLower(os.Getenv("POWER_MANAGE_SERVICE_BACKEND")) {
+	var serviceTool string
+	switch cfg.ServiceBackend {
 	case "openrc":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendOpenRC)
-		logger.Info("service backend set", "backend", "openrc")
+		serviceTool = "rc-service"
 	case "runit":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendRunit)
-		logger.Info("service backend set", "backend", "runit")
+		serviceTool = "sv"
 	case "s6":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendS6)
-		logger.Info("service backend set", "backend", "s6")
+		serviceTool = "s6-svc"
 	case "systemd", "":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
-		logger.Info("service backend set", "backend", "systemd")
+		serviceTool = "systemctl"
 	default:
 		logger.Warn("unknown POWER_MANAGE_SERVICE_BACKEND, staying on systemd",
-			"value", os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
+			"value", cfg.ServiceBackend)
 		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
+		serviceTool = "systemctl"
 	}
+	if _, err := osexec.LookPath(serviceTool); err != nil {
+		return fmt.Errorf("service backend %q selected but %q is not on PATH: %w",
+			normalizedServiceBackend(cfg.ServiceBackend), serviceTool, err)
+	}
+	logger.Info("service backend set", "backend", normalizedServiceBackend(cfg.ServiceBackend))
 
 	// Disk-encryption tooling. Only LUKS is implemented today.
-	switch strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND")) {
+	// GELI/CGD live on BSD where we don't probe for a specific CLI
+	// binary — the SDK's encryption package handles detection there.
+	var encName string
+	switch cfg.EncryptionBackend {
 	case "geli":
 		sysenc.SetBackend(sysenc.BackendGELI)
-		logger.Info("encryption backend set", "backend", "geli")
+		encName = "geli"
 	case "cgd":
 		sysenc.SetBackend(sysenc.BackendCGD)
-		logger.Info("encryption backend set", "backend", "cgd")
+		encName = "cgd"
 	case "luks", "":
 		sysenc.SetBackend(sysenc.BackendLUKS)
-		logger.Info("encryption backend set", "backend", "luks")
+		encName = "luks"
 	default:
 		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks",
-			"value", os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND"))
+			"value", cfg.EncryptionBackend)
 		sysenc.SetBackend(sysenc.BackendLUKS)
+		encName = "luks"
 	}
+	if encName == "luks" {
+		if _, err := osexec.LookPath("cryptsetup"); err != nil {
+			// Not fatal — devices without encryption actions assigned
+			// don't need cryptsetup. Warn so operators troubleshooting
+			// a failed encryption action have the context.
+			logger.Warn("luks backend selected but cryptsetup not on PATH; encryption actions will fail",
+				"error", err)
+		}
+	}
+	logger.Info("encryption backend set", "backend", encName)
+
+	return nil
+}
+
+// normalizedServiceBackend returns the canonical name for logging so
+// the empty-string default case doesn't log "service backend set
+// backend=" with a blank value.
+func normalizedServiceBackend(s string) string {
+	if s == "" {
+		return "systemd"
+	}
+	return s
 }
 
 // Config holds the agent configuration.
@@ -137,6 +185,15 @@ type Config struct {
 	// Logging
 	LogLevel  string
 	LogFormat string
+
+	// Backend selections resolved from POWER_MANAGE_*_BACKEND env vars
+	// at parseFlags() time. Stored as lowercase strings because the SDK
+	// enum conversion lives inside applyBackendOverrides — keeping the
+	// Config free of SDK types makes the struct trivially serializable
+	// and keeps parseFlags a pure string parser. Empty means "default".
+	PrivilegeBackend  string
+	ServiceBackend    string
+	EncryptionBackend string
 
 	// Pending security alert to send after connection (internal use)
 	pendingSecurityAlert *pendingSecurityAlert
@@ -201,7 +258,10 @@ func main() {
 	// Linux-systemd-sudo deployment continues working with no
 	// configuration; operators on OpenBSD-style doas or OpenRC-flavoured
 	// systems flip the backend once via env var.
-	applyBackendOverrides(logger)
+	if err := applyBackendOverrides(cfg, logger); err != nil {
+		logger.Error("backend validation failed", "error", err)
+		os.Exit(1)
+	}
 
 	// Clean up stale update state from a previous cycle (if any).
 	executor.CheckStartupUpdateState(cfg.DataDir, logger)
@@ -912,6 +972,10 @@ func parseFlags() *Config {
 		cfg.SkipVerify = true
 	}
 
+	cfg.PrivilegeBackend = strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
+	cfg.ServiceBackend = strings.ToLower(os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
+	cfg.EncryptionBackend = strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND"))
+
 	return cfg
 }
 
@@ -967,19 +1031,43 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	return result, nil
 }
 
-// runSetup installs the agent's sudoers configuration.
-// Usage: power-manage-agent setup [--user USER]
+// runSetup installs the agent's privilege-escalation configuration.
+// Usage: power-manage-agent setup [--user USER] [--backend sudo|doas]
+//
+// The backend defaults to POWER_MANAGE_PRIVILEGE_BACKEND if set,
+// otherwise sudo. The --backend flag overrides both so an operator
+// reinstalling a drop-in for a different backend than the running
+// agent uses (e.g. prepping a dual-booted system) doesn't have to
+// shuffle env vars.
 func runSetup(args []string) {
 	fs := flag.NewFlagSet("setup", flag.ExitOnError)
-	user := fs.String("user", "power-manage", "Service user name for sudoers")
+	user := fs.String("user", "power-manage", "Service user name for the drop-in")
+	defaultBackend := strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
+	if defaultBackend == "" {
+		defaultBackend = "sudo"
+	}
+	backend := fs.String("backend", defaultBackend, "Privilege backend: sudo or doas")
 	fs.Parse(args)
 
-	fmt.Printf("Installing sudoers for user: %s\n", *user)
-	if err := setup.InstallSudoers(*user); err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+	switch strings.ToLower(*backend) {
+	case "sudo":
+		fmt.Printf("Installing sudoers drop-in for user: %s\n", *user)
+		if err := setup.InstallSudoers(*user); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("Sudoers installed successfully")
+	case "doas":
+		fmt.Printf("Installing doas drop-in for user: %s\n", *user)
+		if err := setup.InstallDoas(*user); err != nil {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+			os.Exit(1)
+		}
+		fmt.Println("doas drop-in installed successfully")
+	default:
+		fmt.Fprintf(os.Stderr, "Error: unknown backend %q (expected sudo or doas)\n", *backend)
 		os.Exit(1)
 	}
-	fmt.Println("Sudoers installed successfully")
 }
 
 // runQuery executes a local osquery table query and prints results.
