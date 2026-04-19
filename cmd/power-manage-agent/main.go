@@ -100,19 +100,27 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 	logger.Info("privilege backend set", "backend", privilegeTool)
 
 	// Service manager. Only systemd has a concrete implementation
-	// today; the other backends are scaffolded so the agent picks
-	// up support as the SDK adds it.
+	// today; the other backends are scaffolded in the SDK so the
+	// proto enum + agent wiring stay stable, but WriteUnit / Enable /
+	// Start return sysservice.unsupported(...) until implementations
+	// land. Warn loudly so operators who select a scaffold backend
+	// don't think the agent silently succeeded — the first action
+	// will fail, but the warning explains why before that happens.
 	var serviceTool string
+	scaffoldOnly := false
 	switch cfg.ServiceBackend {
 	case "openrc":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendOpenRC)
 		serviceTool = "rc-service"
+		scaffoldOnly = true
 	case "runit":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendRunit)
 		serviceTool = "sv"
+		scaffoldOnly = true
 	case "s6":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendS6)
 		serviceTool = "s6-svc"
+		scaffoldOnly = true
 	case "systemd", "":
 		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
 		serviceTool = "systemctl"
@@ -121,6 +129,10 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 			"value", cfg.ServiceBackend)
 		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
 		serviceTool = "systemctl"
+	}
+	if scaffoldOnly {
+		logger.Warn("service backend has no SDK implementation yet; SERVICE actions will fail until support lands",
+			"backend", cfg.ServiceBackend)
 	}
 	if _, err := osexec.LookPath(serviceTool); err != nil {
 		return fmt.Errorf("service backend %q selected but %q is not on PATH: %w",

@@ -206,7 +206,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		}
 	case pb.ActionType_ACTION_TYPE_SERVICE:
 		var changed bool
-		output, changed, execErr = e.executeSystemd(ctx, action.GetService())
+		output, changed, execErr = e.executeService(ctx, action.GetService())
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_FILE:
 		var changed bool
@@ -938,9 +938,21 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	return execOutput, verifyOutput, true, nil
 }
 
-func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams) (*pb.CommandOutput, bool, error) {
+func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("service params required")
+	}
+
+	// Reject the unit name up front via the backend's own naming rules
+	// (systemd: <name>.<type>; future backends define their own). This
+	// replaces the ad-hoc path-traversal check below — WriteUnit owns
+	// the path and validates the name through the same helper, so a
+	// bad name can never reach the filesystem.
+	if err := sysservice.ValidateUnitName(params.UnitName); err != nil {
+		return &pb.CommandOutput{
+			ExitCode: 1,
+			Stderr:   err.Error() + "\n",
+		}, false, err
 	}
 
 	// Never allow managing the agent's own service
@@ -956,25 +968,19 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams)
 
 	// Check and update unit file content if provided
 	if params.UnitContent != "" {
+		// Skip-if-unchanged — hashes are cheap and saves the atomic
+		// write + daemon-reload cycle on every assign-on-connect run.
+		// The systemd unit path is an implementation detail of the
+		// backend, but reading it directly is fine here because a
+		// mismatch / missing file just falls through to the write path.
 		unitPath := filepath.Join("/etc/systemd/system", params.UnitName)
-
-		// Validate the resolved path stays within /etc/systemd/system/
-		cleanPath := filepath.Clean(unitPath)
-		if !strings.HasPrefix(cleanPath, "/etc/systemd/system/") {
-			return &pb.CommandOutput{
-				ExitCode: 1,
-				Stderr:   fmt.Sprintf("invalid unit path: %s resolves outside /etc/systemd/system/\n", params.UnitName),
-			}, false, fmt.Errorf("path traversal in unit name: %s", params.UnitName)
-		}
-
-		// Check if unit file already has the correct content
 		needsUpdate := true
 		if existingContent, err := os.ReadFile(unitPath); err == nil {
 			existingHash := sha256.Sum256(existingContent)
 			desiredHash := sha256.Sum256([]byte(params.UnitContent))
 			if existingHash == desiredHash {
 				needsUpdate = false
-				output.WriteString(fmt.Sprintf("unit file %s is already up to date\n", unitPath))
+				output.WriteString(fmt.Sprintf("unit file %s is already up to date\n", params.UnitName))
 			}
 		}
 
@@ -984,18 +990,25 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams)
 				return out, false, err
 			}
 
-			// Write unit file using sudo tee
-			if cmdOutput, err := writeFileWithSudo(ctx, unitPath, params.UnitContent); err != nil {
-				return cmdOutput, false, fmt.Errorf("write unit file: %s", formatCmdError(err, cmdOutput))
+			// Delegate the write to the SDK so the active service
+			// backend (systemd today; openrc/runit/s6 when implemented)
+			// owns the unit-file location and validation. This keeps
+			// the agent backend-agnostic — a POWER_MANAGE_SERVICE_BACKEND
+			// change no longer silently writes systemd files on a host
+			// that doesn't use systemd.
+			if err := sysservice.WriteUnit(ctx, params.UnitName, params.UnitContent); err != nil {
+				return nil, false, fmt.Errorf("write unit %s: %w", params.UnitName, err)
 			}
-			output.WriteString(fmt.Sprintf("updated unit file %s\n", unitPath))
+			output.WriteString(fmt.Sprintf("updated unit file %s\n", params.UnitName))
 			changed = true
 
-			// Reload systemd
+			// Reload the service manager so it picks up the new unit.
+			// DaemonReload is a no-op for backends that don't need it
+			// (the SDK dispatches per-backend).
 			if err := sysservice.DaemonReload(ctx); err != nil {
 				return nil, changed, fmt.Errorf("daemon-reload failed: %w", err)
 			}
-			output.WriteString("reloaded systemd daemon\n")
+			output.WriteString("reloaded service manager\n")
 		}
 	}
 
@@ -1060,25 +1073,42 @@ func (e *Executor) executeSystemd(ctx context.Context, params *pb.ServiceParams)
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, changed, nil
 }
 
-// isUnitEnabled checks if a systemd unit is enabled. The SDK's
+// isUnitEnabled checks if a service unit is enabled. The SDK's
 // sysservice.IsEnabled returns (bool, error); callers of this agent
-// helper just want the bool. Any error is logged at the call path
-// that matters (status reporting) rather than here — treating an
-// error as "not enabled" keeps the previous behaviour.
+// helper just want the bool. A transient failure (dbus timeout,
+// systemctl missing on a non-systemd host, etc.) is treated as "not
+// enabled" to keep the previous behaviour, but logged at debug so
+// operators have the context when troubleshooting why a unit wasn't
+// marked enabled.
 func (e *Executor) isUnitEnabled(unitName string) bool {
-	enabled, _ := sysservice.IsEnabled(unitName)
+	enabled, err := sysservice.IsEnabled(unitName)
+	if err != nil {
+		e.logger.Debug("sysservice.IsEnabled failed; treating as not enabled",
+			"unit", unitName, "error", err)
+	}
 	return enabled
 }
 
-// isUnitMasked checks if a systemd unit is masked.
+// isUnitMasked checks if a service unit is masked. Errors are logged
+// at warn — the masked/unmasked distinction drives whether we reject
+// an Enable attempt with a "run systemctl unmask" hint, so a false
+// negative here is a confusing user-visible failure worth surfacing.
 func (e *Executor) isUnitMasked(unitName string) bool {
-	masked, _ := sysservice.IsMasked(unitName)
+	masked, err := sysservice.IsMasked(unitName)
+	if err != nil {
+		e.logger.Warn("sysservice.IsMasked failed; treating as not masked",
+			"unit", unitName, "error", err)
+	}
 	return masked
 }
 
-// isUnitActive checks if a systemd unit is currently active (running).
+// isUnitActive checks if a service unit is currently active (running).
 func (e *Executor) isUnitActive(unitName string) bool {
-	active, _ := sysservice.IsActive(unitName)
+	active, err := sysservice.IsActive(unitName)
+	if err != nil {
+		e.logger.Debug("sysservice.IsActive failed; treating as not active",
+			"unit", unitName, "error", err)
+	}
 	return active
 }
 
