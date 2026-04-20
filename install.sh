@@ -361,13 +361,27 @@ RestrictSUIDSGID=false
 # power-manage user, so without CAP_SETUID / CAP_SETGID granted as
 # ambient caps the setresuid syscall fails with EPERM and the session
 # never starts ("allocate pty: fork/exec /bin/bash: operation not
-# permitted"). Both must appear in CapabilityBoundingSet too so
-# systemd doesn't drop them before the exec.
+# permitted"). Both must appear in CapabilityBoundingSet too, because
+# systemd's bounding set is a hard ceiling on ambient caps — and the
+# ambient wiring also requires NoNewPrivileges=false and
+# RestrictSUIDSGID=false (both already set above).
 #
-# The rest of the bounding set matches capabilities the agent already
-# relies on: package install hooks, chown on written files, binding
-# privileged ports for the enrollment socket companion, and sys-admin
-# for mount/unmount during LUKS operations.
+# The rest of the bounding set lists caps the agent needs to keep
+# available for sudo-launched children from shell actions — the
+# agent process itself never uses them directly:
+#
+#   - CAP_CHOWN / CAP_DAC_OVERRIDE / CAP_FOWNER: file ownership
+#     and permission overrides during package install hooks and
+#     writing system config files.
+#   - CAP_NET_BIND_SERVICE: daemons restarted by shell actions
+#     (e.g. bundled services using file-cap port-binding) need
+#     this in the bounding set or the exec strips it.
+#   - CAP_NET_ADMIN: firewall-control actions that shell out to
+#     ufw / firewall-cmd / nft.
+#   - CAP_SYS_ADMIN: mount/unmount during LUKS operations.
+#
+# The agent's only listener is a UNIX socket at
+# /run/pm-agent/enroll.sock — it does NOT bind TCP ports itself.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
 
