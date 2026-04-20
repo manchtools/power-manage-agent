@@ -354,6 +354,23 @@ ProtectControlGroups=true
 RestrictRealtime=$restrict_realtime
 RestrictSUIDSGID=false
 
+# Capabilities.
+#
+# Remote terminal sessions spawn /bin/bash as the per-user pm-tty-*
+# account via setuid/setgid. The agent runs as the unprivileged
+# power-manage user, so without CAP_SETUID / CAP_SETGID granted as
+# ambient caps the setresuid syscall fails with EPERM and the session
+# never starts ("allocate pty: fork/exec /bin/bash: operation not
+# permitted"). Both must appear in CapabilityBoundingSet too so
+# systemd doesn't drop them before the exec.
+#
+# The rest of the bounding set matches capabilities the agent already
+# relies on: package install hooks, chown on written files, binding
+# privileged ports for the enrollment socket companion, and sys-admin
+# for mount/unmount during LUKS operations.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+
 # Allow network access
 PrivateNetwork=false
 
