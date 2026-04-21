@@ -38,6 +38,108 @@ import (
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// Repo-field shape constraints. These run in addition to the
+// newline-rejection pass in validateRepositoryParams — newlines are
+// the classic config-injection vector (they let a signed action
+// smuggle extra lines into apt/dnf/pacman configuration), but the
+// fields below also have a naturally narrow grammar, so an allow-list
+// of permitted characters costs nothing and eliminates shell /
+// argument-confusion attacks on runSudoCmd calls that splice these
+// values into a command line.
+var (
+	// APT distribution codenames: "jammy", "bookworm", "focal-updates".
+	validAptDistribution = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	// APT components: "main", "contrib", "non-free-firmware".
+	validAptComponent = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	// APT architecture filter: "amd64", "arm64", comma-separated list.
+	validAptArch = regexp.MustCompile(`^[a-z0-9][a-z0-9,_-]*$`)
+	// Pacman SigLevel: space-separated tokens, e.g. "Optional TrustAll".
+	validPacmanSigLevel = regexp.MustCompile(`^[a-zA-Z ]+$`)
+	// Zypper repository type: "rpm-md", "yast2", "plaindir".
+	validZypperType = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*$`)
+)
+
+// validateRepositoryParams refuses repository configurations that
+// contain newlines in any string field the agent later splices into
+// a config file or shell argument, plus tight regex grammars on the
+// enum-like fields (distribution, component, architecture, siglevel,
+// zypper type). Since actions are signed and admin-controlled, this
+// is not "untrusted input" in the classic sense — but a compromised
+// or malformed admin action should not be able to inject extra
+// directives into /etc/apt/sources.list.d/*, /etc/yum.repos.d/*,
+// /etc/pacman.conf, or zypper metadata.
+func validateRepositoryParams(params *pb.RepositoryParams) error {
+	reject := func(field, value string) error {
+		return fmt.Errorf("repository %s contains newline or invalid character: %q", field, value)
+	}
+	badShape := func(field, value string) error {
+		return fmt.Errorf("repository %s has invalid shape: %q", field, value)
+	}
+
+	if apt := params.Apt; apt != nil {
+		if containsNewline(apt.Url) {
+			return reject("apt.url", apt.Url)
+		}
+		if containsNewline(apt.Distribution) {
+			return reject("apt.distribution", apt.Distribution)
+		}
+		if apt.Distribution != "" && !validAptDistribution.MatchString(apt.Distribution) {
+			return badShape("apt.distribution", apt.Distribution)
+		}
+		for _, c := range apt.Components {
+			if containsNewline(c) {
+				return reject("apt.components entry", c)
+			}
+			if !validAptComponent.MatchString(c) {
+				return badShape("apt.components entry", c)
+			}
+		}
+		if containsNewline(apt.Arch) {
+			return reject("apt.arch", apt.Arch)
+		}
+		if apt.Arch != "" && !validAptArch.MatchString(apt.Arch) {
+			return badShape("apt.arch", apt.Arch)
+		}
+		if containsNewline(apt.GpgKeyUrl) {
+			return reject("apt.gpg_key_url", apt.GpgKeyUrl)
+		}
+	}
+	if dnf := params.Dnf; dnf != nil {
+		if containsNewline(dnf.Baseurl) || containsNewline(dnf.Description) {
+			return reject("dnf.baseurl or dnf.description", dnf.Baseurl+" / "+dnf.Description)
+		}
+		if containsNewline(dnf.Gpgkey) {
+			return reject("dnf.gpgkey", dnf.Gpgkey)
+		}
+	}
+	if pac := params.Pacman; pac != nil {
+		if containsNewline(pac.Server) {
+			return reject("pacman.server", pac.Server)
+		}
+		if containsNewline(pac.SigLevel) {
+			return reject("pacman.sig_level", pac.SigLevel)
+		}
+		if pac.SigLevel != "" && !validPacmanSigLevel.MatchString(pac.SigLevel) {
+			return badShape("pacman.sig_level", pac.SigLevel)
+		}
+	}
+	if zyp := params.Zypper; zyp != nil {
+		if containsNewline(zyp.Url) || containsNewline(zyp.Description) {
+			return reject("zypper.url or zypper.description", zyp.Url+" / "+zyp.Description)
+		}
+		if containsNewline(zyp.Gpgkey) {
+			return reject("zypper.gpgkey", zyp.Gpgkey)
+		}
+		if containsNewline(zyp.Type) {
+			return reject("zypper.type", zyp.Type)
+		}
+		if zyp.Type != "" && !validZypperType.MatchString(zyp.Type) {
+			return badShape("zypper.type", zyp.Type)
+		}
+	}
+	return nil
+}
+
 // maxScriptSize is the maximum allowed size for shell scripts (1 MiB).
 const maxScriptSize = 1 << 20
 
@@ -2223,18 +2325,11 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
 	}
 
-	// Validate that repo URLs/descriptions don't contain newlines (config injection)
-	if params.Apt != nil && containsNewline(params.Apt.Url) {
-		return nil, false, fmt.Errorf("APT repository URL contains newlines")
-	}
-	if params.Dnf != nil && (containsNewline(params.Dnf.Baseurl) || containsNewline(params.Dnf.Description)) {
-		return nil, false, fmt.Errorf("DNF repository URL or description contains newlines")
-	}
-	if params.Pacman != nil && containsNewline(params.Pacman.Server) {
-		return nil, false, fmt.Errorf("Pacman server URL contains newlines")
-	}
-	if params.Zypper != nil && (containsNewline(params.Zypper.Url) || containsNewline(params.Zypper.Description)) {
-		return nil, false, fmt.Errorf("Zypper repository URL or description contains newlines")
+	// Reject config-injection or shape-violating values in every
+	// repository string field, not just URL/description. See
+	// validateRepositoryParams for the per-field rules.
+	if err := validateRepositoryParams(params); err != nil {
+		return nil, false, err
 	}
 
 	// Detect package manager and execute the appropriate configuration

@@ -663,7 +663,16 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			continue
 		}
 
-		// Build mTLS client using current (still valid) certificate
+		// Build mTLS client using current (still valid) certificate.
+		//
+		// NOTE: after the agent bumps to sdk >= v0.3.0 (which makes
+		// WithMTLSFromPEM strict — internal CA only — to close the
+		// trust-broadening audit finding), this call must switch to
+		// sdk.WithMTLSFromPEMAndSystemRoots. The control server sits
+		// behind a public CA (Traefik + Let's Encrypt in the
+		// reference deployment), so server verification needs
+		// system roots; application-layer identity is proven by the
+		// current certificate in the RenewCertificate request body.
 		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
 		if err != nil {
 			logger.Error("cert rotation: failed to configure mTLS", "error", err)

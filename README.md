@@ -51,6 +51,16 @@ The agent supports two enrollment methods:
 6. The Control Server validates the token, signs the certificate, and returns credentials
 7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and connects to the gateway
 
+> **Trust boundary.** The enrollment socket is intentionally
+> world-accessible (mode `0666`); the security boundary is the
+> registration token, which is validated by the Control Server.
+> The agent applies a **global** rate limit of 5 enrollment attempts
+> per minute across all local callers, so any local user can briefly
+> prevent a legitimate enrollment by flooding the socket with bad
+> tokens. This is acceptable for a self-hosted MDM — the admin who
+> runs the install script will retry — but it is not suitable for
+> adversarial multi-tenant hosts.
+
 ```
                                   ┌─────────────────────────┐
   User (no sudo)                  │   Agent (systemd svc)   │
