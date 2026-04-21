@@ -791,7 +791,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 			Username:   username,
 			Shell:      "/usr/sbin/nologin",
 			CreateHome: false,
-			Comment:    "create_home:false regression test",
+			Comment:    "regression test for create_home false",
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
@@ -816,7 +816,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 		action.Params = &pb.Action_User{User: &pb.UserParams{
 			Username:   username,
 			CreateHome: true,
-			Comment:    "create_home:true regression test",
+			Comment:    "regression test for create_home true",
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
