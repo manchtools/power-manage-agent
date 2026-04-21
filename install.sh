@@ -250,8 +250,18 @@ download_binary() {
     local tmp_binary tmp_sums
     tmp_binary=$(mktemp "${dest_dir}/.power-manage-agent.XXXXXX")
     tmp_sums=$(mktemp "${dest_dir}/.SHA256SUMS.XXXXXX")
-    # shellcheck disable=SC2064
-    trap "rm -f '${tmp_binary}' '${tmp_sums}'" EXIT INT TERM
+    # Trap via a named function so the tmp paths are expanded
+    # inside the function body (where normal "$var" quoting
+    # handles spaces / quotes cleanly) rather than spliced into
+    # the trap command string at registration time. An earlier
+    # shape used `trap "rm -f '${tmp_binary}' '${tmp_sums}'"`,
+    # which would break if BINARY_PATH's directory ever contained
+    # a single quote — unlikely on a typical deploy host, but a
+    # gratuitous shell-quoting fragility we can just drop.
+    cleanup_download_tmp() {
+        rm -f "$tmp_binary" "$tmp_sums"
+    }
+    trap cleanup_download_tmp EXIT INT TERM
 
     if command -v curl &>/dev/null; then
         if ! curl -gfSL --progress-bar -o "$tmp_binary" "$download_url"; then
