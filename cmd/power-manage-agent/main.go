@@ -1648,21 +1648,25 @@ func runTTY(args []string) int {
 		return 1
 	}
 
-	// Device-authoritative guard for mutating subcommands. `enable`/`disable`
-	// must be invoked by a human with root privileges attached to a real
-	// terminal. Without this gate the server could flip the flag remotely
-	// by dispatching `ACTION_TYPE_SHELL { script: "power-manage-agent tty enable" }` —
-	// that shell runs as the power-manage user which owns the SQLite DB,
-	// so it would otherwise succeed. Status stays readable without a
-	// terminal so operators can `if power-manage-agent tty status` in
-	// shell scripts.
+	// Require root for mutating subcommands. The tty.enabled row in the
+	// agent's SQLite DB is owned by the agent service user; another
+	// unprivileged local user must not be able to flip the flag for a
+	// user they aren't. Root-only enforces that — sudo or an equivalent
+	// privilege backend is the only path to the mutator.
+	//
+	// An earlier revision also required the call to originate from an
+	// interactive TTY so a server-dispatched `ACTION_TYPE_SHELL` couldn't
+	// flip the flag remotely. That gate was dropped in this revision:
+	// the `script(1)` utility routes around it in one line (pty
+	// allocation makes the stdin check pass), so the gate only added
+	// operational friction without providing real defence-in-depth. The
+	// server-side answer to "who can grant terminal access on which
+	// device" belongs in the permission model (RBAC + the fleet-wide
+	// distribution of shell actions), not in a terminal-shape check on
+	// the agent CLI.
 	if sub == "enable" || sub == "disable" {
 		if os.Geteuid() != 0 {
 			fmt.Fprintf(os.Stderr, "Error: tty %s must be run as root (try: sudo power-manage-agent tty %s)\n", sub, sub)
-			return 1
-		}
-		if !term.IsTerminal(int(os.Stdin.Fd())) {
-			fmt.Fprintf(os.Stderr, "Error: tty %s must be run interactively from a local terminal\n", sub)
 			return 1
 		}
 	}
