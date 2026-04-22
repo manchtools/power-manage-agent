@@ -38,6 +38,120 @@ import (
 // This prevents path traversal, shell injection, and sed/regex injection.
 var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
 
+// Repo-field shape constraints. These run in addition to the
+// newline-rejection pass in validateRepositoryParams — newlines are
+// the classic config-injection vector (they let a signed action
+// smuggle extra lines into apt/dnf/pacman configuration), but the
+// fields below also have a naturally narrow grammar, so an allow-list
+// of permitted characters costs nothing and eliminates shell /
+// argument-confusion attacks on runSudoCmd calls that splice these
+// values into a command line.
+var (
+	// APT distribution codenames: "jammy", "bookworm", "focal-updates".
+	validAptDistribution = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	// APT components: "main", "contrib", "non-free-firmware".
+	validAptComponent = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
+	// APT architecture filter: "amd64", "arm64", comma-separated list.
+	validAptArch = regexp.MustCompile(`^[a-z0-9][a-z0-9,_-]*$`)
+	// Pacman SigLevel: space-separated tokens, e.g. "Optional TrustAll".
+	validPacmanSigLevel = regexp.MustCompile(`^[a-zA-Z ]+$`)
+	// Zypper repository type: "rpm-md", "yast2", "plaindir".
+	validZypperType = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*$`)
+)
+
+// validateRepositoryParams refuses repository configurations that
+// contain newlines in any string field the agent later splices into
+// a config file or shell argument, plus tight regex grammars on the
+// enum-like fields (distribution, component, architecture, siglevel,
+// zypper type). Since actions are signed and admin-controlled, this
+// is not "untrusted input" in the classic sense — but a compromised
+// or malformed admin action should not be able to inject extra
+// directives into /etc/apt/sources.list.d/*, /etc/yum.repos.d/*,
+// /etc/pacman.conf, or zypper metadata.
+func validateRepositoryParams(params *pb.RepositoryParams) error {
+	// Field-level errors name the offending field but do NOT echo
+	// the rejected value. Repository URLs / GPG key URLs / descriptions
+	// can carry secrets or per-deployment URLs that should not leak
+	// into task-result payloads, audit projections, or log sinks. A
+	// named field tells the operator enough to go check the action
+	// definition — the full value is one click away in the UI.
+	reject := func(field string) error {
+		return fmt.Errorf("repository field %q contains newline or control character", field)
+	}
+	badShape := func(field string) error {
+		return fmt.Errorf("repository field %q has invalid shape", field)
+	}
+
+	if apt := params.Apt; apt != nil {
+		if containsNewline(apt.Url) {
+			return reject("apt.url")
+		}
+		if containsNewline(apt.Distribution) {
+			return reject("apt.distribution")
+		}
+		if apt.Distribution != "" && !validAptDistribution.MatchString(apt.Distribution) {
+			return badShape("apt.distribution")
+		}
+		for _, c := range apt.Components {
+			if containsNewline(c) {
+				return reject("apt.components entry")
+			}
+			if !validAptComponent.MatchString(c) {
+				return badShape("apt.components entry")
+			}
+		}
+		if containsNewline(apt.Arch) {
+			return reject("apt.arch")
+		}
+		if apt.Arch != "" && !validAptArch.MatchString(apt.Arch) {
+			return badShape("apt.arch")
+		}
+		if containsNewline(apt.GpgKeyUrl) {
+			return reject("apt.gpg_key_url")
+		}
+	}
+	if dnf := params.Dnf; dnf != nil {
+		if containsNewline(dnf.Baseurl) {
+			return reject("dnf.baseurl")
+		}
+		if containsNewline(dnf.Description) {
+			return reject("dnf.description")
+		}
+		if containsNewline(dnf.Gpgkey) {
+			return reject("dnf.gpgkey")
+		}
+	}
+	if pac := params.Pacman; pac != nil {
+		if containsNewline(pac.Server) {
+			return reject("pacman.server")
+		}
+		if containsNewline(pac.SigLevel) {
+			return reject("pacman.sig_level")
+		}
+		if pac.SigLevel != "" && !validPacmanSigLevel.MatchString(pac.SigLevel) {
+			return badShape("pacman.sig_level")
+		}
+	}
+	if zyp := params.Zypper; zyp != nil {
+		if containsNewline(zyp.Url) {
+			return reject("zypper.url")
+		}
+		if containsNewline(zyp.Description) {
+			return reject("zypper.description")
+		}
+		if containsNewline(zyp.Gpgkey) {
+			return reject("zypper.gpgkey")
+		}
+		if containsNewline(zyp.Type) {
+			return reject("zypper.type")
+		}
+		if zyp.Type != "" && !validZypperType.MatchString(zyp.Type) {
+			return badShape("zypper.type")
+		}
+	}
+	return nil
+}
+
 // maxScriptSize is the maximum allowed size for shell scripts (1 MiB).
 const maxScriptSize = 1 << 20
 
@@ -2211,30 +2325,32 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name required")
 	}
 
-	// Repair filesystem if mounted read-only
-	if out, err := e.requireWritableFS(ctx); err != nil {
-		return out, false, err
-	}
-
+	// Validate BEFORE requireWritableFS: requireWritableFS can
+	// invoke sudo-backed remount/repair on a read-only root, so
+	// dispatching it for a malformed action (invalid name, oversized
+	// name, newline injection in a URL/GPG field, etc.) leaks
+	// privileged side-effects that the action should have been
+	// rejected for up front. Keep validation cheap and before any
+	// system mutation.
 	if !validRepoName.MatchString(params.Name) {
-		return nil, false, fmt.Errorf("invalid repository name %q: must match [a-zA-Z0-9][a-zA-Z0-9._-]*", params.Name)
+		return nil, false, fmt.Errorf("invalid repository name: must match [a-zA-Z0-9][a-zA-Z0-9._-]*")
 	}
 	if len(params.Name) > 128 {
 		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
 	}
 
-	// Validate that repo URLs/descriptions don't contain newlines (config injection)
-	if params.Apt != nil && containsNewline(params.Apt.Url) {
-		return nil, false, fmt.Errorf("APT repository URL contains newlines")
+	// Reject config-injection or shape-violating values in every
+	// repository string field, not just URL/description. See
+	// validateRepositoryParams for the per-field rules.
+	if err := validateRepositoryParams(params); err != nil {
+		return nil, false, err
 	}
-	if params.Dnf != nil && (containsNewline(params.Dnf.Baseurl) || containsNewline(params.Dnf.Description)) {
-		return nil, false, fmt.Errorf("DNF repository URL or description contains newlines")
-	}
-	if params.Pacman != nil && containsNewline(params.Pacman.Server) {
-		return nil, false, fmt.Errorf("Pacman server URL contains newlines")
-	}
-	if params.Zypper != nil && (containsNewline(params.Zypper.Url) || containsNewline(params.Zypper.Description)) {
-		return nil, false, fmt.Errorf("Zypper repository URL or description contains newlines")
+
+	// Repair filesystem if mounted read-only. Only reached once the
+	// action has passed every structural check, so the sudo-backed
+	// remount never fires for a payload we were going to refuse.
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Detect package manager and execute the appropriate configuration

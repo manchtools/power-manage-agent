@@ -225,25 +225,60 @@ download_binary() {
     local arch
     arch=$(detect_arch)
     local binary_name="power-manage-agent-linux-${arch}"
-    local download_url
+    local download_url sums_url release_base
 
     if [[ "$VERSION" == "latest" ]]; then
-        download_url="https://github.com/${GITHUB_REPO}/releases/latest/download/${binary_name}"
+        release_base="https://github.com/${GITHUB_REPO}/releases/latest/download"
     else
-        download_url="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}/${binary_name}"
+        release_base="https://github.com/${GITHUB_REPO}/releases/download/${VERSION}"
     fi
+    download_url="${release_base}/${binary_name}"
+    sums_url="${release_base}/SHA256SUMS"
 
     log_info "Detected architecture: ${arch}"
     log_info "Downloading agent from ${download_url}..."
 
+    # Download to a sibling tmp file inside the destination directory
+    # so the final `mv` is an atomic rename inside the same filesystem.
+    # Clobbering BINARY_PATH directly with a partial download — the
+    # previous behaviour — could leave the host with a truncated or
+    # malicious binary if the transfer was interrupted or the release
+    # endpoint was compromised.
+    local dest_dir
+    dest_dir=$(dirname "$BINARY_PATH")
+    mkdir -p "$dest_dir"
+    local tmp_binary tmp_sums
+    tmp_binary=$(mktemp "${dest_dir}/.power-manage-agent.XXXXXX")
+    tmp_sums=$(mktemp "${dest_dir}/.SHA256SUMS.XXXXXX")
+    # Trap via a named function so the tmp paths are expanded
+    # inside the function body (where normal "$var" quoting
+    # handles spaces / quotes cleanly) rather than spliced into
+    # the trap command string at registration time. An earlier
+    # shape used `trap "rm -f '${tmp_binary}' '${tmp_sums}'"`,
+    # which would break if BINARY_PATH's directory ever contained
+    # a single quote — unlikely on a typical deploy host, but a
+    # gratuitous shell-quoting fragility we can just drop.
+    cleanup_download_tmp() {
+        rm -f "$tmp_binary" "$tmp_sums"
+    }
+    trap cleanup_download_tmp EXIT INT TERM
+
     if command -v curl &>/dev/null; then
-        if ! curl -gfSL --progress-bar -o "$BINARY_PATH" "$download_url"; then
+        if ! curl -gfSL --progress-bar -o "$tmp_binary" "$download_url"; then
             log_error "Download failed. Check the version and that the release exists."
             exit 1
         fi
+        if ! curl -gfSL -o "$tmp_sums" "$sums_url"; then
+            log_error "SHA256SUMS download failed. Refusing to install unverified binary."
+            exit 1
+        fi
     elif command -v wget &>/dev/null; then
-        if ! wget -q --show-progress -O "$BINARY_PATH" "$download_url"; then
+        if ! wget -q --show-progress -O "$tmp_binary" "$download_url"; then
             log_error "Download failed. Check the version and that the release exists."
+            exit 1
+        fi
+        if ! wget -q -O "$tmp_sums" "$sums_url"; then
+            log_error "SHA256SUMS download failed. Refusing to install unverified binary."
             exit 1
         fi
     else
@@ -251,7 +286,46 @@ download_binary() {
         exit 1
     fi
 
-    chmod +x "$BINARY_PATH"
+    # Verify the downloaded binary against the publisher's SHA256SUMS.
+    # Fail closed: a missing / mismatched / tampered checksum ends the
+    # install before we touch BINARY_PATH. The SHA256SUMS file is served
+    # by the same GitHub release as the binary, so this does not protect
+    # against a release-channel compromise on its own — the release
+    # workflow should additionally sign the file (cosign / minisign) and
+    # this script should verify that signature once CI publishes it.
+    # Until then, SHA256SUMS still catches the "half-downloaded binary
+    # was silently installed as root" class of failures.
+    local expected_sha actual_sha
+    expected_sha=$(awk -v f="$binary_name" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp_sums")
+    if [[ -z "$expected_sha" ]]; then
+        log_error "SHA256SUMS has no entry for ${binary_name}. Refusing to install."
+        exit 1
+    fi
+    if ! command -v sha256sum &>/dev/null; then
+        log_error "sha256sum not found. Cannot verify binary integrity; refusing to install."
+        exit 1
+    fi
+    actual_sha=$(sha256sum "$tmp_binary" | awk '{print $1}')
+    if [[ "$expected_sha" != "$actual_sha" ]]; then
+        log_error "SHA256 mismatch for ${binary_name}."
+        log_error "  expected: ${expected_sha}"
+        log_error "  actual:   ${actual_sha}"
+        log_error "Refusing to install tampered or corrupt binary."
+        exit 1
+    fi
+    log_info "SHA256 verified."
+
+    chmod 0755 "$tmp_binary"
+    # mv across the same filesystem is atomic, so a crash here never
+    # leaves BINARY_PATH in a partially-written state. The trap above
+    # handles the case where the mv itself fails.
+    if ! mv -f "$tmp_binary" "$BINARY_PATH"; then
+        log_error "Failed to install binary to ${BINARY_PATH}."
+        exit 1
+    fi
+    rm -f "$tmp_sums"
+    trap - EXIT INT TERM
+
     log_info "Binary installed to $BINARY_PATH"
 }
 
@@ -413,10 +487,18 @@ enroll_agent() {
 
     log_info "Enrolling agent with server via socket..."
 
-    local enroll_cmd="$BINARY_PATH enroll -server=$SERVER_URL -token=$REGISTRATION_TOKEN"
+    # Build the enrollment command as an array so arguments are passed
+    # one-per-element and bash does not word-split, glob, or re-tokenise
+    # user-supplied values such as SERVER_URL or REGISTRATION_TOKEN.
+    local -a enroll_cmd=(
+        "$BINARY_PATH"
+        "enroll"
+        "-server=$SERVER_URL"
+        "-token=$REGISTRATION_TOKEN"
+    )
 
     if [[ -n "$SKIP_VERIFY" ]]; then
-        enroll_cmd="$enroll_cmd -skip-verify"
+        enroll_cmd+=("-skip-verify")
     fi
 
     # Wait for the enrollment socket to become available (agent needs to start first)
@@ -433,12 +515,13 @@ enroll_agent() {
     fi
 
     # Enroll via socket — no sudo needed, any user can connect
-    if $enroll_cmd; then
+    if "${enroll_cmd[@]}"; then
         log_info "Agent enrolled successfully"
     else
         log_error "Agent enrollment failed"
         log_info "You can try again later by running:"
-        log_info "  $enroll_cmd"
+        # printf %q quotes each argument safely for copy-paste.
+        log_info "  $(printf '%q ' "${enroll_cmd[@]}")"
         return 1
     fi
 }
@@ -549,20 +632,48 @@ install_luks_sudoers() {
 
     log_info "Installing LUKS sudoers rule..."
 
-    cat > "$sudoers_file" << 'EOF'
+    # Validate BINARY_PATH before interpolating it into a NOPASSWD
+    # sudoers rule. The rule grants passwordless root for anything
+    # matching "$BINARY_PATH luks *", so a malicious or malformed
+    # path is a privilege-escalation hazard:
+    #   - Must be absolute (anchors the sudoers pattern; relative
+    #     paths in sudoers are a non-starter).
+    #   - Must contain only characters that are safe both in a file
+    #     path and in a sudoers Cmnd_Alias: letters, digits,
+    #     `/._-`. Notably no spaces (sudoers tokenizer), no quotes,
+    #     no commas, no wildcards of our own.
+    if [[ "$BINARY_PATH" != /* ]]; then
+        log_error "BINARY_PATH ($BINARY_PATH) must be absolute to install sudoers rule"
+        exit 1
+    fi
+    if [[ ! "$BINARY_PATH" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
+        log_error "BINARY_PATH ($BINARY_PATH) contains characters unsafe for sudoers; must match /[A-Za-z0-9/._-]+"
+        exit 1
+    fi
+
+    # Unquoted heredoc so $BINARY_PATH expands — the rule must match
+    # the actual binary location, which differs when the operator passes
+    # --binary. Sudoers treats wildcards on the argument list specially,
+    # so this remains a path match for /PATH/TO/power-manage-agent +
+    # "luks" verb + any args.
+    cat > "$sudoers_file" <<EOF
 # Allow all users to run LUKS passphrase commands without password
-ALL ALL=(root) NOPASSWD: /usr/local/bin/power-manage-agent luks *
+ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks *
 EOF
 
     chmod 440 "$sudoers_file"
 
-    # Validate sudoers syntax
-    if visudo -c -f "$sudoers_file" &>/dev/null; then
-        log_info "LUKS sudoers rule installed"
-    else
-        log_error "Invalid sudoers syntax, removing file"
+    # Validate sudoers syntax. Fail-closed: if visudo rejects the
+    # generated file, remove it AND fail the install. Continuing
+    # the install after visudo rejection used to leave the host in
+    # a state where LUKS actions would prompt for a password (no
+    # sudoers rule in effect) — surprising and undebuggable.
+    if ! visudo -c -f "$sudoers_file" &>/dev/null; then
+        log_error "Invalid sudoers syntax in $sudoers_file; removing and aborting install"
         rm -f "$sudoers_file"
+        exit 1
     fi
+    log_info "LUKS sudoers rule installed"
 }
 
 show_status() {
