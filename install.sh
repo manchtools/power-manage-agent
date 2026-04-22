@@ -632,6 +632,25 @@ install_luks_sudoers() {
 
     log_info "Installing LUKS sudoers rule..."
 
+    # Validate BINARY_PATH before interpolating it into a NOPASSWD
+    # sudoers rule. The rule grants passwordless root for anything
+    # matching "$BINARY_PATH luks *", so a malicious or malformed
+    # path is a privilege-escalation hazard:
+    #   - Must be absolute (anchors the sudoers pattern; relative
+    #     paths in sudoers are a non-starter).
+    #   - Must contain only characters that are safe both in a file
+    #     path and in a sudoers Cmnd_Alias: letters, digits,
+    #     `/._-`. Notably no spaces (sudoers tokenizer), no quotes,
+    #     no commas, no wildcards of our own.
+    if [[ "$BINARY_PATH" != /* ]]; then
+        log_error "BINARY_PATH ($BINARY_PATH) must be absolute to install sudoers rule"
+        exit 1
+    fi
+    if [[ ! "$BINARY_PATH" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
+        log_error "BINARY_PATH ($BINARY_PATH) contains characters unsafe for sudoers; must match /[A-Za-z0-9/._-]+"
+        exit 1
+    fi
+
     # Unquoted heredoc so $BINARY_PATH expands — the rule must match
     # the actual binary location, which differs when the operator passes
     # --binary. Sudoers treats wildcards on the argument list specially,
@@ -644,13 +663,17 @@ EOF
 
     chmod 440 "$sudoers_file"
 
-    # Validate sudoers syntax
-    if visudo -c -f "$sudoers_file" &>/dev/null; then
-        log_info "LUKS sudoers rule installed"
-    else
-        log_error "Invalid sudoers syntax, removing file"
+    # Validate sudoers syntax. Fail-closed: if visudo rejects the
+    # generated file, remove it AND fail the install. Continuing
+    # the install after visudo rejection used to leave the host in
+    # a state where LUKS actions would prompt for a password (no
+    # sudoers rule in effect) — surprising and undebuggable.
+    if ! visudo -c -f "$sudoers_file" &>/dev/null; then
+        log_error "Invalid sudoers syntax in $sudoers_file; removing and aborting install"
         rm -f "$sudoers_file"
+        exit 1
     fi
+    log_info "LUKS sudoers rule installed"
 }
 
 show_status() {

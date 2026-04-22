@@ -69,72 +69,84 @@ var (
 // directives into /etc/apt/sources.list.d/*, /etc/yum.repos.d/*,
 // /etc/pacman.conf, or zypper metadata.
 func validateRepositoryParams(params *pb.RepositoryParams) error {
-	reject := func(field, value string) error {
-		return fmt.Errorf("repository %s contains newline or invalid character: %q", field, value)
+	// Field-level errors name the offending field but do NOT echo
+	// the rejected value. Repository URLs / GPG key URLs / descriptions
+	// can carry secrets or per-deployment URLs that should not leak
+	// into task-result payloads, audit projections, or log sinks. A
+	// named field tells the operator enough to go check the action
+	// definition — the full value is one click away in the UI.
+	reject := func(field string) error {
+		return fmt.Errorf("repository field %q contains newline or control character", field)
 	}
-	badShape := func(field, value string) error {
-		return fmt.Errorf("repository %s has invalid shape: %q", field, value)
+	badShape := func(field string) error {
+		return fmt.Errorf("repository field %q has invalid shape", field)
 	}
 
 	if apt := params.Apt; apt != nil {
 		if containsNewline(apt.Url) {
-			return reject("apt.url", apt.Url)
+			return reject("apt.url")
 		}
 		if containsNewline(apt.Distribution) {
-			return reject("apt.distribution", apt.Distribution)
+			return reject("apt.distribution")
 		}
 		if apt.Distribution != "" && !validAptDistribution.MatchString(apt.Distribution) {
-			return badShape("apt.distribution", apt.Distribution)
+			return badShape("apt.distribution")
 		}
 		for _, c := range apt.Components {
 			if containsNewline(c) {
-				return reject("apt.components entry", c)
+				return reject("apt.components entry")
 			}
 			if !validAptComponent.MatchString(c) {
-				return badShape("apt.components entry", c)
+				return badShape("apt.components entry")
 			}
 		}
 		if containsNewline(apt.Arch) {
-			return reject("apt.arch", apt.Arch)
+			return reject("apt.arch")
 		}
 		if apt.Arch != "" && !validAptArch.MatchString(apt.Arch) {
-			return badShape("apt.arch", apt.Arch)
+			return badShape("apt.arch")
 		}
 		if containsNewline(apt.GpgKeyUrl) {
-			return reject("apt.gpg_key_url", apt.GpgKeyUrl)
+			return reject("apt.gpg_key_url")
 		}
 	}
 	if dnf := params.Dnf; dnf != nil {
-		if containsNewline(dnf.Baseurl) || containsNewline(dnf.Description) {
-			return reject("dnf.baseurl or dnf.description", dnf.Baseurl+" / "+dnf.Description)
+		if containsNewline(dnf.Baseurl) {
+			return reject("dnf.baseurl")
+		}
+		if containsNewline(dnf.Description) {
+			return reject("dnf.description")
 		}
 		if containsNewline(dnf.Gpgkey) {
-			return reject("dnf.gpgkey", dnf.Gpgkey)
+			return reject("dnf.gpgkey")
 		}
 	}
 	if pac := params.Pacman; pac != nil {
 		if containsNewline(pac.Server) {
-			return reject("pacman.server", pac.Server)
+			return reject("pacman.server")
 		}
 		if containsNewline(pac.SigLevel) {
-			return reject("pacman.sig_level", pac.SigLevel)
+			return reject("pacman.sig_level")
 		}
 		if pac.SigLevel != "" && !validPacmanSigLevel.MatchString(pac.SigLevel) {
-			return badShape("pacman.sig_level", pac.SigLevel)
+			return badShape("pacman.sig_level")
 		}
 	}
 	if zyp := params.Zypper; zyp != nil {
-		if containsNewline(zyp.Url) || containsNewline(zyp.Description) {
-			return reject("zypper.url or zypper.description", zyp.Url+" / "+zyp.Description)
+		if containsNewline(zyp.Url) {
+			return reject("zypper.url")
+		}
+		if containsNewline(zyp.Description) {
+			return reject("zypper.description")
 		}
 		if containsNewline(zyp.Gpgkey) {
-			return reject("zypper.gpgkey", zyp.Gpgkey)
+			return reject("zypper.gpgkey")
 		}
 		if containsNewline(zyp.Type) {
-			return reject("zypper.type", zyp.Type)
+			return reject("zypper.type")
 		}
 		if zyp.Type != "" && !validZypperType.MatchString(zyp.Type) {
-			return badShape("zypper.type", zyp.Type)
+			return badShape("zypper.type")
 		}
 	}
 	return nil
@@ -2313,13 +2325,15 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name required")
 	}
 
-	// Repair filesystem if mounted read-only
-	if out, err := e.requireWritableFS(ctx); err != nil {
-		return out, false, err
-	}
-
+	// Validate BEFORE requireWritableFS: requireWritableFS can
+	// invoke sudo-backed remount/repair on a read-only root, so
+	// dispatching it for a malformed action (invalid name, oversized
+	// name, newline injection in a URL/GPG field, etc.) leaks
+	// privileged side-effects that the action should have been
+	// rejected for up front. Keep validation cheap and before any
+	// system mutation.
 	if !validRepoName.MatchString(params.Name) {
-		return nil, false, fmt.Errorf("invalid repository name %q: must match [a-zA-Z0-9][a-zA-Z0-9._-]*", params.Name)
+		return nil, false, fmt.Errorf("invalid repository name: must match [a-zA-Z0-9][a-zA-Z0-9._-]*")
 	}
 	if len(params.Name) > 128 {
 		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
@@ -2330,6 +2344,13 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	// validateRepositoryParams for the per-field rules.
 	if err := validateRepositoryParams(params); err != nil {
 		return nil, false, err
+	}
+
+	// Repair filesystem if mounted read-only. Only reached once the
+	// action has passed every structural check, so the sudo-backed
+	// remount never fires for a payload we were going to refuse.
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
 	}
 
 	// Detect package manager and execute the appropriate configuration
