@@ -762,6 +762,76 @@ func TestIntegration_User(t *testing.T) {
 	})
 }
 
+// TestIntegration_User_CreateHomeRespected locks down the fix for the
+// agent inverting `create_home: false` to `true` for non-system users.
+// Before the fix, the control server's pm-tty-* sync explicitly set
+// create_home: false on the UserParams but the agent overrode it and
+// produced a home directory at /home/pm-tty-<username> anyway, which
+// contradicted the wire contract.
+//
+// Two sub-tests — the explicit-false path and the explicit-true path.
+// Both exercise non-system users (the branch that used to invert).
+func TestIntegration_User_CreateHomeRespected(t *testing.T) {
+	e := newTestExecutor()
+	ctx := context.Background()
+
+	t.Run("ExplicitFalse_NoHomeCreated", func(t *testing.T) {
+		username := "pmtestnohome"
+		homeDir := "/home/" + username
+		t.Cleanup(func() {
+			cleanupTestUser(t, username)
+			// Defensive: some failure paths can leave a home behind
+			// even after userdel; clean it up so a re-run isn't
+			// polluted.
+			sudoRun("rm", "-rf", homeDir).Run()
+		})
+
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_User{User: &pb.UserParams{
+			Username:   username,
+			Shell:      "/usr/sbin/nologin",
+			CreateHome: false,
+			Comment:    "regression test for create_home false",
+		}}
+		result := e.Execute(ctx, action)
+		assertSuccess(t, result)
+		if !userExists(username) {
+			t.Fatal("user not created")
+		}
+
+		if _, err := os.Stat(homeDir); !os.IsNotExist(err) {
+			t.Errorf("home directory %s exists but create_home was false: stat err = %v", homeDir, err)
+		}
+	})
+
+	t.Run("ExplicitTrue_HomeCreated", func(t *testing.T) {
+		username := "pmtestwithhome"
+		homeDir := "/home/" + username
+		t.Cleanup(func() {
+			cleanupTestUser(t, username)
+			sudoRun("rm", "-rf", homeDir).Run()
+		})
+
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_User{User: &pb.UserParams{
+			Username:   username,
+			CreateHome: true,
+			Comment:    "regression test for create_home true",
+		}}
+		result := e.Execute(ctx, action)
+		assertSuccess(t, result)
+		if !userExists(username) {
+			t.Fatal("user not created")
+		}
+
+		if info, err := os.Stat(homeDir); err != nil {
+			t.Errorf("home directory %s missing but create_home was true: stat err = %v", homeDir, err)
+		} else if !info.IsDir() {
+			t.Errorf("%s exists but is not a directory", homeDir)
+		}
+	})
+}
+
 // =============================================================================
 // Group Tests
 // =============================================================================

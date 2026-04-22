@@ -2974,12 +2974,16 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-r") // Create system account
 	}
 
-	// Create home directory (default true for normal users)
+	// Respect the explicit create_home value from the proto. A prior
+	// revision inverted false → true for non-system users on the
+	// assumption that proto3 scalar false meant "unset, use default."
+	// That broke the UserParams contract — the server could not
+	// express "no home directory" for a non-system user even when it
+	// explicitly set create_home: false, because the agent would
+	// silently override. The control server's system-managed pm-tty
+	// action and the web UI's "Create home" checkbox both rely on
+	// explicit-false being honoured.
 	createHome := params.CreateHome
-	if !params.SystemUser && !params.CreateHome {
-		// For normal users, default to creating home
-		createHome = true
-	}
 
 	// Determine home directory path to check if it exists
 	homeDir := params.HomeDir
@@ -3153,11 +3157,11 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		changed = true
 	}
 
-	// Ensure home directory exists (may be missing if a prior run failed)
+	// Ensure home directory exists (may be missing if a prior run
+	// failed). Same change as in createUser — honour the explicit
+	// create_home value from the proto rather than inverting false
+	// to true for non-system users.
 	createHome := params.CreateHome
-	if !params.SystemUser && !params.CreateHome {
-		createHome = true
-	}
 	if createHome {
 		homeDir := params.HomeDir
 		if homeDir == "" {
