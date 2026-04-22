@@ -140,7 +140,6 @@ URI Parameters:
 - `server:port` - Control server address (required)
 - `token` - Registration token (required for first run)
 - `skip-verify=true` - Skip TLS verification (development only)
-- `tls=false` - Use HTTP instead of HTTPS
 
 ### Subcommands
 

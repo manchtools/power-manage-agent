@@ -433,6 +433,10 @@ func main() {
 // The private key never leaves the agent. The control server returns the gateway URL
 // for subsequent mTLS streaming connections.
 func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Logger) (*credentials.Credentials, error) {
+	if err := requireHTTPSURL(cfg.ServerURL, "control server URL"); err != nil {
+		return nil, err
+	}
+
 	logger.Info("registering with control server",
 		"server", cfg.ServerURL,
 		"hostname", hostname,
@@ -478,6 +482,35 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 	}, nil
 }
 
+func newGatewayMTLSClient(creds *credentials.Credentials) (*sdk.Client, error) {
+	if creds == nil {
+		return nil, fmt.Errorf("credentials required")
+	}
+	if err := requireHTTPSURL(creds.GatewayAddr, "gateway URL"); err != nil {
+		return nil, err
+	}
+
+	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+	if err != nil {
+		return nil, err
+	}
+	return sdk.NewClient(creds.GatewayAddr,
+		mtlsOpt,
+		sdk.WithAuth(creds.DeviceID, ""),
+	), nil
+}
+
+func requireHTTPSURL(rawURL, label string) error {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("parse %s: %w", label, err)
+	}
+	if parsed.Scheme != "https" {
+		return fmt.Errorf("%s must use https", label)
+	}
+	return nil
+}
+
 // runAgent connects to the gateway and processes messages.
 // The agent continues to run scheduled actions even when disconnected.
 // If securityAlert is non-nil, it will be sent to the server after connection.
@@ -495,27 +528,10 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		// Reset handler connection state for new connection
 		h.ResetConnection()
 
-		var client *sdk.Client
-
-		// Check if using http:// (h2c mode for development) or https:// (mTLS for production)
-		if strings.HasPrefix(creds.GatewayAddr, "http://") {
-			// Development mode: use h2c (HTTP/2 cleartext)
-			logger.Debug("using h2c mode (development)")
-			client = sdk.NewClient(creds.GatewayAddr,
-				sdk.WithH2C(),
-				sdk.WithAuth(creds.DeviceID, ""),
-			)
-		} else {
-			// Production mode: use mTLS
-			mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-			if err != nil {
-				logger.Error("failed to configure mTLS", "error", err)
-				os.Exit(1)
-			}
-			client = sdk.NewClient(creds.GatewayAddr,
-				mtlsOpt,
-				sdk.WithAuth(creds.DeviceID, ""),
-			)
+		client, err := newGatewayMTLSClient(creds)
+		if err != nil {
+			logger.Error("failed to configure gateway mTLS client", "error", err)
+			os.Exit(1)
 		}
 
 		// Create a child context for this connection session
@@ -567,7 +583,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 		// Wait for the stream to end
 		connStart := time.Now()
-		err := <-streamDone
+		streamErr := <-streamDone
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
@@ -586,7 +602,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		}
 
 		logger.Error("connection lost, continuing with scheduled actions",
-			"error", err,
+			"error", streamErr,
 			"backoff", currentBackoff.String(),
 		)
 
@@ -1007,14 +1023,12 @@ type registrationURI struct {
 }
 
 // parseRegistrationURI parses a power-manage:// URI.
-// Format: power-manage://server:port?token=xxx[&skip-verify=true][&tls=false]
+// Format: power-manage://server:port?token=xxx[&skip-verify=true]
 // Examples:
 //   - power-manage://gateway.example.com:8080?token=abc123
 //   - power-manage://192.168.1.100:8080?token=abc123&skip-verify=true
-//   - power-manage://gateway.example.com:8080?token=abc123&tls=false
 func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	// Replace power-manage:// with https:// for parsing
-	// We'll determine the actual scheme from query params
 	normalizedURI := strings.Replace(rawURI, "power-manage://", "https://", 1)
 
 	parsed, err := url.Parse(normalizedURI)
@@ -1038,15 +1052,12 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 		result.SkipVerify = true
 	}
 
-	// Determine scheme (default to https)
-	scheme := "https"
 	if query.Get("tls") == "false" {
-		scheme = "http"
-		result.SkipVerify = true // No TLS means no verification needed
+		return nil, fmt.Errorf("tls=false registration URIs are no longer supported")
 	}
 
 	// Build server URL
-	result.ServerURL = fmt.Sprintf("%s://%s", scheme, parsed.Host)
+	result.ServerURL = fmt.Sprintf("https://%s", parsed.Host)
 
 	return result, nil
 }
@@ -1348,19 +1359,11 @@ func runLuksSetPassphrase(token, dataDir string) {
 		os.Exit(1)
 	}
 
-	// Connect to gateway via mTLS
-	var clientOpts []sdk.ClientOption
-	if strings.HasPrefix(creds.GatewayAddr, "http://") {
-		clientOpts = append(clientOpts, sdk.WithH2C(), sdk.WithAuth(creds.DeviceID, ""))
-	} else {
-		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to configure mTLS: %v\n", err)
-			os.Exit(1)
-		}
-		clientOpts = append(clientOpts, mtlsOpt, sdk.WithAuth(creds.DeviceID, ""))
+	client, err := newGatewayMTLSClient(creds)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to configure gateway mTLS client: %v\n", err)
+		os.Exit(1)
 	}
-	client := sdk.NewClient(creds.GatewayAddr, clientOpts...)
 
 	// Validate token — server returns action details and complexity requirements
 	result, err := client.ValidateLuksToken(ctx, token)
@@ -1563,22 +1566,10 @@ func runSelfTest(args []string) int {
 	logger.Info("self-test: credentials loaded", "device_id", creds.DeviceID)
 
 	// Step 2: Create mTLS client
-	var client *sdk.Client
-	if strings.HasPrefix(creds.GatewayAddr, "http://") {
-		client = sdk.NewClient(creds.GatewayAddr,
-			sdk.WithH2C(),
-			sdk.WithAuth(creds.DeviceID, ""),
-		)
-	} else {
-		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-		if err != nil {
-			logger.Error("self-test: failed to configure mTLS", "error", err)
-			return 1
-		}
-		client = sdk.NewClient(creds.GatewayAddr,
-			mtlsOpt,
-			sdk.WithAuth(creds.DeviceID, ""),
-		)
+	client, err := newGatewayMTLSClient(creds)
+	if err != nil {
+		logger.Error("self-test: failed to configure gateway mTLS client", "error", err)
+		return 1
 	}
 
 	// Step 3: Connect and send Hello, wait for Welcome
