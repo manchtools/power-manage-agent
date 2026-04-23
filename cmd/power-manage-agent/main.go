@@ -495,28 +495,26 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 		// Reset handler connection state for new connection
 		h.ResetConnection()
 
-		var client *sdk.Client
-
-		// Check if using http:// (h2c mode for development) or https:// (mTLS for production)
+		// rc10: refuse http:// (h2c) for the network gateway path.
+		// The only h2c use in this binary is the local unix-socket
+		// enrollment client, never a remote gateway. A stored
+		// `http://` GatewayAddr means either a dev-leftover creds
+		// file or a tampered redirect — both are reasons to fail
+		// fast rather than silently skip mTLS on the live fleet.
 		if strings.HasPrefix(creds.GatewayAddr, "http://") {
-			// Development mode: use h2c (HTTP/2 cleartext)
-			logger.Debug("using h2c mode (development)")
-			client = sdk.NewClient(creds.GatewayAddr,
-				sdk.WithH2C(),
-				sdk.WithAuth(creds.DeviceID, ""),
-			)
-		} else {
-			// Production mode: use mTLS
-			mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-			if err != nil {
-				logger.Error("failed to configure mTLS", "error", err)
-				os.Exit(1)
-			}
-			client = sdk.NewClient(creds.GatewayAddr,
-				mtlsOpt,
-				sdk.WithAuth(creds.DeviceID, ""),
-			)
+			logger.Error("refusing h2c gateway URL — agent requires https:// for gateway connections; re-enrol against an https:// gateway or delete the cached credentials",
+				"gateway", creds.GatewayAddr)
+			os.Exit(1)
 		}
+		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+		if err != nil {
+			logger.Error("failed to configure mTLS", "error", err)
+			os.Exit(1)
+		}
+		client := sdk.NewClient(creds.GatewayAddr,
+			mtlsOpt,
+			sdk.WithAuth(creds.DeviceID, ""),
+		)
 
 		// Create a child context for this connection session
 		sessionCtx, cancelSession := context.WithCancel(ctx)
@@ -567,7 +565,7 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 
 		// Wait for the stream to end
 		connStart := time.Now()
-		err := <-streamDone
+		err = <-streamDone
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
@@ -1348,19 +1346,23 @@ func runLuksSetPassphrase(token, dataDir string) {
 		os.Exit(1)
 	}
 
-	// Connect to gateway via mTLS
-	var clientOpts []sdk.ClientOption
+	// Connect to gateway via mTLS. rc10 refuses http:// here too —
+	// the luks-setup command path is production-only (ships via the
+	// packaged binary on managed devices), so an http:// gateway
+	// would mean the stored credentials are stale or tampered.
 	if strings.HasPrefix(creds.GatewayAddr, "http://") {
-		clientOpts = append(clientOpts, sdk.WithH2C(), sdk.WithAuth(creds.DeviceID, ""))
-	} else {
-		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to configure mTLS: %v\n", err)
-			os.Exit(1)
-		}
-		clientOpts = append(clientOpts, mtlsOpt, sdk.WithAuth(creds.DeviceID, ""))
+		fmt.Fprintf(os.Stderr, "error: refusing h2c gateway URL (%s) — agent requires https:// for gateway connections\n", creds.GatewayAddr)
+		os.Exit(1)
 	}
-	client := sdk.NewClient(creds.GatewayAddr, clientOpts...)
+	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to configure mTLS: %v\n", err)
+		os.Exit(1)
+	}
+	client := sdk.NewClient(creds.GatewayAddr,
+		mtlsOpt,
+		sdk.WithAuth(creds.DeviceID, ""),
+	)
 
 	// Validate token — server returns action details and complexity requirements
 	result, err := client.ValidateLuksToken(ctx, token)
@@ -1562,24 +1564,24 @@ func runSelfTest(args []string) int {
 	}
 	logger.Info("self-test: credentials loaded", "device_id", creds.DeviceID)
 
-	// Step 2: Create mTLS client
-	var client *sdk.Client
+	// Step 2: Create mTLS client. rc10 refuses http:// here: the
+	// self-test is invoked by the packaged install flow on managed
+	// devices and must exercise the same security posture as normal
+	// agent operation.
 	if strings.HasPrefix(creds.GatewayAddr, "http://") {
-		client = sdk.NewClient(creds.GatewayAddr,
-			sdk.WithH2C(),
-			sdk.WithAuth(creds.DeviceID, ""),
-		)
-	} else {
-		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-		if err != nil {
-			logger.Error("self-test: failed to configure mTLS", "error", err)
-			return 1
-		}
-		client = sdk.NewClient(creds.GatewayAddr,
-			mtlsOpt,
-			sdk.WithAuth(creds.DeviceID, ""),
-		)
+		logger.Error("self-test: refusing h2c gateway URL — agent requires https:// for gateway connections",
+			"gateway", creds.GatewayAddr)
+		return 1
 	}
+	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+	if err != nil {
+		logger.Error("self-test: failed to configure mTLS", "error", err)
+		return 1
+	}
+	client := sdk.NewClient(creds.GatewayAddr,
+		mtlsOpt,
+		sdk.WithAuth(creds.DeviceID, ""),
+	)
 
 	// Step 3: Connect and send Hello, wait for Welcome
 	if err := client.Connect(ctx); err != nil {
