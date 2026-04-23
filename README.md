@@ -168,13 +168,20 @@ URI Parameters:
 
 ### Environment Variables
 
+When both a flag and an env var are set, the env var wins (flag defaults are
+applied first, then env vars override).
+
 | Variable | Description |
 |----------|-------------|
-| `PM_SERVER` | Control server URL (used for registration) |
-| `PM_TOKEN` | Registration token |
-| `PM_DATA_DIR` | Data directory |
-| `PM_SKIP_VERIFY` | Skip TLS verification |
-| `PM_LOG_LEVEL` | Log level |
+| `POWER_MANAGE_SERVER` | Control server URL (used for registration) |
+| `POWER_MANAGE_TOKEN` | Registration token (first run only) |
+| `POWER_MANAGE_DATA_DIR` | Data directory for state |
+| `POWER_MANAGE_SKIP_VERIFY` | Skip TLS certificate verification (`true` to enable) |
+| `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `sudo` (default) or `doas` |
+| `POWER_MANAGE_SERVICE_BACKEND` | Service backend override: `systemd` (default) |
+| `POWER_MANAGE_ENCRYPTION_BACKEND` | Encryption backend override: `luks` (default) |
+
+Log level has no env var; set it via the `-log-level` flag.
 
 ## Action Types
 
