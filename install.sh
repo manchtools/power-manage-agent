@@ -456,8 +456,17 @@ RestrictSUIDSGID=false
 #
 # The agent's only listener is a UNIX socket at
 # /run/pm-agent/enroll.sock — it does NOT bind TCP ports itself.
-AmbientCapabilities=CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+#
+# CAP_AUDIT_WRITE: required for sudo to write USER_CMD records to the
+# kernel audit subsystem. Without it sudo invocations succeed but
+# emit "audit message cannot be sent: operation not permitted" to
+# stderr (issue #55) and the dedicated kernel-audit channel stays
+# dark for the agent's privileged operations — a compliance gap on
+# SOC2/PCI/CIS-regulated deployments. Granting only the write cap
+# matches what sshd / login / cron / systemd-logind already have;
+# it does not allow reading audit records or controlling auditd.
+AmbientCapabilities=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
 
 # Allow network access
 PrivateNetwork=false
