@@ -456,8 +456,21 @@ RestrictSUIDSGID=false
 #
 # The agent's only listener is a UNIX socket at
 # /run/pm-agent/enroll.sock — it does NOT bind TCP ports itself.
+#
+# CAP_AUDIT_WRITE: in the bounding set ONLY (not ambient). Required
+# so sudo (setuid-root, invoked for run_as_root shell actions) can
+# call audit_log_user_message() to write USER_CMD records to the
+# kernel audit subsystem. On execve, setuid-root binaries pick up
+# caps from `bounding ∩ file_caps` — the bounding-set entry is what
+# allows sudo to keep CAP_AUDIT_WRITE; the ambient entry would be
+# extra privilege for the agent process itself, which never calls
+# audit(2) directly. Without the bounding-set grant, sudo
+# invocations succeed but emit "audit message cannot be sent:
+# operation not permitted" (issue #55) and the kernel-audit channel
+# is dark for privileged operations — a compliance gap on
+# SOC2/PCI/CIS-regulated deployments.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
 
 # Allow network access
 PrivateNetwork=false
