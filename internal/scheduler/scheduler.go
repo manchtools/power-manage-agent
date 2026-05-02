@@ -144,21 +144,39 @@ func (s *Scheduler) GetStoredActions() ([]*store.StoredAction, error) {
 	return s.store.GetAllActions()
 }
 
-// runDueActions executes all actions that are due.
+// runDueActions executes all actions that are due — both standalone
+// actions (per-action schedule) and grouped actions (one schedule per
+// container, members run in declared order when the container fires).
+//
+// Standalone actions run first, then groups. Within a group every
+// member executes serially in declared order; the executor is the
+// existing single-action path, so the group simply iterates and
+// dispatches one at a time. This is what gives manchtools/power-manage-
+// agent#45 its ordering guarantee: when a container fires, all of its
+// members enter the queue together rather than each firing
+// independently and racing.
 func (s *Scheduler) runDueActions(ctx context.Context) {
 	actions, err := s.store.GetDueActions()
 	if err != nil {
 		s.logger.Error("failed to get due actions", "error", err)
 		return
 	}
+	groups, err := s.store.GetDueGroups()
+	if err != nil {
+		s.logger.Error("failed to get due groups", "error", err)
+		// Continue with standalone-only — group failures shouldn't
+		// silently strand standalone work.
+	}
 
-	if len(actions) == 0 {
+	if len(actions) == 0 && len(groups) == 0 {
 		return
 	}
 
-	s.logger.Debug("found due actions", "count", len(actions))
+	if len(actions) > 0 || len(groups) > 0 {
+		s.logger.Debug("found due actions", "standalone", len(actions), "groups", len(groups))
+	}
 
-	// Reset the per-cycle agent update dedup flag
+	// Reset the per-cycle agent update dedup flag.
 	executor.ResetAgentUpdateCycle()
 
 	for _, stored := range actions {
@@ -171,9 +189,60 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 		s.executeAction(ctx, stored)
 	}
 
-	// Cleanup old results periodically
+	for _, g := range groups {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+		s.executeGroup(ctx, g)
+	}
+
+	// Cleanup old results periodically.
 	if err := s.store.CleanupOldResults(ResultRetention); err != nil {
 		s.logger.Warn("failed to cleanup old results", "error", err)
+	}
+}
+
+// executeGroup walks a due group's members in declared order, dispatches
+// each through the existing per-action executor, and advances the
+// group's next_execute_at when all members have been attempted.
+//
+// A failure on one member does NOT short-circuit the rest. Idempotent
+// retries on the next cycle handle recovery; if an operator wants
+// strict skip-on-failure semantics that's a follow-up.
+func (s *Scheduler) executeGroup(ctx context.Context, g store.StoredActionGroup) {
+	s.logger.Info("group due",
+		"group_id", g.ID,
+		"member_count", len(g.MemberActionIDs),
+	)
+
+	for _, actionID := range g.MemberActionIDs {
+		select {
+		case <-ctx.Done():
+			return
+		default:
+		}
+
+		stored, err := s.store.GetAction(actionID)
+		if err != nil {
+			s.logger.Error("failed to get group member action",
+				"group_id", g.ID, "action_id", actionID, "error", err)
+			continue
+		}
+		if stored == nil {
+			s.logger.Warn("group member action missing from store",
+				"group_id", g.ID, "action_id", actionID)
+			continue
+		}
+
+		s.executeAction(ctx, stored)
+	}
+
+	// Mark the group as fired so its next_execute_at advances.
+	if err := s.store.MarkGroupExecuted(g.ID, time.Now()); err != nil {
+		s.logger.Error("failed to mark group executed",
+			"group_id", g.ID, "error", err)
 	}
 }
 
@@ -323,13 +392,21 @@ func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.Acti
 
 // SyncActions replaces all stored actions with the provided list from the server.
 // This syncs the local action store with the server's assigned actions.
-// Removed actions: policy-type actions (SSH, SSHD, Sudo, LPS) are reverted
-// to ABSENT state before removal. Other action types are removed without
-// reverting to avoid destructive side effects.
-// Changed actions (desired_state flipped) are re-executed.
-// New actions are executed immediately.
-// If firstSync is true, all actions are executed (used on agent startup).
-func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, firstSync bool) error {
+// Removed standalone actions: policy-type actions (SSH, SSHD, Sudo, LPS,
+// USER, GROUP) are reverted to ABSENT state before removal. Other types
+// are removed without reverting to avoid destructive side effects.
+// Changed actions (desired_state flipped, or migrated standalone↔grouped)
+// are re-executed.
+// New actions are executed immediately on first sync.
+//
+// Grouped actions are stored with their containers (action_groups +
+// group_members) and only fire when their group's schedule is due —
+// they are NOT executed individually here. New groups are handled by
+// runDueActions on the next tick (their initial next_execute_at honors
+// the schedule's run_on_assign / interval). The scheduler's per-tick
+// loop fires every due group's members in declared order, which is the
+// ordering guarantee introduced for #45.
+func (s *Scheduler) SyncActions(ctx context.Context, standalone []*pb.Action, groups []*pb.ActionGroup, firstSync bool) error {
 	// Check for shutdown before starting
 	if ctx.Err() != nil {
 		return ctx.Err()
@@ -338,25 +415,28 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 	// Reset the per-cycle agent update dedup flag for the sync batch.
 	executor.ResetAgentUpdateCycle()
 
-	s.logger.Info("syncing actions from server", "count", len(actions), "first_sync", firstSync)
+	s.logger.Info("syncing actions from server",
+		"standalone", len(standalone),
+		"groups", len(groups),
+		"first_sync", firstSync)
 
 	// Sync actions to store and get change info
-	syncResult, err := s.store.SyncActions(actions)
+	syncResult, err := s.store.SyncStandaloneAndGrouped(standalone, groups)
 	if err != nil {
 		s.logger.Error("failed to sync actions", "error", err)
 		return err
 	}
 
 	s.logger.Info("actions synced successfully",
-		"total", len(actions),
-		"new", len(syncResult.NewActionIDs),
-		"changed", len(syncResult.ChangedActionIDs),
-		"removed", len(syncResult.RemovedActions),
+		"standalone_total", len(standalone),
+		"groups_total", len(groups),
+		"new_standalone", len(syncResult.NewActionIDs),
+		"changed_standalone", len(syncResult.ChangedActionIDs),
+		"new_groups", len(syncResult.NewGroupIDs),
+		"removed_standalone", len(syncResult.RemovedActions),
 	)
 
 	// Revert policy-type actions before removal to clean up their effects.
-	// Non-policy actions (Package, User, File, etc.) are just removed without
-	// reverting to avoid destructive side effects.
 	if len(syncResult.RemovedActions) > 0 {
 		for _, removed := range syncResult.RemovedActions {
 			if removed.Id != nil {
@@ -376,27 +456,24 @@ func (s *Scheduler) SyncActions(ctx context.Context, actions []*pb.Action, first
 		}
 	}
 
-	// Determine which stored actions to execute
+	// Determine which standalone actions to execute right now.
 	var actionsToExecute []string
 	if firstSync {
-		// On first sync, execute ALL actions
-		for _, action := range actions {
+		for _, action := range standalone {
 			if action.Id != nil {
 				actionsToExecute = append(actionsToExecute, action.Id.Value)
 			}
 		}
 		if len(actionsToExecute) > 0 {
-			s.logger.Info("first sync: executing all assigned actions", "count", len(actionsToExecute))
+			s.logger.Info("first sync: executing all standalone actions", "count", len(actionsToExecute))
 		}
 	} else {
-		// On subsequent syncs, execute new and changed actions
 		actionsToExecute = append(syncResult.NewActionIDs, syncResult.ChangedActionIDs...)
 		if len(actionsToExecute) > 0 {
-			s.logger.Info("executing new/changed actions", "count", len(actionsToExecute))
+			s.logger.Info("executing new/changed standalone actions", "count", len(actionsToExecute))
 		}
 	}
 
-	// Execute the actions
 	for _, actionID := range actionsToExecute {
 		select {
 		case <-ctx.Done():
