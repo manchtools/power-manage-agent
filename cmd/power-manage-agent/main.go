@@ -809,7 +809,7 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 		return 0
 	}
 
-	if err := sched.SyncActions(ctx, result.Actions, firstSync); err != nil {
+	if err := sched.SyncActions(ctx, result.StandaloneActions, result.GroupedActions, firstSync); err != nil {
 		logger.Error("failed to update local action store", "error", err)
 		return 0
 	}
@@ -823,7 +823,8 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 	}
 
 	logger.Info("actions synced from server",
-		"total", len(result.Actions),
+		"standalone_total", len(result.StandaloneActions),
+		"groups_total", len(result.GroupedActions),
 		"first_sync", firstSync,
 		"sync_interval", syncInterval.String(),
 	)

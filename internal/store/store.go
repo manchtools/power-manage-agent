@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -45,6 +46,19 @@ type SyncResult struct {
 	NewActionIDs     []string     // Actions that were not previously stored
 	ChangedActionIDs []string     // Actions whose desired_state changed
 	RemovedActions   []*pb.Action // Full action data for removed actions (for undo)
+	NewGroupIDs      []string     // Groups that were not previously stored (run-on-first-sync)
+}
+
+// StoredActionGroup represents one container's worth of actions sharing
+// a schedule. The group's schedule fires every member action when due,
+// in declared order — see manchtools/power-manage-agent#45.
+type StoredActionGroup struct {
+	ID              string // server-emitted source_label, e.g. "definition:<ulid>"
+	SourceLabel     string
+	Schedule        *pb.ActionSchedule
+	LastExecutedAt  *time.Time
+	NextExecuteAt   time.Time
+	MemberActionIDs []string // in declared sort_order; duplicates allowed
 }
 
 // StoredResult represents an execution result stored locally (for sync when online).
@@ -176,15 +190,27 @@ func (s *Store) GetAction(actionID string) (*StoredAction, error) {
 	return &stored, nil
 }
 
-// GetDueActions returns all actions that are due for execution.
-func (s *Store) GetDueActions() ([]*StoredAction, error) {
+// GetDueActions returns all standalone actions that are due for
+// execution. Grouped action members are skipped (is_grouped = 1) — they
+// only fire when their owning group fires, via GetDueGroups +
+// executeGroup. This is the load-bearing invariant for #45's ordering
+// guarantee: members must not race each other on independent per-action
+// schedules. Note that RecordExecution updates next_execute_at on every
+// run including for grouped members, so without this filter a grouped
+// member would silently leak back into standalone scheduling after its
+// first execution.
+//
+// Takes a context so the scheduler can cancel a blocking SQLite query
+// when shutdown fires; without this the poll loop would stall on the
+// query rather than honoring ctx.Done().
+func (s *Store) GetDueActions(ctx context.Context) ([]*StoredAction, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, action_json, assigned_at, last_executed_at, next_execute_at, last_result_hash
 		FROM actions
-		WHERE next_execute_at <= ?
+		WHERE next_execute_at <= ? AND is_grouped = 0
 		ORDER BY next_execute_at ASC
 	`, time.Now().UTC())
 	if err != nil {
@@ -535,6 +561,450 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		return nil, err
 	}
 	return result, nil
+}
+
+// SyncStandaloneAndGrouped replaces both the standalone-action store
+// and the grouped-action store with the server's latest snapshot.
+//
+// Standalone actions follow the existing SyncActions semantics: the
+// caller's slice is upserted into the actions table with is_grouped=0,
+// new/changed/removed are reported in SyncResult, and removed actions
+// are returned in full so policy-style executors can revert them.
+//
+// Grouped action data is upserted with is_grouped=1 so the standalone
+// runDueActions query (next_execute_at <= now AND is_grouped = 0)
+// silently skips it — these actions only fire when their group fires.
+//
+// action_groups + group_members are dropped and rebuilt on every call
+// per the design (server is authoritative; the agent is a snapshot).
+// New groups (not present on the previous sync) are reported in
+// SyncResult.NewGroupIDs so the scheduler can fire them once on first
+// arrival before their normal cadence kicks in.
+func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.ActionGroup) (*SyncResult, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	result := &SyncResult{}
+
+	tx, err := s.db.Begin()
+	if err != nil {
+		return nil, fmt.Errorf("begin transaction: %w", err)
+	}
+	defer tx.Rollback()
+
+	// ---- standalone actions: existing diff/upsert pattern ----
+
+	serverStandalone := make(map[string]*pb.Action, len(standalone))
+	for _, a := range standalone {
+		if a.Id != nil {
+			serverStandalone[a.Id.Value] = a
+		}
+	}
+
+	// Collect every action id that should be present on the agent. We
+	// keep grouped-member ids in a second set so we can distinguish
+	// removed-standalone (returned in RemovedActions for revert) from
+	// removed-or-now-grouped (silent — group members never get the
+	// revert path because they're driven by the group, not by their own
+	// schedule).
+	groupedMembers := make(map[string]bool)
+	for _, g := range groups {
+		for _, ga := range g.Actions {
+			if ga.Id != nil {
+				groupedMembers[ga.Id.Value] = true
+			}
+		}
+	}
+
+	rows, err := tx.Query("SELECT id, action_json, desired_state, is_grouped FROM actions")
+	if err != nil {
+		return nil, fmt.Errorf("query actions: %w", err)
+	}
+	type localAction struct {
+		id           string
+		actionJSON   string
+		desiredState int32
+		isGrouped    int
+	}
+	localActions := make(map[string]*localAction)
+	for rows.Next() {
+		var la localAction
+		if err := rows.Scan(&la.id, &la.actionJSON, &la.desiredState, &la.isGrouped); err != nil {
+			rows.Close()
+			return nil, fmt.Errorf("scan action: %w", err)
+		}
+		localActions[la.id] = &la
+	}
+	rows.Close()
+
+	// Removals: action no longer present on standalone OR grouped.
+	for localID, la := range localActions {
+		if _, isStandalone := serverStandalone[localID]; isStandalone {
+			continue
+		}
+		if groupedMembers[localID] {
+			continue
+		}
+		// Only return previously-standalone actions for revert; grouped
+		// members that simply migrated to standalone (or vice versa)
+		// were already handled by the upsert below in past syncs.
+		if la.isGrouped == 0 {
+			action := &pb.Action{}
+			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
+				slog.Warn("failed to unmarshal removed action for undo", "action_id", localID, "error", err)
+			} else {
+				result.RemovedActions = append(result.RemovedActions, action)
+			}
+		}
+		if _, err := tx.Exec("DELETE FROM actions WHERE id = ?", localID); err != nil {
+			return nil, fmt.Errorf("delete action %s: %w", localID, err)
+		}
+	}
+
+	// Standalone upserts.
+	now := time.Now()
+	for _, action := range standalone {
+		if action.Id == nil {
+			continue
+		}
+		actionID := action.Id.Value
+		newDesiredState := int32(action.DesiredState)
+
+		actionJSON, err := protojson.Marshal(action)
+		if err != nil {
+			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
+		}
+
+		local, exists := localActions[actionID]
+		if !exists {
+			result.NewActionIDs = append(result.NewActionIDs, actionID)
+		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) || local.isGrouped != 0 {
+			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
+		}
+
+		nextExecute := s.calculateNextExecute(action, &now, false)
+
+		_, err = tx.Exec(`
+			INSERT INTO actions (id, action_json, assigned_at, next_execute_at, desired_state, is_grouped)
+			VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, 0)
+			ON CONFLICT(id) DO UPDATE SET
+				action_json = excluded.action_json,
+				desired_state = excluded.desired_state,
+				is_grouped = 0,
+				next_execute_at = CASE
+					WHEN excluded.desired_state != actions.desired_state
+						OR excluded.action_json != actions.action_json
+						OR actions.is_grouped != 0
+					THEN excluded.next_execute_at
+					ELSE actions.next_execute_at
+				END
+		`, actionID, string(actionJSON), nextExecute, newDesiredState)
+		if err != nil {
+			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
+		}
+	}
+
+	// Grouped action data upserts. is_grouped=1 keeps the standalone
+	// tick from picking them up; next_execute_at is irrelevant for the
+	// scheduler but kept non-NULL to satisfy the column constraint.
+	farFuture := time.Date(9999, 1, 1, 0, 0, 0, 0, time.UTC)
+	for _, g := range groups {
+		for _, action := range g.Actions {
+			if action.Id == nil {
+				continue
+			}
+			actionID := action.Id.Value
+			actionJSON, err := protojson.Marshal(action)
+			if err != nil {
+				return nil, fmt.Errorf("marshal grouped action %s: %w", actionID, err)
+			}
+			_, err = tx.Exec(`
+				INSERT INTO actions (id, action_json, assigned_at, next_execute_at, desired_state, is_grouped)
+				VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?, 1)
+				ON CONFLICT(id) DO UPDATE SET
+					action_json = excluded.action_json,
+					desired_state = excluded.desired_state,
+					is_grouped = 1,
+					next_execute_at = excluded.next_execute_at
+			`, actionID, string(actionJSON), farFuture, int32(action.DesiredState))
+			if err != nil {
+				return nil, fmt.Errorf("upsert grouped action %s: %w", actionID, err)
+			}
+		}
+	}
+
+	// ---- groups: drop and recreate in this same TX ----
+
+	// Snapshot existing groups' execution state. The drop+rebuild path
+	// would otherwise wipe last_executed_at and next_execute_at every
+	// sync, and a group with an interval/run_on_assign schedule would
+	// then come back with lastExecuted=nil and re-fire immediately.
+	// For groups whose schedule_json is unchanged we preserve the
+	// existing cadence; only schedule changes (or a brand-new group)
+	// reset to the schedule's first slot.
+	type existingGroup struct {
+		scheduleJSON   string
+		lastExecutedAt sql.NullTime
+		nextExecuteAt  time.Time
+	}
+	existingGroups := make(map[string]existingGroup)
+	groupRows, err := tx.Query(`
+		SELECT id, schedule_json, last_executed_at, next_execute_at
+		FROM action_groups
+	`)
+	if err != nil {
+		return nil, fmt.Errorf("query action_groups: %w", err)
+	}
+	for groupRows.Next() {
+		var id string
+		var eg existingGroup
+		if err := groupRows.Scan(&id, &eg.scheduleJSON, &eg.lastExecutedAt, &eg.nextExecuteAt); err != nil {
+			groupRows.Close()
+			return nil, fmt.Errorf("scan action_group: %w", err)
+		}
+		existingGroups[id] = eg
+	}
+	groupRows.Close()
+
+	if _, err := tx.Exec("DELETE FROM group_members"); err != nil {
+		return nil, fmt.Errorf("clear group_members: %w", err)
+	}
+	if _, err := tx.Exec("DELETE FROM action_groups"); err != nil {
+		return nil, fmt.Errorf("clear action_groups: %w", err)
+	}
+
+	for _, g := range groups {
+		groupID := g.SourceLabel
+		if groupID == "" {
+			// Defensive: a group with no source label is unidentifiable
+			// across syncs; skip rather than collide on PRIMARY KEY.
+			slog.Warn("dropping action group with empty source_label", "actions", len(g.Actions))
+			continue
+		}
+
+		schedJSON, err := protojson.Marshal(g.Schedule)
+		if err != nil {
+			return nil, fmt.Errorf("marshal group schedule for %s: %w", groupID, err)
+		}
+
+		// Preserve cadence across syncs when nothing about the group's
+		// schedule changed; otherwise reset to the new schedule's first
+		// slot.
+		var nextExecute time.Time
+		var lastExecutedAt sql.NullTime
+		if prior, ok := existingGroups[groupID]; ok && prior.scheduleJSON == string(schedJSON) {
+			nextExecute = prior.nextExecuteAt
+			lastExecutedAt = prior.lastExecutedAt
+		} else {
+			var lastExec *time.Time
+			if prior, ok := existingGroups[groupID]; ok && prior.lastExecutedAt.Valid {
+				t := prior.lastExecutedAt.Time
+				lastExec = &t
+				lastExecutedAt = prior.lastExecutedAt
+			}
+			nextExecute = calculateNextExecuteFromSchedule(g.Schedule, lastExec, false)
+		}
+
+		if _, err := tx.Exec(`
+			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, last_executed_at, next_execute_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+		`, groupID, g.SourceLabel, string(schedJSON), lastExecutedAt, nextExecute); err != nil {
+			return nil, fmt.Errorf("insert action_group %s: %w", groupID, err)
+		}
+
+		for pos, action := range g.Actions {
+			if action.Id == nil {
+				continue
+			}
+			if _, err := tx.Exec(`
+				INSERT INTO group_members (group_id, position, action_id)
+				VALUES (?, ?, ?)
+			`, groupID, pos, action.Id.Value); err != nil {
+				return nil, fmt.Errorf("insert group_member %s/%d: %w", groupID, pos, err)
+			}
+		}
+
+		if _, existed := existingGroups[groupID]; !existed {
+			result.NewGroupIDs = append(result.NewGroupIDs, groupID)
+		}
+	}
+
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// GetDueGroups returns action groups whose schedule says they're due
+// for execution. Caller fetches members via GetGroupMembers and runs
+// them in declared order.
+//
+// Takes a context so the scheduler can cancel a blocking SQLite query
+// when shutdown fires, same rationale as GetDueActions.
+func (s *Store) GetDueGroups(ctx context.Context) ([]StoredActionGroup, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	now := time.Now().UTC()
+	rows, err := s.db.QueryContext(ctx, `
+		SELECT id, source_label, schedule_json, last_executed_at, next_execute_at
+		FROM action_groups
+		WHERE next_execute_at <= ?
+		ORDER BY next_execute_at ASC
+	`, now)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	var due []StoredActionGroup
+	for rows.Next() {
+		var g StoredActionGroup
+		var schedJSON string
+		var lastExec sql.NullTime
+		if err := rows.Scan(&g.ID, &g.SourceLabel, &schedJSON, &lastExec, &g.NextExecuteAt); err != nil {
+			return nil, err
+		}
+		var sched pb.ActionSchedule
+		if err := protojson.Unmarshal([]byte(schedJSON), &sched); err != nil {
+			slog.Warn("failed to unmarshal group schedule", "group_id", g.ID, "error", err)
+		} else {
+			g.Schedule = &sched
+		}
+		if lastExec.Valid {
+			t := lastExec.Time
+			g.LastExecutedAt = &t
+		}
+		due = append(due, g)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+
+	// Hydrate member ids in declared order.
+	for i := range due {
+		members, err := s.getGroupMemberIDs(due[i].ID)
+		if err != nil {
+			return nil, err
+		}
+		due[i].MemberActionIDs = members
+	}
+	return due, nil
+}
+
+// GetGroupByID returns a group's metadata + members in declared order.
+// Returns nil if the group is not in the store.
+func (s *Store) GetGroupByID(groupID string) (*StoredActionGroup, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var g StoredActionGroup
+	var schedJSON string
+	var lastExec sql.NullTime
+	err := s.db.QueryRow(`
+		SELECT id, source_label, schedule_json, last_executed_at, next_execute_at
+		FROM action_groups WHERE id = ?
+	`, groupID).Scan(&g.ID, &g.SourceLabel, &schedJSON, &lastExec, &g.NextExecuteAt)
+	if err == sql.ErrNoRows {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var sched pb.ActionSchedule
+	if err := protojson.Unmarshal([]byte(schedJSON), &sched); err == nil {
+		g.Schedule = &sched
+	}
+	if lastExec.Valid {
+		t := lastExec.Time
+		g.LastExecutedAt = &t
+	}
+	members, err := s.getGroupMemberIDs(groupID)
+	if err != nil {
+		return nil, err
+	}
+	g.MemberActionIDs = members
+	return &g, nil
+}
+
+func (s *Store) getGroupMemberIDs(groupID string) ([]string, error) {
+	rows, err := s.db.Query(`
+		SELECT action_id FROM group_members
+		WHERE group_id = ? ORDER BY position ASC
+	`, groupID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var ids []string
+	for rows.Next() {
+		var id string
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		ids = append(ids, id)
+	}
+	return ids, rows.Err()
+}
+
+// MarkGroupExecuted records that a group fired and advances its
+// next_execute_at to the next slot of its schedule. Called by the
+// scheduler after every member of a due group has run (or attempted).
+func (s *Store) MarkGroupExecuted(groupID string, executedAt time.Time) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var schedJSON string
+	if err := s.db.QueryRow("SELECT schedule_json FROM action_groups WHERE id = ?", groupID).Scan(&schedJSON); err != nil {
+		return err
+	}
+	var sched pb.ActionSchedule
+	if err := protojson.Unmarshal([]byte(schedJSON), &sched); err != nil {
+		return fmt.Errorf("unmarshal group schedule: %w", err)
+	}
+	executedUTC := executedAt.UTC()
+	next := calculateNextExecuteFromSchedule(&sched, &executedUTC, false)
+
+	_, err := s.db.Exec(`
+		UPDATE action_groups SET last_executed_at = ?, next_execute_at = ?
+		WHERE id = ?
+	`, executedUTC, next, groupID)
+	return err
+}
+
+// calculateNextExecuteFromSchedule mirrors calculateNextExecute but
+// works directly on an ActionSchedule pointer so groups can use it
+// without faking a pb.Action.
+func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted *time.Time, runImmediately bool) time.Time {
+	now := time.Now().UTC()
+	if runImmediately && lastExecuted == nil {
+		return now
+	}
+	if schedule == nil {
+		if lastExecuted == nil {
+			return now
+		}
+		return lastExecuted.UTC().Add(8 * time.Hour)
+	}
+	if schedule.RunOnAssign && lastExecuted == nil {
+		return now
+	}
+	if schedule.Cron != "" {
+		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
+		sched, err := parser.Parse(schedule.Cron)
+		if err == nil {
+			return sched.Next(now.Local()).UTC()
+		}
+		slog.Warn("invalid cron expression on group schedule", "cron", schedule.Cron, "error", err)
+	}
+	interval := schedule.IntervalHours
+	if interval <= 0 {
+		interval = 8
+	}
+	if lastExecuted == nil {
+		return now
+	}
+	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
 }
 
 // GetAllActionIDs returns the IDs of all stored actions.

@@ -262,13 +262,13 @@ func TestSyncActions_PolicyActionRevertedOnRemoval(t *testing.T) {
 	// Assign SSH and Package actions
 	sshAction := makeTestAction("ssh-sync", pb.ActionType_ACTION_TYPE_SSH, pb.DesiredState_DESIRED_STATE_PRESENT)
 	pkgAction := makeTestAction("pkg-sync", pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
-	if err := sched.SyncActions(ctx, []*pb.Action{sshAction, pkgAction}, true); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{sshAction, pkgAction}, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	mock.reset()
 
 	// Sync again with only the package action — SSH is now removed
-	if err := sched.SyncActions(ctx, []*pb.Action{pkgAction}, false); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{pkgAction}, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -296,13 +296,13 @@ func TestSyncActions_NonPolicyActionNotRevertedOnRemoval(t *testing.T) {
 
 	// Assign a package action
 	pkgAction := makeTestAction("pkg-only", pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
-	if err := sched.SyncActions(ctx, []*pb.Action{pkgAction}, true); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{pkgAction}, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	mock.reset()
 
 	// Sync with empty list — package action is removed but NOT reverted
-	if err := sched.SyncActions(ctx, []*pb.Action{}, false); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{}, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -335,13 +335,13 @@ func TestSyncActions_MultiplePolicyActionsReverted(t *testing.T) {
 		makeTestAction("a-lps", pb.ActionType_ACTION_TYPE_LPS, pb.DesiredState_DESIRED_STATE_PRESENT),
 		makeTestAction("a-pkg", pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT),
 	}
-	if err := sched.SyncActions(ctx, actions, true); err != nil {
+	if err := sched.SyncActions(ctx, actions, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	mock.reset()
 
 	// Remove all actions by syncing with empty list
-	if err := sched.SyncActions(ctx, []*pb.Action{}, false); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{}, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -388,13 +388,13 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 			},
 		},
 	}
-	if err := sched.SyncActions(ctx, []*pb.Action{sudoAction}, true); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{sudoAction}, nil, true); err != nil {
 		t.Fatal(err)
 	}
 	mock.reset()
 
 	// Remove it
-	if err := sched.SyncActions(ctx, []*pb.Action{}, false); err != nil {
+	if err := sched.SyncActions(ctx, []*pb.Action{}, nil, false); err != nil {
 		t.Fatal(err)
 	}
 
@@ -420,5 +420,112 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	}
 	if len(sudo.Users) != 1 || sudo.Users[0] != "alice" {
 		t.Errorf("expected users [alice], got %v", sudo.Users)
+	}
+}
+
+// ---------------------------------------------------------------------------
+// Grouped sync (#45)
+// ---------------------------------------------------------------------------
+
+// When the server pushes an ActionGroup with run_on_assign=true, the
+// group's first runDueActions tick walks its members in declared order,
+// dispatching each through the executor — sequentially, no inter-leaving.
+func TestRunDueActions_GroupRunOnAssign_OrdersMembers(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	a1 := makeTestAction("g-a1", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	a2 := makeTestAction("g-a2", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	a3 := makeTestAction("g-a3", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+
+	group := &pb.ActionGroup{
+		SourceLabel: "action_set:run-on-assign",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true, IntervalHours: 8},
+		Actions:     []*pb.Action{a1, a2, a3},
+	}
+
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{group}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Sync itself does not execute group members; only the next tick does.
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("sync should not execute group members directly, got %d", got)
+	}
+
+	sched.runDueActions(ctx)
+
+	calls := mock.getCalls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 group member calls, got %d", len(calls))
+	}
+	wantOrder := []string{"g-a1", "g-a2", "g-a3"}
+	for i, want := range wantOrder {
+		if calls[i].Id.Value != want {
+			t.Errorf("call %d: expected %q got %q", i, want, calls[i].Id.Value)
+		}
+	}
+}
+
+// Same action id can appear at multiple positions within a group (e.g.
+// AAA in two sets that compose the same definition). Each occurrence
+// dispatches the executor — idempotent action contracts absorb the cost.
+func TestRunDueActions_GroupAllowsDuplicateMembers(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	common := makeTestAction("dup-action", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	other := makeTestAction("other", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+
+	group := &pb.ActionGroup{
+		SourceLabel: "definition:dup-positions",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true},
+		Actions:     []*pb.Action{common, other, common},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{group}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	sched.runDueActions(ctx)
+
+	calls := mock.getCalls()
+	if len(calls) != 3 {
+		t.Fatalf("expected 3 calls (dup-action runs twice), got %d", len(calls))
+	}
+	gotOrder := []string{calls[0].Id.Value, calls[1].Id.Value, calls[2].Id.Value}
+	wantOrder := []string{"dup-action", "other", "dup-action"}
+	for i, want := range wantOrder {
+		if gotOrder[i] != want {
+			t.Errorf("call %d: expected %q got %q", i, want, gotOrder[i])
+		}
+	}
+}
+
+// Group members are NOT picked up by the standalone-tick — they only
+// fire when their group fires. This is the load-bearing invariant for
+// the ordering guarantee: members must not race each other on
+// independent per-action schedules.
+func TestRunDueActions_GroupedActionsSkipStandaloneTick(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	a1 := makeTestAction("g-only", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	// Cron "0 0 1 1 *" = Jan 1 at midnight; far-future for almost any
+	// year except a brief Jan-1 window. This guarantees the group is
+	// not currently due so we can assert the standalone tick is not
+	// silently picking up grouped members on its own.
+	group := &pb.ActionGroup{
+		SourceLabel: "action_set:far-future",
+		Schedule:    &pb.ActionSchedule{Cron: "0 0 1 1 *"},
+		Actions:     []*pb.Action{a1},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{group}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	sched.runDueActions(ctx)
+
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("far-future group must not fire AND its member must not run via standalone tick, got %d calls", got)
 	}
 }
