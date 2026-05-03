@@ -208,9 +208,16 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 // each through the existing per-action executor, and advances the
 // group's next_execute_at when all members have been attempted.
 //
-// A failure on one member does NOT short-circuit the rest. Idempotent
-// retries on the next cycle handle recovery; if an operator wants
-// strict skip-on-failure semantics that's a follow-up.
+// A failure on one member does NOT short-circuit the rest — this is a
+// deliberate design choice from the #45 design discussion. The original
+// issue text proposed cascading SKIPPED_DEPENDENCY_FAILED to siblings,
+// but during design we landed on simpler "ordered execution + idempotent
+// retries" semantics: members run in declared order on every group fire,
+// and a failed member fails again next cycle. Sibling failures don't
+// hide root-cause failures — they each surface their own status — but
+// we don't fabricate skip records for them either. If an operator wants
+// strict skip-on-failure with explicit dependency reporting later,
+// that's a follow-up that re-introduces SKIPPED_DEPENDENCY_FAILED.
 func (s *Scheduler) executeGroup(ctx context.Context, g store.StoredActionGroup) {
 	s.logger.Info("group due",
 		"group_id", g.ID,

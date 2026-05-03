@@ -189,7 +189,15 @@ func (s *Store) GetAction(actionID string) (*StoredAction, error) {
 	return &stored, nil
 }
 
-// GetDueActions returns all actions that are due for execution.
+// GetDueActions returns all standalone actions that are due for
+// execution. Grouped action members are skipped (is_grouped = 1) — they
+// only fire when their owning group fires, via GetDueGroups +
+// executeGroup. This is the load-bearing invariant for #45's ordering
+// guarantee: members must not race each other on independent per-action
+// schedules. Note that RecordExecution updates next_execute_at on every
+// run including for grouped members, so without this filter a grouped
+// member would silently leak back into standalone scheduling after its
+// first execution.
 func (s *Store) GetDueActions() ([]*StoredAction, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
@@ -197,7 +205,7 @@ func (s *Store) GetDueActions() ([]*StoredAction, error) {
 	rows, err := s.db.Query(`
 		SELECT id, action_json, assigned_at, last_executed_at, next_execute_at, last_result_hash
 		FROM actions
-		WHERE next_execute_at <= ?
+		WHERE next_execute_at <= ? AND is_grouped = 0
 		ORDER BY next_execute_at ASC
 	`, time.Now().UTC())
 	if err != nil {
