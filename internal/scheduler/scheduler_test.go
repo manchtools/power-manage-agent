@@ -5,6 +5,7 @@ import (
 	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
@@ -528,4 +529,134 @@ func TestRunDueActions_GroupedActionsSkipStandaloneTick(t *testing.T) {
 	if got := len(mock.getCalls()); got != 0 {
 		t.Fatalf("far-future group must not fire AND its member must not run via standalone tick, got %d calls", got)
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Maintenance window gate
+// ---------------------------------------------------------------------------
+
+// A window that allows every weekday and every hour acts like "no
+// constraint" — useful as a control for the deny case below.
+//
+// Uses a group rather than a standalone action because SyncActions
+// runs new standalone actions inline (advancing their cursor), which
+// would leave runDueActions with nothing due. Group members never
+// run on the inline-sync path, so a freshly-synced group is still
+// due on the first runDueActions tick.
+func TestRunDueActions_MaintenanceWindow_AllAllowed(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	g := &pb.ActionGroup{
+		SourceLabel: "action_set:permissive",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true, IntervalHours: 8},
+		Actions: []*pb.Action{
+			makeTestAction("g-a", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT),
+		},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{g}, false); err != nil {
+		t.Fatal(err)
+	}
+	mock.reset()
+
+	sched.SetMaintenanceWindow(&pb.MaintenanceWindow{Schedule: []*pb.MaintenanceWindowEntry{
+		{Days: []string{"mon", "tue", "wed", "thu", "fri", "sat", "sun"}, Allow: "00:00-23:59"},
+	}})
+
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 1 {
+		t.Fatalf("permissive window should not gate dispatch, got %d calls", got)
+	}
+}
+
+// A window with no entry matching the current weekday must defer
+// every due group dispatch without advancing the group's next-fire
+// cursor — reopening the window in the next tick replays the work.
+//
+// Standalone actions stay out of this case on purpose: SyncActions
+// executes new/changed standalone actions inline as part of the sync
+// (firstSync / new-action codepath), which leaves them with an
+// already-advanced next_execute_at by the time runDueActions runs.
+// The group path is the load-bearing one for the gate — group
+// members never run on the inline-sync path; they only fire through
+// runDueActions, so deferring them is observable.
+func TestRunDueActions_MaintenanceWindow_NoMatchingDayDefersAll(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	g := &pb.ActionGroup{
+		SourceLabel: "action_set:gated",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true, IntervalHours: 8},
+		Actions: []*pb.Action{
+			makeTestAction("g-a", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT),
+		},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{g}, false); err != nil {
+		t.Fatal(err)
+	}
+	mock.reset()
+
+	// Pick a weekday three days from today so neither today nor
+	// yesterday matches — the latter check is what catches a window
+	// that crosses midnight from the previous day.
+	now := time.Now().Local()
+	farDay := weekdayToken((int(now.Weekday()) + 3) % 7)
+	sched.SetMaintenanceWindow(&pb.MaintenanceWindow{Schedule: []*pb.MaintenanceWindowEntry{
+		{Days: []string{farDay}, Allow: "00:01-23:58"},
+	}})
+
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("closed window must defer due group, got %d calls", got)
+	}
+
+	// Reopening the window and re-ticking must run the deferred
+	// group — proves the defer didn't advance the group's
+	// next_execute_at past now.
+	sched.SetMaintenanceWindow(nil)
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 1 {
+		t.Fatalf("after reopening, deferred group member must fire exactly once, got %d", got)
+	}
+}
+
+// SetMaintenanceWindow round-trips through the agent store so a
+// scheduler restored via New() picks up the previously-set window.
+func TestSetMaintenanceWindow_PersistsAcrossSchedulerRestart(t *testing.T) {
+	dir := t.TempDir()
+	st, err := store.New(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer st.Close()
+
+	first := New(st, &mockExecutor{}, slog.Default())
+	w := &pb.MaintenanceWindow{Schedule: []*pb.MaintenanceWindowEntry{
+		{Days: []string{"mon", "tue", "wed", "thu", "fri"}, Allow: "22:00-06:00"},
+	}}
+	first.SetMaintenanceWindow(w)
+
+	// Fresh scheduler against the same store — simulates a restart.
+	restored := New(st, &mockExecutor{}, slog.Default())
+	got := restored.activeWindow()
+	if got == nil || len(got.Schedule) != 1 {
+		t.Fatalf("expected restored window, got %v", got)
+	}
+	if got.Schedule[0].Allow != "22:00-06:00" {
+		t.Fatalf("restored allow range mismatch: %q", got.Schedule[0].Allow)
+	}
+
+	// Clearing the window deletes the persisted row.
+	first.SetMaintenanceWindow(nil)
+	cleared := New(st, &mockExecutor{}, slog.Default())
+	if w := cleared.activeWindow(); w != nil && len(w.Schedule) != 0 {
+		t.Fatalf("clearing the window should remove persistence, got %v", w)
+	}
+}
+
+// weekdayToken maps a 0..6 weekday index (Sunday=0) to the lowercase
+// three-letter token used in MaintenanceWindowEntry.Days.
+func weekdayToken(idx int) string {
+	tokens := [7]string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
+	return tokens[idx]
 }

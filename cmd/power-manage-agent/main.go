@@ -814,6 +814,13 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 		return 0
 	}
 
+	// Apply the resolved maintenance window from the same sync. Done
+	// after SyncActions so the scheduler's next tick already gates by
+	// the new window — and persisted via the scheduler so an agent
+	// restart inside an active freeze keeps deferring instead of
+	// blasting through queued work. See manchtools/power-manage-server#58.
+	sched.SetMaintenanceWindow(result.MaintenanceWindow)
+
 	// Convert sync interval from minutes to duration
 	var syncInterval time.Duration
 	if result.SyncIntervalMinutes > 0 {
