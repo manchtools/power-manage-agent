@@ -6,7 +6,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
@@ -85,15 +84,20 @@ func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Sche
 }
 
 // SetMaintenanceWindow replaces the active window in memory and on
-// disk. A nil or empty window clears the gate; non-nil rewrites both
-// the cached pointer and the persisted JSON. Persistence errors are
-// logged but non-fatal — the in-memory pointer is still updated so
-// the running scheduler reflects the latest sync.
+// disk. A nil or empty window clears the gate; non-empty windows are
+// deep-cloned so the caller cannot mutate the cached pointer after
+// returning. Persistence errors are logged but non-fatal — the
+// in-memory pointer is still updated so the running scheduler
+// reflects the latest sync.
 func (s *Scheduler) SetMaintenanceWindow(w *pb.MaintenanceWindow) {
+	var normalized *pb.MaintenanceWindow
+	if w != nil && len(w.GetSchedule()) > 0 {
+		normalized = proto.Clone(w).(*pb.MaintenanceWindow)
+	}
 	s.windowMu.Lock()
-	s.window = w
+	s.window = normalized
 	s.windowMu.Unlock()
-	if err := storeMaintenanceWindow(s.store, w); err != nil {
+	if err := storeMaintenanceWindow(s.store, normalized); err != nil {
 		s.logger.Warn("failed to persist maintenance window; in-memory only", "error", err)
 	}
 }
@@ -109,30 +113,21 @@ func (s *Scheduler) activeWindow() *pb.MaintenanceWindow {
 // loadMaintenanceWindow restores the persisted window from settings.
 // An empty / missing entry yields (nil, nil) — the agent boots
 // unconstrained, which is the same default a fresh-install device
-// gets before its first sync.
+// gets before its first sync. Encoded with proto wire format so any
+// future field added to MaintenanceWindow round-trips automatically;
+// a JSON shadow schema would silently drop new fields and let the
+// post-restart evaluator diverge from the live one.
 func loadMaintenanceWindow(st *store.Store) (*pb.MaintenanceWindow, error) {
 	raw, err := st.GetSetting(maintenanceWindowSettingKey)
 	if err != nil || raw == "" {
 		return nil, err
 	}
-	var payload struct {
-		Schedule []struct {
-			Days  []string `json:"days"`
-			Allow string   `json:"allow"`
-		} `json:"schedule"`
-	}
-	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+	out := &pb.MaintenanceWindow{}
+	if err := proto.Unmarshal([]byte(raw), out); err != nil {
 		return nil, err
 	}
-	if len(payload.Schedule) == 0 {
+	if len(out.GetSchedule()) == 0 {
 		return nil, nil
-	}
-	out := &pb.MaintenanceWindow{Schedule: make([]*pb.MaintenanceWindowEntry, 0, len(payload.Schedule))}
-	for _, e := range payload.Schedule {
-		out.Schedule = append(out.Schedule, &pb.MaintenanceWindowEntry{
-			Days:  e.Days,
-			Allow: e.Allow,
-		})
 	}
 	return out, nil
 }
@@ -140,19 +135,13 @@ func loadMaintenanceWindow(st *store.Store) (*pb.MaintenanceWindow, error) {
 // storeMaintenanceWindow encodes the window for the settings table.
 // nil / empty windows clear the row so a subsequent restart sees
 // "no constraint" (matches the SetMaintenanceWindow contract: empty
-// in = unconstrained out).
+// in = unconstrained out). Uses proto wire format so persistence
+// stays bound to the message shape the shared evaluator consumes.
 func storeMaintenanceWindow(st *store.Store, w *pb.MaintenanceWindow) error {
 	if w == nil || len(w.GetSchedule()) == 0 {
 		return st.DeleteSetting(maintenanceWindowSettingKey)
 	}
-	entries := make([]map[string]any, 0, len(w.GetSchedule()))
-	for _, e := range w.GetSchedule() {
-		entries = append(entries, map[string]any{
-			"days":  e.GetDays(),
-			"allow": e.GetAllow(),
-		})
-	}
-	raw, err := json.Marshal(map[string]any{"schedule": entries})
+	raw, err := proto.Marshal(w)
 	if err != nil {
 		return err
 	}
