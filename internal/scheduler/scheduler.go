@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"log/slog"
 	"sync"
 	"time"
@@ -15,6 +16,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/maintenance"
 )
 
 const (
@@ -29,6 +31,13 @@ type ActionExecutor interface {
 	Execute(ctx context.Context, action *pb.Action) *pb.ActionResult
 }
 
+// maintenanceWindowSettingKey is the agent-store settings key under
+// which the most-recently-synced resolved MaintenanceWindow lives.
+// Persisting it across restarts means an agent that boots inside a
+// freeze window won't blast through queued actions just because it
+// hasn't completed its first sync yet.
+const maintenanceWindowSettingKey = "maintenance_window"
+
 // Scheduler manages autonomous action execution.
 type Scheduler struct {
 	store    *store.Store
@@ -39,6 +48,12 @@ type Scheduler struct {
 	running   bool
 	stopCh    chan struct{}
 	resultsCh chan *ExecutionResult
+
+	// windowMu guards window. Separate from mu so a long Sync that
+	// also holds mu cannot block runDueActions' window check on a
+	// scheduler that's already started.
+	windowMu sync.RWMutex
+	window   *pb.MaintenanceWindow
 }
 
 // ExecutionResult contains the result of a scheduled execution.
@@ -50,14 +65,98 @@ type ExecutionResult struct {
 	ExecutedAt time.Time
 }
 
-// New creates a new scheduler.
+// New creates a new scheduler. The persisted maintenance window (if
+// any) is restored from the agent store so a restart inside an active
+// freeze keeps gating dispatches until the next sync overwrites it.
 func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Scheduler {
-	return &Scheduler{
+	s := &Scheduler{
 		store:     store,
 		executor:  executor,
 		logger:    logger,
 		resultsCh: make(chan *ExecutionResult, 100),
 	}
+	if w, err := loadMaintenanceWindow(store); err != nil {
+		logger.Warn("failed to load persisted maintenance window; defaulting to no constraint",
+			"error", err)
+	} else {
+		s.window = w
+	}
+	return s
+}
+
+// SetMaintenanceWindow replaces the active window in memory and on
+// disk. A nil or empty window clears the gate; non-nil rewrites both
+// the cached pointer and the persisted JSON. Persistence errors are
+// logged but non-fatal — the in-memory pointer is still updated so
+// the running scheduler reflects the latest sync.
+func (s *Scheduler) SetMaintenanceWindow(w *pb.MaintenanceWindow) {
+	s.windowMu.Lock()
+	s.window = w
+	s.windowMu.Unlock()
+	if err := storeMaintenanceWindow(s.store, w); err != nil {
+		s.logger.Warn("failed to persist maintenance window; in-memory only", "error", err)
+	}
+}
+
+// activeWindow returns a snapshot of the current window for read
+// without holding the lock during evaluation.
+func (s *Scheduler) activeWindow() *pb.MaintenanceWindow {
+	s.windowMu.RLock()
+	defer s.windowMu.RUnlock()
+	return s.window
+}
+
+// loadMaintenanceWindow restores the persisted window from settings.
+// An empty / missing entry yields (nil, nil) — the agent boots
+// unconstrained, which is the same default a fresh-install device
+// gets before its first sync.
+func loadMaintenanceWindow(st *store.Store) (*pb.MaintenanceWindow, error) {
+	raw, err := st.GetSetting(maintenanceWindowSettingKey)
+	if err != nil || raw == "" {
+		return nil, err
+	}
+	var payload struct {
+		Schedule []struct {
+			Days  []string `json:"days"`
+			Allow string   `json:"allow"`
+		} `json:"schedule"`
+	}
+	if err := json.Unmarshal([]byte(raw), &payload); err != nil {
+		return nil, err
+	}
+	if len(payload.Schedule) == 0 {
+		return nil, nil
+	}
+	out := &pb.MaintenanceWindow{Schedule: make([]*pb.MaintenanceWindowEntry, 0, len(payload.Schedule))}
+	for _, e := range payload.Schedule {
+		out.Schedule = append(out.Schedule, &pb.MaintenanceWindowEntry{
+			Days:  e.Days,
+			Allow: e.Allow,
+		})
+	}
+	return out, nil
+}
+
+// storeMaintenanceWindow encodes the window for the settings table.
+// nil / empty windows clear the row so a subsequent restart sees
+// "no constraint" (matches the SetMaintenanceWindow contract: empty
+// in = unconstrained out).
+func storeMaintenanceWindow(st *store.Store, w *pb.MaintenanceWindow) error {
+	if w == nil || len(w.GetSchedule()) == 0 {
+		return st.DeleteSetting(maintenanceWindowSettingKey)
+	}
+	entries := make([]map[string]any, 0, len(w.GetSchedule()))
+	for _, e := range w.GetSchedule() {
+		entries = append(entries, map[string]any{
+			"days":  e.GetDays(),
+			"allow": e.GetAllow(),
+		})
+	}
+	raw, err := json.Marshal(map[string]any{"schedule": entries})
+	if err != nil {
+		return err
+	}
+	return st.SetSetting(maintenanceWindowSettingKey, string(raw))
 }
 
 // HasPriorExecution returns true if the action has been executed before.
@@ -169,6 +268,27 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 	}
 
 	if len(actions) == 0 && len(groups) == 0 {
+		return
+	}
+
+	// Maintenance-window gate. Evaluated in device-local time so
+	// "02:00 local" means 02:00 wherever the device runs (the server
+	// can't compute this; only the agent knows its time.Local). When
+	// the active window denies the moment, every due item defers to
+	// the next tick — runDueActions does NOT advance next_execute_at,
+	// so a deferred action stays "due" until the window opens.
+	//
+	// The window does not gate the stream-dispatched path: instant
+	// actions (REBOOT, SYNC) and pushed dispatches arrive through
+	// the gateway and bypass this scheduler entirely. That matches
+	// the spec — admins hitting "reboot now" expect immediate
+	// execution.
+	window := s.activeWindow()
+	if !maintenance.IsAllowed(window, time.Now().Local()) {
+		s.logger.Info("maintenance window closed; deferring due dispatches",
+			"standalone", len(actions),
+			"groups", len(groups),
+		)
 		return
 	}
 
