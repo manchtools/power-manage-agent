@@ -21,6 +21,3 @@ reviews:
 knowledge_base:
   learnings:
     scope: auto
-  linked_repositories:
-    - repository: manchtools/power-manage-sdk
-    - repository: manchtools/power-manage-server
