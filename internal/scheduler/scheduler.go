@@ -156,12 +156,12 @@ func (s *Scheduler) GetStoredActions() ([]*store.StoredAction, error) {
 // members enter the queue together rather than each firing
 // independently and racing.
 func (s *Scheduler) runDueActions(ctx context.Context) {
-	actions, err := s.store.GetDueActions()
+	actions, err := s.store.GetDueActions(ctx)
 	if err != nil {
 		s.logger.Error("failed to get due actions", "error", err)
 		return
 	}
-	groups, err := s.store.GetDueGroups()
+	groups, err := s.store.GetDueGroups(ctx)
 	if err != nil {
 		s.logger.Error("failed to get due groups", "error", err)
 		// Continue with standalone-only — group failures shouldn't

@@ -3,6 +3,7 @@
 package store
 
 import (
+	"context"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -198,11 +199,15 @@ func (s *Store) GetAction(actionID string) (*StoredAction, error) {
 // run including for grouped members, so without this filter a grouped
 // member would silently leak back into standalone scheduling after its
 // first execution.
-func (s *Store) GetDueActions() ([]*StoredAction, error) {
+//
+// Takes a context so the scheduler can cancel a blocking SQLite query
+// when shutdown fires; without this the poll loop would stall on the
+// query rather than honoring ctx.Done().
+func (s *Store) GetDueActions(ctx context.Context) ([]*StoredAction, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, action_json, assigned_at, last_executed_at, next_execute_at, last_result_hash
 		FROM actions
 		WHERE next_execute_at <= ? AND is_grouped = 0
@@ -730,18 +735,34 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 
 	// ---- groups: drop and recreate in this same TX ----
 
-	priorGroupIDs := make(map[string]bool)
-	groupRows, err := tx.Query("SELECT id FROM action_groups")
+	// Snapshot existing groups' execution state. The drop+rebuild path
+	// would otherwise wipe last_executed_at and next_execute_at every
+	// sync, and a group with an interval/run_on_assign schedule would
+	// then come back with lastExecuted=nil and re-fire immediately.
+	// For groups whose schedule_json is unchanged we preserve the
+	// existing cadence; only schedule changes (or a brand-new group)
+	// reset to the schedule's first slot.
+	type existingGroup struct {
+		scheduleJSON   string
+		lastExecutedAt sql.NullTime
+		nextExecuteAt  time.Time
+	}
+	existingGroups := make(map[string]existingGroup)
+	groupRows, err := tx.Query(`
+		SELECT id, schedule_json, last_executed_at, next_execute_at
+		FROM action_groups
+	`)
 	if err != nil {
 		return nil, fmt.Errorf("query action_groups: %w", err)
 	}
 	for groupRows.Next() {
 		var id string
-		if err := groupRows.Scan(&id); err != nil {
+		var eg existingGroup
+		if err := groupRows.Scan(&id, &eg.scheduleJSON, &eg.lastExecutedAt, &eg.nextExecuteAt); err != nil {
 			groupRows.Close()
-			return nil, fmt.Errorf("scan group id: %w", err)
+			return nil, fmt.Errorf("scan action_group: %w", err)
 		}
-		priorGroupIDs[id] = true
+		existingGroups[id] = eg
 	}
 	groupRows.Close()
 
@@ -766,12 +787,28 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			return nil, fmt.Errorf("marshal group schedule for %s: %w", groupID, err)
 		}
 
-		nextExecute := calculateNextExecuteFromSchedule(g.Schedule, nil, false)
+		// Preserve cadence across syncs when nothing about the group's
+		// schedule changed; otherwise reset to the new schedule's first
+		// slot.
+		var nextExecute time.Time
+		var lastExecutedAt sql.NullTime
+		if prior, ok := existingGroups[groupID]; ok && prior.scheduleJSON == string(schedJSON) {
+			nextExecute = prior.nextExecuteAt
+			lastExecutedAt = prior.lastExecutedAt
+		} else {
+			var lastExec *time.Time
+			if prior, ok := existingGroups[groupID]; ok && prior.lastExecutedAt.Valid {
+				t := prior.lastExecutedAt.Time
+				lastExec = &t
+				lastExecutedAt = prior.lastExecutedAt
+			}
+			nextExecute = calculateNextExecuteFromSchedule(g.Schedule, lastExec, false)
+		}
 
 		if _, err := tx.Exec(`
-			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, next_execute_at)
-			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?)
-		`, groupID, g.SourceLabel, string(schedJSON), nextExecute); err != nil {
+			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, last_executed_at, next_execute_at)
+			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
+		`, groupID, g.SourceLabel, string(schedJSON), lastExecutedAt, nextExecute); err != nil {
 			return nil, fmt.Errorf("insert action_group %s: %w", groupID, err)
 		}
 
@@ -787,7 +824,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			}
 		}
 
-		if !priorGroupIDs[groupID] {
+		if _, existed := existingGroups[groupID]; !existed {
 			result.NewGroupIDs = append(result.NewGroupIDs, groupID)
 		}
 	}
@@ -801,12 +838,15 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 // GetDueGroups returns action groups whose schedule says they're due
 // for execution. Caller fetches members via GetGroupMembers and runs
 // them in declared order.
-func (s *Store) GetDueGroups() ([]StoredActionGroup, error) {
+//
+// Takes a context so the scheduler can cancel a blocking SQLite query
+// when shutdown fires, same rationale as GetDueActions.
+func (s *Store) GetDueGroups(ctx context.Context) ([]StoredActionGroup, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
 	now := time.Now().UTC()
-	rows, err := s.db.Query(`
+	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, source_label, schedule_json, last_executed_at, next_execute_at
 		FROM action_groups
 		WHERE next_execute_at <= ?
