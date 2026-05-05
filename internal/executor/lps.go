@@ -245,12 +245,24 @@ func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username s
 
 // killUserSessions terminates all sessions and processes for a user.
 // This ensures the old password cannot be used after rotation.
-// Errors are logged but not returned — the user may not have active sessions.
+// Errors are logged at Warn but not returned — the user may have no
+// active sessions (the most common case), in which case both
+// loginctl and pkill exit non-zero. Operators triaging "the old
+// password still works after rotation" need the underlying error in
+// the journal to distinguish "no sessions present" from "loginctl /
+// pkill failed", so the discarded errors get logged with stage tags
+// instead of being silently swallowed.
 func killUserSessions(ctx context.Context, username string) {
 	// Graceful: terminate systemd-logind sessions
-	runSudoCmd(ctx, "loginctl", "terminate-user", username)
+	if _, err := runSudoCmd(ctx, "loginctl", "terminate-user", username); err != nil {
+		slog.Warn("killUserSessions: loginctl terminate-user failed (may be benign — no active sessions)",
+			"username", username, "error", err)
+	}
 	// Forceful: kill all remaining processes owned by the user
-	runSudoCmd(ctx, "pkill", "-KILL", "-u", username)
+	if _, err := runSudoCmd(ctx, "pkill", "-KILL", "-u", username); err != nil {
+		slog.Warn("killUserSessions: pkill failed (may be benign — no remaining processes)",
+			"username", username, "error", err)
+	}
 	// Brief wait for processes to fully exit
 	time.Sleep(500 * time.Millisecond)
 }
