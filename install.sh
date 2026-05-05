@@ -665,13 +665,21 @@ install_luks_sudoers() {
     fi
 
     # Unquoted heredoc so $BINARY_PATH expands — the rule must match
-    # the actual binary location, which differs when the operator passes
-    # --binary. Sudoers treats wildcards on the argument list specially,
-    # so this remains a path match for /PATH/TO/power-manage-agent +
-    # "luks" verb + any args.
+    # the actual binary location, which differs when the operator
+    # passes --binary.
+    #
+    # The previous rule used "luks *" which auto-elevated ANY
+    # future luks subcommand the agent might add. Replaced with an
+    # explicit "luks set-passphrase *" entry so only the currently-
+    # documented subcommand is privileged. New subcommands need a
+    # conscious sudoers update (and review) before they can run
+    # without a password — forward-compatible defense in depth.
     cat > "$sudoers_file" <<EOF
-# Allow all users to run LUKS passphrase commands without password
-ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks *
+# Allow all users to run the LUKS set-passphrase command without
+# password. The wildcard at the end matches the variable arguments
+# (--token, --data-dir, the token value itself) without granting
+# any other luks subcommand the same privilege.
+ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks set-passphrase *
 EOF
 
     chmod 440 "$sudoers_file"

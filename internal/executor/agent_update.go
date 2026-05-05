@@ -420,11 +420,13 @@ func clearUpdateState(dataDir string) {
 
 // CheckStartupUpdateState cleans up stale update state from a previous cycle.
 // With the self-test approach, updates are validated before swapping the binary,
-// so there is no rollback logic needed at startup. This function only cleans up
-// state files left behind by interrupted updates.
+// so there is no rollback logic needed at startup. This function cleans up
+// state files left behind by interrupted updates AND any leftover
+// agent-update-*.tmp staging files older than 24h that os.CreateTemp left
+// behind when the agent crashed mid-download.
 //
 // Parameters:
-//   - dataDir: agent data directory containing update/state.json
+//   - dataDir: agent data directory containing update/state.json + update/
 //   - logger: structured logger
 func CheckStartupUpdateState(dataDir string, logger interface {
 	Info(string, ...any)
@@ -438,5 +440,35 @@ func CheckStartupUpdateState(dataDir string, logger interface {
 	if phase != "" {
 		logger.Info("cleaning up stale update state", "phase", phase)
 		clearUpdateState(dataDir)
+	}
+
+	// Sweep stale staging files. The defer os.Remove(tmpPath) inside
+	// executeAgentUpdate handles the happy path AND any return-with-
+	// error path inside that function, but a hard crash (OOM, kernel
+	// panic, power loss) can leave agent-update-*.tmp files behind.
+	// 24h is a generous threshold — a single update completes in
+	// seconds, so anything older is definitively orphaned.
+	updateDir := filepath.Join(dataDir, "update")
+	entries, err := os.ReadDir(updateDir)
+	if err != nil {
+		// update/ doesn't exist on a never-updated agent — not an error.
+		return
+	}
+	cutoff := time.Now().Add(-24 * time.Hour)
+	for _, entry := range entries {
+		name := entry.Name()
+		if !strings.HasPrefix(name, "agent-update-") || !strings.HasSuffix(name, ".tmp") {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil || info.ModTime().After(cutoff) {
+			continue
+		}
+		path := filepath.Join(updateDir, name)
+		if err := os.Remove(path); err != nil {
+			logger.Warn("failed to remove stale update tmp file", "path", path, "error", err)
+			continue
+		}
+		logger.Info("removed stale update tmp file", "path", path, "age", time.Since(info.ModTime()).Round(time.Second))
 	}
 }
