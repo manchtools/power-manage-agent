@@ -451,7 +451,15 @@ func CheckStartupUpdateState(dataDir string, logger interface {
 	updateDir := filepath.Join(dataDir, "update")
 	entries, err := os.ReadDir(updateDir)
 	if err != nil {
-		// update/ doesn't exist on a never-updated agent — not an error.
+		// update/ doesn't exist on a never-updated agent — not an
+		// error and not worth a log line. Anything else (EACCES,
+		// IO failure on the device) IS worth surfacing because it
+		// means future self-updates will silently fail to clean up
+		// after themselves.
+		if !os.IsNotExist(err) {
+			logger.Warn("failed to read update dir for stale tmp sweep",
+				"dir", updateDir, "error", err)
+		}
 		return
 	}
 	cutoff := time.Now().Add(-24 * time.Hour)

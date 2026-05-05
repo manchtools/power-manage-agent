@@ -409,6 +409,15 @@ func main() {
 	// install location. Operators who install with `install.sh
 	// --binary /opt/bin/...` get correct in-place updates instead
 	// of a silently-wrong overwrite of /usr/local/bin/.
+	//
+	// Symlink note: os.Executable resolves symlinks on Linux, so
+	// if the agent was launched via a symlink chain (e.g.
+	// /usr/bin/power-manage-agent -> /opt/pm/current/bin/power-manage-agent)
+	// the self-update replaces the symlink TARGET, leaving the
+	// symlink itself intact. That matches the typical "rotate
+	// /opt/pm/current/" deployment pattern; if an operator
+	// instead intends "update by repointing the symlink" they
+	// should rely on package management rather than self-update.
 	binaryPath, err := os.Executable()
 	if err != nil {
 		// os.Executable can fail on platforms that don't expose
