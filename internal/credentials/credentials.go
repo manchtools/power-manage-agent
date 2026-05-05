@@ -4,6 +4,7 @@
 package credentials
 
 import (
+	"bytes"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -32,6 +33,16 @@ const (
 
 	// Default data directory
 	DefaultDataDir = "/var/lib/power-manage"
+
+	// credentialsMagicV1 is the magic prefix for the v1 on-disk
+	// credential format (Argon2id-derived AES-256-GCM, nonce
+	// prepended to the GCM ciphertext). The prefix lets future
+	// format migrations (e.g. TPM-sealed key, different KDF
+	// parameters, alternate cipher) be detected at Load() time
+	// instead of requiring a flag-day migration. Pre-versioning
+	// installs have no magic prefix; Load() detects the absence
+	// and falls back to the legacy parser.
+	credentialsMagicV1 = "pmcred:v1:"
 )
 
 // Credentials holds the agent's identity and certificates.
@@ -88,11 +99,17 @@ func (s *Store) Save(creds *Credentials) error {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
 
-	// Encrypt
+	// Encrypt and prepend the format-version magic. New writes
+	// always use v1; Load() recognises both v1 (magic-prefixed) and
+	// the original unprefixed layout for backward compatibility with
+	// agents enrolled before the format was versioned. Future
+	// migrations (e.g. TPM-sealed key, different KDF parameters)
+	// bump the magic and Load() picks the matching path.
 	ciphertext, err := encrypt(key, plaintext)
 	if err != nil {
 		return fmt.Errorf("encrypt credentials: %w", err)
 	}
+	ciphertext = append([]byte(credentialsMagicV1), ciphertext...)
 
 	// Write encrypted credentials atomically. A direct os.WriteFile
 	// leaves a partially written file on crash / full disk / power
@@ -183,6 +200,16 @@ func (s *Store) Load() (*Credentials, error) {
 	ciphertext, err := os.ReadFile(credPath)
 	if err != nil {
 		return nil, fmt.Errorf("read credentials: %w", err)
+	}
+
+	// Strip the format-version magic if present. New writes always
+	// include the v1 prefix; pre-versioning installs have raw
+	// nonce+ciphertext with no prefix. The decrypt path is identical
+	// either way once the prefix is removed — the version difference
+	// is purely about future-proofing format migrations, not about
+	// the cipher in use today.
+	if bytes.HasPrefix(ciphertext, []byte(credentialsMagicV1)) {
+		ciphertext = ciphertext[len(credentialsMagicV1):]
 	}
 
 	// Decrypt

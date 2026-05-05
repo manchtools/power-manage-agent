@@ -22,7 +22,6 @@
 #   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
 #   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
 #   -u, --user USER         Service user name (default: power-manage)
-#   --skip-verify           Skip TLS certificate verification (development only)
 #   --skip-download         Skip downloading the binary (use existing binary at --binary path)
 #   --uninstall             Remove the agent and all configuration
 #   -h, --help              Show this help message
@@ -39,7 +38,6 @@ SERVICE_USER="power-manage"
 SERVICE_NAME="power-manage-agent"
 REGISTRATION_TOKEN=""
 SERVER_URL=""
-SKIP_VERIFY=""
 SKIP_DOWNLOAD=""
 PRE_RELEASE=""
 VERSION="latest"
@@ -80,7 +78,6 @@ Options:
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
   -u, --user USER         Service user name (default: power-manage)
-  --skip-verify           Skip TLS certificate verification (development only)
   --skip-download         Skip downloading the binary (use existing binary at --binary path)
   --uninstall             Remove the agent and all configuration
   -h, --help              Show this help message
@@ -135,7 +132,15 @@ parse_args() {
                 shift
                 ;;
             --skip-verify)
-                SKIP_VERIFY="true"
+                # Deprecation shim: the agent CLI no longer accepts
+                # -skip-verify and TLS verification cannot be
+                # disabled. Print a clear, actionable message rather
+                # than silently passing the flag to enroll (which
+                # would now fail with an "unknown flag" error and
+                # surprise operators running install scripts written
+                # against the old contract).
+                log_warn "--skip-verify is no longer supported; TLS verification is always enforced."
+                log_warn "Ignoring --skip-verify flag and continuing with TLS verification."
                 shift
                 ;;
             --skip-download)
@@ -510,10 +515,6 @@ enroll_agent() {
         "-token=$REGISTRATION_TOKEN"
     )
 
-    if [[ -n "$SKIP_VERIFY" ]]; then
-        enroll_cmd+=("-skip-verify")
-    fi
-
     # Wait for the enrollment socket to become available (agent needs to start first)
     local max_wait=10
     local waited=0
@@ -665,13 +666,21 @@ install_luks_sudoers() {
     fi
 
     # Unquoted heredoc so $BINARY_PATH expands — the rule must match
-    # the actual binary location, which differs when the operator passes
-    # --binary. Sudoers treats wildcards on the argument list specially,
-    # so this remains a path match for /PATH/TO/power-manage-agent +
-    # "luks" verb + any args.
+    # the actual binary location, which differs when the operator
+    # passes --binary.
+    #
+    # The previous rule used "luks *" which auto-elevated ANY
+    # future luks subcommand the agent might add. Replaced with an
+    # explicit "luks set-passphrase *" entry so only the currently-
+    # documented subcommand is privileged. New subcommands need a
+    # conscious sudoers update (and review) before they can run
+    # without a password — forward-compatible defense in depth.
     cat > "$sudoers_file" <<EOF
-# Allow all users to run LUKS passphrase commands without password
-ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks *
+# Allow all users to run the LUKS set-passphrase command without
+# password. The wildcard at the end matches the variable arguments
+# (--token, --data-dir, the token value itself) without granting
+# any other luks subcommand the same privilege.
+ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks set-passphrase *
 EOF
 
     chmod 440 "$sudoers_file"

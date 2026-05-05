@@ -187,9 +187,8 @@ func normalizedServiceBackend(s string) string {
 // Config holds the agent configuration.
 type Config struct {
 	// Registration
-	Token      string
-	ServerURL  string
-	SkipVerify bool
+	Token     string
+	ServerURL string
 
 	// Storage
 	DataDir string
@@ -404,11 +403,35 @@ func main() {
 	// Create handler with scheduler integration
 	h := handler.NewHandler(logger, exec, sched, actionStore, syncTrigger)
 
-	// Enable action-based agent self-update.
+	// Enable action-based agent self-update. The binary path is
+	// resolved at runtime via os.Executable() so the self-update
+	// targets the actually-running binary, not a hardcoded
+	// install location. Operators who install with `install.sh
+	// --binary /opt/bin/...` get correct in-place updates instead
+	// of a silently-wrong overwrite of /usr/local/bin/.
+	//
+	// Symlink note: os.Executable resolves symlinks on Linux, so
+	// if the agent was launched via a symlink chain (e.g.
+	// /usr/bin/power-manage-agent -> /opt/pm/current/bin/power-manage-agent)
+	// the self-update replaces the symlink TARGET, leaving the
+	// symlink itself intact. That matches the typical "rotate
+	// /opt/pm/current/" deployment pattern; if an operator
+	// instead intends "update by repointing the symlink" they
+	// should rely on package management rather than self-update.
+	binaryPath, err := os.Executable()
+	if err != nil {
+		// os.Executable can fail on platforms that don't expose
+		// /proc/self/exe symlink semantics; fall back to the
+		// canonical install path so self-update at least targets
+		// the documented default rather than refusing to enable.
+		logger.Warn("os.Executable failed; falling back to /usr/local/bin/power-manage-agent for self-update target",
+			"error", err)
+		binaryPath = "/usr/local/bin/power-manage-agent"
+	}
 	exec.SetUpdateConfig(&executor.AgentUpdateConfig{
 		Version:    version,
 		DataDir:    cfg.DataDir,
-		BinaryPath: "/usr/local/bin/power-manage-agent",
+		BinaryPath: binaryPath,
 		Shutdown:   cancel,
 	})
 
@@ -445,15 +468,12 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 		return nil, fmt.Errorf("generate CSR: %w", err)
 	}
 
-	// Create client options for registration
-	var clientOpts []sdk.ClientOption
-	if cfg.SkipVerify {
-		logger.Warn("TLS verification disabled - only use for development!")
-		clientOpts = append(clientOpts, sdk.WithInsecureSkipVerify())
-	}
-
-	// Register via control server RPC
-	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM, clientOpts...)
+	// Register via control server RPC. TLS verification is always
+	// enforced — there is intentionally no opt-out, as bypassing it
+	// during initial registration enables MITM attacks that can
+	// substitute the gateway URL and a malicious certificate before
+	// the agent has any trust anchor of its own.
+	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM)
 	if err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
@@ -607,8 +627,34 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 // startCertRotation runs a background loop that renews the agent's mTLS
 // certificate before it expires. Renewal is attempted at 80% of the cert's
 // lifetime. On failure it retries every hour.
+//
+// Consecutive failures are tracked so prolonged outages become visible
+// in operator logs without an additional alerting pipeline. The first
+// few failures stay at "the call failed once, retrying" volume; once
+// the count crosses a threshold the messages escalate to mention how
+// long the agent has been unable to rotate, which is what an operator
+// needs to triage "is the control server reachable?".
 func startCertRotation(ctx context.Context, credStore *credentials.Store, hostname string, logger *slog.Logger) {
-	const retryInterval = 1 * time.Hour
+	const (
+		retryInterval     = 1 * time.Hour
+		escalateThreshold = 3 // hours of consecutive failure before the log volume rises
+	)
+	consecutiveFailures := 0
+	logRetryFailure := func(stage string, err error) {
+		consecutiveFailures++
+		attrs := []any{"stage", stage, "error", err, "consecutive_failures", consecutiveFailures}
+		if consecutiveFailures >= escalateThreshold {
+			// Escalated wording so a `journalctl -u power-manage-agent
+			// | grep "rotation stalled"` query surfaces the issue
+			// fast. The hours-stalled value is the operator-facing
+			// triage handle.
+			logger.Error("cert rotation: rotation stalled, control server may be unreachable",
+				append(attrs, "hours_stalled", consecutiveFailures)...,
+			)
+		} else {
+			logger.Error("cert rotation: renewal attempt failed, will retry", attrs...)
+		}
+	}
 
 	for {
 		creds, err := credStore.Load()
@@ -652,7 +698,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		// Generate CSR from existing private key
 		csrPEM, err := pmcrypto.GenerateCSRFromKey(hostname, creds.PrivateKey)
 		if err != nil {
-			logger.Error("cert rotation: failed to generate CSR", "error", err)
+			logRetryFailure("generate_csr", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -672,7 +718,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		// RenewCertificate request body.
 		mtlsOpt, err := sdk.WithMTLSFromPEMAndSystemRoots(creds.Certificate, creds.PrivateKey, creds.CACert)
 		if err != nil {
-			logger.Error("cert rotation: failed to configure mTLS", "error", err)
+			logRetryFailure("configure_mtls", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -684,7 +730,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		// Call RenewCertificate on the control server
 		result, err := sdk.RenewCertificate(ctx, creds.ControlAddr, csrPEM, creds.Certificate, mtlsOpt)
 		if err != nil {
-			logger.Error("cert rotation: renewal failed, will retry", "error", err)
+			logRetryFailure("renew_certificate", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -699,7 +745,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			creds.CACert = result.CACert
 		}
 		if err := credStore.Save(creds); err != nil {
-			logger.Error("cert rotation: failed to save new certificate", "error", err)
+			logRetryFailure("save_credentials", err)
 			select {
 			case <-ctx.Done():
 				return
@@ -708,6 +754,10 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			continue
 		}
 
+		// Successful rotation — reset the consecutive-failure counter
+		// so the next failure starts at 1, not stuck above the
+		// escalation threshold from a prior outage.
+		consecutiveFailures = 0
 		logger.Info("cert rotation: certificate renewed successfully",
 			"not_after", result.NotAfter,
 		)
@@ -950,7 +1000,6 @@ func parseFlags() *Config {
 	flag.StringVar(&cfg.Token, "t", "", "Registration token (shorthand)")
 	flag.StringVar(&cfg.ServerURL, "server", "", "Control server URL for registration")
 	flag.StringVar(&cfg.ServerURL, "s", "", "Control server URL (shorthand)")
-	flag.BoolVar(&cfg.SkipVerify, "skip-verify", false, "Skip TLS verification (development only)")
 	flag.StringVar(&cfg.DataDir, "data-dir", credentials.DefaultDataDir, "Data directory for credentials")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.LogFormat, "log-format", "text", "Log format (text, json)")
@@ -970,7 +1019,7 @@ func parseFlags() *Config {
 	}
 
 	// Parse power-manage:// URI if provided (registration URIs)
-	// Format: power-manage://server:port?token=xxx[&skip-verify=true]
+	// Format: power-manage://server:port?token=xxx
 	if uri != "" {
 		if parsed, err := parseRegistrationURI(uri); err == nil {
 			// Try socket enrollment first (no sudo needed)
@@ -980,7 +1029,6 @@ func parseFlags() *Config {
 			// Fallback to direct registration (sudo/service mode)
 			cfg.ServerURL = parsed.ServerURL
 			cfg.Token = parsed.Token
-			cfg.SkipVerify = parsed.SkipVerify
 		}
 	}
 
@@ -994,9 +1042,6 @@ func parseFlags() *Config {
 	if v := os.Getenv("POWER_MANAGE_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}
-	if os.Getenv("POWER_MANAGE_SKIP_VERIFY") == "true" {
-		cfg.SkipVerify = true
-	}
 
 	cfg.PrivilegeBackend = strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
 	cfg.ServiceBackend = strings.ToLower(os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
@@ -1007,20 +1052,22 @@ func parseFlags() *Config {
 
 // registrationURI holds parsed registration URI data.
 type registrationURI struct {
-	ServerURL  string
-	Token      string
-	SkipVerify bool
+	ServerURL string
+	Token     string
 }
 
 // parseRegistrationURI parses a power-manage:// URI.
-// Format: power-manage://server:port?token=xxx[&skip-verify=true][&tls=false]
+// Format: power-manage://server:port?token=xxx
 // Examples:
 //   - power-manage://gateway.example.com:8080?token=abc123
-//   - power-manage://192.168.1.100:8080?token=abc123&skip-verify=true
-//   - power-manage://gateway.example.com:8080?token=abc123&tls=false
+//
+// TLS verification is always enforced. The previous `skip-verify=true`
+// and `tls=false` query parameters were removed because bypassing
+// TLS during initial registration enables MITM attacks that can
+// substitute the gateway URL and a malicious certificate before the
+// agent has any trust anchor of its own.
 func parseRegistrationURI(rawURI string) (*registrationURI, error) {
-	// Replace power-manage:// with https:// for parsing
-	// We'll determine the actual scheme from query params
+	// Replace power-manage:// with https:// for parsing.
 	normalizedURI := strings.Replace(rawURI, "power-manage://", "https://", 1)
 
 	parsed, err := url.Parse(normalizedURI)
@@ -1028,33 +1075,16 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 		return nil, fmt.Errorf("invalid URI: %w", err)
 	}
 
-	result := &registrationURI{}
-
-	// Get query parameters
-	query := parsed.Query()
-
-	// Token is required
-	result.Token = query.Get("token")
-	if result.Token == "" {
+	// Token is required.
+	token := parsed.Query().Get("token")
+	if token == "" {
 		return nil, fmt.Errorf("token parameter is required in URI")
 	}
 
-	// Check for skip-verify
-	if query.Get("skip-verify") == "true" {
-		result.SkipVerify = true
-	}
-
-	// Determine scheme (default to https)
-	scheme := "https"
-	if query.Get("tls") == "false" {
-		scheme = "http"
-		result.SkipVerify = true // No TLS means no verification needed
-	}
-
-	// Build server URL
-	result.ServerURL = fmt.Sprintf("%s://%s", scheme, parsed.Host)
-
-	return result, nil
+	return &registrationURI{
+		ServerURL: fmt.Sprintf("https://%s", parsed.Host),
+		Token:     token,
+	}, nil
 }
 
 // runSetup installs the agent's privilege-escalation configuration.
@@ -1739,7 +1769,6 @@ func runEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	token := fs.String("token", "", "Registration token")
 	server := fs.String("server", "", "Control server URL")
-	skipVerify := fs.Bool("skip-verify", false, "Skip TLS verification")
 	socketPath := fs.String("socket", deviceauth.EnrollSocketPath, "Agent enrollment socket")
 	fs.Parse(args)
 
@@ -1750,7 +1779,6 @@ func runEnroll(args []string) {
 			if parsed, err := parseRegistrationURI(arg); err == nil {
 				*server = parsed.ServerURL
 				*token = parsed.Token
-				*skipVerify = parsed.SkipVerify
 			} else {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
@@ -1785,11 +1813,12 @@ func runEnroll(args []string) {
 		return
 	}
 
-	// Enroll via socket
+	// Enroll via socket. SkipVerify is intentionally NOT set —
+	// the agent CLI no longer exposes any way to disable TLS
+	// verification during registration (MITM hardening).
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl:  *server,
-		Token:      *token,
-		SkipVerify: *skipVerify,
+		ServerUrl: *server,
+		Token:     *token,
 	}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: enrollment failed: %v\n", err)
@@ -1821,9 +1850,8 @@ func trySocketEnroll(parsed *registrationURI) bool {
 	}
 
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl:  parsed.ServerURL,
-		Token:      parsed.Token,
-		SkipVerify: parsed.SkipVerify,
+		ServerUrl: parsed.ServerURL,
+		Token:     parsed.Token,
 	}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %v\n", err)

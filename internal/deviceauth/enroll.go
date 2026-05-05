@@ -80,6 +80,25 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
+	// Reject any caller that tries to disable TLS verification —
+	// the CLI surface no longer exposes a path to set this, and
+	// the proto field is being phased out of the SDK. A SkipVerify
+	// request now indicates either an outdated client or a tampered
+	// IPC payload trying to bypass MITM protection.
+	//
+	// This MUST run before the already-enrolled fast path: otherwise
+	// an attacker who finds a SkipVerify-enabled client can hit the
+	// socket on an enrolled agent and get Success=true back, which
+	// could be misread as "the SkipVerify request was honoured".
+	// CR caught this on PR #61.
+	if req.Msg.SkipVerify {
+		h.logger.Warn("rejecting enrollment request with SkipVerify=true (TLS bypass is not supported)")
+		return connect.NewResponse(&pm.EnrollResponse{
+			Success: false,
+			Error:   "TLS verification cannot be disabled; remove SkipVerify from the enrollment request",
+		}), nil
+	}
+
 	// Check if already enrolled
 	if h.credStore.Exists() {
 		creds, err := h.credStore.Load()
@@ -103,14 +122,8 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
-	// Build client options
-	var clientOpts []sdk.ClientOption
-	if req.Msg.SkipVerify {
-		clientOpts = append(clientOpts, sdk.WithInsecureSkipVerify())
-	}
-
-	// Register via control server RPC
-	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM, clientOpts...)
+	// Register via control server RPC.
+	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM)
 	if err != nil {
 		h.logger.Error("registration failed", "error", err)
 		return connect.NewResponse(&pm.EnrollResponse{

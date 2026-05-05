@@ -3729,20 +3729,35 @@ func (e *Executor) executeSshd(ctx context.Context, params *pb.SshdParams, state
 }
 
 // generateSshdGlobalConfig generates sshd_config content from directives.
-func generateSshdGlobalConfig(params *pb.SshdParams) string {
+// Returns an error if any directive's key or value contains a newline,
+// carriage return, or NUL — these characters would split one directive
+// into multiple lines (or terminate the file early via NUL) and let a
+// crafted action smuggle arbitrary additional sshd directives past the
+// caller's intent. sshd_config has no escape syntax; fail loudly at
+// generation time.
+func generateSshdGlobalConfig(params *pb.SshdParams) (string, error) {
 	var lines []string
 	lines = append(lines, "# Managed by Power Manage - do not edit manually")
 	for _, d := range params.Directives {
+		if strings.ContainsAny(d.Key, "\n\r\x00") {
+			return "", fmt.Errorf("sshd directive key contains forbidden control character (CR, LF, or NUL)")
+		}
+		if strings.ContainsAny(d.Value, "\n\r\x00") {
+			return "", fmt.Errorf("sshd directive %q value contains forbidden control character (CR, LF, or NUL)", d.Key)
+		}
 		lines = append(lines, fmt.Sprintf("%s %s", d.Key, d.Value))
 	}
-	return strings.Join(lines, "\n") + "\n"
+	return strings.Join(lines, "\n") + "\n", nil
 }
 
 // setupSshdConfig creates or updates an sshd_config.d drop-in file and reloads sshd if changed.
 func (e *Executor) setupSshdConfig(ctx context.Context, params *pb.SshdParams, configPath string) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 
-	content := generateSshdGlobalConfig(params)
+	content, err := generateSshdGlobalConfig(params)
+	if err != nil {
+		return nil, false, err
+	}
 
 	// Check idempotency
 	if e.configMatchesDesired(ctx, configPath, content) {
