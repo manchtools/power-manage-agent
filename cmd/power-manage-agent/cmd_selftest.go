@@ -81,7 +81,7 @@ func runSelfTest(args []string) int {
 		logger.Error("self-test: failed to configure mTLS", "error", err)
 		return 1
 	}
-	client := sdk.NewClient(creds.GatewayAddr,
+	client := sdk.NewClient(gatewayAddr,
 		mtlsOpt,
 		sdk.WithAuth(creds.DeviceID, ""),
 	)
