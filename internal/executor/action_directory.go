@@ -111,17 +111,20 @@ func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryPara
 		}
 	}
 
-	// Check owner/group if specified
+	// Check owner/group if specified. See fileMatchesDesired for
+	// the full rationale — same group-only mismatch bug lived
+	// here too and made directoryMatchesDesired never return true
+	// when only the group was requested, so the action rechowned
+	// on every run.
 	if params.Owner != "" || params.Group != "" {
 		currentOwner, currentGroup := getFileOwnership(path)
 		if currentOwner == "" && currentGroup == "" {
 			return false
 		}
-		if params.Group == "" {
-			if currentOwner != params.Owner {
-				return false
-			}
-		} else if currentOwner != params.Owner || currentGroup != params.Group {
+		if params.Owner != "" && currentOwner != params.Owner {
+			return false
+		}
+		if params.Group != "" && currentGroup != params.Group {
 			return false
 		}
 	}

@@ -47,15 +47,12 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, err
 	}
 
-	// Repair filesystem if mounted read-only. Only reached once the
-	// action has passed every structural check, so the sudo-backed
-	// remount never fires for a payload we were going to refuse.
-	if out, err := e.requireWritableFS(ctx); err != nil {
-		return out, false, err
-	}
-
-	// Detect package manager and execute the appropriate configuration
-	// Repository actions always report changed=true since they write config files
+	// Per-manager skip-check moved BEFORE requireWritableFS: if
+	// the action carries no config for the host's package manager,
+	// it's a no-op and shouldn't trigger a sudo-backed remount on
+	// a read-only root just to bail out on the first line of the
+	// dispatcher. The skip path returns changed=false; remount
+	// only fires when we're about to actually mutate state.
 	switch {
 	case pkg.IsApt():
 		if params.Apt == nil || params.Apt.Disabled {
@@ -64,8 +61,6 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no APT repository configuration provided",
 			}, false, nil
 		}
-		return e.executeAptRepository(ctx, params.Name, params.Apt, state)
-
 	case pkg.IsDnf():
 		if params.Dnf == nil || params.Dnf.Disabled {
 			return &pb.CommandOutput{
@@ -73,9 +68,6 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no DNF repository configuration provided",
 			}, false, nil
 		}
-		output, err := e.executeDnfRepository(ctx, params.Name, params.Dnf, state)
-		return output, err == nil, err
-
 	case pkg.IsPacman():
 		if params.Pacman == nil || params.Pacman.Disabled {
 			return &pb.CommandOutput{
@@ -83,9 +75,6 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no Pacman repository configuration provided",
 			}, false, nil
 		}
-		output, err := e.executePacmanRepository(ctx, params.Name, params.Pacman, state)
-		return output, err == nil, err
-
 	case pkg.IsZypper():
 		if params.Zypper == nil || params.Zypper.Disabled {
 			return &pb.CommandOutput{
@@ -93,10 +82,29 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 				Stdout:   "skipped: no Zypper repository configuration provided",
 			}, false, nil
 		}
-		output, err := e.executeZypperRepository(ctx, params.Name, params.Zypper, state)
-		return output, err == nil, err
-
 	default:
+		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
+	}
+
+	// Repair filesystem if mounted read-only. Only reached once we
+	// know we have actual work to do for THIS host's package
+	// manager — a no-op skip never triggers it.
+	if out, err := e.requireWritableFS(ctx); err != nil {
+		return out, false, err
+	}
+
+	switch {
+	case pkg.IsApt():
+		return e.executeAptRepository(ctx, params.Name, params.Apt, state)
+	case pkg.IsDnf():
+		return e.executeDnfRepository(ctx, params.Name, params.Dnf, state)
+	case pkg.IsPacman():
+		return e.executePacmanRepository(ctx, params.Name, params.Pacman, state)
+	case pkg.IsZypper():
+		return e.executeZypperRepository(ctx, params.Name, params.Zypper, state)
+	default:
+		// Unreachable: the per-manager skip switch above already
+		// rejects unknown managers. Defensive return.
 		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
 	}
 }
@@ -107,12 +115,18 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 // repository URL was previously configured under a different name or with different keys.
 // The skipRepoFile and skipKeyFile parameters specify files that should NOT be deleted
 // (typically the target repository being configured).
-func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepoFile, skipKeyFile string, output *strings.Builder) {
+//
+// Returns true if any conflicting file was removed so the caller can
+// flip the action's `changed` flag — silently removing config files
+// while reporting `changed=false` would make compliance projections
+// miss real on-disk state mutations.
+func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepoFile, skipKeyFile string, output *strings.Builder) bool {
 	sourcesDir := "/etc/apt/sources.list.d"
 	entries, err := os.ReadDir(sourcesDir)
 	if err != nil {
-		return // Directory might not exist, that's fine
+		return false // Directory might not exist, that's fine
 	}
+	cleanedUp := false
 
 	for _, entry := range entries {
 		if entry.IsDir() {
@@ -145,6 +159,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 		}
 
 		output.WriteString(fmt.Sprintf("removing conflicting repository config: %s\n", filePath))
+		cleanedUp = true
 
 		// Extract Signed-By path from DEB822 format (.sources files)
 		if strings.HasSuffix(filename, ".sources") {
@@ -185,6 +200,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 		// Remove the repository file
 		runSudoCmd(ctx, "rm", "-f", filePath)
 	}
+	return cleanedUp
 }
 
 // executeAptRepository configures an APT repository.
@@ -215,8 +231,14 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		// First, scan for and remove any existing repository configs that use the same URL
 		// This prevents "conflicting values set for option Signed-By" errors when the same
 		// repository was previously configured under a different name or with different keys
-		// We skip our own repo file and key file to allow the comparison logic to work
-		e.cleanupConflictingAptRepos(ctx, repo.Url, repoFile, keyFile, &output)
+		// We skip our own repo file and key file to allow the comparison logic to work.
+		// Track whether anything was removed so the action's `changed`
+		// flag reflects the on-disk mutation — without this, an
+		// idempotent re-apply that quietly resolves a conflict would
+		// look like a no-op to compliance projections.
+		if e.cleanupConflictingAptRepos(ctx, repo.Url, repoFile, keyFile, &output) {
+			changed = true
+		}
 
 		// Clean up legacy .list file if it exists
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
@@ -407,44 +429,42 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 }
 
 // executeDnfRepository configures a DNF/YUM repository.
-func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *pb.DnfRepository, state pb.DesiredState) (*pb.CommandOutput, error) {
+func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *pb.DnfRepository, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	repoFile := fmt.Sprintf("/etc/yum.repos.d/%s.repo", name)
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
+		// No-op when the repo file is already absent. Reporting
+		// changed=true here used to flood operators with spurious
+		// state-change events for actions that did nothing.
+		if _, err := os.Stat(repoFile); os.IsNotExist(err) {
+			output.WriteString(fmt.Sprintf("repository %s already absent\n", name))
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
+		}
 		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
-			return nil, fmt.Errorf("failed to remove repo file: %w", err)
+			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		// Clean up any existing repository configuration to ensure clean state
-		// This handles cases where the repository was previously configured with different settings
-		if _, err := os.Stat(repoFile); err == nil {
-			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-			runSudoCmd(ctx, "rm", "-f", repoFile)
-		}
-
-		// Build repo file content
+		// Build the desired repo file content first so we can
+		// compare against on-disk state and skip the rewrite when
+		// the file already matches.
 		var content strings.Builder
 		content.WriteString(fmt.Sprintf("[%s]\n", name))
-
 		if repo.Description != "" {
 			content.WriteString(fmt.Sprintf("name=%s\n", repo.Description))
 		} else {
 			content.WriteString(fmt.Sprintf("name=%s\n", name))
 		}
-
 		content.WriteString(fmt.Sprintf("baseurl=%s\n", repo.Baseurl))
-
 		if repo.Enabled {
 			content.WriteString("enabled=1\n")
 		} else {
 			content.WriteString("enabled=0\n")
 		}
-
 		if repo.Gpgcheck {
 			content.WriteString("gpgcheck=1\n")
 			if repo.Gpgkey != "" {
@@ -453,20 +473,32 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		} else {
 			content.WriteString("gpgcheck=0\n")
 		}
-
 		if repo.ModuleHotfixes {
 			content.WriteString("module_hotfixes=1\n")
 		}
+		desired := content.String()
 
-		// Write the repo file
-		if _, err := writeFileWithSudo(ctx, repoFile, content.String()); err != nil {
-			return nil, fmt.Errorf("failed to write repo file: %w", err)
+		// Idempotency: if the existing file matches byte-for-byte,
+		// don't rewrite + report changed.
+		if existing, err := os.ReadFile(repoFile); err == nil && string(existing) == desired {
+			output.WriteString(fmt.Sprintf("repository %s already up to date\n", name))
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
 		}
 
+		// Cleanup any existing repository configuration first
+		// (handles previous configurations with different settings).
+		if _, err := os.Stat(repoFile); err == nil {
+			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
+			runSudoCmd(ctx, "rm", "-f", repoFile)
+		}
+
+		if _, err := writeFileWithSudo(ctx, repoFile, desired); err != nil {
+			return nil, false, fmt.Errorf("failed to write repo file: %w", err)
+		}
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
 
-		// Import GPG key if provided
-		// rpm --import is idempotent - re-importing an existing key is a no-op
+		// Import GPG key if provided.
+		// rpm --import is idempotent - re-importing an existing key is a no-op.
 		if repo.Gpgkey != "" {
 			keyOutput, _ := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
 			if keyOutput != nil && keyOutput.Stdout != "" {
@@ -474,16 +506,16 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 			}
 		}
 
-		// Refresh metadata (use -y for non-interactive mode)
+		// Refresh metadata (use -y for non-interactive mode).
 		refreshOutput, _ := runSudoCmd(ctx, "dnf", "-y", "makecache", "--repo", name)
 		if refreshOutput != nil {
 			output.WriteString(refreshOutput.Stdout)
 		}
 
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	default:
-		return nil, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
@@ -511,14 +543,14 @@ func removePacmanSection(content, name string) string {
 }
 
 // executePacmanRepository configures a Pacman repository.
-func (e *Executor) executePacmanRepository(ctx context.Context, name string, repo *pb.PacmanRepository, state pb.DesiredState) (*pb.CommandOutput, error) {
+func (e *Executor) executePacmanRepository(ctx context.Context, name string, repo *pb.PacmanRepository, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 	confFile := "/etc/pacman.conf"
 
 	// Read current pacman.conf
 	confContent, err := os.ReadFile(confFile)
 	if err != nil {
-		return nil, fmt.Errorf("failed to read pacman.conf: %w", err)
+		return nil, false, fmt.Errorf("failed to read pacman.conf: %w", err)
 	}
 	confStr := string(confContent)
 
@@ -530,17 +562,17 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		if !hasRepo {
 			output.WriteString(fmt.Sprintf("repository %s not found, nothing to remove\n", name))
-			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
 		}
 
 		// Remove the repository section in Go (no sed, no shell injection risk)
 		newConf := removePacmanSection(confStr, name)
 		if _, err := writeFileWithSudo(ctx, confFile, newConf); err != nil {
-			return nil, fmt.Errorf("failed to update pacman.conf: %w", err)
+			return nil, false, fmt.Errorf("failed to update pacman.conf: %w", err)
 		}
 
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		// Build new repo section
@@ -558,8 +590,15 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 		}
 		newConf += section.String()
 
+		// Idempotency: skip the write + db-sync if pacman.conf
+		// already matches.
+		if newConf == confStr {
+			output.WriteString(fmt.Sprintf("repository %s already configured\n", name))
+			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
+		}
+
 		if _, err := writeFileWithSudo(ctx, confFile, newConf); err != nil {
-			return nil, fmt.Errorf("failed to write pacman.conf: %w", err)
+			return nil, false, fmt.Errorf("failed to write pacman.conf: %w", err)
 		}
 
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
@@ -570,30 +609,32 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 			output.WriteString(syncOutput.Stdout)
 		}
 
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	default:
-		return nil, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
 // executeZypperRepository configures a Zypper repository.
-func (e *Executor) executeZypperRepository(ctx context.Context, name string, repo *pb.ZypperRepository, state pb.DesiredState) (*pb.CommandOutput, error) {
+func (e *Executor) executeZypperRepository(ctx context.Context, name string, repo *pb.ZypperRepository, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	var output strings.Builder
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		cmdOutput, err := runSudoCmd(ctx, "zypper", "--non-interactive", "removerepo", name)
 		if err != nil {
-			// Ignore if repo doesn't exist
+			// Already-absent is the no-op case — surface as
+			// changed=false so operators don't see spurious
+			// state-change events.
 			if cmdOutput != nil && strings.Contains(cmdOutput.Stderr, "not found") {
 				output.WriteString(fmt.Sprintf("repository %s not found, nothing to remove\n", name))
-				return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+				return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
 			}
-			return nil, fmt.Errorf("failed to remove repository: %w", err)
+			return nil, false, fmt.Errorf("failed to remove repository: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		// Build zypper addrepo command
@@ -616,7 +657,7 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 			if cmdOutput != nil {
 				output.WriteString(cmdOutput.Stderr)
 			}
-			return nil, fmt.Errorf("failed to add repository: %w", err)
+			return nil, false, fmt.Errorf("failed to add repository: %w", err)
 		}
 
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
@@ -652,9 +693,9 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 			output.WriteString(refreshOutput.Stdout)
 		}
 
-		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, nil
+		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
 	default:
-		return nil, fmt.Errorf("unknown desired state: %v", state)
+		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }

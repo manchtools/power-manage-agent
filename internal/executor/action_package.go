@@ -64,7 +64,15 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 
 	if err == nil && params.Pin {
 		if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
-			result.Stderr += fmt.Sprintf("\nwarning: failed to pin package: %v", pinErr)
+			// Pin is part of the requested state. The previous shape
+			// degraded to a stderr warning while the action result
+			// stayed success — operators saw "installed and pinned"
+			// when only install happened, and the package would
+			// upgrade out from under the next maintenance window.
+			// Surface as a real failure: the install is durable, but
+			// the action did not reach the requested state.
+			result.Stderr += fmt.Sprintf("\nfailed to pin package: %v", pinErr)
+			err = fmt.Errorf("install succeeded but pin failed: %w", pinErr)
 		}
 	}
 	return packageResult(result, err)
@@ -164,17 +172,14 @@ func (e *Executor) getPackageNameForManager(params *pb.PackageParams) string {
 		}
 	}
 
-	// Check if any manager-specific names are set
-	// If so, and we don't have one for this manager, return empty (skip)
-	hasManagerSpecificNames := params.AptName != "" || params.DnfName != "" ||
-		params.PacmanName != "" || params.ZypperName != ""
-
-	if hasManagerSpecificNames {
-		// Manager-specific names are being used, but none for this manager
-		return ""
-	}
-
-	// Fall back to generic name
+	// Fall back to the generic name even when other managers have
+	// overrides set. The previous shape returned "" (skip) when ANY
+	// manager-specific name was present but no override existed for
+	// THIS manager — a curl action specifying just AptName="curl"
+	// would silently no-op on dnf/zypper/pacman hosts even though
+	// the generic Name=curl is the right answer for those managers
+	// too. The override-only-when-set semantics belong on a
+	// per-manager basis, not as a cross-manager kill switch.
 	return params.Name
 }
 

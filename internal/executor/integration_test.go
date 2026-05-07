@@ -1634,9 +1634,19 @@ func TestIntegration_Rpm(t *testing.T) {
 	})
 
 	t.Run("Remove", func(t *testing.T) {
+		// PR #77 changed RPM ABSENT to download the package and ask
+		// `rpm -qp NAME` for the canonical package name (the prior
+		// dash-split heuristic was unsound for any package whose
+		// upstream name contains a dash). The URL therefore needs to
+		// resolve, not 404 — give Remove a real local file server.
+		rpmData := createTestRpm(t)
+		ts := startFileServer(t, map[string][]byte{
+			"/pmtestrpm-1.0.0-1.noarch.rpm": rpmData,
+		})
+
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: "http://example.com/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
@@ -1647,9 +1657,16 @@ func TestIntegration_Rpm(t *testing.T) {
 	})
 
 	t.Run("RemoveAbsent", func(t *testing.T) {
+		// Same reason as Remove above — must download to learn the
+		// canonical NAME before asking rpm whether it's installed.
+		rpmData := createTestRpm(t)
+		ts := startFileServer(t, map[string][]byte{
+			"/pmtestrpm-1.0.0-1.noarch.rpm": rpmData,
+		})
+
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: "http://example.com/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
