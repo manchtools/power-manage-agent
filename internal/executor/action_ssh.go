@@ -6,9 +6,26 @@ import (
 	"fmt"
 	"strings"
 
+	"github.com/oklog/ulid/v2"
+
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
+
+// validateActionIDForFilesystem rejects an actionID that isn't a
+// well-formed ULID. Action IDs flow into filesystem paths
+// (/etc/sudoers.d/<id>, /etc/ssh/sshd_config.d/<id>.conf etc.); a
+// non-ULID value containing slashes or shell metacharacters would
+// let a signed action escape the intended directory or overwrite
+// arbitrary system files. ULIDs are 26 characters, base32-Crockford,
+// no path-meaningful characters — exact match means the input can
+// be spliced into a path safely.
+func validateActionIDForFilesystem(actionID string) error {
+	if _, err := ulid.Parse(actionID); err != nil {
+		return fmt.Errorf("action ID %q is not a valid ULID; refusing to splice into filesystem path", actionID)
+	}
+	return nil
+}
 
 // sshGroupName creates a valid Linux group name from the action ID for SSH access.
 // Linux group names: max 32 chars. pm-ssh- (7 chars) + up to 25 chars of action ID.
@@ -36,8 +53,8 @@ func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state p
 	if params == nil {
 		return nil, false, fmt.Errorf("ssh params required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for ssh group/file naming")
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
 	users := sshEffectiveUsers(params)
@@ -187,8 +204,8 @@ func (e *Executor) executeSshd(ctx context.Context, params *pb.SshdParams, state
 	if len(params.Directives) == 0 && state != pb.DesiredState_DESIRED_STATE_ABSENT {
 		return nil, false, fmt.Errorf("at least one directive is required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for sshd config file naming")
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
 	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, actionID)

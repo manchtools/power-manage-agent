@@ -3,6 +3,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -235,23 +236,72 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 	}
 }
 
+// removeStaleLockFile removes a package-manager lock file ONLY if
+// no live process currently holds it open. Unconditionally
+// `rm -f`-ing a lock while a real apt/dpkg/pacman/zypper process is
+// mid-flight corrupts the database — the running process keeps its
+// open file descriptor (POSIX semantics) but a NEW process can now
+// grab the lock and start a concurrent transaction.
+//
+// Liveness check uses `fuser <path>`: exit 0 means at least one
+// process has the file open (skip removal), exit 1 means no holder
+// (safe to remove), other exits / fuser-not-installed are treated
+// as "be safe, skip" so we never delete a lock we couldn't prove
+// stale.
+func (e *Executor) removeStaleLockFile(ctx context.Context, path string) {
+	if _, err := os.Stat(path); err != nil {
+		// Already absent — nothing to do.
+		return
+	}
+	// `fuser -s` runs silently and uses exit codes only.
+	cmd := exec.CommandContext(ctx, "fuser", "-s", path)
+	err := cmd.Run()
+	if err == nil {
+		// Exit 0 → file is held by a live process. Refuse to
+		// unlink: yanking the lock now would let a second pkg-mgr
+		// process race in on top of an in-flight transaction.
+		slog.Warn("repair: lock file held by live process; refusing to unlink",
+			"path", path)
+		return
+	}
+	var exitErr *exec.ExitError
+	if !errors.As(err, &exitErr) {
+		// fuser missing, ENOENT, or any other invocation problem.
+		// Be conservative — don't unlink something we couldn't
+		// prove stale.
+		slog.Warn("repair: cannot probe lock file holder (fuser unavailable or errored); skipping unlink",
+			"path", path, "error", err)
+		return
+	}
+	// fuser returned a non-zero exit. Exit 1 is the "no holder"
+	// signal we want; any other exit is unexpected — also skip.
+	if exitErr.ExitCode() != 1 {
+		slog.Warn("repair: unexpected fuser exit; skipping lock-file unlink",
+			"path", path, "exit_code", exitErr.ExitCode())
+		return
+	}
+	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
+		slog.Warn("repair: failed to remove confirmed-stale lock file",
+			"path", path, "error", err)
+	}
+}
+
 // repairApt fixes common apt/dpkg issues:
 // - Stale lock files from interrupted operations
 // - Interrupted dpkg operations (dpkg --configure -a)
 // - Broken dependencies (apt -f install)
 // - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
-	// Remove stale lock files that may be left from interrupted operations
-	lockFiles := []string{
+	// Remove stale lock files that may be left from interrupted operations.
+	// Each removal is gated on a fuser-based liveness probe so we never
+	// yank a lock from a live apt/dpkg process.
+	for _, lf := range []string{
 		"/var/lib/dpkg/lock-frontend",
 		"/var/lib/dpkg/lock",
 		"/var/lib/apt/lists/lock",
 		"/var/cache/apt/archives/lock",
-	}
-	for _, lf := range lockFiles {
-		if _, err := runSudoCmd(ctx, "rm", "-f", lf); err != nil {
-			slog.Warn("repairApt: failed to remove lock file", "path", lf, "error", err)
-		}
+	} {
+		e.removeStaleLockFile(ctx, lf)
 	}
 
 	// Fix any interrupted dpkg operations.
@@ -307,11 +357,10 @@ func (e *Executor) repairDnf(ctx context.Context) {
 // - Corrupted package database
 // - Keyring issues
 func (e *Executor) repairPacman(ctx context.Context) {
-	// Remove stale lock file if it exists
-	// This handles "unable to lock database" errors from interrupted operations
-	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck"); err != nil {
-		slog.Warn("repairPacman: failed to remove lock file", "error", err)
-	}
+	// Remove stale lock file if held by no live process — handles
+	// "unable to lock database" errors from interrupted operations
+	// without yanking the lock from a real concurrent transaction.
+	e.removeStaleLockFile(ctx, "/var/lib/pacman/db.lck")
 
 	// Refresh package database to fix potential corruption
 	// Using -Syy to force refresh even if recently updated
@@ -335,10 +384,9 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Repository metadata issues
 // - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
-	// Remove stale lock files
-	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid"); err != nil {
-		slog.Warn("repairZypper: failed to remove lock file", "error", err)
-	}
+	// Remove stale lock file if held by no live process — same
+	// liveness probe as the apt/pacman repair paths.
+	e.removeStaleLockFile(ctx, "/var/run/zypp.pid")
 
 	// Clean repository metadata cache to fix stale metadata issues
 	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all"); err != nil {

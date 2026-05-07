@@ -94,6 +94,18 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}, false, nil
 		}
 
+		// Refuse ABSENT delete on protected system paths. The PRESENT
+		// branches above already guard via isProtectedPath, but
+		// ABSENT used to bypass entirely — a signed action could
+		// request deletion of /etc/shadow, /etc/sudoers, /etc/passwd,
+		// etc. and the agent would oblige. Apply the same allowlist.
+		// Managed-block mode is fine to leave gated by the same
+		// rule: editing protected files via block-removal is just as
+		// dangerous as full deletion.
+		if isProtectedPath(resolvedPath) {
+			return nil, false, fmt.Errorf("refusing to remove protected system path: %s", resolvedPath)
+		}
+
 		// Repair filesystem if mounted read-only
 		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
