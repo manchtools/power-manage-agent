@@ -1813,9 +1813,9 @@ func runEnroll(args []string) {
 		return
 	}
 
-	// Enroll via socket. SkipVerify is intentionally NOT set —
-	// the agent CLI no longer exposes any way to disable TLS
-	// verification during registration (MITM hardening).
+	// Enroll via the local socket. The SDK proto no longer carries
+	// a TLS-bypass field; agents always validate the server cert
+	// during enrollment.
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
 		ServerUrl: *server,
 		Token:     *token,
