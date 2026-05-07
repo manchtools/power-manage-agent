@@ -940,20 +940,16 @@ func (e *Executor) executeShell(ctx context.Context, params *pb.ShellParams) (*p
 
 // runShellScript executes a single shell script string using the shared interpreter,
 // environment, sudo, and working directory settings from ShellParams.
+//
+// RunAsRoot dispatches through sysexec.PrivilegedStreaming, which
+// goes through the SDK's privilege-backend resolution
+// (sudo/doas + -n flag + absolute-path + backend-installed check)
+// so the agent stays consistent with the rest of the SDK's
+// privilege contract instead of hard-coding "sudo -n".
 func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, script string, callback OutputCallback) (*pb.CommandOutput, error) {
 	interpreter := params.Interpreter
 	if interpreter == "" {
 		interpreter = "/bin/sh"
-	}
-
-	var name string
-	var args []string
-	if params.RunAsRoot {
-		name = "sudo"
-		args = []string{"-n", interpreter, "-c", script}
-	} else {
-		name = interpreter
-		args = []string{"-c", script}
 	}
 
 	// Build environment — reject dangerous variable names that could
@@ -969,7 +965,12 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 		}
 	}
 
-	return runCmdStreaming(ctx, name, args, envVars, params.WorkingDirectory, callback)
+	args := []string{"-c", script}
+	if params.RunAsRoot {
+		r, err := sysexec.PrivilegedStreaming(ctx, interpreter, args, envVars, params.WorkingDirectory, callback)
+		return toOutput(r), err
+	}
+	return runCmdStreaming(ctx, interpreter, args, envVars, params.WorkingDirectory, callback)
 }
 
 // executeShellStreaming executes a shell action with optional detection/execution/verification flow.
