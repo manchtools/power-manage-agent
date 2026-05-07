@@ -60,11 +60,29 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
-		// Install with dpkg (requires sudo)
+		// Install with dpkg (requires sudo). On failure, retry via
+		// `apt --fix-broken install` which can complete a half-done
+		// dpkg invocation. If the retry succeeds, clear the
+		// original dpkg error — the action recovered. The previous
+		// shape ran FixBroken but propagated the original error
+		// regardless, so callers saw "install failed" even when the
+		// recovery path resolved it. Verify the final state by
+		// re-checking installation rather than trusting either
+		// command's exit alone, since FixBroken can succeed without
+		// having installed the requested package.
 		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
 		if err != nil {
-			// Try to fix dependencies
-			pkg.NewAptWithContext(ctx).FixBroken()
+			fbOutput, fbErr := pkg.NewAptWithContext(ctx).FixBroken()
+			if fbOutput != nil {
+				if output == nil {
+					output = &pb.CommandOutput{}
+				}
+				output.Stdout += "\n=== apt --fix-broken install ===\n" + fbOutput.Stdout
+				output.Stderr += fbOutput.Stderr
+			}
+			if fbErr == nil && e.isDebInstalled(pkgName) {
+				err = nil
+			}
 		}
 		return output, true, err
 

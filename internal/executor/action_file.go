@@ -191,18 +191,22 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 		}
 	}
 
-	// Check owner/group if specified
+	// Check owner/group if specified. Compare ONLY the requested
+	// fields: a group-only request (Owner=="") used to fall through
+	// the else-branch and compare currentOwner against the empty
+	// requested owner, so fileMatchesDesired could never return
+	// true and the action rewrote/chowned the file on every run.
+	// Three cases — owner-only, group-only, both — each compares
+	// only what was asked for.
 	if params.Owner != "" || params.Group != "" {
 		currentOwner, currentGroup := getFileOwnership(path)
 		if currentOwner == "" && currentGroup == "" {
 			return false
 		}
-		// Handle case where only owner is specified
-		if params.Group == "" {
-			if currentOwner != params.Owner {
-				return false
-			}
-		} else if currentOwner != params.Owner || currentGroup != params.Group {
+		if params.Owner != "" && currentOwner != params.Owner {
+			return false
+		}
+		if params.Group != "" && currentGroup != params.Group {
 			return false
 		}
 	}

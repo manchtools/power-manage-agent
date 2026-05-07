@@ -6,12 +6,34 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"io"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 )
+
+// sha256File streams the file at path through sha256 and returns
+// the hex digest. Used by checksum-gated install paths so AppImage
+// (and any other large-file action) can verify identity without
+// buffering the entire payload — an io.ReadAll + sha256.Sum256
+// pattern would push tens-to-hundreds of megabytes through the
+// heap on every idempotency check.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path)
+	if err != nil {
+		return "", err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(h.Sum(nil)), nil
+}
 
 func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	if params == nil {
@@ -23,7 +45,25 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		installPath = "/opt/appimages"
 	}
 
-	filename := filepath.Base(params.Url)
+	// Validate the download URL BEFORE deriving the on-disk
+	// filename. The previous shape ran filepath.Base(params.Url)
+	// directly, so a URL like "https://evil.example/../../etc/" or
+	// a malformed input could produce a path-meaningful filename
+	// and either escape installPath or land on an unexpected name.
+	// Require a parseable https/http URL with a non-empty host;
+	// derive the filename from a path segment that has no slashes
+	// or other directory components.
+	parsedURL, err := url.Parse(strings.TrimSpace(params.Url))
+	if err != nil ||
+		(parsedURL.Scheme != "https" && parsedURL.Scheme != "http") ||
+		parsedURL.Opaque != "" ||
+		parsedURL.Host == "" {
+		return nil, false, fmt.Errorf("invalid appimage URL: %q", params.Url)
+	}
+	filename := filepath.Base(parsedURL.Path)
+	if filename == "." || filename == "/" || filename == "" || strings.ContainsAny(filename, `/\`) {
+		return nil, false, fmt.Errorf("appimage URL %q does not yield a usable filename", params.Url)
+	}
 	fullPath := filepath.Join(installPath, filename)
 
 	// Resolve symlinks to prevent traversal attacks
@@ -34,11 +74,14 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		// Check if file already exists with correct checksum
+		// Check if file already exists with correct checksum.
+		// Stream-hash the existing file rather than os.ReadFile +
+		// sha256.Sum256 — AppImages are routinely tens to hundreds
+		// of megabytes; buffering the entire payload to derive a
+		// hash that's compared once is wasteful and risks tipping
+		// the agent into OOM territory on small VMs.
 		if params.ChecksumSha256 != "" {
-			if content, err := os.ReadFile(resolvedPath); err == nil {
-				h := sha256.Sum256(content)
-				actualHash := hex.EncodeToString(h[:])
+			if actualHash, hashErr := sha256File(resolvedPath); hashErr == nil {
 				if actualHash == params.ChecksumSha256 {
 					return &pb.CommandOutput{
 						ExitCode: 0,
