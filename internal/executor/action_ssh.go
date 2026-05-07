@@ -3,6 +3,8 @@ package executor
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
 	"strings"
 
@@ -10,14 +12,77 @@ import (
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
+// shortGroupName builds a Linux-group-safe name from a prefix and an
+// actionID, enforcing the 32-character group-name limit. If
+// prefix+actionID fits, the actionID is used verbatim (preserving
+// human-readable naming for typical ULID-length inputs). If it would
+// overflow, the actionID is replaced with a short stable hash so two
+// IDs sharing a long common prefix can't collide on the same group.
+// The hash carries 32 bits of collision space — adequate per host
+// because the namespace is per-action and the group is unlinked when
+// the action is removed.
+func shortGroupName(prefix, actionID string) string {
+	const linuxGroupMax = 32
+	lower := strings.ToLower(actionID)
+	full := prefix + lower
+	if len(full) <= linuxGroupMax {
+		return full
+	}
+	sum := sha256.Sum256([]byte(lower))
+	hashHex := hex.EncodeToString(sum[:])
+	// Reserve 1 char for separator, 8 chars for hash; the rest is
+	// readable prefix from the actionID itself.
+	const hashLen = 8
+	const sepLen = 1
+	keep := linuxGroupMax - len(prefix) - sepLen - hashLen
+	if keep < 1 {
+		// Pathological: prefix alone leaves no room for any hash.
+		// Caller should keep prefixes short; truncate the prefix in
+		// that case so the hash fits — name is no longer
+		// human-readable but stays collision-resistant.
+		return prefix[:linuxGroupMax-sepLen-hashLen] + "-" + hashHex[:hashLen]
+	}
+	return prefix + lower[:keep] + "-" + hashHex[:hashLen]
+}
+
+// maxActionIDForFilesystem caps the length of an actionID before it is
+// spliced into a filesystem path or Linux group name. getActionID
+// already enforces the same ceiling at the entry point, but the
+// per-action functions accept actionID as a parameter, so we re-check
+// here as defense in depth. Set the same as getActionID's limit to
+// avoid divergence: any ID accepted upstream is accepted here.
+const maxActionIDForFilesystem = 64
+
+// validateActionIDForFilesystem rejects an actionID that is empty,
+// too long, or contains any character outside the alphanumeric-safe
+// set. Action IDs flow into filesystem paths
+// (/etc/sudoers.d/<id>, /etc/ssh/sshd_config.d/<id>.conf, …) and into
+// Linux group names (pm-ssh-<id>, pm-sudo-<id>). The entry-point
+// getActionID enforces the same rule, but each action_*.go file
+// accepts actionID as a parameter and any future caller that bypasses
+// getActionID would otherwise smuggle path-meaningful characters
+// straight into a system path. Errors are split per failure mode so
+// callers can distinguish length issues from character issues.
+func validateActionIDForFilesystem(actionID string) error {
+	if actionID == "" {
+		return fmt.Errorf("action ID required for group/file naming")
+	}
+	if len(actionID) > maxActionIDForFilesystem {
+		return fmt.Errorf("action ID %q exceeds %d-character limit for filesystem use", actionID, maxActionIDForFilesystem)
+	}
+	if !validActionIDRegex.MatchString(actionID) {
+		return fmt.Errorf("action ID %q contains characters that are unsafe for filesystem paths", actionID)
+	}
+	return nil
+}
+
 // sshGroupName creates a valid Linux group name from the action ID for SSH access.
 // Linux group names: max 32 chars. pm-ssh- (7 chars) + up to 25 chars of action ID.
+// For longer action IDs, falls back to a hash-suffix scheme to keep
+// the mapping unique — naïve truncation could otherwise let two
+// distinct IDs sharing a 25-char prefix collide on the same group.
 func sshGroupName(actionID string) string {
-	lower := strings.ToLower(actionID)
-	if len(lower) > 25 {
-		lower = lower[:25]
-	}
-	return "pm-ssh-" + lower
+	return shortGroupName("pm-ssh-", actionID)
 }
 
 // sshConfigPath returns the path for an SSH config drop-in file.
@@ -36,8 +101,8 @@ func (e *Executor) executeSsh(ctx context.Context, params *pb.SshParams, state p
 	if params == nil {
 		return nil, false, fmt.Errorf("ssh params required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for ssh group/file naming")
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
 	users := sshEffectiveUsers(params)
@@ -187,11 +252,11 @@ func (e *Executor) executeSshd(ctx context.Context, params *pb.SshdParams, state
 	if len(params.Directives) == 0 && state != pb.DesiredState_DESIRED_STATE_ABSENT {
 		return nil, false, fmt.Errorf("at least one directive is required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for sshd config file naming")
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
-	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, actionID)
+	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, strings.ToLower(actionID))
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:

@@ -235,23 +235,119 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 	}
 }
 
+// removeStaleLockFile removes a package-manager lock file ONLY if
+// no live process currently holds it open. Unconditionally
+// `rm -f`-ing a lock while a real apt/dpkg/pacman/zypper process is
+// mid-flight corrupts the database — the running process keeps its
+// open file descriptor (POSIX semantics) but a NEW process can now
+// grab the lock and start a concurrent transaction.
+//
+// Liveness check uses `fuser <path>`: exit 0 means at least one
+// process has the file open (skip removal), exit 1 means no holder
+// (safe to remove), other exits / fuser-not-installed are treated
+// as "be safe, skip" so we never delete a lock we couldn't prove
+// stale.
+func (e *Executor) removeStaleLockFile(ctx context.Context, path string) {
+	if _, err := os.Stat(path); err != nil {
+		// Already absent — nothing to do.
+		return
+	}
+	// `fuser -s` runs silently and uses exit codes only:
+	//   exit 0 → file is held by a live process (skip removal),
+	//   exit 1 → no holder (safe to unlink),
+	//   any other exit (incl. fuser-missing) → can't prove stale,
+	//                                          be safe and skip.
+	fuserOut, fuserErr := runSudoCmd(ctx, "fuser", "-s", path)
+	if fuserErr == nil {
+		slog.Warn("repair: lock file held by live process; refusing to unlink",
+			"path", path)
+		return
+	}
+	if fuserOut == nil || fuserOut.ExitCode != 1 {
+		slog.Warn("repair: cannot probe lock file holder; skipping unlink",
+			"path", path, "error", fuserErr)
+		return
+	}
+	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
+		slog.Warn("repair: failed to remove confirmed-stale lock file",
+			"path", path, "error", err)
+	}
+}
+
+// removeStaleZyppPidFile removes a zypper PID file ONLY if the
+// recorded PID does not belong to a running process. zypp.pid
+// records zypper's PID; the daemonized process closes the fd
+// after writing, so fuser would report no holder even when zypper
+// is mid-flight — using removeStaleLockFile here would mis-classify
+// a running zypper as stale and yank the lock from under it.
+//
+// Liveness check uses `kill -0 <pid>`: exit 0 means the process
+// exists (skip removal), nonzero means no such process (safe to
+// remove). A malformed file (no parseable PID) is treated as
+// stale and removed. We never delete a PID file we couldn't prove
+// stale via a successful kill -0 negative.
+func (e *Executor) removeStaleZyppPidFile(ctx context.Context, path string) {
+	if _, err := os.Stat(path); err != nil {
+		return
+	}
+	out, readErr := runSudoCmd(ctx, "cat", "--", path)
+	if readErr != nil || out == nil {
+		slog.Warn("repair: cannot read zypp PID file; skipping unlink",
+			"path", path, "error", readErr)
+		return
+	}
+	pid := strings.TrimSpace(out.Stdout)
+	if pid == "" {
+		// Empty PID file — no live holder to harm; remove it.
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
+			slog.Warn("repair: failed to remove empty zypp PID file",
+				"path", path, "error", err)
+		}
+		return
+	}
+	// Validate PID is purely numeric before splicing into kill.
+	for _, r := range pid {
+		if r < '0' || r > '9' {
+			slog.Warn("repair: zypp PID file contains non-numeric content; skipping unlink",
+				"path", path, "content", pid)
+			return
+		}
+	}
+	killOut, killErr := runSudoCmd(ctx, "kill", "-0", pid)
+	if killErr == nil {
+		slog.Warn("repair: zypper process is still running; refusing to unlink PID file",
+			"path", path, "pid", pid)
+		return
+	}
+	if killOut == nil || killOut.ExitCode != 1 {
+		// kill -0 returns 1 for "no such process" and 2 for permission/usage.
+		// Anything other than 1 means we couldn't prove the process is gone.
+		slog.Warn("repair: cannot probe zypp PID liveness; skipping unlink",
+			"path", path, "pid", pid, "error", killErr)
+		return
+	}
+	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
+		slog.Warn("repair: failed to remove confirmed-stale zypp PID file",
+			"path", path, "error", err)
+	}
+}
+
 // repairApt fixes common apt/dpkg issues:
 // - Stale lock files from interrupted operations
 // - Interrupted dpkg operations (dpkg --configure -a)
 // - Broken dependencies (apt -f install)
 // - Stale package lists
 func (e *Executor) repairApt(ctx context.Context) {
-	// Remove stale lock files that may be left from interrupted operations
-	lockFiles := []string{
+	// Remove stale lock files that may be left from interrupted operations.
+	// Each removal is gated on a fuser-based liveness probe so we never
+	// yank a lock from a live apt/dpkg process.
+	for _, lf := range []string{
 		"/var/lib/dpkg/lock-frontend",
 		"/var/lib/dpkg/lock",
 		"/var/lib/apt/lists/lock",
 		"/var/cache/apt/archives/lock",
-	}
-	for _, lf := range lockFiles {
-		if _, err := runSudoCmd(ctx, "rm", "-f", lf); err != nil {
-			slog.Warn("repairApt: failed to remove lock file", "path", lf, "error", err)
-		}
+	} {
+		e.removeStaleLockFile(ctx, lf)
 	}
 
 	// Fix any interrupted dpkg operations.
@@ -307,11 +403,10 @@ func (e *Executor) repairDnf(ctx context.Context) {
 // - Corrupted package database
 // - Keyring issues
 func (e *Executor) repairPacman(ctx context.Context) {
-	// Remove stale lock file if it exists
-	// This handles "unable to lock database" errors from interrupted operations
-	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/lib/pacman/db.lck"); err != nil {
-		slog.Warn("repairPacman: failed to remove lock file", "error", err)
-	}
+	// Remove stale lock file if held by no live process — handles
+	// "unable to lock database" errors from interrupted operations
+	// without yanking the lock from a real concurrent transaction.
+	e.removeStaleLockFile(ctx, "/var/lib/pacman/db.lck")
 
 	// Refresh package database to fix potential corruption
 	// Using -Syy to force refresh even if recently updated
@@ -335,10 +430,11 @@ func (e *Executor) repairPacman(ctx context.Context) {
 // - Repository metadata issues
 // - Broken dependencies
 func (e *Executor) repairZypper(ctx context.Context) {
-	// Remove stale lock files
-	if _, err := runSudoCmd(ctx, "rm", "-f", "/var/run/zypp.pid"); err != nil {
-		slog.Warn("repairZypper: failed to remove lock file", "error", err)
-	}
+	// /var/run/zypp.pid is a PID file, not a flock-style lockfile.
+	// `fuser` would report no holder even when zypper is running
+	// because the daemonized zypper writes the PID and closes the
+	// file descriptor. Use a PID-based liveness probe instead.
+	e.removeStaleZyppPidFile(ctx, "/var/run/zypp.pid")
 
 	// Clean repository metadata cache to fix stale metadata issues
 	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all"); err != nil {

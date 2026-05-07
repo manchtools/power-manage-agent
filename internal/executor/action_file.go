@@ -37,6 +37,22 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}, false, nil
 		}
 
+		// Refuse content overwrite of critical files (/etc/passwd,
+		// /etc/shadow, /etc/sudoers, …). Unlike ABSENT, the PRESENT
+		// branch is NOT blocked from writing under protected
+		// directories — managed config under /etc/foo.d/ is the whole
+		// point of the file action; only the named individual files
+		// are off-limits. Check both the cleaned input and the
+		// resolved-symlink path so /etc/resolv.conf -> /run/... can't
+		// slip past via symlink resolution.
+		// isCriticalFile already runs filepath.Clean internally, but
+		// pass the cleaned path explicitly here for symmetry with the
+		// ABSENT branch's `isProtectedPath(filepath.Clean(...))` call
+		// — both call sites read the same way.
+		if isCriticalFile(resolvedPath) || isCriticalFile(filepath.Clean(params.Path)) {
+			return nil, false, fmt.Errorf("refusing to overwrite critical system file: %s (resolved from %s)", resolvedPath, params.Path)
+		}
+
 		// Repair filesystem if mounted read-only
 		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
@@ -92,6 +108,20 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("file %s does not exist, nothing to remove", resolvedPath),
 			}, false, nil
+		}
+
+		// Refuse ABSENT delete on protected system paths. A signed
+		// action could otherwise request deletion of /etc/shadow,
+		// /etc/sudoers, /etc/passwd, etc. and the agent would oblige.
+		// Check BOTH the resolved path and the cleaned original path:
+		// e.g. /etc/resolv.conf is a symlink to /run/systemd/resolve/...
+		// on systemd-resolved hosts; the resolved path has 3 components
+		// and slips past isProtectedPath, but the original is in the
+		// criticalFiles denylist. Managed-block mode is gated by the
+		// same rule: editing protected files via block-removal is just
+		// as dangerous as full deletion.
+		if isProtectedPath(resolvedPath) || isProtectedPath(filepath.Clean(params.Path)) {
+			return nil, false, fmt.Errorf("refusing to remove protected system path: %s (resolved from %s)", resolvedPath, params.Path)
 		}
 
 		// Repair filesystem if mounted read-only
@@ -210,8 +240,7 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 	return true
 }
 
-// protectedPaths contains paths that should never be deleted.
-// These are checked as prefixes after path cleaning.
+// protectedPaths contains directories that should never be deleted as a whole.
 var protectedPaths = []string{
 	"/",
 	"/bin",
@@ -237,26 +266,65 @@ var protectedPaths = []string{
 	"/var",
 }
 
-// isProtectedPath checks if a path is a protected system directory.
-// Returns true if the path should not be deleted.
+// criticalFiles lists individual files whose removal would render the
+// system unbootable, lock the operator out, or destroy account/auth
+// state. Their parent directories (e.g. /etc) are not blanket-protected
+// because legitimate managed-file removal under /etc must keep working;
+// these specific files are denylisted instead.
+var criticalFiles = []string{
+	"/etc/passwd",
+	"/etc/shadow",
+	"/etc/group",
+	"/etc/gshadow",
+	"/etc/sudoers",
+	"/etc/fstab",
+	"/etc/hosts",
+	"/etc/hostname",
+	"/etc/resolv.conf",
+	"/etc/nsswitch.conf",
+	"/etc/ssh/sshd_config",
+	"/etc/pam.conf",
+	"/etc/machine-id",
+}
+
+// isProtectedPath checks if a path is a protected system directory or a
+// critical file. Returns true if the path should not be deleted.
 func isProtectedPath(path string) bool {
-	// Clean and get absolute path
 	cleanPath := filepath.Clean(path)
 
-	// Check exact matches against protected paths
 	for _, protected := range protectedPaths {
 		if cleanPath == protected {
 			return true
 		}
 	}
 
-	// Also protect immediate children of / that aren't in our list
-	// (e.g., /lost+found, or any other top-level directory)
-	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
-	if len(parts) == 1 && parts[0] != "" {
-		// This is a top-level directory like /something
+	if isCriticalFile(cleanPath) {
 		return true
 	}
 
+	// Also protect immediate children of / that aren't in our list
+	// (e.g., /lost+found, or any other top-level directory).
+	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
+	if len(parts) == 1 && parts[0] != "" {
+		return true
+	}
+
+	return false
+}
+
+// isCriticalFile checks if a path matches a critical-file denylist entry.
+// Used by both ABSENT and PRESENT branches: deletion AND content overwrite
+// of /etc/passwd, /etc/shadow, /etc/sudoers, etc. is catastrophic. The
+// PRESENT branch only blocks criticalFiles (not the protectedPaths
+// directories) because writing managed config under /etc/foo.d/ is the
+// whole point of the file action; only the named individual files are
+// off-limits.
+func isCriticalFile(path string) bool {
+	cleanPath := filepath.Clean(path)
+	for _, critical := range criticalFiles {
+		if cleanPath == critical {
+			return true
+		}
+	}
 	return false
 }

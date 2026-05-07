@@ -224,10 +224,14 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Setup SSH authorized keys
+	// Setup SSH authorized keys. Newline / control-character rejection
+	// from setupSSHKeys is fatal by design (the function comment is
+	// explicit). Surface as a real error so the action result reports
+	// FAILED — the previous "warning" path silently degraded a
+	// rejected-input failure into apparent success.
 	if len(params.SshAuthorizedKeys) > 0 {
 		if _, err := e.setupSSHKeys(ctx, params, output); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+			return nil, nil, fmt.Errorf("setup SSH keys: %w", err)
 		}
 	}
 
@@ -371,10 +375,12 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Setup SSH authorized keys
+	// Setup SSH authorized keys. Same fatal-on-rejection contract as
+	// in createUser — see the comment there. Newline / CR in a key
+	// must fail the action, not degrade to a warning.
 	if len(params.SshAuthorizedKeys) > 0 {
 		if keysChanged, err := e.setupSSHKeys(ctx, params, output); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+			return nil, changed, fmt.Errorf("setup SSH keys: %w", err)
 		} else if keysChanged {
 			changed = true
 		}
@@ -507,10 +513,23 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 
 	// Build desired authorized_keys content
 	var keysContent strings.Builder
-	for _, key := range params.SshAuthorizedKeys {
+	validKeyCount := 0
+	for i, key := range params.SshAuthorizedKeys {
 		trimmedKey := strings.TrimSpace(key)
 		if trimmedKey == "" {
 			continue
+		}
+		// Reject keys with embedded newlines BEFORE the prefix check.
+		// Without this, a signed action could smuggle additional
+		// authorized_keys entries (extra principals, command=
+		// overrides, restrict= bypasses) by embedding "\nssh-rsa
+		// ATTACKER..." in a single key value. The prefix check on
+		// the first line would pass, and the appended lines would
+		// land in the file unfiltered. Treat embedded \n or \r as
+		// fatal — silent skip is wrong here, the caller needs to
+		// know their input was rejected.
+		if strings.ContainsAny(trimmedKey, "\n\r") {
+			return false, fmt.Errorf("authorized_keys entry contains embedded newline (input index %d for user %s); refusing to splice into file", i, params.Username)
 		}
 		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
 			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key (doesn't start with ssh- or ecdsa-): %s...\n", trimmedKey[:min(30, len(trimmedKey))]))
@@ -518,6 +537,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		}
 		keysContent.WriteString(trimmedKey)
 		keysContent.WriteString("\n")
+		validKeyCount++
 	}
 	desiredContent := keysContent.String()
 
@@ -557,7 +577,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to set authorized_keys permissions: %w", err)
 	}
 
-	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", len(params.SshAuthorizedKeys)))
+	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", validKeyCount))
 	return true, nil
 }
 
