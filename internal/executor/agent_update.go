@@ -23,10 +23,10 @@ import (
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
 type AgentUpdateConfig struct {
-	Version    string       // Current running agent version
-	DataDir    string       // Data directory for update staging
-	BinaryPath string       // Path to the installed agent binary (e.g., /usr/local/bin/power-manage-agent)
-	Shutdown   func()       // Called after a successful update to trigger graceful agent shutdown
+	Version    string // Current running agent version
+	DataDir    string // Data directory for update staging
+	BinaryPath string // Path to the installed agent binary (e.g., /usr/local/bin/power-manage-agent)
+	Shutdown   func() // Called after a successful update to trigger graceful agent shutdown
 }
 
 // agentUpdateExecuted tracks whether an AGENT_UPDATE action already ran in the current sync cycle.
@@ -440,7 +440,6 @@ func readUpdateState(dataDir string) (phase, version string, err error) {
 func clearUpdateState(dataDir string) {
 	os.Remove(filepath.Join(dataDir, "update", "state.json"))
 }
-
 
 // CheckStartupUpdateState cleans up stale update state from a previous cycle.
 // With the self-test approach, updates are validated before swapping the binary,
