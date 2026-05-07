@@ -45,7 +45,11 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		// are off-limits. Check both the cleaned input and the
 		// resolved-symlink path so /etc/resolv.conf -> /run/... can't
 		// slip past via symlink resolution.
-		if isCriticalFile(resolvedPath) || isCriticalFile(params.Path) {
+		// isCriticalFile already runs filepath.Clean internally, but
+		// pass the cleaned path explicitly here for symmetry with the
+		// ABSENT branch's `isProtectedPath(filepath.Clean(...))` call
+		// — both call sites read the same way.
+		if isCriticalFile(resolvedPath) || isCriticalFile(filepath.Clean(params.Path)) {
 			return nil, false, fmt.Errorf("refusing to overwrite critical system file: %s (resolved from %s)", resolvedPath, params.Path)
 		}
 

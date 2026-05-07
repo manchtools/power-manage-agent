@@ -224,10 +224,14 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Setup SSH authorized keys
+	// Setup SSH authorized keys. Newline / control-character rejection
+	// from setupSSHKeys is fatal by design (the function comment is
+	// explicit). Surface as a real error so the action result reports
+	// FAILED — the previous "warning" path silently degraded a
+	// rejected-input failure into apparent success.
 	if len(params.SshAuthorizedKeys) > 0 {
 		if _, err := e.setupSSHKeys(ctx, params, output); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+			return nil, nil, fmt.Errorf("setup SSH keys: %w", err)
 		}
 	}
 
@@ -371,10 +375,12 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Setup SSH authorized keys
+	// Setup SSH authorized keys. Same fatal-on-rejection contract as
+	// in createUser — see the comment there. Newline / CR in a key
+	// must fail the action, not degrade to a warning.
 	if len(params.SshAuthorizedKeys) > 0 {
 		if keysChanged, err := e.setupSSHKeys(ctx, params, output); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to setup SSH keys: %v\n", err))
+			return nil, changed, fmt.Errorf("setup SSH keys: %w", err)
 		} else if keysChanged {
 			changed = true
 		}
