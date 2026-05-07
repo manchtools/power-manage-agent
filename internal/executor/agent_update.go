@@ -204,21 +204,29 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	// are rarely useful and accumulate disk cost with frequent
 	// updates. If the backup fails we abort the upgrade rather
 	// than swap without a fallback.
+	// All cp/mv/chmod/rm calls below pass `--` before the path
+	// operands as defence in depth against option-injection: any
+	// future code path that lets cfg.BinaryPath, tmpPath, or
+	// stagePath start with a `-` would otherwise be interpreted as
+	// a flag by the sudo'd tool. Today these paths are derived from
+	// fixed config + os.MkdirTemp output (neither produces a
+	// leading-dash filename), but the cost of the separator is
+	// zero and the protection survives future refactors.
 	bakPath := cfg.BinaryPath + ".bak"
-	if _, err := runSudoCmd(ctx, "cp", cfg.BinaryPath, bakPath); err != nil {
+	if _, err := runSudoCmd(ctx, "cp", "--", cfg.BinaryPath, bakPath); err != nil {
 		return nil, false, fmt.Errorf("backup current binary to %s: %w", bakPath, err)
 	}
 
 	stagePath := cfg.BinaryPath + ".new"
-	if _, err := runSudoCmd(ctx, "cp", tmpPath, stagePath); err != nil {
+	if _, err := runSudoCmd(ctx, "cp", "--", tmpPath, stagePath); err != nil {
 		return nil, false, fmt.Errorf("stage binary: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "+x", stagePath); err != nil {
-		runSudoCmd(ctx, "rm", "-f", stagePath)
+	if _, err := runSudoCmd(ctx, "chmod", "+x", "--", stagePath); err != nil {
+		runSudoCmd(ctx, "rm", "-f", "--", stagePath)
 		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "mv", stagePath, cfg.BinaryPath); err != nil {
-		runSudoCmd(ctx, "rm", "-f", stagePath)
+	if _, err := runSudoCmd(ctx, "mv", "--", stagePath, cfg.BinaryPath); err != nil {
+		runSudoCmd(ctx, "rm", "-f", "--", stagePath)
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 
