@@ -21,7 +21,7 @@ require (
 // whatever happens to be in a local ../sdk checkout. Developers who
 // want to iterate against a local SDK override this with a per-dev
 // go.work at their workspace root — see agent/README.md for setup.
-replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260507030409-26fe2c926f63
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260507082154-8a164ce50030
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
