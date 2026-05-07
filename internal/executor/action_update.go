@@ -478,7 +478,6 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if newRebootRequired && params != nil && params.RebootIfRequired {
-			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 			// Issue the shutdown FIRST and only report success if
 			// it actually went out — the prior shape printed
 			// "Scheduling reboot..." regardless of whether
@@ -486,7 +485,9 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			// would see "scheduled" in the action result while
 			// the host stayed up. Failure to schedule a reboot
 			// the operator explicitly asked for is a real action
-			// failure, not a logged warning.
+			// failure, not a logged warning. The desktop
+			// notification is also gated on success so we don't
+			// tell users "your system will reboot" when it won't.
 			if out, err := runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot"); err != nil {
 				if out != nil {
 					allOutput.WriteString(out.Stdout)
@@ -497,6 +498,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 					lastErr = fmt.Errorf("schedule reboot: %w", err)
 				}
 			} else {
+				sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 				allOutput.WriteString("Scheduled reboot in 1 minute.\n")
 			}
 		}
