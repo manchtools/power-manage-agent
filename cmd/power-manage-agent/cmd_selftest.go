@@ -71,8 +71,16 @@ func runSelfTest(args []string) int {
 	// URL — both block sdk.WithMTLSFromPEM from running.
 	gatewayAddr := strings.TrimSpace(creds.GatewayAddr)
 	parsed, parseErr := url.Parse(gatewayAddr)
-	if parseErr != nil || strings.ToLower(parsed.Scheme) != "https" {
-		logger.Error("self-test: refusing non-https gateway URL — agent requires https:// for gateway connections",
+	// Require a proper https://host URL. The Opaque + Host checks
+	// catch the corner cases url.Parse leaves accepted: a bare
+	// "https:" parses with Scheme="https" but no Host, and an
+	// opaque "https:foo" parses with Opaque="foo" rather than as
+	// a network URL — both would slip past a Scheme-only check.
+	if parseErr != nil ||
+		strings.ToLower(parsed.Scheme) != "https" ||
+		parsed.Opaque != "" ||
+		parsed.Host == "" {
+		logger.Error("self-test: refusing non-https or hostless gateway URL — agent requires https://host for gateway connections",
 			"gateway", creds.GatewayAddr, "parse_error", parseErr)
 		return 1
 	}
