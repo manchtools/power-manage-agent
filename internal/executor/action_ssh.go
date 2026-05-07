@@ -256,7 +256,7 @@ func (e *Executor) executeSshd(ctx context.Context, params *pb.SshdParams, state
 		return nil, false, err
 	}
 
-	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, actionID)
+	configPath := fmt.Sprintf("/etc/ssh/sshd_config.d/%04d-pm-%s.conf", params.Priority, strings.ToLower(actionID))
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:

@@ -46,7 +46,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		// resolved-symlink path so /etc/resolv.conf -> /run/... can't
 		// slip past via symlink resolution.
 		if isCriticalFile(resolvedPath) || isCriticalFile(params.Path) {
-			return nil, false, fmt.Errorf("refusing to overwrite critical system file: %s", resolvedPath)
+			return nil, false, fmt.Errorf("refusing to overwrite critical system file: %s (resolved from %s)", resolvedPath, params.Path)
 		}
 
 		// Repair filesystem if mounted read-only
@@ -117,7 +117,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		// same rule: editing protected files via block-removal is just
 		// as dangerous as full deletion.
 		if isProtectedPath(resolvedPath) || isProtectedPath(filepath.Clean(params.Path)) {
-			return nil, false, fmt.Errorf("refusing to remove protected system path: %s", resolvedPath)
+			return nil, false, fmt.Errorf("refusing to remove protected system path: %s (resolved from %s)", resolvedPath, params.Path)
 		}
 
 		// Repair filesystem if mounted read-only

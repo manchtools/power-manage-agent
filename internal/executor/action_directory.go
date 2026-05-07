@@ -66,7 +66,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		// a symlinked protected directory can't be removed by aiming
 		// at the symlink and slipping past via resolution.
 		if isProtectedPath(cleanPath) || isProtectedPath(filepath.Clean(params.Path)) {
-			return nil, false, fmt.Errorf("refusing to delete protected system path: %s", cleanPath)
+			return nil, false, fmt.Errorf("refusing to delete protected system path: %s (resolved from %s)", cleanPath, params.Path)
 		}
 
 		// Repair filesystem if mounted read-only
