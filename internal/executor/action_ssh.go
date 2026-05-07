@@ -6,23 +6,25 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/oklog/ulid/v2"
-
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
-// validateActionIDForFilesystem rejects an actionID that isn't a
-// well-formed ULID. Action IDs flow into filesystem paths
-// (/etc/sudoers.d/<id>, /etc/ssh/sshd_config.d/<id>.conf etc.); a
-// non-ULID value containing slashes or shell metacharacters would
-// let a signed action escape the intended directory or overwrite
-// arbitrary system files. ULIDs are 26 characters, base32-Crockford,
-// no path-meaningful characters — exact match means the input can
-// be spliced into a path safely.
+// validateActionIDForFilesystem rejects an actionID that contains
+// any character outside the alphanumeric-safe set. Action IDs flow
+// into filesystem paths (/etc/sudoers.d/<id>,
+// /etc/ssh/sshd_config.d/<id>.conf, …) and into Linux group names
+// (pm-ssh-<id>, pm-sudo-<id>). The entry-point getActionID enforces
+// the same rule, but defense-in-depth at the splice point matters
+// because each action_*.go file accepts actionID as a parameter:
+// any future caller that bypasses getActionID would otherwise smuggle
+// path-meaningful characters straight into a system path.
 func validateActionIDForFilesystem(actionID string) error {
-	if _, err := ulid.Parse(actionID); err != nil {
-		return fmt.Errorf("action ID %q is not a valid ULID; refusing to splice into filesystem path", actionID)
+	if actionID == "" {
+		return fmt.Errorf("action ID required for group/file naming")
+	}
+	if len(actionID) > 64 || !validActionIDRegex.MatchString(actionID) {
+		return fmt.Errorf("action ID %q contains characters that are unsafe for filesystem paths", actionID)
 	}
 	return nil
 }

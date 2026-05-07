@@ -222,8 +222,7 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 	return true
 }
 
-// protectedPaths contains paths that should never be deleted.
-// These are checked as prefixes after path cleaning.
+// protectedPaths contains directories that should never be deleted as a whole.
 var protectedPaths = []string{
 	"/",
 	"/bin",
@@ -249,24 +248,48 @@ var protectedPaths = []string{
 	"/var",
 }
 
-// isProtectedPath checks if a path is a protected system directory.
-// Returns true if the path should not be deleted.
+// criticalFiles lists individual files whose removal would render the
+// system unbootable, lock the operator out, or destroy account/auth
+// state. Their parent directories (e.g. /etc) are not blanket-protected
+// because legitimate managed-file removal under /etc must keep working;
+// these specific files are denylisted instead.
+var criticalFiles = []string{
+	"/etc/passwd",
+	"/etc/shadow",
+	"/etc/group",
+	"/etc/gshadow",
+	"/etc/sudoers",
+	"/etc/fstab",
+	"/etc/hosts",
+	"/etc/hostname",
+	"/etc/resolv.conf",
+	"/etc/nsswitch.conf",
+	"/etc/ssh/sshd_config",
+	"/etc/pam.conf",
+	"/etc/machine-id",
+}
+
+// isProtectedPath checks if a path is a protected system directory or a
+// critical file. Returns true if the path should not be deleted.
 func isProtectedPath(path string) bool {
-	// Clean and get absolute path
 	cleanPath := filepath.Clean(path)
 
-	// Check exact matches against protected paths
 	for _, protected := range protectedPaths {
 		if cleanPath == protected {
 			return true
 		}
 	}
 
+	for _, critical := range criticalFiles {
+		if cleanPath == critical {
+			return true
+		}
+	}
+
 	// Also protect immediate children of / that aren't in our list
-	// (e.g., /lost+found, or any other top-level directory)
+	// (e.g., /lost+found, or any other top-level directory).
 	parts := strings.Split(strings.TrimPrefix(cleanPath, "/"), "/")
 	if len(parts) == 1 && parts[0] != "" {
-		// This is a top-level directory like /something
 		return true
 	}
 

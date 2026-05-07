@@ -29,8 +29,8 @@ func (e *Executor) executeSudo(ctx context.Context, params *pb.AdminPolicyParams
 	if params == nil {
 		return nil, false, fmt.Errorf("sudo params required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for sudo group/file naming")
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
 	groupName := sanitizeSudoGroupName(actionID)

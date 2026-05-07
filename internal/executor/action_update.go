@@ -3,7 +3,6 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -253,31 +252,20 @@ func (e *Executor) removeStaleLockFile(ctx context.Context, path string) {
 		// Already absent — nothing to do.
 		return
 	}
-	// `fuser -s` runs silently and uses exit codes only.
-	cmd := exec.CommandContext(ctx, "fuser", "-s", path)
-	err := cmd.Run()
-	if err == nil {
-		// Exit 0 → file is held by a live process. Refuse to
-		// unlink: yanking the lock now would let a second pkg-mgr
-		// process race in on top of an in-flight transaction.
+	// `fuser -s` runs silently and uses exit codes only:
+	//   exit 0 → file is held by a live process (skip removal),
+	//   exit 1 → no holder (safe to unlink),
+	//   any other exit (incl. fuser-missing) → can't prove stale,
+	//                                          be safe and skip.
+	fuserOut, fuserErr := runSudoCmd(ctx, "fuser", "-s", path)
+	if fuserErr == nil {
 		slog.Warn("repair: lock file held by live process; refusing to unlink",
 			"path", path)
 		return
 	}
-	var exitErr *exec.ExitError
-	if !errors.As(err, &exitErr) {
-		// fuser missing, ENOENT, or any other invocation problem.
-		// Be conservative — don't unlink something we couldn't
-		// prove stale.
-		slog.Warn("repair: cannot probe lock file holder (fuser unavailable or errored); skipping unlink",
-			"path", path, "error", err)
-		return
-	}
-	// fuser returned a non-zero exit. Exit 1 is the "no holder"
-	// signal we want; any other exit is unexpected — also skip.
-	if exitErr.ExitCode() != 1 {
-		slog.Warn("repair: unexpected fuser exit; skipping lock-file unlink",
-			"path", path, "exit_code", exitErr.ExitCode())
+	if fuserOut == nil || fuserOut.ExitCode != 1 {
+		slog.Warn("repair: cannot probe lock file holder; skipping unlink",
+			"path", path, "error", fuserErr)
 		return
 	}
 	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
