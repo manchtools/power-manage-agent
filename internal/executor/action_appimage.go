@@ -61,7 +61,9 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		return nil, false, fmt.Errorf("invalid appimage URL: %q", params.Url)
 	}
 	filename := filepath.Base(parsedURL.Path)
-	if filename == "." || filename == "/" || filename == "" || strings.ContainsAny(filename, `/\`) {
+	// Reject ".." too — filepath.Base of e.g. https://x.example/.. returns
+	// "..", which would land at the parent of installPath when joined.
+	if filename == "." || filename == ".." || filename == "/" || filename == "" || strings.ContainsAny(filename, `/\`) {
 		return nil, false, fmt.Errorf("appimage URL %q does not yield a usable filename", params.Url)
 	}
 	fullPath := filepath.Join(installPath, filename)
