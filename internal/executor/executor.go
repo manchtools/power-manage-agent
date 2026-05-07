@@ -952,17 +952,32 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 		interpreter = "/bin/sh"
 	}
 
-	// Build environment — reject dangerous variable names that could
-	// hijack the child process (e.g. LD_PRELOAD, PATH, LD_LIBRARY_PATH).
-	var envVars []string
-	if len(params.Environment) > 0 {
-		envVars = os.Environ()
-		for k, v := range params.Environment {
-			if !sysexec.IsAllowedEnvVar(k) {
-				return nil, fmt.Errorf("environment variable %q is not allowed", k)
-			}
-			envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
+	// Build environment from a curated baseline plus only the
+	// caller-supplied entries that pass IsAllowedEnvVar. The
+	// previous shape (`os.Environ()` baseline + per-entry validation)
+	// defeated the guard: any dangerous variable already set in the
+	// agent's own environment (LD_PRELOAD, LD_LIBRARY_PATH, PATH
+	// hijacks, etc.) would leak through unchecked, because validation
+	// only ran for *new* additions. Empty `params.Environment` was
+	// even worse — `envVars` stayed nil, so the child silently
+	// inherited the *full* ambient environment.
+	//
+	// The baseline below is the minimum needed for a useful shell:
+	// PATH (to find common binaries) and LANG/HOME/USER (to keep
+	// locale-aware tools and `~` expansion sane). Anything else the
+	// action needs goes through `params.Environment` and the
+	// IsAllowedEnvVar gate.
+	envVars := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"LANG=" + os.Getenv("LANG"),
+		"HOME=" + os.Getenv("HOME"),
+		"USER=" + os.Getenv("USER"),
+	}
+	for k, v := range params.Environment {
+		if !sysexec.IsAllowedEnvVar(k) {
+			return nil, fmt.Errorf("environment variable %q is not allowed", k)
 		}
+		envVars = append(envVars, fmt.Sprintf("%s=%s", k, v))
 	}
 
 	args := []string{"-c", script}
