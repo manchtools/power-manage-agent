@@ -84,7 +84,13 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		// the agent into OOM territory on small VMs.
 		if params.ChecksumSha256 != "" {
 			if actualHash, hashErr := sha256File(resolvedPath); hashErr == nil {
-				if actualHash == params.ChecksumSha256 {
+				// EqualFold + TrimSpace: sha256File returns lowercase
+				// hex, but operators commonly paste uppercase hashes
+				// from `sha256sum` output / web pages / clipboard
+				// trimming. Without case-insensitive compare an
+				// uppercase-but-correct checksum forces a redownload
+				// on every run.
+				if strings.EqualFold(actualHash, strings.TrimSpace(params.ChecksumSha256)) {
 					return &pb.CommandOutput{
 						ExitCode: 0,
 						Stdout:   fmt.Sprintf("appimage %s already installed with correct checksum", filename),
