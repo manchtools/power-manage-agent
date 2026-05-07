@@ -11,12 +11,10 @@ import (
 
 // sanitizeSudoGroupName creates a valid Linux group name from the action ID.
 // Linux group names: max 32 chars. pm-sudo- (8 chars) + up to 24 chars of action ID.
+// For longer action IDs, falls back to a hash-suffix scheme to keep
+// the mapping unique — see shortGroupName.
 func sanitizeSudoGroupName(actionID string) string {
-	lower := strings.ToLower(actionID)
-	if len(lower) > 24 {
-		lower = lower[:24]
-	}
-	return "pm-sudo-" + lower
+	return shortGroupName("pm-sudo-", actionID)
 }
 
 // sudoersFilePath returns the path for a sudoers drop-in file.

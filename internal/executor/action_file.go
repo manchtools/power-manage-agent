@@ -37,6 +37,18 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}, false, nil
 		}
 
+		// Refuse content overwrite of critical files (/etc/passwd,
+		// /etc/shadow, /etc/sudoers, …). Unlike ABSENT, the PRESENT
+		// branch is NOT blocked from writing under protected
+		// directories — managed config under /etc/foo.d/ is the whole
+		// point of the file action; only the named individual files
+		// are off-limits. Check both the cleaned input and the
+		// resolved-symlink path so /etc/resolv.conf -> /run/... can't
+		// slip past via symlink resolution.
+		if isCriticalFile(resolvedPath) || isCriticalFile(params.Path) {
+			return nil, false, fmt.Errorf("refusing to overwrite critical system file: %s", resolvedPath)
+		}
+
 		// Repair filesystem if mounted read-only
 		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
@@ -94,15 +106,17 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			}, false, nil
 		}
 
-		// Refuse ABSENT delete on protected system paths. The PRESENT
-		// branches above already guard via isProtectedPath, but
-		// ABSENT used to bypass entirely — a signed action could
-		// request deletion of /etc/shadow, /etc/sudoers, /etc/passwd,
-		// etc. and the agent would oblige. Apply the same allowlist.
-		// Managed-block mode is fine to leave gated by the same
-		// rule: editing protected files via block-removal is just as
-		// dangerous as full deletion.
-		if isProtectedPath(resolvedPath) {
+		// Refuse ABSENT delete on protected system paths. A signed
+		// action could otherwise request deletion of /etc/shadow,
+		// /etc/sudoers, /etc/passwd, etc. and the agent would oblige.
+		// Check BOTH the resolved path and the cleaned original path:
+		// e.g. /etc/resolv.conf is a symlink to /run/systemd/resolve/...
+		// on systemd-resolved hosts; the resolved path has 3 components
+		// and slips past isProtectedPath, but the original is in the
+		// criticalFiles denylist. Managed-block mode is gated by the
+		// same rule: editing protected files via block-removal is just
+		// as dangerous as full deletion.
+		if isProtectedPath(resolvedPath) || isProtectedPath(filepath.Clean(params.Path)) {
 			return nil, false, fmt.Errorf("refusing to remove protected system path: %s", resolvedPath)
 		}
 
@@ -280,10 +294,8 @@ func isProtectedPath(path string) bool {
 		}
 	}
 
-	for _, critical := range criticalFiles {
-		if cleanPath == critical {
-			return true
-		}
+	if isCriticalFile(cleanPath) {
+		return true
 	}
 
 	// Also protect immediate children of / that aren't in our list
@@ -293,5 +305,22 @@ func isProtectedPath(path string) bool {
 		return true
 	}
 
+	return false
+}
+
+// isCriticalFile checks if a path matches a critical-file denylist entry.
+// Used by both ABSENT and PRESENT branches: deletion AND content overwrite
+// of /etc/passwd, /etc/shadow, /etc/sudoers, etc. is catastrophic. The
+// PRESENT branch only blocks criticalFiles (not the protectedPaths
+// directories) because writing managed config under /etc/foo.d/ is the
+// whole point of the file action; only the named individual files are
+// off-limits.
+func isCriticalFile(path string) bool {
+	cleanPath := filepath.Clean(path)
+	for _, critical := range criticalFiles {
+		if cleanPath == critical {
+			return true
+		}
+	}
 	return false
 }

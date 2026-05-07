@@ -508,7 +508,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	// Build desired authorized_keys content
 	var keysContent strings.Builder
 	validKeyCount := 0
-	for _, key := range params.SshAuthorizedKeys {
+	for i, key := range params.SshAuthorizedKeys {
 		trimmedKey := strings.TrimSpace(key)
 		if trimmedKey == "" {
 			continue
@@ -523,7 +523,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		// fatal — silent skip is wrong here, the caller needs to
 		// know their input was rejected.
 		if strings.ContainsAny(trimmedKey, "\n\r") {
-			return false, fmt.Errorf("authorized_keys entry contains embedded newline (key index %d for user %s); refusing to splice into file", validKeyCount, params.Username)
+			return false, fmt.Errorf("authorized_keys entry contains embedded newline (input index %d for user %s); refusing to splice into file", i, params.Username)
 		}
 		if !strings.HasPrefix(trimmedKey, "ssh-") && !strings.HasPrefix(trimmedKey, "ecdsa-") {
 			output.WriteString(fmt.Sprintf("warning: skipping invalid SSH key (doesn't start with ssh- or ecdsa-): %s...\n", trimmedKey[:min(30, len(trimmedKey))]))

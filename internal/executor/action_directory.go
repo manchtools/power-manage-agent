@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
@@ -59,8 +60,12 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 			}, false, nil
 		}
 
-		// Safety check: refuse to delete protected system directories
-		if isProtectedPath(cleanPath) {
+		// Safety check: refuse to delete protected system directories.
+		// Check both the resolved path (after sysfs.ResolveAndValidatePath
+		// followed any symlinks) AND the cleaned input path, so that
+		// a symlinked protected directory can't be removed by aiming
+		// at the symlink and slipping past via resolution.
+		if isProtectedPath(cleanPath) || isProtectedPath(filepath.Clean(params.Path)) {
 			return nil, false, fmt.Errorf("refusing to delete protected system path: %s", cleanPath)
 		}
 
