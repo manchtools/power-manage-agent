@@ -3,6 +3,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -494,9 +495,13 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 					allOutput.WriteString(out.Stderr)
 				}
 				allOutput.WriteString(fmt.Sprintf("FAILED to schedule reboot: %v\n", err))
-				if lastErr == nil {
-					lastErr = fmt.Errorf("schedule reboot: %w", err)
-				}
+				// Always join the reboot failure into lastErr — the
+				// preceding comment claims this is a real action
+				// failure, but a first-error-wins guard would silently
+				// demote it whenever an earlier upgrade error already
+				// occupied lastErr. errors.Join keeps both visible to
+				// the caller.
+				lastErr = errors.Join(lastErr, fmt.Errorf("schedule reboot: %w", err))
 			} else {
 				sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
 				allOutput.WriteString("Scheduled reboot in 1 minute.\n")
