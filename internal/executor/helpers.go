@@ -94,7 +94,6 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 	return changed, nil
 }
 
-
 // writeAndValidateConfig writes a config file atomically and validates it with an external command.
 // If validation fails, the file is removed and the validation error is returned.
 // On success, returns nil, nil.

@@ -508,4 +508,3 @@ func (e *Executor) verifyKeyRoundTrip(ctx context.Context, actionID, devicePath,
 type ActionStore interface {
 	GetStoredActions() ([]*store.StoredAction, error)
 }
-
