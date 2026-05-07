@@ -101,12 +101,18 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 		changed = true
 	} else if !params.Enable && isEnabled {
 		if err := sysservice.Disable(ctx, params.UnitName); err != nil {
-			// Ignore errors for disable (unit might not exist)
-			output.WriteString("disable failed (unit may not exist)\n")
-		} else {
-			output.WriteString("disabled unit\n")
-			changed = true
+			// Don't swallow real disable failures. The earlier
+			// shape blanket-suppressed every error with "unit may
+			// not exist" — but isEnabled was just true, so a
+			// missing-unit explanation contradicts the precondition.
+			// A real failure here (permissions, masked, systemd
+			// not responding) means the unit stays enabled
+			// against the operator's intent; surface it so the
+			// caller sees a failed action and can investigate.
+			return nil, false, fmt.Errorf("disable %s: %w", params.UnitName, err)
 		}
+		output.WriteString("disabled unit\n")
+		changed = true
 	}
 
 	// Handle running state

@@ -3,6 +3,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"os"
@@ -535,22 +536,37 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
 		countBefore := installedPackageCount()
+		// Capture autoremove errors so the action result reflects
+		// "we tried to autoremove and the call itself failed", not
+		// "everything succeeded but stale packages quietly remain".
+		// The previous shape only wrote stderr to the buffer and
+		// dropped the err on the floor.
+		var autoremoveErr error
 		if pkg.IsApt() {
 			apt := pkg.NewAptWithContext(ctx)
-			if output, err := apt.Autoremove(); err == nil {
+			output, err := apt.Autoremove()
+			if output != nil {
 				allOutput.WriteString(output.Stdout)
-			} else if output != nil {
-				allOutput.WriteString(output.Stderr)
+				if err != nil {
+					allOutput.WriteString(output.Stderr)
+				}
 			}
+			autoremoveErr = err
 		} else if pkg.IsDnf() {
-			if output, err := dnfAutoremove(ctx); err == nil {
+			output, err := dnfAutoremove(ctx)
+			if output != nil {
 				allOutput.WriteString(output.Stdout)
-			} else if output != nil {
-				allOutput.WriteString(output.Stderr)
+				if err != nil {
+					allOutput.WriteString(output.Stderr)
+				}
 			}
+			autoremoveErr = err
 		}
 		countAfter := installedPackageCount()
 		autoremoved = countBefore > 0 && countAfter > 0 && countBefore != countAfter
+		if autoremoveErr != nil && lastErr == nil {
+			lastErr = fmt.Errorf("autoremove: %w", autoremoveErr)
+		}
 	}
 
 	// Check if this run created a new reboot requirement.
@@ -559,9 +575,33 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if newRebootRequired && params != nil && params.RebootIfRequired {
-			sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
-			allOutput.WriteString("Scheduling reboot in 1 minute...\n")
-			runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
+			// Issue the shutdown FIRST and only report success if
+			// it actually went out — the prior shape printed
+			// "Scheduling reboot..." regardless of whether
+			// shutdown(8) accepted the request, so an operator
+			// would see "scheduled" in the action result while
+			// the host stayed up. Failure to schedule a reboot
+			// the operator explicitly asked for is a real action
+			// failure, not a logged warning. The desktop
+			// notification is also gated on success so we don't
+			// tell users "your system will reboot" when it won't.
+			if out, err := runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot"); err != nil {
+				if out != nil {
+					allOutput.WriteString(out.Stdout)
+					allOutput.WriteString(out.Stderr)
+				}
+				allOutput.WriteString(fmt.Sprintf("FAILED to schedule reboot: %v\n", err))
+				// Always join the reboot failure into lastErr — the
+				// preceding comment claims this is a real action
+				// failure, but a first-error-wins guard would silently
+				// demote it whenever an earlier upgrade error already
+				// occupied lastErr. errors.Join keeps both visible to
+				// the caller.
+				lastErr = errors.Join(lastErr, fmt.Errorf("schedule reboot: %w", err))
+			} else {
+				sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
+				allOutput.WriteString("Scheduled reboot in 1 minute.\n")
+			}
 		}
 	}
 
@@ -580,7 +620,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 // executeAptUpgrade performs apt-specific upgrade.
 func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
 	if params != nil && params.SecurityOnly {
-		// Use unattended-upgrades for security-only updates if available
+		// Use unattended-upgrades for security-only updates if available.
 		if _, err := exec.LookPath("unattended-upgrade"); err == nil {
 			cmdOutput, err := runSudoCmd(ctx, "unattended-upgrade", "-v")
 			if cmdOutput != nil {
@@ -589,9 +629,15 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 			}
 			return err
 		}
-		// Fallback: try apt with security pocket only
-		// This is distribution-specific and may not work everywhere
-		output.WriteString("Note: security-only updates requested but unattended-upgrade not available\n")
+		// No security-only path on this host. Fail closed instead
+		// of silently falling through to a full apt.Upgrade() —
+		// the caller asked for security-only because their
+		// compliance posture forbids the broader upgrade, and
+		// quietly delivering it anyway is a real compliance
+		// violation. Operators can install unattended-upgrades or
+		// switch the action to allow full upgrades.
+		output.WriteString("ERROR: security-only updates requested but no security-only path is available on this host (install unattended-upgrades, or set SecurityOnly=false to allow full upgrades).\n")
+		return fmt.Errorf("security-only apt updates requested but unattended-upgrade is not installed")
 	}
 
 	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
