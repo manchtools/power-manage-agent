@@ -16,6 +16,8 @@ import (
 	"path/filepath"
 
 	"golang.org/x/crypto/argon2"
+
+	sdkfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 )
 
 const (
@@ -120,63 +122,10 @@ func (s *Store) Save(creds *Credentials) error {
 	// before the directory entry is swapped, and the parent-dir
 	// fsync afterwards flushes the directory entry itself.
 	credPath := filepath.Join(s.dataDir, credentialsFile)
-	if err := atomicWriteFile(credPath, ciphertext, 0600); err != nil {
+	if err := sdkfs.AtomicWriteFile(credPath, ciphertext, 0600); err != nil {
 		return fmt.Errorf("write credentials: %w", err)
 	}
 
-	return nil
-}
-
-// atomicWriteFile writes data to path via a same-directory temp file
-// followed by fsync + rename + directory fsync. Callers MUST use
-// this for any credential / salt / token file where a half-written
-// state would break the agent.
-//
-// Permissions are applied before rename so the final inode has the
-// intended mode from the first moment it is reachable by name.
-func atomicWriteFile(path string, data []byte, perm os.FileMode) error {
-	dir := filepath.Dir(path)
-	tmp, err := os.CreateTemp(dir, ".tmp-*")
-	if err != nil {
-		return fmt.Errorf("create temp: %w", err)
-	}
-	tmpPath := tmp.Name()
-	// If any step below fails we remove the temp file so we don't
-	// leave ".tmp-*" clutter in the data directory.
-	cleanup := func() {
-		_ = os.Remove(tmpPath)
-	}
-
-	if _, err := tmp.Write(data); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return fmt.Errorf("write temp: %w", err)
-	}
-	if err := tmp.Chmod(perm); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return fmt.Errorf("chmod temp: %w", err)
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		cleanup()
-		return fmt.Errorf("fsync temp: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		cleanup()
-		return fmt.Errorf("close temp: %w", err)
-	}
-	if err := os.Rename(tmpPath, path); err != nil {
-		cleanup()
-		return fmt.Errorf("rename temp: %w", err)
-	}
-	// Flush the directory entry so a crash after the rename still
-	// sees the new inode on recovery. Ignore ENOSYS etc. on exotic
-	// filesystems — the rename itself has already completed.
-	if d, err := os.Open(dir); err == nil {
-		_ = d.Sync()
-		_ = d.Close()
-	}
 	return nil
 }
 
@@ -266,7 +215,7 @@ func (s *Store) loadOrCreateSalt() ([]byte, error) {
 	// Save salt atomically — the salt is paired with the encrypted
 	// credentials and a corrupt salt is just as fatal as a corrupt
 	// credentials.enc.
-	if err := atomicWriteFile(saltPath, salt, 0600); err != nil {
+	if err := sdkfs.AtomicWriteFile(saltPath, salt, 0600); err != nil {
 		return nil, fmt.Errorf("write salt: %w", err)
 	}
 
