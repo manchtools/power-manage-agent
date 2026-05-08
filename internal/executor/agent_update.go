@@ -218,23 +218,27 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	stagePath := cfg.BinaryPath + ".new"
+	// cleanupStage runs rm under a fresh, short-lived context so a
+	// timeout/cancellation on the parent ctx (the typical reason
+	// chmod/mv fail) doesn't also kill the cleanup, leaving a stale
+	// *.new on disk that blocks the next update attempt.
+	cleanupStage := func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, rmErr := runSudoCmd(cleanupCtx, "rm", "-f", "--", stagePath); rmErr != nil {
+			e.logger.Warn("agent_update: stage cleanup failed; binary may need manual removal",
+				"stage_path", stagePath, "rm_error", rmErr)
+		}
+	}
 	if _, err := runSudoCmd(ctx, "cp", "--", tmpPath, stagePath); err != nil {
 		return nil, false, fmt.Errorf("stage binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "+x", "--", stagePath); err != nil {
-		if _, rmErr := runSudoCmd(ctx, "rm", "-f", "--", stagePath); rmErr != nil {
-			// Stale .new file blocks the next update attempt;
-			// the operator needs to know to clean up by hand.
-			e.logger.Warn("agent_update: chmod failed AND stage cleanup failed; binary may need manual removal",
-				"stage_path", stagePath, "rm_error", rmErr)
-		}
+		cleanupStage()
 		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "mv", "--", stagePath, cfg.BinaryPath); err != nil {
-		if _, rmErr := runSudoCmd(ctx, "rm", "-f", "--", stagePath); rmErr != nil {
-			e.logger.Warn("agent_update: mv failed AND stage cleanup failed; binary may need manual removal",
-				"stage_path", stagePath, "rm_error", rmErr)
-		}
+		cleanupStage()
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 

@@ -279,8 +279,11 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 			// doesn't flood logs.
 			slog.Debug("heartbeat: memory_info parse failed",
 				"memory_total_err", totalErr, "memory_free_err", freeErr)
-		}
-		if total > 0 {
+		} else if total > 0 {
+			// Only compute MemoryPercent when BOTH values parsed
+			// cleanly — otherwise free defaults to 0 (CR catch on
+			// PR #81) and we'd report 100% used on every heartbeat
+			// for an agent whose osquery is missing memory_free.
 			hb.MemoryPercent = float32(100 * (total - free) / total)
 		}
 	}

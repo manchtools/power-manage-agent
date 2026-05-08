@@ -200,7 +200,13 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 
 	if len(userStates) > 0 {
 		if err := e.store.DeleteLpsState(actionID); err != nil {
-			e.logger.Warn("failed to delete LPS state", "action_id", actionID, "error", err)
+			// Mirror the LUKS ABSENT-transition fix: returning
+			// success here would tell the control plane the action
+			// set is removed while leaving the local state row
+			// intact, so the next reconcile re-rotates passwords
+			// for users that should already be unmanaged.
+			e.logger.Error("failed to delete LPS state", "action_id", actionID, "error", err)
+			return nil, false, nil, fmt.Errorf("delete lps state: %w", err)
 		}
 		return &pb.CommandOutput{
 			ExitCode: 0,

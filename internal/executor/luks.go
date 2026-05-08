@@ -46,12 +46,13 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 	localState, _ := e.store.GetLuksState(actionID)
 	if localState != nil {
 		if err := e.store.DeleteLuksState(actionID); err != nil {
-			// Per project policy ("always log errors and never
-			// ignore them"). The state row was loaded above, so a
-			// delete failure here means the agent has stale local
-			// state — operators need to know to clean it up.
-			e.logger.Warn("removeLuksManagement: failed to delete local state",
+			// Reporting success here would mask an incomplete
+			// ABSENT transition: the action set claims the row is
+			// gone but the agent still has the managed-state entry
+			// and would re-rotate it on the next reconcile.
+			e.logger.Error("removeLuksManagement: failed to delete local state",
 				"action_id", actionID, "error", err)
+			return nil, false, nil, fmt.Errorf("delete luks state: %w", err)
 		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
