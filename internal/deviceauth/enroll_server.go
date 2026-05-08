@@ -71,8 +71,11 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 	mux.Handle(path, handler)
 
 	s.httpServer = &http.Server{
-		Handler:           mux,
-		BaseContext:       func(net.Listener) context.Context { return ctx },
+		Handler: mux,
+		// BaseContext deliberately omitted: per-request contexts must
+		// outlive the supervising ctx so Shutdown() can drain in-flight
+		// enrollment requests instead of cancelling them mid-CSR-sign
+		// when the agent receives SIGTERM.
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,
