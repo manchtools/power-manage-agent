@@ -195,7 +195,13 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	userStates, err := e.store.GetLpsState(actionID)
 	if err != nil {
-		e.logger.Warn("failed to check LPS state for removal", "action_id", actionID, "error", err)
+		// Sibling of the DeleteLpsState fail-closed below. Treating
+		// a lookup failure as "no users to clean up" would let the
+		// next branch return success even though the agent never
+		// inspected its real local state.
+		e.logger.Error("removeLpsManagement: failed to read local state",
+			"action_id", actionID, "error", err)
+		return nil, false, nil, fmt.Errorf("get lps state: %w", err)
 	}
 
 	if len(userStates) > 0 {

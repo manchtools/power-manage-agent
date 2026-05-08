@@ -43,7 +43,17 @@ func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams,
 
 // removeLuksManagement handles ABSENT state — removes local state only, LUKS keys stay on device.
 func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
-	localState, _ := e.store.GetLuksState(actionID)
+	localState, err := e.store.GetLuksState(actionID)
+	if err != nil {
+		// Sibling of the DeleteLuksState fail-closed below: a state
+		// lookup error here would otherwise be swallowed and the
+		// "no managed state" branch would report success, lying to
+		// the control plane about an ABSENT transition that never
+		// actually happened.
+		e.logger.Error("removeLuksManagement: failed to read local state",
+			"action_id", actionID, "error", err)
+		return nil, false, nil, fmt.Errorf("get luks state: %w", err)
+	}
 	if localState != nil {
 		if err := e.store.DeleteLuksState(actionID); err != nil {
 			// Reporting success here would mask an incomplete
