@@ -139,8 +139,10 @@ power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
 URI Parameters:
 - `server:port` - Control server address (required)
 - `token` - Registration token (required for first run)
-- `skip-verify=true` - Skip TLS verification (development only)
 - `tls=false` - Use HTTP instead of HTTPS
+
+> TLS verification is mandatory; the previous `skip-verify` URI parameter
+> was removed (it has no effect on current builds).
 
 ### Subcommands
 
@@ -163,8 +165,10 @@ URI Parameters:
 | `-server` | (required) | Control server URL (used for registration) |
 | `-token` | (optional) | Registration token (first run only) |
 | `-data-dir` | `/var/lib/power-manage` | Data directory for state |
-| `-skip-verify` | `false` | Skip TLS certificate verification |
 | `-log-level` | `info` | Log level (debug, info, warn, error) |
+
+> TLS verification is mandatory; the previous `-skip-verify` flag was
+> removed (along with the `POWER_MANAGE_SKIP_VERIFY` env var below).
 
 ### Environment Variables
 
@@ -176,7 +180,6 @@ applied first, then env vars override).
 | `POWER_MANAGE_SERVER` | Control server URL (used for registration) |
 | `POWER_MANAGE_TOKEN` | Registration token (first run only) |
 | `POWER_MANAGE_DATA_DIR` | Data directory for state |
-| `POWER_MANAGE_SKIP_VERIFY` | Skip TLS certificate verification (`true` to enable) |
 | `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `sudo` (default) or `doas` |
 | `POWER_MANAGE_SERVICE_BACKEND` | Service backend override: `systemd` (default) |
 | `POWER_MANAGE_ENCRYPTION_BACKEND` | Encryption backend override: `luks` (default) |

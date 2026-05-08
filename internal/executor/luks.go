@@ -45,7 +45,14 @@ func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams,
 func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	localState, _ := e.store.GetLuksState(actionID)
 	if localState != nil {
-		e.store.DeleteLuksState(actionID)
+		if err := e.store.DeleteLuksState(actionID); err != nil {
+			// Per project policy ("always log errors and never
+			// ignore them"). The state row was loaded above, so a
+			// delete failure here means the agent has stale local
+			// state — operators need to know to clean it up.
+			e.logger.Warn("removeLuksManagement: failed to delete local state",
+				"action_id", actionID, "error", err)
+		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   "LUKS: management removed, keys remain on device\n",
@@ -54,7 +61,7 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
-		Stdout:   "LUKS: not managed, nothing to remove\n",
+		Stdout:   "LUKS: no managed state for this action, nothing to remove\n",
 	}, false, nil, nil
 }
 
@@ -237,7 +244,14 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	if params.RotationIntervalDays > 0 {
 		// No previous rotation recorded — set the timestamp and skip.
 		if localState.LastRotatedAt.IsZero() {
-			e.store.SetLuksLastRotatedAt(actionID, time.Now())
+			if err := e.store.SetLuksLastRotatedAt(actionID, time.Now()); err != nil {
+				// First-rotation timestamp persistence failed.
+				// Subsequent ticks re-enter this branch and re-skip
+				// rotation — log so the operator can notice
+				// rotation is silently disabled.
+				e.logger.Warn("checkAndRotate: failed to set initial LUKS rotation timestamp",
+					"action_id", actionID, "error", err)
+			}
 			return false, nil
 		}
 		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour

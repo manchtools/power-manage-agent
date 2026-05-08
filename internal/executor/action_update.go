@@ -15,11 +15,6 @@ import (
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 )
 
-// dnfMakecache runs dnf makecache to refresh package metadata.
-func dnfMakecache(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "dnf", "-y", "makecache")
-}
-
 // hasUpdatesAvailable checks if there are pending package updates.
 // Uses exit codes and structured queries — language-agnostic.
 func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
@@ -102,26 +97,6 @@ func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, erro
 // dnfAutoremove runs dnf autoremove -y to remove unused packages.
 func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
 	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
-}
-
-// zypperRefresh runs zypper refresh to update repository metadata.
-func zypperRefresh(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "zypper", "--non-interactive", "refresh")
-}
-
-// zypperUpdate runs zypper update to upgrade all packages.
-func zypperUpdate(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "zypper", "--non-interactive", "update")
-}
-
-// pacmanSync runs pacman -Sy to sync package databases.
-func pacmanSync(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "pacman", "-Sy", "--noconfirm")
-}
-
-// pacmanUpgrade runs pacman -Syu to sync and upgrade all packages.
-func pacmanUpgrade(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "pacman", "-Syu", "--noconfirm")
 }
 
 // repairFilesystem attempts to fix read-only filesystem issues.

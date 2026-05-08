@@ -29,9 +29,9 @@ type Handler struct {
 	scheduler    *scheduler.Scheduler
 	store        *store.Store
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
-	mu           sync.Mutex     // protects connectedCh, connectedSet and the terminal* fields below
+	mu           sync.Mutex      // protects connectedCh, connectedSet and the terminal* fields below
 	connectedCh  chan struct{}   // closed when welcome is received and connection is ready
-	connectedSet bool           // tracks if connectedCh has been closed
+	connectedSet bool            // tracks if connectedCh has been closed
 
 	// Remote terminal session state. terminals is the live registry,
 	// guarded by mu. terminalSender is the SDK Client (or any
@@ -270,8 +270,16 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 	// Get memory usage
 	if result, _ := oq.Query(&pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
 		data := result.Rows[0].Data
-		total, _ := strconv.ParseInt(data["memory_total"], 10, 64)
-		free, _ := strconv.ParseInt(data["memory_free"], 10, 64)
+		total, totalErr := strconv.ParseInt(data["memory_total"], 10, 64)
+		free, freeErr := strconv.ParseInt(data["memory_free"], 10, 64)
+		if totalErr != nil || freeErr != nil {
+			// Audit F029: previously silent — a malformed osquery
+			// row caused MemoryPercent to silently retain the prior
+			// value or zero. Debug-only so a steady-state agent
+			// doesn't flood logs.
+			slog.Debug("heartbeat: memory_info parse failed",
+				"memory_total_err", totalErr, "memory_free_err", freeErr)
+		}
 		if total > 0 {
 			hb.MemoryPercent = float32(100 * (total - free) / total)
 		}

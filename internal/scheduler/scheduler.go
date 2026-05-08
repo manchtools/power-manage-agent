@@ -6,6 +6,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"fmt"
 	"log/slog"
 	"sync"
 	"time"
@@ -213,7 +214,13 @@ func (s *Scheduler) AddAction(action *pb.Action) error {
 	if action.Schedule != nil {
 		runOnAssign = action.Schedule.RunOnAssign
 	}
-	return s.store.SaveAction(action, runOnAssign)
+	if err := s.store.SaveAction(action, runOnAssign); err != nil {
+		// Wrap with the action_id so the caller's "failed to store
+		// action" log line points at the specific action that
+		// failed instead of just the generic class. Audit F030.
+		return fmt.Errorf("save action %s: %w", action.GetId().GetValue(), err)
+	}
+	return nil
 }
 
 // RemoveAction removes an action from the store. Policy-type actions (SSH,

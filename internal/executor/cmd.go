@@ -4,7 +4,6 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
@@ -25,18 +24,6 @@ func toOutput(r *sysexec.Result) *pb.CommandOutput {
 		Stdout:   r.Stdout,
 		Stderr:   r.Stderr,
 	}
-}
-
-// runCmd executes a command and returns its output.
-func runCmd(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := sysexec.Run(ctx, name, args...)
-	return toOutput(r), err
-}
-
-// runCmdInDir executes a command in a specific directory.
-func runCmdInDir(ctx context.Context, dir, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := sysexec.RunInDir(ctx, dir, name, args...)
-	return toOutput(r), err
 }
 
 // runCmdWithStdin executes a command with stdin input.
@@ -76,14 +63,6 @@ func queryCmdOutput(name string, args ...string) (stdout string, exitCode int, e
 // checkCmdSuccess runs a command and returns true if it succeeds (exit 0).
 func checkCmdSuccess(name string, args ...string) bool {
 	return sysexec.Check(name, args...)
-}
-
-// formatCmdError formats a command error with stderr output for better diagnostics.
-func formatCmdError(err error, output *pb.CommandOutput) string {
-	if output != nil && output.Stderr != "" {
-		return fmt.Sprintf("%v: %s", err, strings.TrimSpace(output.Stderr))
-	}
-	return err.Error()
 }
 
 // stderrSuffix returns " (<stderr>)" if the result has stderr content, or "".

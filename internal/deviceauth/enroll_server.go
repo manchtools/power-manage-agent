@@ -72,7 +72,7 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 
 	s.httpServer = &http.Server{
 		Handler:           mux,
-		BaseContext:        func(net.Listener) context.Context { return ctx },
+		BaseContext:       func(net.Listener) context.Context { return ctx },
 		ReadHeaderTimeout: 10 * time.Second,
 		ReadTimeout:       30 * time.Second,
 		WriteTimeout:      30 * time.Second,

@@ -222,11 +222,19 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("stage binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "+x", "--", stagePath); err != nil {
-		runSudoCmd(ctx, "rm", "-f", "--", stagePath)
+		if _, rmErr := runSudoCmd(ctx, "rm", "-f", "--", stagePath); rmErr != nil {
+			// Stale .new file blocks the next update attempt;
+			// the operator needs to know to clean up by hand.
+			e.logger.Warn("agent_update: chmod failed AND stage cleanup failed; binary may need manual removal",
+				"stage_path", stagePath, "rm_error", rmErr)
+		}
 		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "mv", "--", stagePath, cfg.BinaryPath); err != nil {
-		runSudoCmd(ctx, "rm", "-f", "--", stagePath)
+		if _, rmErr := runSudoCmd(ctx, "rm", "-f", "--", stagePath); rmErr != nil {
+			e.logger.Warn("agent_update: mv failed AND stage cleanup failed; binary may need manual removal",
+				"stage_path", stagePath, "rm_error", rmErr)
+		}
 		return nil, false, fmt.Errorf("swap binary: %w", err)
 	}
 

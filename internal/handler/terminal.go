@@ -10,8 +10,8 @@ import (
 	"sync"
 	"time"
 
-	sdk "github.com/manchtools/power-manage/sdk/go"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sdk "github.com/manchtools/power-manage/sdk/go"
 	"github.com/manchtools/power-manage/sdk/go/sys/terminal"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )

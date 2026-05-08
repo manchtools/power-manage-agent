@@ -18,11 +18,11 @@ import (
 
 	"github.com/pressly/goose/v3"
 	"github.com/robfig/cron/v3"
-	_ "modernc.org/sqlite"
 	"google.golang.org/protobuf/encoding/protojson"
+	_ "modernc.org/sqlite"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store/migrations"
+	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
 // Store manages persistent storage for actions and execution results.
@@ -63,15 +63,15 @@ type StoredActionGroup struct {
 
 // StoredResult represents an execution result stored locally (for sync when online).
 type StoredResult struct {
-	ID            string
-	ActionID      string
-	ExecutedAt    time.Time
-	Status        pb.ExecutionStatus
-	Error         string
-	Output        *pb.CommandOutput
-	DurationMs    int64
-	HasChanges    bool // Whether this execution made changes
-	Synced        bool // Whether this result has been sent to the server
+	ID         string
+	ActionID   string
+	ExecutedAt time.Time
+	Status     pb.ExecutionStatus
+	Error      string
+	Output     *pb.CommandOutput
+	DurationMs int64
+	HasChanges bool // Whether this execution made changes
+	Synced     bool // Whether this result has been sent to the server
 }
 
 // New creates a new store with the given data directory.

@@ -5,6 +5,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -172,14 +173,39 @@ type Executor struct {
 // NewExecutor creates a new action executor.
 // If verifier is non-nil, action signatures will be checked before execution.
 func NewExecutor(verifier *verify.ActionVerifier) *Executor {
-	pm, _ := pkg.New() // May be nil if no supported package manager found
+	pm, pmErr := pkg.New()
+	logger := slog.Default()
+	switch {
+	case pmErr != nil || pm == nil:
+		// Operators with no supported package manager need to know
+		// every package action will fail — silently no-op'ing on
+		// boot makes the diagnosis hard later. Audit F031.
+		logger.Warn("no supported package manager detected; package actions will fail", "error", pmErr)
+	default:
+		// Detection is via SDK helpers (IsApt/IsDnf/etc.) so the
+		// startup line names whichever shells out at runtime.
+		var name string
+		switch {
+		case pkg.IsApt():
+			name = "apt"
+		case pkg.IsDnf():
+			name = "dnf"
+		case pkg.IsPacman():
+			name = "pacman"
+		case pkg.IsZypper():
+			name = "zypper"
+		default:
+			name = "unknown"
+		}
+		logger.Info("package manager detected", "manager", name)
+	}
 	return &Executor{
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
 		pkgManager: pm,
 		verifier:   verifier,
-		logger:     slog.Default(),
+		logger:     logger,
 	}
 }
 
@@ -223,13 +249,6 @@ func (e *Executor) getStore() *store.Store {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.store
-}
-
-// getActionStore returns the action store (thread-safe).
-func (e *Executor) getActionStore() ActionStore {
-	e.mu.RLock()
-	defer e.mu.RUnlock()
-	return e.actionStore
 }
 
 // Execute runs an action and returns the result.
@@ -384,10 +403,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 
 	// Check context errors first - distinguish between timeout and cancellation
 	switch {
-	case ctx.Err() == context.DeadlineExceeded:
+	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
 		result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
-	case ctx.Err() == context.Canceled:
+	case errors.Is(ctx.Err(), context.Canceled):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"
 	case execErr != nil:
@@ -411,11 +430,6 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	}
 
 	return result
-}
-
-func (e *Executor) executeShell(ctx context.Context, params *pb.ShellParams) (*pb.CommandOutput, error) {
-	execOutput, _, _, err := e.executeShellStreaming(ctx, params, nil)
-	return execOutput, err
 }
 
 // runShellScript executes a single shell script string using the shared interpreter,
@@ -622,22 +636,6 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	}
 	return nil
 }
-
-// =============================================================================
-// DNF Helper Functions
-// =============================================================================
-
-// =============================================================================
-// Zypper Helper Functions
-// =============================================================================
-
-// =============================================================================
-// Pacman Helper Functions
-// =============================================================================
-
-// =============================================================================
-// Package Pinning Helper Functions
-// =============================================================================
 
 // IsInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).
 func IsInstantAction(t pb.ActionType) bool {
