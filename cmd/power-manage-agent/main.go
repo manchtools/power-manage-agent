@@ -154,9 +154,12 @@ func main() {
 			"gateway", creds.GatewayAddr,
 		)
 
-		// Ignore registration token if already registered
+		// Ignore registration token if already registered. Promoted
+		// from Debug to Info because operators who re-run with a
+		// fresh token expecting re-enrollment otherwise get no
+		// feedback about why nothing happened. Audit F037.
 		if cfg.Token != "" {
-			logger.Debug("ignoring registration token - agent is already registered")
+			logger.Info("ignoring registration token — agent is already registered; delete credentials.enc first to re-enroll")
 		}
 	} else if cfg.Token != "" {
 		// Direct registration (backwards compatible, works with sudo)
@@ -260,19 +263,23 @@ func main() {
 	binaryPath, err := os.Executable()
 	if err != nil {
 		// os.Executable can fail on platforms that don't expose
-		// /proc/self/exe symlink semantics; fall back to the
-		// canonical install path so self-update at least targets
-		// the documented default rather than refusing to enable.
-		logger.Warn("os.Executable failed; falling back to /usr/local/bin/power-manage-agent for self-update target",
-			"error", err)
-		binaryPath = "/usr/local/bin/power-manage-agent"
+		// /proc/self/exe symlink semantics. The previous behaviour
+		// silently fell back to /usr/local/bin/power-manage-agent
+		// — but on a non-standard install that hard-codes the
+		// wrong target and self-update would later overwrite some
+		// unrelated file. Refuse to enable self-update instead, so
+		// the operator notices and can intervene. Audit F046.
+		logger.Error("os.Executable failed; self-update DISABLED for this process",
+			"error", err,
+			"remediation", "run from a path where os.Executable can resolve /proc/self/exe, or disable self-update upstream")
+	} else {
+		exec.SetUpdateConfig(&executor.AgentUpdateConfig{
+			Version:    version,
+			DataDir:    cfg.DataDir,
+			BinaryPath: binaryPath,
+			Shutdown:   cancel,
+		})
 	}
-	exec.SetUpdateConfig(&executor.AgentUpdateConfig{
-		Version:    version,
-		DataDir:    cfg.DataDir,
-		BinaryPath: binaryPath,
-		Shutdown:   cancel,
-	})
 
 	// Start certificate rotation goroutine
 	if creds.ControlAddr != "" {

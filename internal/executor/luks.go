@@ -43,9 +43,27 @@ func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams,
 
 // removeLuksManagement handles ABSENT state — removes local state only, LUKS keys stay on device.
 func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
-	localState, _ := e.store.GetLuksState(actionID)
+	localState, err := e.store.GetLuksState(actionID)
+	if err != nil {
+		// Sibling of the DeleteLuksState fail-closed below: a state
+		// lookup error here would otherwise be swallowed and the
+		// "no managed state" branch would report success, lying to
+		// the control plane about an ABSENT transition that never
+		// actually happened.
+		e.logger.Error("removeLuksManagement: failed to read local state",
+			"action_id", actionID, "error", err)
+		return nil, false, nil, fmt.Errorf("get luks state: %w", err)
+	}
 	if localState != nil {
-		e.store.DeleteLuksState(actionID)
+		if err := e.store.DeleteLuksState(actionID); err != nil {
+			// Reporting success here would mask an incomplete
+			// ABSENT transition: the action set claims the row is
+			// gone but the agent still has the managed-state entry
+			// and would re-rotate it on the next reconcile.
+			e.logger.Error("removeLuksManagement: failed to delete local state",
+				"action_id", actionID, "error", err)
+			return nil, false, nil, fmt.Errorf("delete luks state: %w", err)
+		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   "LUKS: management removed, keys remain on device\n",
@@ -54,7 +72,7 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 
 	return &pb.CommandOutput{
 		ExitCode: 0,
-		Stdout:   "LUKS: not managed, nothing to remove\n",
+		Stdout:   "LUKS: no managed state for this action, nothing to remove\n",
 	}, false, nil, nil
 }
 
@@ -237,7 +255,14 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	if params.RotationIntervalDays > 0 {
 		// No previous rotation recorded — set the timestamp and skip.
 		if localState.LastRotatedAt.IsZero() {
-			e.store.SetLuksLastRotatedAt(actionID, time.Now())
+			if err := e.store.SetLuksLastRotatedAt(actionID, time.Now()); err != nil {
+				// First-rotation timestamp persistence failed.
+				// Subsequent ticks re-enter this branch and re-skip
+				// rotation — log so the operator can notice
+				// rotation is silently disabled.
+				e.logger.Warn("checkAndRotate: failed to set initial LUKS rotation timestamp",
+					"action_id", actionID, "error", err)
+			}
 			return false, nil
 		}
 		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour

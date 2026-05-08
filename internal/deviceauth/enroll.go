@@ -4,7 +4,6 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
-	"os"
 	"sync"
 	"time"
 
@@ -178,13 +177,4 @@ func (h *EnrollHandler) GetEnrollmentStatus(_ context.Context, _ *connect.Reques
 		Enrolled: true,
 		DeviceId: creds.DeviceID,
 	}), nil
-}
-
-// getHostname returns the system hostname, used as fallback.
-func getHostname() string {
-	h, err := os.Hostname()
-	if err != nil {
-		return "unknown"
-	}
-	return h
 }
