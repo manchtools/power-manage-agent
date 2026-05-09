@@ -15,7 +15,7 @@ import (
 // LuksKeyStore is the interface for LUKS key operations via the agent stream.
 type LuksKeyStore interface {
 	GetKey(ctx context.Context, actionID string) (string, error)
-	StoreKey(ctx context.Context, actionID, devicePath, passphrase, reason string) error
+	StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error
 }
 
 // executeLuks manages LUKS disk encryption.
@@ -227,7 +227,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	}
 
 	// Store on server — must succeed before removing PSK
-	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, passphrase, "initial"); err != nil {
+	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, passphrase, pb.RotationReason_ROTATION_REASON_INITIAL); err != nil {
 		// Rollback: remove the managed key we just added
 		sysenc.RemoveKey(ctx, devicePath, passphrase)
 		return fmt.Errorf("store key on server: %w", err)
@@ -294,7 +294,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	}
 
 	// Store on server — must succeed before removing old key
-	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, newPassphrase, "scheduled"); err != nil {
+	if err := e.luksKeyStore.StoreKey(ctx, actionID, devicePath, newPassphrase, pb.RotationReason_ROTATION_REASON_SCHEDULED); err != nil {
 		// Rollback: remove the new key we just added
 		sysenc.RemoveKey(ctx, devicePath, newPassphrase)
 		return false, fmt.Errorf("store new key on server: %w", err)

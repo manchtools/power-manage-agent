@@ -4,6 +4,7 @@ package main
 import (
 	"context"
 
+	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sdk "github.com/manchtools/power-manage/sdk/go"
 )
 
@@ -16,6 +17,6 @@ func (s *clientLuksKeyStore) GetKey(ctx context.Context, actionID string) (strin
 	return s.client.GetLuksKey(ctx, actionID)
 }
 
-func (s *clientLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath, passphrase, reason string) error {
+func (s *clientLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error {
 	return s.client.StoreLuksKey(ctx, actionID, devicePath, passphrase, reason)
 }
