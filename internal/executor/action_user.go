@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
@@ -102,7 +103,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Ensure group exists
-		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists", "group", params.PrimaryGroup, "error", err)
 		}
 		args = append(args, "-g", params.PrimaryGroup)
@@ -299,7 +300,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists for usermod", "group", params.PrimaryGroup, "error", err)
 		}
 		// For simplicity, always set if specified by name (could be optimized)
@@ -564,17 +565,25 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
-	// Write authorized_keys file
-	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(desiredContent), "tee", authKeysFile); err != nil {
+	// Write authorized_keys file via the SDK's SafeReplaceFile (F022).
+	// The previous shape (`mkdir -p` → `chown` → sudo `tee` → `chown`)
+	// followed symlinks at the tee step: a local user able to plant a
+	// symlink at ~/.ssh/authorized_keys between the chown and the tee
+	// could redirect the write to e.g. /etc/cron.d/root. SafeReplaceFile
+	// reopens its temp file with O_NOFOLLOW after CreateTemp and uses
+	// renameat2 RENAME_NOREPLACE on Linux, closing both the open-side
+	// and the rename-side of the symlink race. The agent runs as root,
+	// so it can write to the user's home directly without sudo'd tee.
+	if err := sysfs.SafeReplaceFile(authKeysFile, []byte(desiredContent), 0o600, true); err != nil {
 		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
 
-	// Set ownership and permissions on authorized_keys
+	// Set ownership on authorized_keys. SafeReplaceFile leaves the
+	// file owned by whoever did the create (root, since the agent runs
+	// as root); a separate chown brings it back to the target user
+	// without re-introducing the tee race.
 	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
-		return false, fmt.Errorf("failed to set authorized_keys permissions: %w", err)
 	}
 
 	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", validKeyCount))
