@@ -94,6 +94,9 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 	if st == nil {
 		return nil, false, nil, fmt.Errorf("agent store not configured")
 	}
+	// Snapshot the action store accessor once per F003 — concurrent
+	// SetActionStore must not change the value mid-execution.
+	as := e.getActionStore()
 
 	var output strings.Builder
 
@@ -130,7 +133,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 	}
 
 	// Conflict resolution — check if another LUKS action should win
-	if e.getActionStore() != nil {
+	if as != nil {
 		winnerID, err := e.resolveLuksConflict(actionID)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
@@ -460,7 +463,11 @@ func (e *Executor) revokeDeviceKeyInternal(ctx context.Context, localState *stor
 // Called by the handler when a RevokeLuksDeviceKey stream message arrives.
 func (e *Executor) RevokeLuksDeviceKey(ctx context.Context, actionID string) (bool, string) {
 	st := e.getStore()
-	if st == nil || e.getLuksKeyStore() == nil {
+	ks := e.getLuksKeyStore()
+	if st == nil {
+		return false, "agent store not configured"
+	}
+	if ks == nil {
 		return false, "LUKS key store not configured"
 	}
 

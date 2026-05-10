@@ -5,8 +5,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"regexp"
 	"strings"
 
@@ -103,26 +105,19 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return output, true, err
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// For ABSENT we have only the URL as a handle; we must
-		// download to learn the canonical NAME before asking dpkg
-		// whether it's installed. Wasteful when the package is
-		// already absent, but the previous URL-split heuristic was
-		// unsound for non-conventional filenames — operator
-		// correctness over network round-trip. Same trade-off as
-		// the rpm path.
-		if out, err := e.requireWritableFS(ctx); err != nil {
-			return out, false, err
-		}
-		tmpFile, err := os.CreateTemp("", "*.deb")
-		if err != nil {
-			return nil, false, fmt.Errorf("create temp file: %w", err)
-		}
-		defer os.Remove(tmpFile.Name())
-		_ = tmpFile.Close()
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
-			return nil, false, fmt.Errorf("download: %w", err)
-		}
-		pkgName, err := debPackageName(tmpFile.Name())
+		// For ABSENT we want to remove a package the operator
+		// previously installed by URL. Downloading the .deb just to
+		// read its Package field is wasteful when it's already gone,
+		// AND it actively breaks the common case where the URL is
+		// dead because the artifact was deleted upstream after the
+		// install (ABSENT then degrades to "download failed" instead
+		// of the desired "already absent"). Use the URL filename's
+		// `name_version_arch.deb` segment as the canonical-name
+		// heuristic — same shape every Debian mirror uses, and the
+		// only field we need is `name`. If the filename doesn't
+		// match, the action is misconfigured and we surface that as
+		// a validation error rather than a silent download attempt.
+		pkgName, err := debPackageNameFromURL(params.Url)
 		if err != nil {
 			return nil, false, err
 		}
@@ -132,7 +127,9 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 				Stdout:   fmt.Sprintf("deb package %s is already not installed", pkgName),
 			}, false, nil
 		}
-
+		if out, err := e.requireWritableFS(ctx); err != nil {
+			return out, false, err
+		}
 		output, err := runSudoCmd(ctx, "dpkg", "-r", pkgName)
 		return output, true, err
 	}
@@ -157,6 +154,39 @@ func debPackageName(debPath string) (string, error) {
 	}
 	if !validDebPkgName.MatchString(name) {
 		return "", fmt.Errorf("invalid debian package name %q in %s", name, debPath)
+	}
+	return name, nil
+}
+
+// debPackageNameFromURL parses the canonical Debian package NAME out
+// of a .deb URL's filename, expecting the standard
+// `<name>_<version>_<arch>.deb` mirror layout. Used by the ABSENT
+// path so an action whose URL has 404'd (artifact deleted upstream)
+// still reports the desired "already absent" status instead of
+// degrading into a download error. The PRESENT path keeps the
+// download + dpkg-deb authoritative read because installing requires
+// the .deb file anyway.
+func debPackageNameFromURL(rawURL string) (string, error) {
+	parsed, err := url.Parse(rawURL)
+	if err != nil {
+		return "", fmt.Errorf("invalid deb url %q: %w", rawURL, err)
+	}
+	base := path.Base(parsed.Path)
+	if base == "" || base == "/" || base == "." {
+		return "", fmt.Errorf("deb url %q has no filename segment", rawURL)
+	}
+	if !strings.HasSuffix(base, ".deb") {
+		return "", fmt.Errorf("deb url filename %q does not end in .deb", base)
+	}
+	// Filename shape is `name_version_arch.deb`; the package name is
+	// everything before the first underscore.
+	stem := strings.TrimSuffix(base, ".deb")
+	name, _, ok := strings.Cut(stem, "_")
+	if !ok || name == "" {
+		return "", fmt.Errorf("deb url filename %q is not in name_version_arch.deb form", base)
+	}
+	if !validDebPkgName.MatchString(name) {
+		return "", fmt.Errorf("invalid debian package name %q derived from %s", name, rawURL)
 	}
 	return name, nil
 }
