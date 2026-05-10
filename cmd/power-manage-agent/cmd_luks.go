@@ -251,11 +251,30 @@ func runLuksSetPassphrase(token, dataDir string) {
 		os.Exit(1)
 	}
 
-	// Update local state
-	agentStore.SetLuksDeviceKeyType(result.ActionID, "user_passphrase")
+	// Update local state. Bundle-A fail-closed: a failure here would
+	// leave the on-disk state row claiming device_key_type=tpm/none
+	// while LUKS slot 7 actually carries the user's passphrase. The
+	// next reconcileDeviceKey tick would then see the divergence and
+	// re-enroll TPM, wiping what the user just set. Surface the error
+	// to stderr and exit non-zero so the operator can rerun.
+	if err := agentStore.SetLuksDeviceKeyType(result.ActionID, "user_passphrase"); err != nil {
+		slog.Error("failed to persist LUKS device key type after slot-7 enrollment",
+			"action_id", result.ActionID, "error", err)
+		fmt.Fprintf(os.Stderr, "error: failed to update local LUKS state: %v\n", err)
+		fmt.Fprintln(os.Stderr, "warning: passphrase is set on the device but local state is stale; rerun this command to recover")
+		os.Exit(1)
+	}
 
-	// Store passphrase hash for reuse prevention (keeps last 3)
-	agentStore.AddLuksPassphraseHash(result.ActionID, sysenc.HashPassphrase(passphrase))
+	// Store passphrase hash for reuse prevention (keeps last 3).
+	// Same fail-closed reasoning as above: a missed history append
+	// lets the user immediately re-pick the same passphrase next
+	// rotation, defeating the reuse check.
+	if err := agentStore.AddLuksPassphraseHash(result.ActionID, sysenc.HashPassphrase(passphrase)); err != nil {
+		slog.Error("failed to persist LUKS passphrase hash after slot-7 enrollment",
+			"action_id", result.ActionID, "error", err)
+		fmt.Fprintf(os.Stderr, "error: failed to update LUKS passphrase history: %v\n", err)
+		os.Exit(1)
+	}
 
 	fmt.Println("LUKS passphrase set successfully.")
 }

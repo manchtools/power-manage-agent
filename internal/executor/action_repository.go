@@ -173,7 +173,10 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 					}
 					if keyPath != "" && strings.HasPrefix(keyPath, "/") {
 						output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-						runSudoCmd(ctx, "rm", "-f", keyPath)
+						if _, err := runSudoCmd(ctx, "rm", "-f", keyPath); err != nil {
+							e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting GPG key",
+								"key_path", keyPath, "error", err)
+						}
 					}
 				}
 			}
@@ -192,13 +195,22 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 				}
 				if len(match) > 1 && strings.HasPrefix(keyPath, "/") {
 					output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-					runSudoCmd(ctx, "rm", "-f", keyPath)
+					if _, err := runSudoCmd(ctx, "rm", "-f", keyPath); err != nil {
+						e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting GPG key",
+							"key_path", keyPath, "error", err)
+					}
 				}
 			}
 		}
 
-		// Remove the repository file
-		runSudoCmd(ctx, "rm", "-f", filePath)
+		// Remove the repository file. A failure here would leave the
+		// stale config in /etc/apt/sources.list.d/ and the next apt
+		// update would still see the conflict — surface the error so
+		// the operator can clean it up manually.
+		if _, err := runSudoCmd(ctx, "rm", "-f", filePath); err != nil {
+			e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting repo file",
+				"file_path", filePath, "error", err)
+		}
 	}
 	return cleanedUp
 }
@@ -217,11 +229,21 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
 			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
-		// Also try to remove legacy .list format
+		// Also try to remove legacy .list format. A failed rm here
+		// leaves a stale config that apt will still parse; surface
+		// to the operator instead of silently swallowing.
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
-		runSudoCmd(ctx, "rm", "-f", legacyFile)
-		// Remove GPG key
-		runSudoCmd(ctx, "rm", "-f", keyFile)
+		if _, err := runSudoCmd(ctx, "rm", "-f", legacyFile); err != nil {
+			e.logger.Warn("apt ABSENT: failed to remove legacy repo file",
+				"file", legacyFile, "error", err)
+		}
+		// Remove GPG key. A leftover key with no .sources file is
+		// inert today but a future re-apply would compare against
+		// the wrong fingerprint — log so the divergence is visible.
+		if _, err := runSudoCmd(ctx, "rm", "-f", keyFile); err != nil {
+			e.logger.Warn("apt ABSENT: failed to remove GPG key",
+				"key_file", keyFile, "error", err)
+		}
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
 
@@ -244,14 +266,20 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
 		if _, err := os.Stat(legacyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy repository file: %s\n", legacyFile))
-			runSudoCmd(ctx, "rm", "-f", legacyFile)
+			if _, err := runSudoCmd(ctx, "rm", "-f", legacyFile); err != nil {
+				e.logger.Warn("apt PRESENT: failed to remove legacy repo file",
+					"file", legacyFile, "error", err)
+			}
 			changed = true
 		}
 		// Clean up legacy GPG key location
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy GPG key: %s\n", legacyKeyFile))
-			runSudoCmd(ctx, "rm", "-f", legacyKeyFile)
+			if _, err := runSudoCmd(ctx, "rm", "-f", legacyKeyFile); err != nil {
+				e.logger.Warn("apt PRESENT: failed to remove legacy GPG key",
+					"key_file", legacyKeyFile, "error", err)
+			}
 			changed = true
 		}
 
@@ -344,8 +372,22 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 		}
 	}
 
-	// Create a temp file for the new key
-	tempFile, err := os.CreateTemp("", "gpgkey-*.gpg")
+	// Create a temp file for the new key under the agent's data dir
+	// rather than $TMPDIR (audit F024). install.sh sets the systemd
+	// unit's PrivateTmp=false so sudo keeps working, which means a
+	// co-resident process in the same tmp namespace could otherwise
+	// race the dearmor write. The agent's data dir is 0700 root-owned
+	// and not shared, so a temp file underneath it isn't reachable by
+	// other UIDs. Falls back to $TMPDIR only if the data dir isn't
+	// configured (test paths, ad-hoc invocations).
+	gpgTmpDir := ""
+	if cfg := e.updateCfg; cfg != nil && cfg.DataDir != "" {
+		gpgTmpDir = filepath.Join(cfg.DataDir, "gpg-tmp")
+		if err := os.MkdirAll(gpgTmpDir, 0o700); err != nil {
+			return false, fmt.Errorf("failed to create gpg-tmp dir %s: %w", gpgTmpDir, err)
+		}
+	}
+	tempFile, err := os.CreateTemp(gpgTmpDir, "gpgkey-*.gpg")
 	if err != nil {
 		return false, fmt.Errorf("failed to create temp file: %w", err)
 	}
@@ -422,8 +464,13 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 		return false, fmt.Errorf("failed to install GPG key: %w", err)
 	}
 
-	// Set proper permissions
-	runSudoCmd(ctx, "chmod", "644", keyFile)
+	// Set proper permissions. A failed chmod on the keyring leaves
+	// dpkg with "the file is unreadable to apt", which masquerades
+	// as a repository fetch problem on the next apt update — return
+	// the error so the operator sees the real cause.
+	if _, err := runSudoCmd(ctx, "chmod", "644", keyFile); err != nil {
+		return false, fmt.Errorf("failed to chmod GPG key %s: %w", keyFile, err)
+	}
 
 	return true, nil
 }
@@ -489,7 +536,10 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// (handles previous configurations with different settings).
 		if _, err := os.Stat(repoFile); err == nil {
 			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-			runSudoCmd(ctx, "rm", "-f", repoFile)
+			if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
+				e.logger.Warn("dnf PRESENT: failed to remove existing repo file before rewrite",
+					"file", repoFile, "error", err)
+			}
 		}
 
 		if _, err := writeFileWithSudo(ctx, repoFile, desired); err != nil {
@@ -500,16 +550,24 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// Import GPG key if provided.
 		// rpm --import is idempotent - re-importing an existing key is a no-op.
 		if repo.Gpgkey != "" {
-			keyOutput, _ := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, keyErr := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
+			}
+			if keyErr != nil {
+				e.logger.Warn("dnf PRESENT: failed to import GPG key",
+					"gpgkey", repo.Gpgkey, "error", keyErr)
 			}
 		}
 
 		// Refresh metadata (use -y for non-interactive mode).
-		refreshOutput, _ := runSudoCmd(ctx, "dnf", "-y", "makecache", "--repo", name)
+		refreshOutput, refreshErr := runSudoCmd(ctx, "dnf", "-y", "makecache", "--repo", name)
 		if refreshOutput != nil {
 			output.WriteString(refreshOutput.Stdout)
+		}
+		if refreshErr != nil {
+			e.logger.Warn("dnf PRESENT: failed to refresh repo metadata",
+				"repo", name, "error", refreshErr)
 		}
 
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
@@ -604,9 +662,13 @@ func (e *Executor) executePacmanRepository(ctx context.Context, name string, rep
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
 
 		// Sync database (--noconfirm for non-interactive mode)
-		syncOutput, _ := runSudoCmd(ctx, "pacman", "-Sy", "--noconfirm")
+		syncOutput, syncErr := runSudoCmd(ctx, "pacman", "-Sy", "--noconfirm")
 		if syncOutput != nil {
 			output.WriteString(syncOutput.Stdout)
+		}
+		if syncErr != nil {
+			e.logger.Warn("pacman PRESENT: failed to sync repository database",
+				"repo", name, "error", syncErr)
 		}
 
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
@@ -648,8 +710,14 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 			args = append(args, "--type", repo.Type)
 		}
 
-		// Check if repo exists, remove first if it does
-		runSudoCmd(ctx, "zypper", "--non-interactive", "removerepo", name)
+		// Check if repo exists, remove first if it does. A failure
+		// here is non-fatal — the addrepo below will surface a real
+		// conflict — but log so the operator can investigate the
+		// cleanup half if addrepo also fails.
+		if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "removerepo", name); err != nil {
+			e.logger.Debug("zypper PRESENT: pre-add removerepo failed (often expected if repo absent)",
+				"repo", name, "error", err)
+		}
 
 		args = append(args, repo.Url, name)
 		cmdOutput, err := runSudoCmd(ctx, "zypper", args...)
@@ -662,35 +730,54 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 
 		output.WriteString(fmt.Sprintf("configured repository: %s\n", name))
 
-		// Set description if provided
+		// Set description if provided. modifyrepo is a state-changing
+		// operation — a failure leaves the repo with a wrong/missing
+		// description versus operator intent. Return as error.
 		if repo.Description != "" {
-			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--name", repo.Description, name)
+			if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--name", repo.Description, name); err != nil {
+				return nil, false, fmt.Errorf("failed to set zypper repo description: %w", err)
+			}
 		}
 
-		// Enable/disable
+		// Enable/disable. Same reasoning as description: a failed
+		// enable/disable diverges from operator intent silently.
 		if repo.Enabled {
-			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--enable", name)
+			if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--enable", name); err != nil {
+				return nil, false, fmt.Errorf("failed to enable zypper repo %s: %w", name, err)
+			}
 		} else {
-			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--disable", name)
+			if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--disable", name); err != nil {
+				return nil, false, fmt.Errorf("failed to disable zypper repo %s: %w", name, err)
+			}
 		}
 
 		// Set autorefresh
 		if repo.Autorefresh {
-			runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--refresh", name)
+			if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "modifyrepo", "--refresh", name); err != nil {
+				return nil, false, fmt.Errorf("failed to enable autorefresh on zypper repo %s: %w", name, err)
+			}
 		}
 
 		// Import GPG key if provided
 		if repo.Gpgkey != "" {
-			keyOutput, _ := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, keyErr := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
+			}
+			if keyErr != nil {
+				e.logger.Warn("zypper PRESENT: failed to import GPG key",
+					"gpgkey", repo.Gpgkey, "error", keyErr)
 			}
 		}
 
 		// Refresh repository
-		refreshOutput, _ := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh", name)
+		refreshOutput, refreshErr := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh", name)
 		if refreshOutput != nil {
 			output.WriteString(refreshOutput.Stdout)
+		}
+		if refreshErr != nil {
+			e.logger.Warn("zypper PRESENT: failed to refresh repo",
+				"repo", name, "error", refreshErr)
 		}
 
 		return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, true, nil
