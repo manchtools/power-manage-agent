@@ -34,7 +34,12 @@ GITHUB_REPO="MANCHTOOLS/power-manage-agent"
 # Default values
 DATA_DIR="/var/lib/power-manage"
 BINARY_PATH="/usr/local/bin/power-manage-agent"
-SERVICE_USER="power-manage"
+# Legacy service user. The agent now runs as root (the previous
+# power-manage + sudoers escalation model was retired); this constant
+# is kept so the uninstall path can still find and offer to remove a
+# legacy power-manage account on hosts originally installed with the
+# pre-root-mode script. Fresh installs do not create or use this user.
+LEGACY_SERVICE_USER="power-manage"
 SERVICE_NAME="power-manage-agent"
 REGISTRATION_TOKEN=""
 SERVER_URL=""
@@ -77,7 +82,7 @@ Options:
   --pre                   Install the latest prerelease (release candidate) version
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
-  -u, --user USER         Service user name (default: power-manage)
+  -u, --user USER         (deprecated, ignored) Agent now runs as root
   --skip-download         Skip downloading the binary (use existing binary at --binary path)
   --uninstall             Remove the agent and all configuration
   -h, --help              Show this help message
@@ -120,7 +125,10 @@ parse_args() {
                 shift 2
                 ;;
             -u|--user)
-                SERVICE_USER="$2"
+                # Deprecated: agent now runs as root. Keep parsing
+                # the flag so existing operator scripts don't error,
+                # but log a warning and ignore the value.
+                log_warn "--user is deprecated and ignored; agent now runs as root."
                 shift 2
                 ;;
             -v|--version)
@@ -334,44 +342,31 @@ download_binary() {
     log_info "Binary installed to $BINARY_PATH"
 }
 
-create_user() {
-    if id "$SERVICE_USER" &>/dev/null; then
-        log_info "User $SERVICE_USER already exists"
-    else
-        log_info "Creating service user: $SERVICE_USER"
-        useradd \
-            --system \
-            --no-create-home \
-            --shell /usr/sbin/nologin \
-            --comment "Power Manage Agent Service" \
-            "$SERVICE_USER"
-    fi
-
-    # Grant journal read access for remote log queries
-    if getent group systemd-journal &>/dev/null; then
-        usermod -aG systemd-journal "$SERVICE_USER"
-        log_info "Added $SERVICE_USER to systemd-journal group"
-    fi
-}
-
-setup_sudo() {
-    log_info "Configuring sudo access for $SERVICE_USER..."
-
-    # Use the agent binary's embedded sudoers template for a single source of truth.
-    # This ensures the sudoers rules always match the agent version.
-    if "$BINARY_PATH" setup --user "$SERVICE_USER"; then
-        log_info "Sudoers configuration installed successfully"
-    else
-        log_error "Failed to install sudoers configuration"
-        exit 1
-    fi
-}
-
 create_directories() {
     log_info "Creating data directory: $DATA_DIR"
     mkdir -p "$DATA_DIR"
-    chown "$SERVICE_USER:$SERVICE_USER" "$DATA_DIR"
+    chown root:root "$DATA_DIR"
     chmod 700 "$DATA_DIR"
+}
+
+# remove_legacy_sudoers cleans up the sudoers / doas drop-ins the
+# previous (pre-root-mode) install script created. Called on fresh
+# installs AND upgrades so an operator on the old layout doesn't end
+# up with both the legacy escalation policy AND a root-mode unit
+# active simultaneously. Safe to call when nothing is there.
+remove_legacy_sudoers() {
+    local removed=""
+    if [[ -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}" ]]; then
+        rm -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}"
+        removed="${removed} /etc/sudoers.d/${LEGACY_SERVICE_USER}"
+    fi
+    if [[ -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf" ]]; then
+        rm -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf"
+        removed="${removed} /etc/doas.d/${LEGACY_SERVICE_USER}.conf"
+    fi
+    if [[ -n "$removed" ]]; then
+        log_info "Removed legacy escalation drop-in(s):${removed}"
+    fi
 }
 
 install_systemd_service() {
@@ -405,8 +400,11 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-User=$SERVICE_USER
-Group=$SERVICE_USER
+# Agent runs as root. The previous power-manage + sudoers escalation
+# model was retired (see agent/README.md "Runs as root"); every
+# privileged operation now runs in-process without a sudo round-trip.
+User=root
+Group=root
 
 # Environment
 Environment="POWER_MANAGE_DATA_DIR=$DATA_DIR"
@@ -422,7 +420,10 @@ RestartSec=10
 RuntimeDirectory=pm-agent
 RuntimeDirectoryMode=0755
 
-# Security hardening
+# Security hardening — most ProtectXxx knobs are intentionally
+# disabled: the agent's job is to mutate system state (install
+# packages, write unit files, reload systemd, set LUKS keys, …) and
+# the protection knobs would block exactly those operations.
 NoNewPrivileges=false
 ProtectSystem=false
 ProtectHome=false
@@ -435,45 +436,44 @@ RestrictSUIDSGID=false
 
 # Capabilities.
 #
-# Remote terminal sessions spawn /bin/bash as the per-user pm-tty-*
-# account via setuid/setgid. The agent runs as the unprivileged
-# power-manage user, so without CAP_SETUID / CAP_SETGID granted as
-# ambient caps the setresuid syscall fails with EPERM and the session
-# never starts ("allocate pty: fork/exec /bin/bash: operation not
-# permitted"). Both must appear in CapabilityBoundingSet too, because
-# systemd's bounding set is a hard ceiling on ambient caps — and the
-# ambient wiring also requires NoNewPrivileges=false and
-# RestrictSUIDSGID=false (both already set above).
+# Running as root means the agent process inherits the full default
+# capability set, but we pin both the ambient set and the bounding
+# set so:
 #
-# The rest of the bounding set lists caps the agent needs to keep
-# available for sudo-launched children from shell actions — the
-# agent process itself never uses them directly:
+#   - Children launched from shell actions (which may shed caps via
+#     execve onto a binary without file caps) keep the caps the
+#     action needs. The bounding set is the hard ceiling that the
+#     execve cap-stripping rules reduce against, so any cap NOT
+#     listed below is unavailable to children regardless of how
+#     they're launched.
 #
-#   - CAP_CHOWN / CAP_DAC_OVERRIDE / CAP_FOWNER: file ownership
-#     and permission overrides during package install hooks and
-#     writing system config files.
-#   - CAP_NET_BIND_SERVICE: daemons restarted by shell actions
-#     (e.g. bundled services using file-cap port-binding) need
-#     this in the bounding set or the exec strips it.
-#   - CAP_NET_ADMIN: firewall-control actions that shell out to
-#     ufw / firewall-cmd / nft.
-#   - CAP_SYS_ADMIN: mount/unmount during LUKS operations.
+#   - Remote terminal sessions spawn /bin/bash under per-user
+#     pm-tty-* accounts via setresuid/setresgid. CAP_SETUID and
+#     CAP_SETGID are already in root's effective set, but listing
+#     them as ambient caps makes the privilege transition explicit
+#     and survives any future drop-priv refactor that runs the
+#     agent as a non-root user with the relevant caps file-set on
+#     the binary.
 #
-# The agent's only listener is a UNIX socket at
-# /run/pm-agent/enroll.sock — it does NOT bind TCP ports itself.
+#   - CAP_AUDIT_WRITE in the bounding set keeps the kernel-audit
+#     channel open for any setuid-root child (sudo invocations
+#     from run_as_root shell actions still happen on hosts where
+#     the operator policy uses them). Without it, audit messages
+#     fail with "audit message cannot be sent: operation not
+#     permitted" — silent compliance gap on SOC2/PCI/CIS hosts.
 #
-# CAP_AUDIT_WRITE: in the bounding set ONLY (not ambient). Required
-# so sudo (setuid-root, invoked for run_as_root shell actions) can
-# call audit_log_user_message() to write USER_CMD records to the
-# kernel audit subsystem. On execve, setuid-root binaries pick up
-# caps from `bounding ∩ file_caps` — the bounding-set entry is what
-# allows sudo to keep CAP_AUDIT_WRITE; the ambient entry would be
-# extra privilege for the agent process itself, which never calls
-# audit(2) directly. Without the bounding-set grant, sudo
-# invocations succeed but emit "audit message cannot be sent:
-# operation not permitted" (issue #55) and the kernel-audit channel
-# is dark for privileged operations — a compliance gap on
-# SOC2/PCI/CIS-regulated deployments.
+# Bounding set caps and what they're for:
+#   CAP_SETUID / CAP_SETGID — drop priv to per-user pm-tty-* shells.
+#   CAP_AUDIT_WRITE — kernel audit log writes from setuid children.
+#   CAP_CHOWN / CAP_DAC_OVERRIDE / CAP_FOWNER — file ownership +
+#     permission overrides during package hooks and config writes.
+#   CAP_NET_BIND_SERVICE — daemons restarted by shell actions that
+#     bind privileged ports without setuid.
+#   CAP_NET_ADMIN — firewall control via ufw / firewall-cmd / nft.
+#   CAP_SYS_ADMIN — mount / umount during LUKS operations.
+#
+# The agent's only listener is the UNIX socket at
+# /run/pm-agent/enroll.sock — it never binds a TCP port itself.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
 CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
 
@@ -572,10 +572,16 @@ uninstall() {
         systemctl daemon-reload
     fi
 
-    # Remove sudoers files
-    if [[ -f "/etc/sudoers.d/$SERVICE_USER" ]]; then
-        log_info "Removing sudoers configuration..."
-        rm -f "/etc/sudoers.d/$SERVICE_USER"
+    # Remove legacy escalation drop-ins (sudoers / doas) from the
+    # pre-root-mode install layout. Idempotent: silently skipped if
+    # neither file exists.
+    if [[ -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}" ]]; then
+        log_info "Removing legacy sudoers configuration..."
+        rm -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}"
+    fi
+    if [[ -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf" ]]; then
+        log_info "Removing legacy doas configuration..."
+        rm -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf"
     fi
     if [[ -f "/etc/sudoers.d/power-manage-luks" ]]; then
         log_info "Removing LUKS sudoers configuration..."
@@ -600,15 +606,17 @@ uninstall() {
         fi
     fi
 
-    # Ask about user
-    if id "$SERVICE_USER" &>/dev/null; then
-        read -p "Remove service user $SERVICE_USER? [y/N] " -n 1 -r
+    # Ask about the legacy power-manage user from the pre-root-mode
+    # layout. Skipped if the user doesn't exist (fresh root-mode
+    # installs never create it).
+    if id "$LEGACY_SERVICE_USER" &>/dev/null; then
+        read -p "Remove legacy service user $LEGACY_SERVICE_USER (no longer needed in root mode)? [y/N] " -n 1 -r
         echo
         if [[ $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Removing service user..."
-            userdel "$SERVICE_USER"
+            log_info "Removing legacy service user..."
+            userdel "$LEGACY_SERVICE_USER"
         else
-            log_info "Service user preserved"
+            log_info "Legacy service user preserved"
         fi
     fi
 
@@ -704,7 +712,7 @@ show_status() {
     echo "  Power Manage Agent Installation Complete"
     echo "=========================================="
     echo ""
-    echo "Service User:  $SERVICE_USER"
+    echo "Runs As:       root"
     echo "Data Directory: $DATA_DIR"
     echo "Binary Path:   $BINARY_PATH"
     echo "Service Name:  $SERVICE_NAME"
@@ -745,9 +753,8 @@ main() {
 
     log_info "Starting Power Manage Agent installation..."
 
-    create_user
-    setup_sudo
     create_directories
+    remove_legacy_sudoers
     install_systemd_service
     install_desktop_handler
     install_luks_sudoers

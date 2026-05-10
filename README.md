@@ -111,10 +111,15 @@ curl -fsSL https://your-server/install.sh | sudo bash -s -- \
 ```
 
 The install script:
-1. Downloads and installs the agent binary
-2. Creates the `power-manage` service user
-3. Installs and starts the systemd service
-4. Enrolls via the enrollment socket (no sudo needed for the enrollment step)
+1. Downloads and installs the agent binary (verifies SHA256 against the publisher's `SHA256SUMS`)
+2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
+3. Removes any leftover `/etc/sudoers.d/power-manage` or `/etc/doas.d/power-manage.conf` from a previous (pre-root-mode) install
+4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
+5. Installs the desktop URI handler for browser-launched enrollment
+6. Installs the LUKS sudoers rule so any local user can run `power-manage-agent luks set-passphrase ...` without a password prompt
+7. Enrolls via the enrollment socket if `--server` and `--token` were provided
+
+The legacy `--user` flag is accepted but ignored — the agent runs as root and no service user is created.
 
 ### Manual Installation
 
@@ -122,10 +127,29 @@ The install script:
 # Build the agent
 go build -o power-manage-agent ./agent/cmd/agent
 
-# Start the agent (as a service or directly) — it will wait for enrollment
-./power-manage-agent
+# Start the agent as root (it will wait for enrollment)
+sudo ./power-manage-agent
 
-# In another terminal (as any user), enroll:
+# In another terminal (as any user), enroll via the local socket:
+power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_TOKEN
+```
+
+For a production-style manual install (without the install script):
+
+```bash
+# 1. Place the binary
+sudo install -m 0755 power-manage-agent /usr/local/bin/
+
+# 2. Create the data directory
+sudo mkdir -p /var/lib/power-manage && sudo chmod 700 /var/lib/power-manage
+
+# 3. Write the systemd unit (User=root, RuntimeDirectory=pm-agent for the
+#    enrollment socket). See install.sh for the full unit including
+#    the AmbientCapabilities / CapabilityBoundingSet block.
+sudo systemctl daemon-reload
+sudo systemctl enable --now power-manage-agent
+
+# 4. Enroll (any user, no sudo needed)
 power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_TOKEN
 ```
 
