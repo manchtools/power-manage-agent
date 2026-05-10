@@ -44,6 +44,7 @@ type Handler struct {
 	terminalLimit          int
 	terminalIdleTimeout    time.Duration
 	terminalSweeperStarted bool
+	terminalSweeperStop    chan struct{} // closed by StopTerminalSweeper to stop the sweep loop
 }
 
 // NewHandler creates a new stream handler.
@@ -162,7 +163,7 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 	var outputCallback executor.OutputCallback
 	if sendChunk != nil {
 		executionID := action.Id.Value
-		outputCallback = func(streamType int, line string, seq int64) {
+		outputCallback = func(streamType sysexec.StreamType, line string, seq int64) {
 			chunk := &pb.OutputChunk{
 				ExecutionId: executionID,
 				Stream:      pb.OutputStreamType(streamType),

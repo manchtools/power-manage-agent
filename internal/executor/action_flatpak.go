@@ -63,13 +63,17 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 			return output, false, fmt.Errorf("flatpak install failed: %w", err)
 		}
 
-		// Pin if requested (mask prevents updates)
+		// Pin if requested (mask prevents updates). The SDK can
+		// return (nil, nil) on success — guard the dereference so a
+		// successful install + successful pin doesn't segfault on the
+		// Stdout += assignment below. Audit F056(a).
 		if params.Pin {
 			pinOutput, pinErr := runSudoCmd(ctx, "flatpak", "mask", systemFlag, params.AppId)
+			if output == nil {
+				output = &pb.CommandOutput{}
+			}
 			if pinErr != nil {
-				if output != nil {
-					output.Stdout += "\nWarning: failed to pin application: " + pinErr.Error()
-				}
+				output.Stdout += "\nWarning: failed to pin application: " + pinErr.Error()
 			} else if pinOutput != nil {
 				output.Stdout += "\n" + pinOutput.Stdout
 			}
@@ -90,8 +94,14 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 			return out, false, err
 		}
 
-		// Remove pin first if it exists
-		runSudoCmd(ctx, "flatpak", "mask", "--remove", systemFlag, params.AppId)
+		// Remove pin first if it exists. The mask may not have been
+		// set, so a non-zero exit is expected and benign — but log
+		// at Debug so the operator can correlate if uninstall later
+		// fails. Audit F056(b).
+		if _, err := runSudoCmd(ctx, "flatpak", "mask", "--remove", systemFlag, params.AppId); err != nil {
+			e.logger.Debug("flatpak ABSENT: unmask before uninstall failed (often expected if not pinned)",
+				"app_id", params.AppId, "error", err)
+		}
 
 		// Uninstall the flatpak application
 		output, err := runSudoCmd(ctx, "flatpak", "uninstall", "-y", "--noninteractive", systemFlag, params.AppId)

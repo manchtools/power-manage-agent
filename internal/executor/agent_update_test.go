@@ -112,13 +112,28 @@ func TestDownloadToFile(t *testing.T) {
 	}
 }
 
+// writeStateForTest writes the legacy update/state.json that the
+// production self-test path no longer creates. The reader and the
+// startup cleanup still consume the format (for crash recovery from
+// an older agent that wrote one), so the read+clear round-trip stays
+// covered. Audit F018: the production writer was deleted; tests
+// fabricate the file directly.
+func writeStateForTest(t *testing.T, dataDir, phase, version string) {
+	t.Helper()
+	dir := filepath.Join(dataDir, "update")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	data := fmt.Sprintf(`{"phase":%q,"version":%q}`, phase, version)
+	if err := os.WriteFile(filepath.Join(dir, "state.json"), []byte(data), 0o600); err != nil {
+		t.Fatalf("write state.json: %v", err)
+	}
+}
+
 func TestWriteAndReadUpdateState(t *testing.T) {
 	dir := t.TempDir()
 
-	err := writeUpdateState(dir, "staged", "v2026.04.01")
-	if err != nil {
-		t.Fatal(err)
-	}
+	writeStateForTest(t, dir, "staged", "v2026.04.01")
 
 	phase, version, err := readUpdateState(dir)
 	if err != nil {
@@ -145,7 +160,7 @@ func TestReadUpdateState_NotFound(t *testing.T) {
 
 func TestClearUpdateState(t *testing.T) {
 	dir := t.TempDir()
-	writeUpdateState(dir, "staged", "v1.0")
+	writeStateForTest(t, dir, "staged", "v1.0")
 	clearUpdateState(dir)
 
 	phase, _, err := readUpdateState(dir)
@@ -158,29 +173,32 @@ func TestClearUpdateState(t *testing.T) {
 }
 
 func TestMarkAgentUpdateExecuted(t *testing.T) {
-	// Reset first
-	ResetAgentUpdateCycle()
+	// Per-instance dedup: each Executor owns its own flag (audit
+	// F042 + F048). Construct a fresh Executor for the test and
+	// exercise the methods directly instead of the deprecated
+	// package-level globals.
+	e := &Executor{}
 
 	// First call should succeed
-	if !markAgentUpdateExecuted() {
+	if !e.markAgentUpdateExecuted() {
 		t.Error("expected first markAgentUpdateExecuted to return true")
 	}
 
 	// Second call should fail (already executed)
-	if markAgentUpdateExecuted() {
+	if e.markAgentUpdateExecuted() {
 		t.Error("expected second markAgentUpdateExecuted to return false")
 	}
 
 	// After reset, should succeed again
-	ResetAgentUpdateCycle()
-	if !markAgentUpdateExecuted() {
+	e.ResetUpdateCycle()
+	if !e.markAgentUpdateExecuted() {
 		t.Error("expected markAgentUpdateExecuted to return true after reset")
 	}
 }
 
 func TestCheckStartupUpdateState_CleansStaleState(t *testing.T) {
 	dir := t.TempDir()
-	writeUpdateState(dir, "staged", "2026.04.01")
+	writeStateForTest(t, dir, "staged", "2026.04.01")
 
 	logger := &testLogger{}
 	CheckStartupUpdateState(dir, logger)

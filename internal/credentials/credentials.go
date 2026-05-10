@@ -157,8 +157,16 @@ func (s *Store) Load() (*Credentials, error) {
 	// either way once the prefix is removed — the version difference
 	// is purely about future-proofing format migrations, not about
 	// the cipher in use today.
+	//
+	// Audit F038: reject any future "pmcred:vN:" prefix that isn't
+	// the v1 we know about. Without this guard a v2 blob would fall
+	// through to decrypt and surface as an opaque AES-GCM auth-tag
+	// error, which is hard to diagnose. Tell the operator they need
+	// to re-enroll instead.
 	if bytes.HasPrefix(ciphertext, []byte(credentialsMagicV1)) {
 		ciphertext = ciphertext[len(credentialsMagicV1):]
+	} else if bytes.HasPrefix(ciphertext, []byte("pmcred:")) {
+		return nil, errors.New("unsupported credentials format version, please re-enroll the agent (delete credentials.enc and re-run with a fresh registration token)")
 	}
 
 	// Decrypt

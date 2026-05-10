@@ -87,7 +87,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if err := sysuser.GroupCreate(ctx, groupName); err != nil {
+		if _, err := sysuser.GroupCreate(ctx, groupName); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
@@ -210,12 +210,14 @@ func generateCustomSudoConfig(groupName, customConfig string) string {
 
 // addUserToGroup adds a user to a supplementary group.
 func addUserToGroup(ctx context.Context, username, groupName string) error {
-	return sysuser.GroupAddUser(ctx, username, groupName)
+	_, err := sysuser.GroupAddUser(ctx, username, groupName)
+	return err
 }
 
 // removeUserFromGroup removes a user from a supplementary group.
 func removeUserFromGroup(ctx context.Context, username, groupName string) error {
-	return sysuser.GroupRemoveUser(ctx, username, groupName)
+	_, err := sysuser.GroupRemoveUser(ctx, username, groupName)
+	return err
 }
 
 // getGroupMembers returns the members of a group.

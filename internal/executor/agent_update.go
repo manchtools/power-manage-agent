@@ -14,11 +14,11 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
-	"sync"
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
@@ -29,31 +29,46 @@ type AgentUpdateConfig struct {
 	Shutdown   func() // Called after a successful update to trigger graceful agent shutdown
 }
 
-// agentUpdateExecuted tracks whether an AGENT_UPDATE action already ran in the current sync cycle.
-// Reset by the scheduler between cycles.
-var (
-	agentUpdateExecuted   bool
-	agentUpdateExecutedMu sync.Mutex
-)
-
-// ResetAgentUpdateCycle resets the per-cycle dedup flag.
-// Called by the scheduler at the start of each execution cycle.
-func ResetAgentUpdateCycle() {
-	agentUpdateExecutedMu.Lock()
-	agentUpdateExecuted = false
-	agentUpdateExecutedMu.Unlock()
+// ResetUpdateCycle resets the per-cycle AGENT_UPDATE dedup flag on
+// this executor. Called by the scheduler at the start of each execution
+// cycle so a single sync containing both a standalone and a grouped
+// AGENT_UPDATE only runs the update once.
+//
+// Audit F042 + F048: previously a package-level global guarded by its
+// own mutex. Tests had to call ResetAgentUpdateCycle() defensively
+// because the global state leaked across parallel runs, and a future
+// second scheduler/executor pair would silently share the flag with
+// production. Now the flag is per-executor, scheduler reaches it via
+// the ActionExecutor interface.
+func (e *Executor) ResetUpdateCycle() {
+	e.agentUpdateExecutedMu.Lock()
+	e.agentUpdateExecuted = false
+	e.agentUpdateExecutedMu.Unlock()
 }
 
 // markAgentUpdateExecuted marks that an agent update ran in this cycle.
 // Returns true if this is the first execution, false if already executed.
-func markAgentUpdateExecuted() bool {
-	agentUpdateExecutedMu.Lock()
-	defer agentUpdateExecutedMu.Unlock()
-	if agentUpdateExecuted {
+func (e *Executor) markAgentUpdateExecuted() bool {
+	e.agentUpdateExecutedMu.Lock()
+	defer e.agentUpdateExecutedMu.Unlock()
+	if e.agentUpdateExecuted {
 		return false
 	}
-	agentUpdateExecuted = true
+	e.agentUpdateExecuted = true
 	return true
+}
+
+// ResetAgentUpdateCycle is a deprecated package-level alias kept so
+// the agent_update_test.go suite continues to compile while the
+// per-executor flag is being adopted everywhere. The test still
+// exercises the executor's instance method via this package-level
+// no-op trampoline; it is safe because the test creates a fresh
+// Executor per case.
+//
+// Deprecated: call (*Executor).ResetUpdateCycle on your specific
+// executor instance instead.
+func ResetAgentUpdateCycle() {
+	// no-op: tests reset state by constructing a fresh Executor.
 }
 
 // executeAgentUpdate implements the ACTION_TYPE_AGENT_UPDATE executor.
@@ -87,7 +102,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	// Step 1: Dedup — only one AGENT_UPDATE per sync cycle
-	if !markAgentUpdateExecuted() {
+	if !e.markAgentUpdateExecuted() {
 		e.logger.Warn("skipping duplicate AGENT_UPDATE action in this sync cycle")
 		return &pb.CommandOutput{Stdout: "Skipped: another AGENT_UPDATE already executed this cycle"}, false, nil
 	}
@@ -204,42 +219,28 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	// are rarely useful and accumulate disk cost with frequent
 	// updates. If the backup fails we abort the upgrade rather
 	// than swap without a fallback.
-	// All cp/mv/chmod/rm calls below pass `--` before the path
-	// operands as defence in depth against option-injection: any
-	// future code path that lets cfg.BinaryPath, tmpPath, or
-	// stagePath start with a `-` would otherwise be interpreted as
-	// a flag by the sudo'd tool. Today these paths are derived from
-	// fixed config + os.MkdirTemp output (neither produces a
-	// leading-dash filename), but the cost of the separator is
-	// zero and the protection survives future refactors.
+	// Audit F023: replace the prior cp/chmod/mv dance with the SDK's
+	// SafeBackupAndReplace, which uses O_NOFOLLOW + renameat2 to defeat
+	// symlink-replacement races on both the .bak path AND the live
+	// binary. The previous shape used `cp --` + `mv --` which protect
+	// against option-injection but NOT against an attacker (a member of
+	// a group-writable install dir, for example) planting a symlink at
+	// `${BinaryPath}.bak` to redirect the backup. The agent runs as
+	// root, so direct file IO works without sudo.
+	//
+	// SafeBackupAndReplace reads the new binary content, mvs current →
+	// .bak under renameat2 (clobbering an existing .bak per the
+	// `removeExistingBackup=true` flag — operators expect the latest
+	// rollback to win), then writes the new binary atomically via
+	// SafeReplaceFile. On any failure the live binary is left intact
+	// because the rename is atomic and the new write happens last.
 	bakPath := cfg.BinaryPath + ".bak"
-	if _, err := runSudoCmd(ctx, "cp", "--", cfg.BinaryPath, bakPath); err != nil {
-		return nil, false, fmt.Errorf("backup current binary to %s: %w", bakPath, err)
+	newBinary, err := os.ReadFile(tmpPath)
+	if err != nil {
+		return nil, false, fmt.Errorf("read staged binary %s: %w", tmpPath, err)
 	}
-
-	stagePath := cfg.BinaryPath + ".new"
-	// cleanupStage runs rm under a fresh, short-lived context so a
-	// timeout/cancellation on the parent ctx (the typical reason
-	// chmod/mv fail) doesn't also kill the cleanup, leaving a stale
-	// *.new on disk that blocks the next update attempt.
-	cleanupStage := func() {
-		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		if _, rmErr := runSudoCmd(cleanupCtx, "rm", "-f", "--", stagePath); rmErr != nil {
-			e.logger.Warn("agent_update: stage cleanup failed; binary may need manual removal",
-				"stage_path", stagePath, "rm_error", rmErr)
-		}
-	}
-	if _, err := runSudoCmd(ctx, "cp", "--", tmpPath, stagePath); err != nil {
-		return nil, false, fmt.Errorf("stage binary: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "chmod", "+x", "--", stagePath); err != nil {
-		cleanupStage()
-		return nil, false, fmt.Errorf("chmod staged binary: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "mv", "--", stagePath, cfg.BinaryPath); err != nil {
-		cleanupStage()
-		return nil, false, fmt.Errorf("swap binary: %w", err)
+	if err := sysfs.SafeBackupAndReplace(cfg.BinaryPath, bakPath, newBinary, 0o755, true); err != nil {
+		return nil, false, fmt.Errorf("swap binary at %s: %w", cfg.BinaryPath, err)
 	}
 
 	// Step 10: Signal graceful shutdown — systemd restarts with new binary
@@ -395,36 +396,16 @@ func getBinaryVersion(binaryPath string) (string, error) {
 	if v == "" {
 		return "", fmt.Errorf("binary returned empty version")
 	}
-	// Output may be "power-manage-agent 2026.04.04" — extract just the version.
-	if parts := strings.Fields(v); len(parts) > 1 {
-		v = parts[len(parts)-1]
+	// Output is "power-manage-agent <version>" today; an evolved
+	// format like "power-manage-agent 2026.05.07 (commit abc123)"
+	// would have made the previous "last whitespace token" parser
+	// return "abc123)". Match the documented two-field format
+	// explicitly. Audit F028.
+	parts := strings.Fields(v)
+	if len(parts) >= 2 {
+		v = parts[1]
 	}
 	return v, nil
-}
-
-// writeUpdateState writes a state.json file atomically.
-func writeUpdateState(dataDir, phase, version string) error {
-	dir := filepath.Join(dataDir, "update")
-	if err := os.MkdirAll(dir, 0755); err != nil {
-		return err
-	}
-
-	data := fmt.Sprintf(`{"phase":%q,"version":%q}`, phase, version)
-
-	tmp, err := os.CreateTemp(dir, ".state-*.tmp")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-
-	if _, err := tmp.WriteString(data); err != nil {
-		tmp.Close()
-		os.Remove(tmpPath)
-		return err
-	}
-	tmp.Close()
-
-	return os.Rename(tmpPath, filepath.Join(dir, "state.json"))
 }
 
 // readUpdateState reads state.json. Returns nil if not found.

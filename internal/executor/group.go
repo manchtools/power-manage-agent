@@ -60,7 +60,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 			extraArgs = append(extraArgs, "-r")
 		}
 
-		if err := sysuser.GroupCreate(ctx, params.Name, extraArgs...); err != nil {
+		if _, err := sysuser.GroupCreate(ctx, params.Name, extraArgs...); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", params.Name, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", params.Name))

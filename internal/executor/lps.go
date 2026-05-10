@@ -11,6 +11,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 
@@ -52,10 +53,15 @@ func (e *Executor) executeLps(ctx context.Context, params *pb.LpsParams, state p
 
 // setupLpsPasswords checks if password rotation is needed for each user and rotates if so.
 func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
+	st := e.getStore()
+	if st == nil {
+		return nil, false, nil, fmt.Errorf("agent store not configured")
+	}
+
 	var output strings.Builder
 
 	// Load state from SQLite
-	userStates, err := e.store.GetLpsState(actionID)
+	userStates, err := st.GetLpsState(actionID)
 	if err != nil {
 		e.logger.Warn("failed to load LPS state, will treat as initial rotation", "action_id", actionID, "error", err)
 		userStates = make(map[string]*store.LpsUserState)
@@ -132,7 +138,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		// Update per-user state in SQLite
 		hash := sha256.Sum256([]byte(password))
 		hashStr := hex.EncodeToString(hash[:])
-		if err := e.store.SetLpsUserState(actionID, username, now, hashStr); err != nil {
+		if err := st.SetLpsUserState(actionID, username, now, hashStr); err != nil {
 			e.logger.Warn("failed to save LPS user state", "action_id", actionID, "username", username, "error", err)
 		}
 
@@ -193,7 +199,11 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 // removeLpsManagement handles ABSENT state — stops managing, cleans up state.
 func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
-	userStates, err := e.store.GetLpsState(actionID)
+	st := e.getStore()
+	if st == nil {
+		return nil, false, nil, fmt.Errorf("agent store not configured")
+	}
+	userStates, err := st.GetLpsState(actionID)
 	if err != nil {
 		// Sibling of the DeleteLpsState fail-closed below. Treating
 		// a lookup failure as "no users to clean up" would let the
@@ -205,7 +215,7 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 	}
 
 	if len(userStates) > 0 {
-		if err := e.store.DeleteLpsState(actionID); err != nil {
+		if err := st.DeleteLpsState(actionID); err != nil {
 			// Mirror the LUKS ABSENT-transition fix: returning
 			// success here would tell the control plane the action
 			// set is removed while leaving the local state row
@@ -280,11 +290,21 @@ func killUserSessions(ctx context.Context, username string) {
 }
 
 // getLastAuthTime returns the most recent login time for a user by parsing `last -1 -F <username>`.
+//
+// Audit F025: forces LC_ALL=C and LANG=C so the weekday strings ("Mon",
+// "Tue", ...) and time format below are deterministic. Under a non-English
+// LANG the weekdays are translated and the parser silently fails with
+// "could not parse date", causing the rotation logic to fall back to the
+// caller's default and rotate every tick. RunWithCLocale is the SDK helper
+// that strips environment to a minimal {LC_ALL=C, LANG=C, PATH=...} set.
 func getLastAuthTime(username string) (time.Time, error) {
-	output, err := queryCmd("last", "-1", "-F", username)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	r, err := sysexec.RunWithCLocale(ctx, "last", "-1", "-F", username)
 	if err != nil {
 		return time.Time{}, fmt.Errorf("last command: %w", err)
 	}
+	output := r.Stdout
 
 	lines := strings.Split(strings.TrimSpace(output), "\n")
 	if len(lines) == 0 {

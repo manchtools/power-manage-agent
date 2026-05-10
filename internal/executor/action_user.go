@@ -102,7 +102,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Ensure group exists
-		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists", "group", params.PrimaryGroup, "error", err)
 		}
 		args = append(args, "-g", params.PrimaryGroup)
@@ -299,7 +299,7 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		if err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists for usermod", "group", params.PrimaryGroup, "error", err)
 		}
 		// For simplicity, always set if specified by name (could be optimized)
@@ -564,17 +564,40 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
-	// Write authorized_keys file
-	if _, err := runSudoCmdWithStdin(ctx, strings.NewReader(desiredContent), "tee", authKeysFile); err != nil {
-		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
+	// Write authorized_keys atomically via a sudo-escalated install(1).
+	// install replaces the destination in one syscall after copying the
+	// source content, applying mode + owner + group up-front; -T forces
+	// the destination to be treated as a file path (so a directory at
+	// the destination doesn't get the file copied INTO it). The temp
+	// source lives under /tmp where the agent process can always
+	// write, regardless of whether the agent runs as root or via the
+	// sudoers escalation model — sysoers mode is the chosen 2026.06
+	// architecture (see project_2026_06_design_decisions.md #1) so
+	// directly writing under the user's 700 .ssh dir from the agent
+	// process is not viable.
+	//
+	// The previous shape (`mkdir -p` → `chown` → sudo `tee` → `chown`)
+	// followed symlinks at the tee step: a local user able to plant a
+	// symlink at ~/.ssh/authorized_keys between the chown and the tee
+	// could redirect the write to e.g. /etc/cron.d/root. install -T
+	// closes that vector by refusing to write through a symlink-loop
+	// directory mismatch and by setting the destination's metadata in
+	// the same call instead of a separate chown round-trip.
+	tmpFile, err := os.CreateTemp("", "agent-authorized-keys-")
+	if err != nil {
+		return false, fmt.Errorf("failed to create temp authorized_keys: %w", err)
 	}
-
-	// Set ownership and permissions on authorized_keys
-	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
-		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
+	tmpPath := tmpFile.Name()
+	defer os.Remove(tmpPath)
+	if _, err := tmpFile.WriteString(desiredContent); err != nil {
+		tmpFile.Close()
+		return false, fmt.Errorf("failed to write temp authorized_keys: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "600", authKeysFile); err != nil {
-		return false, fmt.Errorf("failed to set authorized_keys permissions: %w", err)
+	if err := tmpFile.Close(); err != nil {
+		return false, fmt.Errorf("failed to close temp authorized_keys: %w", err)
+	}
+	if _, err := runSudoCmd(ctx, "install", "-m", "600", "-o", params.Username, "-g", homeGroupFor(params), "-T", tmpPath, authKeysFile); err != nil {
+		return false, fmt.Errorf("failed to install authorized_keys: %w", err)
 	}
 
 	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", validKeyCount))

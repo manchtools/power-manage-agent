@@ -6,6 +6,8 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 
 The executor delegates low-level system operations to the SDK's `sys/` packages (`sys/exec`, `sys/fs`, `sys/user`, `sys/systemd`), keeping the agent focused on action dispatch, idempotency checks, and result reporting.
 
+> **LUKS executor exception (audit F039):** the LUKS action type does NOT delegate purely to `sys/encryption`. Key material flows through a separate `LuksKeyStore` interface that proxies to the gateway over the live SDK stream — the executor calls `e.luksKeyStore.GetKey/StoreKey/RotateKey`, those methods round-trip through the connected `sdk.Client` to the gateway, and the gateway forwards to the control server's encrypted key store. **Implication for operators:** LUKS rotations cannot proceed when the agent is disconnected from the gateway; an offline agent will see the action in its scheduled queue but fail at the `GetKey` call with "LUKS key store not configured (no stream connection)". This is intentional fail-closed behaviour — no LUKS operation should rely on a stale local key.
+
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                        Agent                                    │
@@ -461,6 +463,7 @@ Only one repository type should be set per action. The matching type is determin
 | `LPS` | Yes | Rotate passwords | Remove state tracking |
 | `LUKS` | Yes | Take ownership, rotate passphrase | Remove state tracking |
 | `REPOSITORY` | Yes | Add/update repository | Remove repository |
+| `WIFI` | Yes | Create/update NetworkManager profile | Delete profile and EAP-TLS certificates |
 | `SHELL` | No | Execute script | Execute script (same) |
 | `UPDATE` | No | Run update | Run update (same) |
 | `SYSTEMD` | No | Uses `SystemdUnitState` | Uses `SystemdUnitState` |
@@ -555,6 +558,7 @@ The agent prevents actions from modifying its own infrastructure:
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
 - **mTLS**: After registration, the agent connects to the Gateway using mutual TLS with certificates signed by the Control Server CA
 - **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
+- **Trust roots — control server vs gateway asymmetry**: Every gateway-bound RPC validates the gateway certificate against the **internal CA** that signed the agent's own certificate (i.e., `WithMTLSFromPEM`). The Control Server's `RenewCertificate` RPC is the one exception: it validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because the control server typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
 - **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id
 
 ### Enrollment Rate Limiting

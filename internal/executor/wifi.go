@@ -36,13 +36,31 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 	certDir := wifiCertPath(actionID)
 
 	if state == pb.DesiredState_DESIRED_STATE_ABSENT {
+		// Audit F055: previously always reported `changed=true`, even
+		// when the connection did not exist before this call. That
+		// surfaced spurious "wifi changed" events to the server on
+		// every re-apply of an already-absent action. Probe with
+		// ConnectionExists first so the result reflects reality.
+		// Pattern matches the DNF/Zypper repository ABSENT branches
+		// in action_repository.go which also short-circuit when the
+		// resource is already gone.
+		existed, existsErr := network.ConnectionExists(ctx, conName)
+		if existsErr != nil {
+			e.logger.Warn("wifi ABSENT: ConnectionExists failed; conservatively reporting changed=true",
+				"connection", conName, "error", existsErr)
+			existed = true
+		}
 		if err := network.Delete(ctx, conName, certDir); err != nil {
 			return nil, false, fmt.Errorf("delete connection: %w", err)
 		}
+		stdout := fmt.Sprintf("connection %s already absent\n", conName)
+		if existed {
+			stdout = fmt.Sprintf("removed connection %s\n", conName)
+		}
 		return &pb.CommandOutput{
 			ExitCode: 0,
-			Stdout:   fmt.Sprintf("removed connection %s\n", conName),
-		}, true, nil
+			Stdout:   stdout,
+		}, existed, nil
 	}
 
 	profile := network.WiFiProfile{

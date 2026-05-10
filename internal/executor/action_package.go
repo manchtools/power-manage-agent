@@ -124,7 +124,14 @@ func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams,
 		return out, false, err
 	}
 	e.repairPackageManager(ctx)
-	e.ensurePackageUnpinned(pkgName)
+	// Audit F061: previously the unpin error was discarded silently —
+	// a pinned package's removal would surface as the package
+	// manager's "held" message instead of the underlying unpin
+	// failure. Log so the operator can correlate.
+	if _, err := e.ensurePackageUnpinned(pkgName); err != nil {
+		e.logger.Warn("ensurePackageAbsent: failed to unpin package before removal",
+			"package", pkgName, "error", err)
+	}
 	result, err := e.pkgManager.Remove(pkgName).Run()
 	return packageResult(result, err)
 }

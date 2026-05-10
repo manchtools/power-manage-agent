@@ -168,6 +168,13 @@ type Executor struct {
 	store        *store.Store
 	actionStore  ActionStore
 	updateCfg    *AgentUpdateConfig
+
+	// Per-cycle AGENT_UPDATE dedup. Audit F042 + F048: previously
+	// package-level globals which made parallel tests serialise on
+	// one mutex and let a future second Executor share state with
+	// production. Now scoped per-instance.
+	agentUpdateExecutedMu sync.Mutex
+	agentUpdateExecuted   bool
 }
 
 // NewExecutor creates a new action executor.
@@ -249,6 +256,16 @@ func (e *Executor) getStore() *store.Store {
 	e.mu.RLock()
 	defer e.mu.RUnlock()
 	return e.store
+}
+
+// getActionStore returns the action store used for LUKS conflict
+// resolution (thread-safe). Audit F003: the LUKS executor used to
+// read e.actionStore directly, bypassing e.mu and racing against
+// SetActionStore — route the read through this accessor instead.
+func (e *Executor) getActionStore() ActionStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.actionStore
 }
 
 // Execute runs an action and returns the result.

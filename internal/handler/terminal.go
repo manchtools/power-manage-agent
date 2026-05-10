@@ -114,6 +114,11 @@ func (ts *terminalSession) isStopping() bool {
 // into the handler. Must be called once after the Client is created
 // and before the stream loop dispatches the first TerminalStart
 // message. Calling it twice replaces the previous sender.
+//
+// On the first call it also starts the idle-session sweeper goroutine
+// in the background. Call StopTerminalSweeper at agent shutdown to
+// stop the sweeper — without that, a Handler kept alive in tests would
+// leak the goroutine forever (audit F004).
 func (h *Handler) SetTerminalSender(sender TerminalSender) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -129,8 +134,31 @@ func (h *Handler) SetTerminalSender(sender TerminalSender) {
 	}
 	if !h.terminalSweeperStarted {
 		h.terminalSweeperStarted = true
-		go h.terminalSweepLoop()
+		h.terminalSweeperStop = make(chan struct{})
+		stopCh := h.terminalSweeperStop
+		go h.terminalSweepLoop(stopCh)
 	}
+}
+
+// StopTerminalSweeper stops the idle-session sweeper goroutine started
+// by the first SetTerminalSender call. Idempotent: safe to call before
+// the sweeper has been started or after it has already stopped. Audit
+// F004: tests that GC a Handler used to leak the sweeper forever.
+func (h *Handler) StopTerminalSweeper() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.terminalSweeperStarted {
+		return
+	}
+	if h.terminalSweeperStop == nil {
+		return
+	}
+	// Closing a nil channel panics; closing a closed channel also
+	// panics — guard with the started/stop fields above and nil out
+	// after close so a second call is a no-op.
+	close(h.terminalSweeperStop)
+	h.terminalSweeperStop = nil
+	h.terminalSweeperStarted = false
 }
 
 // snapshotTerminalSender returns the currently-installed sender under
@@ -496,7 +524,16 @@ func (h *Handler) pumpTerminalOutput(sessionCtx context.Context, ts *terminalSes
 			State:     pb.TerminalSessionState_TERMINAL_SESSION_STATE_EXITED,
 			ExitCode:  int32(exitCode),
 		}
-		if err := ts.sender.SendTerminalStateChange(context.Background(), state); err != nil {
+		// Bound the EXITED-state send so a hung/unresponsive gateway
+		// peer cannot wedge this goroutine forever, holding the
+		// terminal-limit slot and blocking new sessions. Audit F053:
+		// previously context.Background() with no timeout. closeTerminal
+		// (below) is local cleanup that has to run regardless of ctx
+		// cancellation, so it stays on Background.
+		sendCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		err := ts.sender.SendTerminalStateChange(sendCtx, state)
+		cancel()
+		if err != nil {
 			h.logger.Warn("failed to send EXITED state change",
 				"session_id", ts.id, "error", err)
 		}
@@ -571,6 +608,12 @@ func (h *Handler) failTerminalStart(ctx context.Context, sender TerminalSender, 
 // OnTerminalStart on its next state check, because Start owns the
 // list of "what has been applied so far".
 func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
+	// Audit F045: log which path triggered the close so post-cleanup
+	// logs can distinguish sweeper-vs-stop-vs-pump-failure. Reason
+	// was previously discarded with `_ = reason` at the bottom.
+	h.logger.Debug("closeTerminal entered",
+		"session_id", sessionID, "reason", reason)
+
 	h.mu.Lock()
 	ts, ok := h.terminals[sessionID]
 	h.mu.Unlock()
@@ -634,7 +677,6 @@ func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
 				"session_id", sessionID, "path", tempHome, "error", err)
 		}
 	}
-	_ = reason
 }
 
 // anySessionForUserExcept reports whether any active session in the
@@ -677,14 +719,21 @@ func (h *Handler) removeTerminal(sessionID string) {
 	h.mu.Unlock()
 }
 
-// terminalSweepLoop runs forever, closing any session that has been
-// idle longer than the configured timeout. Started lazily on the
-// first SetTerminalSender call.
-func (h *Handler) terminalSweepLoop() {
+// terminalSweepLoop closes any session that has been idle longer than
+// the configured timeout. Started lazily on the first SetTerminalSender
+// call; exits when stopCh is closed (StopTerminalSweeper). Audit F004:
+// previously a `for range t.C` loop with no exit, leaking the goroutine
+// on Handler GC in tests.
+func (h *Handler) terminalSweepLoop(stopCh <-chan struct{}) {
 	t := time.NewTicker(terminalSweepInterval)
 	defer t.Stop()
-	for range t.C {
-		h.sweepIdleTerminals()
+	for {
+		select {
+		case <-stopCh:
+			return
+		case <-t.C:
+			h.sweepIdleTerminals()
+		}
 	}
 }
 
