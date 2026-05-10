@@ -4,6 +4,7 @@ package store
 
 import (
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
@@ -24,6 +25,13 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store/migrations"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
+
+// cronParser is constructed once at package init instead of per-call
+// inside calculateNextExecuteFromSchedule / calculateNextExecute, both
+// of which run inside the scheduler's tick-frequency hot loop. Audit
+// F044: cron.NewParser is cheap but not free, and the previous shape
+// allocated a new parser on every action evaluation.
+var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
 
 // Store manages persistent storage for actions and execution results.
 type Store struct {
@@ -86,7 +94,14 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Enable WAL mode for better concurrent access
+	// Enable WAL mode. NOTE: the Store also serializes all SQL
+	// through a Go-level RWMutex (s.mu), so WAL's reader/writer
+	// concurrency does not currently translate into actual Go-level
+	// concurrency — writes block reads at the application layer
+	// regardless. WAL is still worth having for crash safety and
+	// fewer fsyncs, but a future pass that drops s.mu in favour of
+	// modernc.org/sqlite's per-conn locking would unlock the real
+	// benefit. Audit F021.
 	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("enable WAL mode: %w", err)
@@ -98,6 +113,11 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	goose.SetBaseFS(migrations.FS)
+	// Audit F009: goose's dialect name is the legacy "sqlite3" even
+	// though the registered driver is "sqlite" (modernc.org/sqlite).
+	// The discrepancy is intentional — both are correct for their
+	// respective libraries — but called out here so the next reader
+	// doesn't try to "fix" the mismatch.
 	if err := goose.SetDialect("sqlite3"); err != nil {
 		db.Close()
 		return nil, fmt.Errorf("set goose dialect: %w", err)
@@ -337,7 +357,20 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		}
 	}
 
-	resultID := fmt.Sprintf("%s-%d", actionID, now.UnixNano())
+	// Append a random suffix to avoid collisions when the same action
+	// fires twice in the same nanosecond (high-precision clocks +
+	// retries can race to the same UnixNano value). Audit F035.
+	var randSuffix [4]byte
+	if _, err := rand.Read(randSuffix[:]); err != nil {
+		// crypto/rand on a healthy Linux box doesn't fail; if it
+		// does, fall back to a constant suffix so we still get a
+		// unique-per-nanosecond ID instead of crashing the result
+		// recorder. Logged so the operator notices a system-wide
+		// entropy source failure.
+		slog.Warn("crypto/rand failed in result-id generation; falling back to time-only id",
+			"error", err)
+	}
+	resultID := fmt.Sprintf("%s-%d-%s", actionID, now.UnixNano(), hex.EncodeToString(randSuffix[:]))
 
 	tx, err := s.db.Begin()
 	if err != nil {
@@ -990,8 +1023,7 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 		return now
 	}
 	if schedule.Cron != "" {
-		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-		sched, err := parser.Parse(schedule.Cron)
+		sched, err := cronParser.Parse(schedule.Cron)
 		if err == nil {
 			return sched.Next(now.Local()).UTC()
 		}
@@ -1059,8 +1091,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	// Cron expressions run in the device's local timezone, so we use
 	// local time as input and convert the result to UTC for storage.
 	if schedule.Cron != "" {
-		parser := cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month | cron.Dow)
-		sched, err := parser.Parse(schedule.Cron)
+		sched, err := cronParser.Parse(schedule.Cron)
 		if err == nil {
 			localNow := now.Local()
 			return sched.Next(localNow).UTC()
