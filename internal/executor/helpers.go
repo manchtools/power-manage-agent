@@ -156,7 +156,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 				changed = true
 			}
 		}
-		if err := sysuser.GroupDelete(ctx, groupName); err != nil {
+		if _, err := sysuser.GroupDelete(ctx, groupName); err != nil {
 			return changed, fmt.Errorf("delete group %s: %w", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))

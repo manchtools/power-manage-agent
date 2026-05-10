@@ -1,6 +1,6 @@
 module github.com/manchtools/power-manage/agent
 
-go 1.25
+go 1.25.0
 
 require (
 	connectrpc.com/connect v1.18.1
@@ -9,8 +9,8 @@ require (
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/crypto v0.47.0
-	golang.org/x/term v0.40.0
+	golang.org/x/crypto v0.50.0
+	golang.org/x/term v0.42.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.44.3
 )
@@ -21,7 +21,16 @@ require (
 // whatever happens to be in a local ../sdk checkout. Developers who
 // want to iterate against a local SDK override this with a per-dev
 // go.work at their workspace root — see agent/README.md for setup.
-replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260509150403-fedab9d3ade5
+//
+// Pin lifecycle (audit F034): this hash is bumped manually after the
+// SDK PR that introduces a new server-visible behaviour merges. The
+// agent maintainer runs `go get
+// github.com/manchtools/power-manage-sdk@<commit>` and commits the
+// resulting go.mod/go.sum together with the agent change that consumes
+// it. There is no automatic floating tag — that's intentional, because
+// SDK proto/Go API drifts between commits should be reviewable in the
+// same PR as the agent change that consumes them.
+replace github.com/manchtools/power-manage/sdk => ../sdk
 
 require (
 	github.com/creack/pty v1.1.24 // indirect
@@ -42,10 +51,10 @@ require (
 	github.com/sethvargo/go-retry v0.3.0 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20251023183803-a4bb9ffd2546 // indirect
-	golang.org/x/net v0.49.0 // indirect
-	golang.org/x/sync v0.19.0 // indirect
-	golang.org/x/sys v0.41.0 // indirect
-	golang.org/x/text v0.33.0 // indirect
+	golang.org/x/net v0.53.0 // indirect
+	golang.org/x/sync v0.20.0 // indirect
+	golang.org/x/sys v0.43.0 // indirect
+	golang.org/x/text v0.36.0 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect
 	modernc.org/libc v1.67.6 // indirect
 	modernc.org/mathutil v1.7.1 // indirect

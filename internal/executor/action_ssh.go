@@ -171,7 +171,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if err := sysuser.GroupCreate(ctx, groupName); err != nil {
+		if _, err := sysuser.GroupCreate(ctx, groupName); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
