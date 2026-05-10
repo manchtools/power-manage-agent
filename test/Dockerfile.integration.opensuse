@@ -1,5 +1,5 @@
 # Stage 1: Get Go toolchain + pre-download modules
-FROM golang:1.25-bookworm AS go-builder
+FROM golang:1.26-bookworm AS go-builder
 WORKDIR /workspace
 COPY agent/ ./agent/
 # Single-module go.work so `go test ./agent/...` works from /workspace
