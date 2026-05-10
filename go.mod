@@ -1,6 +1,6 @@
 module github.com/manchtools/power-manage/agent
 
-go 1.25.0
+go 1.25.10
 
 require (
 	connectrpc.com/connect v1.18.1
@@ -30,7 +30,7 @@ require (
 // it. There is no automatic floating tag — that's intentional, because
 // SDK proto/Go API drifts between commits should be reviewable in the
 // same PR as the agent change that consumes them.
-replace github.com/manchtools/power-manage/sdk => ../sdk
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260510104607-3bfd7be9fb42
 
 require (
 	github.com/creack/pty v1.1.24 // indirect

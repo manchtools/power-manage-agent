@@ -163,7 +163,7 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 	var outputCallback executor.OutputCallback
 	if sendChunk != nil {
 		executionID := action.Id.Value
-		outputCallback = func(streamType int, line string, seq int64) {
+		outputCallback = func(streamType sysexec.StreamType, line string, seq int64) {
 			chunk := &pb.OutputChunk{
 				ExecutionId: executionID,
 				Stream:      pb.OutputStreamType(streamType),
