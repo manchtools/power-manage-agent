@@ -20,10 +20,24 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
+
+// init mirrors the agent's runtime privilege-backend selection so the
+// integration suite exercises the same dispatcher branch as production.
+// When the test process is already root (the post-rewire default —
+// containers no longer set up a power-manage user), use the no-escalation
+// root backend so privileged calls don't depend on per-distro sudoers
+// quirks (notably openSUSE Tumbleweed's default /etc/sudoers excludes
+// root, breaking every `sudo -n cmd` invocation).
+func init() {
+	if os.Geteuid() == 0 {
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+	}
+}
 
 // =============================================================================
 // Test Helpers
@@ -263,9 +277,18 @@ func cleanupTestGroup(t *testing.T, groupName string) {
 	sudoRun("groupdel", groupName).Run()
 }
 
-// sudoRun creates an exec.Cmd that runs a command via sudo -n.
-// Used by test setup/cleanup to match production's sudo-based execution.
+// sudoRun creates an exec.Cmd for a privileged setup/cleanup step.
+// Mirrors the agent's runtime privilege backend selection: when the
+// test process is already root (the post-rewire default — production
+// agent runs as root via systemd User=root), exec the command
+// directly. Otherwise wrap with `sudo -n`. The direct path matters on
+// distros (notably openSUSE Tumbleweed) whose default /etc/sudoers
+// excludes root, so `sudo -n cmd` would fail with "root is not in the
+// sudoers file" on every invocation.
 func sudoRun(name string, args ...string) *exec.Cmd {
+	if os.Geteuid() == 0 {
+		return exec.Command(name, args...)
+	}
 	sudoArgs := append([]string{"-n", name}, args...)
 	return exec.Command("sudo", sudoArgs...)
 }
