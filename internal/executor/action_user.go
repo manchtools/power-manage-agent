@@ -12,6 +12,7 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
 	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
 )
 
@@ -564,40 +565,25 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
-	// Write authorized_keys atomically via a sudo-escalated install(1).
-	// install replaces the destination in one syscall after copying the
-	// source content, applying mode + owner + group up-front; -T forces
-	// the destination to be treated as a file path (so a directory at
-	// the destination doesn't get the file copied INTO it). The temp
-	// source lives under /tmp where the agent process can always
-	// write, regardless of whether the agent runs as root or via the
-	// sudoers escalation model — sysoers mode is the chosen 2026.06
-	// architecture (see project_2026_06_design_decisions.md #1) so
-	// directly writing under the user's 700 .ssh dir from the agent
-	// process is not viable.
-	//
+	// Write authorized_keys file via the SDK's SafeReplaceFile (F022).
 	// The previous shape (`mkdir -p` → `chown` → sudo `tee` → `chown`)
 	// followed symlinks at the tee step: a local user able to plant a
 	// symlink at ~/.ssh/authorized_keys between the chown and the tee
-	// could redirect the write to e.g. /etc/cron.d/root. install -T
-	// closes that vector by refusing to write through a symlink-loop
-	// directory mismatch and by setting the destination's metadata in
-	// the same call instead of a separate chown round-trip.
-	tmpFile, err := os.CreateTemp("", "agent-authorized-keys-")
-	if err != nil {
-		return false, fmt.Errorf("failed to create temp authorized_keys: %w", err)
+	// could redirect the write to e.g. /etc/cron.d/root. SafeReplaceFile
+	// reopens its temp file with O_NOFOLLOW after CreateTemp and uses
+	// renameat2 RENAME_NOREPLACE on Linux, closing both the open-side
+	// and the rename-side of the symlink race. The agent runs as root
+	// (post root-mode rewire), so it can write to the user's home
+	// directly without a sudo'd helper.
+	if err := sysfs.SafeReplaceFile(authKeysFile, []byte(desiredContent), 0o600, true); err != nil {
+		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
-	tmpPath := tmpFile.Name()
-	defer os.Remove(tmpPath)
-	if _, err := tmpFile.WriteString(desiredContent); err != nil {
-		tmpFile.Close()
-		return false, fmt.Errorf("failed to write temp authorized_keys: %w", err)
-	}
-	if err := tmpFile.Close(); err != nil {
-		return false, fmt.Errorf("failed to close temp authorized_keys: %w", err)
-	}
-	if _, err := runSudoCmd(ctx, "install", "-m", "600", "-o", params.Username, "-g", homeGroupFor(params), "-T", tmpPath, authKeysFile); err != nil {
-		return false, fmt.Errorf("failed to install authorized_keys: %w", err)
+
+	// Set ownership on authorized_keys. SafeReplaceFile leaves the
+	// file owned by the agent process (root); a separate chown brings
+	// it back to the target user without re-introducing the tee race.
+	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
+		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 
 	output.WriteString(fmt.Sprintf("configured %d SSH authorized key(s)\n", validKeyCount))

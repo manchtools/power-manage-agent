@@ -152,7 +152,7 @@ URI Parameters:
 |------------|-------------|
 | `enroll` | Enroll the agent via the enrollment socket (no sudo required). Supports `-s`/`-t` shorthand flags. |
 | `version` | Print agent version |
-| `setup` | Install sudoers configuration |
+| `setup` | No-op deprecation notice (agent now runs as root; see Security section) |
 | `query` | Query system information via osquery |
 | `luks` | LUKS passphrase management |
 | `tty` | Manage the device-local remote terminal toggle (`enable` / `disable` / `status`) |
@@ -525,32 +525,22 @@ The agent automatically detects the system's package manager:
 
 ## Security
 
-### Dedicated Service User
+### Runs as root
 
-The agent runs as a dedicated `power-manage` system user with restricted sudo access. The install script (`power-manage-agent setup`) creates:
+The agent runs as `root` (systemd `User=root`). The previous "dedicated `power-manage` user with sudoers escalation" model has been retired — every privileged operation now runs in-process without a `sudo -n` round-trip, eliminating the sudoers drop-in as both an attack surface and a per-distro install / validate / packaging burden.
 
-- A `power-manage` system user with `/usr/sbin/nologin` shell (added to `systemd-journal` group for log access)
-- A sudoers policy at `/etc/sudoers.d/power-manage` granting access only to specific commands
+The `power-manage-agent setup` subcommand still exists for backwards compatibility but is a no-op deprecation notice; legacy operator scripts that invoke it keep working without erroring. Operators upgrading from the sudoers-mode build should:
 
-The sudoers template (`internal/setup/sudoers.tmpl`) restricts access to:
-- Package managers (apt, dnf, pacman, zypper, flatpak)
-- Systemd service management (start, stop, restart, reload, enable, disable, status, daemon-reload)
-- File operations (tee, chown, chmod, mkdir, rm, cp, mv, cat)
-- System information (ss, lsof)
-- Process management (pkill, loginctl)
-- User/group management (useradd, usermod, userdel, groupadd, groupdel, gpasswd, chpasswd, chage, getent)
-- Sudoers/SSHD validation (visudo, sshd)
-- Shell execution for `run_as_root` scripts (bash, sh)
-- Filesystem repair (mount -o remount,rw /)
-- System power management (shutdown)
-- LUKS disk encryption management (cryptsetup)
+1. Remove `/etc/sudoers.d/power-manage` (or `/etc/doas.d/power-manage.conf`) left over from the previous install.
+2. Update the systemd unit's `User=` to `root` (was `power-manage`).
+3. The `power-manage` system user can be deleted if no other tooling depends on it.
 
-All privileged commands are executed via `sudo -n` with absolute paths for sudoers matching. The agent itself never runs as root.
+The privileged-operation surface is the same as before — package managers, systemd unit lifecycle, file/user/group management, LUKS, etc. — it just no longer tunnels through `sudo`.
 
 ### Self-Protection
 
 The agent prevents actions from modifying its own infrastructure:
-- The `power-manage` user and group cannot be deleted via USER/GROUP actions
+- The `power-manage` user and group cannot be deleted via USER/GROUP actions (defensive holdover from the sudoers-mode era — harmless if neither exists)
 - This prevents accidental self-destruction through misconfigured actions
 
 ### Network Security
@@ -760,7 +750,7 @@ The release workflow (`.github/workflows/release.yml`) gates binary builds on pa
 
 ## Integration Test Suite
 
-The test suite (`internal/executor/integration_test.go`, ~3,500 lines) exercises the executor against real system state inside containerized environments. Each test container mimics the production setup: a `power-manage` system user with the real sudoers template from `internal/setup/sudoers.tmpl`, so any missing sudo permission causes an immediate test failure.
+The test suite (`internal/executor/integration_test.go`, ~3,500 lines) exercises the executor against real system state inside containerized environments. Each test container mirrors production: tests run as `root` directly, the same way the agent runs in production (systemd `User=root`).
 
 ### Test Containers
 
@@ -768,21 +758,18 @@ Each distro has its own Dockerfile in `test/`:
 
 | Container | Dockerfile | Base Image | Package Manager |
 |-----------|------------|------------|-----------------|
-| Debian | `Dockerfile.integration` | `golang:1.25-bookworm` | apt |
-| Fedora | `Dockerfile.integration.fedora` | `fedora:latest` | dnf |
+| Debian | `Dockerfile.integration` | `golang:1.26-bookworm` | apt |
+| Fedora | `Dockerfile.integration.fedora` | `fedora:42` | dnf |
 | openSUSE | `Dockerfile.integration.opensuse` | `opensuse/tumbleweed` | zypper |
-| Arch Linux | `Dockerfile.integration.archlinux` | `archlinux:base` | pacman |
+| Arch Linux | `Dockerfile.integration.archlinux` | `archlinux:latest` | pacman |
 
 Container setup:
 1. Install Go toolchain and test dependencies
-2. Create `power-manage` system user (matching production)
-3. Install the real sudoers template rendered with `sed 's/{{.User}}/power-manage/g'`
-4. Install test-only sudoers for mount/umount/chattr (edge case tests only)
-5. Create LPS state directory owned by `power-manage`
-6. Set up SSHD host keys and config directory for validation tests
-7. Pre-download Go module dependencies
+2. Create LPS state directory under `/var/lib/power-manage/` (root-owned)
+3. Set up SSHD host keys and config directory for validation tests
+4. Pre-download Go module dependencies
 
-Tests run via `runuser -u power-manage -- go test ...`, so every privileged operation must go through sudo, exactly as in production.
+Tests run via `gotestsum ...` directly as root — same execution context as the production systemd unit.
 
 ### Core Action Tests
 

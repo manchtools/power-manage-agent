@@ -1,16 +1,15 @@
 FROM golang:1.26-bookworm
 
+# Agent runs as root in production (systemd User=root) — no power-manage
+# user, no sudoers drop-in. Integration tests run as root too so they
+# exercise the same code path.
+
 RUN apt-get update && apt-get install -y \
     sudo \
     gpg \
     openssh-server \
     systemd \
     && rm -rf /var/lib/apt/lists/*
-
-# Create power-manage user (matches production setup)
-RUN useradd --system --no-create-home --shell /usr/sbin/nologin power-manage && \
-    mkdir -p /home/power-manage && \
-    chown power-manage:power-manage /home/power-manage
 
 # sshd_config.d directory + host keys for sshd -t validation
 RUN mkdir -p /etc/ssh/sshd_config.d && ssh-keygen -A
@@ -19,9 +18,8 @@ RUN mkdir -p /etc/ssh/sshd_config.d && ssh-keygen -A
 RUN grep -q 'Include /etc/ssh/sshd_config.d' /etc/ssh/sshd_config || \
     echo 'Include /etc/ssh/sshd_config.d/*.conf' >> /etc/ssh/sshd_config
 
-# LPS state directory (owned by power-manage, matches production)
-RUN mkdir -p /var/lib/power-manage/lps && \
-    chown -R power-manage:power-manage /var/lib/power-manage
+# LPS state directory (root-owned, matches production)
+RUN mkdir -p /var/lib/power-manage/lps
 
 # sshd privilege separation directory (needed by sshd -t)
 RUN mkdir -p /run/sshd
@@ -42,17 +40,3 @@ RUN printf 'go 1.25.10\n\nuse (\n\t./agent\n)\n' > go.work
 # Pre-download dependencies and install gotestsum for clear failure reporting
 RUN cd agent && go mod download
 RUN go install gotest.tools/gotestsum@latest
-
-# Install real sudoers from production template (single source of truth)
-RUN sed 's/{{.User}}/power-manage/g' agent/internal/setup/sudoers.tmpl \
-      > /etc/sudoers.d/power-manage && \
-    chmod 0440 /etc/sudoers.d/power-manage && \
-    visudo -c -f /etc/sudoers.d/power-manage
-
-# Test-only sudoers: mount/umount for privileged edge case tests (NOT in production template)
-RUN printf 'power-manage ALL=(root) NOPASSWD: /usr/bin/mount *, /bin/mount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/umount *, /bin/umount *\npower-manage ALL=(root) NOPASSWD: /usr/bin/chattr *, /bin/chattr *\n' \
-      > /etc/sudoers.d/power-manage-test && \
-    chmod 0440 /etc/sudoers.d/power-manage-test
-
-# Own workspace and Go caches so power-manage user can compile tests
-RUN chown -R power-manage:power-manage /workspace /home/power-manage
