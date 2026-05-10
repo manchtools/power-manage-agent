@@ -13,8 +13,9 @@ import (
 
 // mockExecutor records all Execute calls for test assertions.
 type mockExecutor struct {
-	mu    sync.Mutex
-	calls []*pb.Action
+	mu     sync.Mutex
+	calls  []*pb.Action
+	resets int
 }
 
 func (m *mockExecutor) Execute(_ context.Context, action *pb.Action) *pb.ActionResult {
@@ -25,6 +26,16 @@ func (m *mockExecutor) Execute(_ context.Context, action *pb.Action) *pb.ActionR
 		ActionId: action.Id,
 		Status:   pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
 	}
+}
+
+// ResetUpdateCycle satisfies the ActionExecutor interface. The
+// scheduler calls this at each runDueActions / ForceExecute / SyncActions
+// to clear the per-cycle AGENT_UPDATE dedup flag (audit F042 + F048).
+// The mock just counts calls so tests can assert the contract.
+func (m *mockExecutor) ResetUpdateCycle() {
+	m.mu.Lock()
+	m.resets++
+	m.mu.Unlock()
 }
 
 func (m *mockExecutor) getCalls() []*pb.Action {

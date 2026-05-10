@@ -44,6 +44,7 @@ type Handler struct {
 	terminalLimit          int
 	terminalIdleTimeout    time.Duration
 	terminalSweeperStarted bool
+	terminalSweeperStop    chan struct{} // closed by StopTerminalSweeper to stop the sweep loop
 }
 
 // NewHandler creates a new stream handler.

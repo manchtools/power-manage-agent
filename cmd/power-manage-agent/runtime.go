@@ -19,7 +19,13 @@ import (
 // The agent continues to run scheduled actions even when disconnected.
 // If securityAlert is non-nil, it will be sent to the server after connection.
 func runAgent(ctx context.Context, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
-	// Current sync interval (can be updated by server)
+	// Current sync interval (can be updated by server). Owned by
+	// runAgent — periodicSync receives its initial value as a
+	// stack-local copy and any subsequent updates over a channel.
+	// The previous shape (`*time.Duration` shared between this loop
+	// and periodicSync) was a write-from-two-goroutines race that
+	// `go test -race` did not catch because no test exercises this
+	// loop. Audit F002.
 	syncInterval := defaultSyncInterval
 
 	// Track if this is the first successful sync (execute all actions)
@@ -86,11 +92,19 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 			securityAlert = nil
 		}
 
-		// Start periodic sync goroutine (also listens for instant sync triggers)
+		// Channel for sending interval updates to periodicSync.
+		// Buffered so the parent never blocks if periodicSync is mid-tick.
+		intervalUpdates := make(chan time.Duration, 1)
+
+		// Start periodic sync goroutine (also listens for instant sync
+		// triggers). It reports any server-driven interval changes
+		// back over intervalUpdatesOut so the parent loop can carry
+		// the latest value forward into the next reconnect.
+		intervalUpdatesOut := make(chan time.Duration, 1)
 		syncDone := make(chan struct{})
 		go func() {
 			defer close(syncDone)
-			periodicSync(sessionCtx, client, sched, &syncInterval, syncTrigger, logger)
+			periodicSync(sessionCtx, client, sched, syncInterval, intervalUpdates, intervalUpdatesOut, syncTrigger, logger)
 		}()
 
 		// Start result sender goroutine to send scheduled execution results to server
@@ -100,15 +114,27 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 			sendScheduledResults(sessionCtx, client, sched, logger)
 		}()
 
-		// Wait for the stream to end
+		// Wait for the stream to end. Drain any interval updates the
+		// child reports during the session so the parent's
+		// `syncInterval` carries the latest value into the next
+		// reconnect attempt.
 		connStart := time.Now()
-		err = <-streamDone
+		streamErr := waitForStreamEnd(streamDone, intervalUpdatesOut, &syncInterval)
+		err = streamErr
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
 		h.Executor().SetLuksKeyStore(nil)
 		<-syncDone
 		<-resultsDone
+
+		// Drain any interval-update the child sent after the stream
+		// closed but before sessionCtx propagated. Non-blocking.
+		select {
+		case updated := <-intervalUpdatesOut:
+			syncInterval = updated
+		default:
+		}
 
 		if ctx.Err() != nil {
 			logger.Info("agent stopped")
@@ -141,11 +167,45 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 	}
 }
 
+// waitForStreamEnd blocks until the SDK stream goroutine sends an
+// error on streamDone. While waiting it consumes any interval updates
+// reported by periodicSync, writing the latest value into *interval so
+// runAgent can carry it into the next reconnect attempt. Extracted so
+// the wait loop avoids labeled-break and stays a plain `for { select }`.
+func waitForStreamEnd(streamDone <-chan error, intervalUpdatesOut <-chan time.Duration, interval *time.Duration) error {
+	for {
+		select {
+		case err := <-streamDone:
+			return err
+		case updated := <-intervalUpdatesOut:
+			*interval = updated
+		}
+	}
+}
+
 // periodicSync runs a loop that periodically syncs actions from the server.
-// The interval can be dynamically updated based on server response.
-// Also listens on syncTrigger for instant sync requests.
-func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Scheduler, syncInterval *time.Duration, syncTrigger <-chan struct{}, logger *slog.Logger) {
-	ticker := time.NewTicker(*syncInterval)
+// The interval starts at initialInterval and can be updated by either:
+//   - the server (returned by syncActionsFromServer) — the new value is
+//     reported back over intervalUpdatesOut so runAgent can carry it into
+//     the next reconnect attempt;
+//   - the parent over intervalUpdates (currently unused, reserved for
+//     future "operator-overridden interval" hooks).
+//
+// Owning the interval as a stack-local closes the F002 shared-pointer
+// race; the previous shape passed `*time.Duration` to this goroutine
+// while runAgent kept writing the same address from its own goroutine.
+func periodicSync(
+	ctx context.Context,
+	client *sdk.Client,
+	sched *scheduler.Scheduler,
+	initialInterval time.Duration,
+	intervalUpdates <-chan time.Duration,
+	intervalUpdatesOut chan<- time.Duration,
+	syncTrigger <-chan struct{},
+	logger *slog.Logger,
+) {
+	syncInterval := initialInterval
+	ticker := time.NewTicker(syncInterval)
 	defer ticker.Stop()
 
 	logger.Info("periodic sync started", "interval", syncInterval.String())
@@ -153,10 +213,18 @@ func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Sche
 	doSync := func(reason string) {
 		logger.Info("syncing actions", "reason", reason)
 		newInterval := syncActionsFromServer(ctx, client, sched, false, logger)
-		if newInterval > 0 && newInterval != *syncInterval {
-			*syncInterval = newInterval
-			ticker.Reset(*syncInterval)
+		if newInterval > 0 && newInterval != syncInterval {
+			syncInterval = newInterval
+			ticker.Reset(syncInterval)
 			logger.Info("sync interval updated", "new_interval", syncInterval.String())
+			// Best-effort report back to runAgent — drop on full
+			// because the channel is buffered with 1 slot and a
+			// stale pending update would just be overwritten by
+			// the next one anyway.
+			select {
+			case intervalUpdatesOut <- syncInterval:
+			default:
+			}
 		}
 	}
 
@@ -169,6 +237,12 @@ func periodicSync(ctx context.Context, client *sdk.Client, sched *scheduler.Sche
 			doSync("periodic")
 		case <-syncTrigger:
 			doSync("instant action trigger")
+		case override := <-intervalUpdates:
+			if override > 0 && override != syncInterval {
+				syncInterval = override
+				ticker.Reset(syncInterval)
+				logger.Info("sync interval overridden", "new_interval", syncInterval.String())
+			}
 		}
 	}
 }

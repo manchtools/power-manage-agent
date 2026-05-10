@@ -295,6 +295,11 @@ func main() {
 	)
 
 	runAgent(ctx, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger)
+
+	// Stop background goroutines started during runAgent. The
+	// terminal sweeper would otherwise outlive the agent process in
+	// any non-os.Exit shutdown path (audit F004).
+	h.StopTerminalSweeper()
 }
 
 func parseFlags() *Config {

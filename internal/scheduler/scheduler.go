@@ -13,7 +13,6 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
-	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/maintenance"
@@ -29,6 +28,12 @@ const (
 // ActionExecutor is the interface for executing actions.
 type ActionExecutor interface {
 	Execute(ctx context.Context, action *pb.Action) *pb.ActionResult
+	// ResetUpdateCycle clears the per-cycle AGENT_UPDATE dedup
+	// flag on the executor instance so a new sync cycle can run an
+	// update again. Audit F042 + F048: replaces the previous
+	// package-level executor.ResetAgentUpdateCycle() global, which
+	// silently shared state across multiple executors.
+	ResetUpdateCycle()
 }
 
 // maintenanceWindowSettingKey is the agent-store settings key under
@@ -44,9 +49,19 @@ type Scheduler struct {
 	executor ActionExecutor
 	logger   *slog.Logger
 
-	mu        sync.RWMutex
-	running   bool
-	stopCh    chan struct{}
+	// mu guards Start/Stop transitions only. resultsCh is set once
+	// at construction in New() and is read on the receiver side
+	// without the lock — the lock here exists purely to make the
+	// running/stopCh state machine race-free, NOT to serialise
+	// access to the results channel. Audit F019: previously
+	// documented as "protects running, stopCh, resultsCh" which was
+	// misleading.
+	mu      sync.RWMutex
+	running bool
+	stopCh  chan struct{}
+
+	// resultsCh is created once in New and never reassigned, so it
+	// is safe to read/write without the lock from any goroutine.
 	resultsCh chan *ExecutionResult
 
 	// windowMu guards window. Separate from mu so a long Sync that
@@ -70,9 +85,15 @@ type ExecutionResult struct {
 // freeze keeps gating dispatches until the next sync overwrites it.
 func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Scheduler {
 	s := &Scheduler{
-		store:     store,
-		executor:  executor,
-		logger:    logger,
+		store:    store,
+		executor: executor,
+		logger:   logger,
+		// resultsCh buffer is sized for typical tick volume (one
+		// channel write per scheduled action result). When full,
+		// executeAction logs a Warn and continues — the result is
+		// still persisted to SQLite, so syncPendingResults will pick
+		// it up on the next reconnect. Audit F036: documented so the
+		// drop behaviour is visible to readers.
 		resultsCh: make(chan *ExecutionResult, 100),
 	}
 	if w, err := loadMaintenanceWindow(store); err != nil {
@@ -189,7 +210,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 }
 
-// Stop stops the scheduler.
+// Stop stops the scheduler. Safe to call multiple times and safe to
+// call on a never-Start()'d scheduler — both no-op without panicking.
+// Audit F020: a `close(s.stopCh)` on a nil channel previously panicked
+// when Stop was called before Start (e.g. during error-path shutdown).
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -197,8 +221,10 @@ func (s *Scheduler) Stop() {
 	if !s.running {
 		return
 	}
-
-	close(s.stopCh)
+	if s.stopCh != nil {
+		close(s.stopCh)
+		s.stopCh = nil
+	}
 	s.running = false
 }
 
@@ -293,7 +319,7 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 	}
 
 	// Reset the per-cycle agent update dedup flag.
-	executor.ResetAgentUpdateCycle()
+	s.executor.ResetUpdateCycle()
 
 	for _, stored := range actions {
 		select {
@@ -494,7 +520,7 @@ func (s *Scheduler) MarkResultSynced(resultID string) error {
 
 // ForceExecute immediately executes an action regardless of schedule.
 func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.ActionResult, error) {
-	executor.ResetAgentUpdateCycle()
+	s.executor.ResetUpdateCycle()
 	stored, err := s.store.GetAction(actionID)
 	if err != nil {
 		return nil, err
@@ -536,7 +562,7 @@ func (s *Scheduler) SyncActions(ctx context.Context, standalone []*pb.Action, gr
 	}
 
 	// Reset the per-cycle agent update dedup flag for the sync batch.
-	executor.ResetAgentUpdateCycle()
+	s.executor.ResetUpdateCycle()
 
 	s.logger.Info("syncing actions from server",
 		"standalone", len(standalone),
