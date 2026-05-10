@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log/slog"
 	"math/rand/v2"
+	"os"
 	osexec "os/exec"
 	"time"
 
@@ -31,28 +32,50 @@ func randomBackoff() time.Duration {
 // doas installed). Fail-fast at startup is cheaper than debugging a
 // "permission denied" on the first privileged call hours later.
 func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
-	// Privilege-escalation tool. sudo remains the default because
-	// every mainstream Linux distro ships it; doas is for OpenBSD-
-	// style setups and some BSD-influenced Linux deployments.
+	// Privilege-escalation tool. The agent now runs as root by default
+	// (systemd User=root, see agent/README.md "Runs as root"). When
+	// POWER_MANAGE_PRIVILEGE_BACKEND is unset and we detect uid 0,
+	// pick the no-escalation root backend so privileged calls dispatch
+	// directly without forking sudo (and without depending on per-distro
+	// quirks like openSUSE's default sudoers excluding root). Operators
+	// running the legacy sudoers/doas model can still set the env var
+	// explicitly and the previous behaviour is preserved.
 	var privilegeTool string
 	switch cfg.PrivilegeBackend {
+	case "root":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+		privilegeTool = ""
 	case "doas":
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
 		privilegeTool = "doas"
-	case "sudo", "":
+	case "sudo":
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
 		privilegeTool = "sudo"
+	case "":
+		if os.Geteuid() == 0 {
+			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+			privilegeTool = ""
+		} else {
+			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+			privilegeTool = "sudo"
+		}
 	default:
 		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo",
 			"value", cfg.PrivilegeBackend)
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
 		privilegeTool = "sudo"
 	}
-	if _, err := osexec.LookPath(privilegeTool); err != nil {
-		return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
-			privilegeTool, privilegeTool, err)
+	if privilegeTool == "" {
+		// Root backend has no external tool to look up — Privileged*
+		// dispatchers exec the resolved command directly.
+		logger.Info("privilege backend set", "backend", "root")
+	} else {
+		if _, err := osexec.LookPath(privilegeTool); err != nil {
+			return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
+				privilegeTool, privilegeTool, err)
+		}
+		logger.Info("privilege backend set", "backend", privilegeTool)
 	}
-	logger.Info("privilege backend set", "backend", privilegeTool)
 
 	// Service manager. Only systemd has a concrete implementation
 	// today; the other backends are scaffolded in the SDK so the
