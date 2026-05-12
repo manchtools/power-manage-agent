@@ -333,17 +333,17 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 			homeDir = "/home/" + params.Username
 		}
 		if _, err := os.Stat(homeDir); os.IsNotExist(err) {
-			if _, mkErr := runSudoCmd(ctx, "mkdir", "-p", homeDir); mkErr != nil {
+			if _, mkErr := runSudoCmd(ctx, "mkdir", "-p", "--", homeDir); mkErr != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
 			} else {
-				runSudoCmd(ctx, "cp", "-a", "/etc/skel/.", homeDir)
+				runSudoCmd(ctx, "cp", "-a", "--", "/etc/skel/.", homeDir)
 				if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
 					if chownResult != nil {
 						output.WriteString(chownResult.Stderr)
 					}
 				}
-				runSudoCmd(ctx, "chmod", "0700", homeDir)
+				runSudoCmd(ctx, "chmod", "0700", "--", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
 				changed = true
 			}
@@ -549,7 +549,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	}
 
 	// Create .ssh directory
-	if _, err := runSudoCmd(ctx, "mkdir", "-p", sshDir); err != nil {
+	if _, err := runSudoCmd(ctx, "mkdir", "-p", "--", sshDir); err != nil {
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
@@ -558,10 +558,10 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	// users created with Gid / PrimaryGroup don't end up with the wrong
 	// group on .ssh and fail authorized_keys writes.
 	ownership := params.Username + ":" + homeGroupFor(params)
-	if _, err := runSudoCmd(ctx, "chown", ownership, sshDir); err != nil {
+	if _, err := runSudoCmd(ctx, "chown", "--", ownership, sshDir); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "700", sshDir); err != nil {
+	if _, err := runSudoCmd(ctx, "chmod", "700", "--", sshDir); err != nil {
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
@@ -582,7 +582,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	// Set ownership on authorized_keys. SafeReplaceFile leaves the
 	// file owned by the agent process (root); a separate chown brings
 	// it back to the target user without re-introducing the tee race.
-	if _, err := runSudoCmd(ctx, "chown", ownership, authKeysFile); err != nil {
+	if _, err := runSudoCmd(ctx, "chown", "--", ownership, authKeysFile); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 

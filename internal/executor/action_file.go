@@ -71,7 +71,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 			// For managed block: read existing content and append block if not present
 			// Use sudo cat to read files with restrictive permissions
 			var existingContent []byte
-			if output, err := runSudoCmd(ctx, "cat", resolvedPath); err == nil {
+			if output, err := runSudoCmd(ctx, "cat", "--", resolvedPath); err == nil {
 				existingContent = []byte(output.Stdout)
 			} else if output != nil && strings.Contains(output.Stderr, "No such file") {
 				// File doesn't exist, that's fine
