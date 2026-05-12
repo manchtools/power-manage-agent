@@ -173,7 +173,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 					}
 					if keyPath != "" && strings.HasPrefix(keyPath, "/") {
 						output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-						if _, err := runSudoCmd(ctx, "rm", "-f", keyPath); err != nil {
+						if _, err := runSudoCmd(ctx, "rm", "-f", "--", keyPath); err != nil {
 							e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting GPG key",
 								"key_path", keyPath, "error", err)
 						}
@@ -195,7 +195,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 				}
 				if len(match) > 1 && strings.HasPrefix(keyPath, "/") {
 					output.WriteString(fmt.Sprintf("removing associated GPG key: %s\n", keyPath))
-					if _, err := runSudoCmd(ctx, "rm", "-f", keyPath); err != nil {
+					if _, err := runSudoCmd(ctx, "rm", "-f", "--", keyPath); err != nil {
 						e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting GPG key",
 							"key_path", keyPath, "error", err)
 					}
@@ -207,7 +207,7 @@ func (e *Executor) cleanupConflictingAptRepos(ctx context.Context, url, skipRepo
 		// stale config in /etc/apt/sources.list.d/ and the next apt
 		// update would still see the conflict — surface the error so
 		// the operator can clean it up manually.
-		if _, err := runSudoCmd(ctx, "rm", "-f", filePath); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", filePath); err != nil {
 			e.logger.Warn("cleanupConflictingAptRepos: failed to remove conflicting repo file",
 				"file_path", filePath, "error", err)
 		}
@@ -226,21 +226,21 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Remove repository file
-		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", repoFile); err != nil {
 			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		// Also try to remove legacy .list format. A failed rm here
 		// leaves a stale config that apt will still parse; surface
 		// to the operator instead of silently swallowing.
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
-		if _, err := runSudoCmd(ctx, "rm", "-f", legacyFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", legacyFile); err != nil {
 			e.logger.Warn("apt ABSENT: failed to remove legacy repo file",
 				"file", legacyFile, "error", err)
 		}
 		// Remove GPG key. A leftover key with no .sources file is
 		// inert today but a future re-apply would compare against
 		// the wrong fingerprint — log so the divergence is visible.
-		if _, err := runSudoCmd(ctx, "rm", "-f", keyFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", keyFile); err != nil {
 			e.logger.Warn("apt ABSENT: failed to remove GPG key",
 				"key_file", keyFile, "error", err)
 		}
@@ -266,7 +266,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		legacyFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.list", name)
 		if _, err := os.Stat(legacyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy repository file: %s\n", legacyFile))
-			if _, err := runSudoCmd(ctx, "rm", "-f", legacyFile); err != nil {
+			if _, err := runSudoCmd(ctx, "rm", "-f", "--", legacyFile); err != nil {
 				e.logger.Warn("apt PRESENT: failed to remove legacy repo file",
 					"file", legacyFile, "error", err)
 			}
@@ -276,7 +276,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		legacyKeyFile := fmt.Sprintf("/etc/apt/trusted.gpg.d/%s.gpg", name)
 		if _, err := os.Stat(legacyKeyFile); err == nil {
 			output.WriteString(fmt.Sprintf("removing legacy GPG key: %s\n", legacyKeyFile))
-			if _, err := runSudoCmd(ctx, "rm", "-f", legacyKeyFile); err != nil {
+			if _, err := runSudoCmd(ctx, "rm", "-f", "--", legacyKeyFile); err != nil {
 				e.logger.Warn("apt PRESENT: failed to remove legacy GPG key",
 					"key_file", legacyKeyFile, "error", err)
 			}
@@ -284,7 +284,7 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		}
 
 		// Ensure keyrings directory exists
-		if _, err := runSudoCmd(ctx, "mkdir", "-p", "/etc/apt/keyrings"); err != nil {
+		if _, err := runSudoCmd(ctx, "mkdir", "-p", "--", "/etc/apt/keyrings"); err != nil {
 			return nil, false, fmt.Errorf("failed to create keyrings directory: %w", err)
 		}
 
@@ -446,7 +446,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 		output.WriteString("GPG key not found, installing\n")
 	} else {
 		// Other error reading the file - try to read with sudo
-		cmdOutput, sudoErr := runSudoCmd(ctx, "cat", keyFile)
+		cmdOutput, sudoErr := runSudoCmd(ctx, "cat", "--", keyFile)
 		if sudoErr == nil && cmdOutput != nil {
 			if bytes.Equal([]byte(cmdOutput.Stdout), newKey) {
 				output.WriteString("GPG key already installed and matches\n")
@@ -459,7 +459,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 	}
 
 	// Copy the new key to the target location with sudo
-	_, err = runSudoCmd(ctx, "cp", tempPath, keyFile)
+	_, err = runSudoCmd(ctx, "cp", "--", tempPath, keyFile)
 	if err != nil {
 		return false, fmt.Errorf("failed to install GPG key: %w", err)
 	}
@@ -468,7 +468,7 @@ func (e *Executor) updateGpgKeyIfNeeded(ctx context.Context, keyFile, keyUrl, ke
 	// dpkg with "the file is unreadable to apt", which masquerades
 	// as a repository fetch problem on the next apt update — return
 	// the error so the operator sees the real cause.
-	if _, err := runSudoCmd(ctx, "chmod", "644", keyFile); err != nil {
+	if _, err := runSudoCmd(ctx, "chmod", "644", "--", keyFile); err != nil {
 		return false, fmt.Errorf("failed to chmod GPG key %s: %w", keyFile, err)
 	}
 
@@ -489,7 +489,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 			output.WriteString(fmt.Sprintf("repository %s already absent\n", name))
 			return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, false, nil
 		}
-		if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
+		if _, err := runSudoCmd(ctx, "rm", "-f", "--", repoFile); err != nil {
 			return nil, false, fmt.Errorf("failed to remove repo file: %w", err)
 		}
 		output.WriteString(fmt.Sprintf("removed repository: %s\n", name))
@@ -536,7 +536,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// (handles previous configurations with different settings).
 		if _, err := os.Stat(repoFile); err == nil {
 			output.WriteString(fmt.Sprintf("replacing existing repository: %s\n", name))
-			if _, err := runSudoCmd(ctx, "rm", "-f", repoFile); err != nil {
+			if _, err := runSudoCmd(ctx, "rm", "-f", "--", repoFile); err != nil {
 				e.logger.Warn("dnf PRESENT: failed to remove existing repo file before rewrite",
 					"file", repoFile, "error", err)
 			}
