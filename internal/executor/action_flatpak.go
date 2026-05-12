@@ -34,11 +34,21 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		remote = "flathub"
 	}
 
-	// Build base args - system-wide by default
-	systemFlag := "--system"
+	// Always install system-wide. Pre-fix #79 SystemWide=false routed
+	// to `flatpak --user`, but install/uninstall ran through sudo —
+	// `flatpak --user` resolves the installation against $HOME, and
+	// under sudo $HOME is /root, so apps landed in
+	// /root/.local/share/flatpak where no desktop user could see them.
+	// The agent isn't a desktop-session actor (it runs as a system
+	// service with no concept of "which desktop user"), so per-user
+	// installs are out of scope. Coerce SystemWide=false to a warning
+	// + system-wide so existing assignments don't silently break
+	// behavior when they upgrade across the fix.
 	if !params.SystemWide {
-		systemFlag = "--user"
+		e.logger.Warn("flatpak: SystemWide=false coerced to system-wide install — per-user flatpak is unsupported by the agent (it has no notion of which desktop user); update the assignment to SystemWide=true to silence this warning",
+			"app_id", params.AppId)
 	}
+	const systemFlag = "--system"
 
 	// Check if flatpak is installed
 	isInstalled := e.isFlatpakInstalled(params.AppId, systemFlag)

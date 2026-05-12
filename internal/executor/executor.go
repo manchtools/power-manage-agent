@@ -175,6 +175,16 @@ type Executor struct {
 	// production. Now scoped per-instance.
 	agentUpdateExecutedMu sync.Mutex
 	agentUpdateExecuted   bool
+
+	// Per-action LUKS rotation-timestamp persistence failure counter.
+	// Tracks consecutive SetLuksLastRotatedAt failures per action ID
+	// so the agent escalates from Warn to Error after
+	// luksTimestampFailureThreshold consecutive failures (#80). The
+	// failure mode it surfaces — silent rotation hot-loop or rotation
+	// never starting because the timestamp never persists — was easy
+	// to miss when buried in journald Warn-level lines.
+	luksTimestampFailMu    sync.Mutex
+	luksTimestampFailCount map[string]int
 }
 
 // NewExecutor creates a new action executor.

@@ -19,6 +19,60 @@ type LuksKeyStore interface {
 	StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error
 }
 
+// luksTimestampFailureThreshold is the consecutive-failure count after
+// which the agent escalates SetLuksLastRotatedAt persistence failures
+// from Warn to Error. Per #80 the operational risk is a silent
+// rotation hot-loop (post-rotation timestamp never persists, so the
+// next tick re-rotates) or rotation that never starts (initial
+// timestamp never persists, so every tick re-enters the init branch);
+// either case is easy to miss at Warn-level in journald and worth
+// surfacing at Error so journald-priority filters page operators.
+const luksTimestampFailureThreshold = 3
+
+// recordLuksTimestampFailure logs a SetLuksLastRotatedAt failure and
+// bumps the per-action consecutive-failure counter. The first
+// (luksTimestampFailureThreshold-1) failures log at Warn; from the
+// threshold-th failure onward the level escalates to Error so
+// journald-priority filters surface what would otherwise be a buried
+// hot-loop or stuck-rotation hazard (#80). The site label distinguishes
+// the initial-timestamp branch from the post-rotation branch in logs.
+func (e *Executor) recordLuksTimestampFailure(actionID, site string, err error) {
+	e.luksTimestampFailMu.Lock()
+	if e.luksTimestampFailCount == nil {
+		e.luksTimestampFailCount = make(map[string]int)
+	}
+	e.luksTimestampFailCount[actionID]++
+	n := e.luksTimestampFailCount[actionID]
+	e.luksTimestampFailMu.Unlock()
+
+	if n >= luksTimestampFailureThreshold {
+		e.logger.Error("LUKS: SetLuksLastRotatedAt failing persistently — rotation may hot-loop or never start; investigate the agent store",
+			"action_id", actionID,
+			"site", site,
+			"consecutive_failures", n,
+			"error", err,
+		)
+		return
+	}
+	e.logger.Warn("LUKS: failed to persist rotation timestamp",
+		"action_id", actionID,
+		"site", site,
+		"consecutive_failures", n,
+		"error", err,
+	)
+}
+
+// clearLuksTimestampFailures resets the per-action consecutive-failure
+// counter on a successful SetLuksLastRotatedAt write. Companion to
+// recordLuksTimestampFailure (#80).
+func (e *Executor) clearLuksTimestampFailures(actionID string) {
+	e.luksTimestampFailMu.Lock()
+	if e.luksTimestampFailCount != nil {
+		delete(e.luksTimestampFailCount, actionID)
+	}
+	e.luksTimestampFailMu.Unlock()
+}
+
 // executeLuks manages LUKS disk encryption.
 //
 // Audit F003: every read of e.luksKeyStore / e.store / e.actionStore in
@@ -299,10 +353,12 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 			if err := st.SetLuksLastRotatedAt(actionID, time.Now()); err != nil {
 				// First-rotation timestamp persistence failed.
 				// Subsequent ticks re-enter this branch and re-skip
-				// rotation — log so the operator can notice
-				// rotation is silently disabled.
-				e.logger.Warn("checkAndRotate: failed to set initial LUKS rotation timestamp",
-					"action_id", actionID, "error", err)
+				// rotation, so rotation never starts. Track
+				// consecutive failures so the buried-Warn case
+				// escalates to Error after the threshold (#80).
+				e.recordLuksTimestampFailure(actionID, "initial", err)
+			} else {
+				e.clearLuksTimestampFailures(actionID)
 			}
 			return false, nil
 		}
@@ -355,9 +411,14 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		e.logger.Warn("failed to remove old key after rotation (both keys work)", "error", err)
 	}
 
-	// Record rotation time locally
+	// Record rotation time locally. If this fails persistently the
+	// next tick believes nothing rotated and re-rotates — a hot loop
+	// that churns LUKS slots. Track consecutive failures so the
+	// buried-Warn case escalates to Error after the threshold (#80).
 	if err := st.SetLuksLastRotatedAt(actionID, time.Now().UTC()); err != nil {
-		e.logger.Warn("failed to record LUKS rotation time", "action_id", actionID, "error", err)
+		e.recordLuksTimestampFailure(actionID, "post_rotation", err)
+	} else {
+		e.clearLuksTimestampFailures(actionID)
 	}
 
 	return true, nil
