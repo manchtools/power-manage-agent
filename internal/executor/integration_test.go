@@ -449,9 +449,18 @@ func TestIntegration_Shell(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
 
+	// All integration tests below set RunAsRoot=true. Pre-#79
+	// RunAsRoot=false silently ran as the agent's UID (root in CI),
+	// which let these tests pass while exercising shell mechanics
+	// rather than the privilege model. Post-#79 RunAsRoot=false
+	// fans out per signed-in user — and CI containers without a
+	// graphical session no-op out of that path. Use RunAsRoot=true
+	// here so the tests still exercise the script execution they
+	// were written for; the privilege-routing tests are in their
+	// own files (action_flatpak_test.go, shell_per_user_test.go).
 	t.Run("BasicScript", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "echo hello"}}
+		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "echo hello", RunAsRoot: true}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
 		if !strings.Contains(safeStdout(result), "hello") {
@@ -461,7 +470,7 @@ func TestIntegration_Shell(t *testing.T) {
 
 	t.Run("NonZeroExit", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
-		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "exit 42"}}
+		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "exit 42", RunAsRoot: true}}
 		result := e.Execute(ctx, action)
 		// Non-zero exit codes are treated as failures for shell actions.
 		// The exit code is captured in the output.
@@ -491,6 +500,7 @@ func TestIntegration_Shell(t *testing.T) {
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
 			Script:      "echo $MY_TEST_VAR",
 			Environment: map[string]string{"MY_TEST_VAR": "test123"},
+			RunAsRoot:   true,
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
@@ -504,6 +514,7 @@ func TestIntegration_Shell(t *testing.T) {
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
 			Script:           "pwd",
 			WorkingDirectory: "/tmp",
+			RunAsRoot:        true,
 		}}
 		result := e.Execute(ctx, action)
 		assertSuccess(t, result)
@@ -2938,7 +2949,8 @@ func TestIntegration_EdgeCase_ShellTimeout(t *testing.T) {
 
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
-		Script: "sleep 30",
+		Script:    "sleep 30",
+		RunAsRoot: true,
 	}}
 	action.TimeoutSeconds = 2
 
@@ -3447,7 +3459,8 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 		// Generate ~2MB of output
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
-			Script: "dd if=/dev/zero bs=1024 count=2048 | tr '\\0' 'A'",
+			Script:    "dd if=/dev/zero bs=1024 count=2048 | tr '\\0' 'A'",
+			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
 		result := e.Execute(ctx, action)
@@ -3458,7 +3471,8 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 		// Generate ~1MB of stderr output
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
-			Script: "dd if=/dev/zero bs=1024 count=1024 | tr '\\0' 'E' >&2",
+			Script:    "dd if=/dev/zero bs=1024 count=1024 | tr '\\0' 'E' >&2",
+			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
 		result := e.Execute(ctx, action)
@@ -3469,7 +3483,8 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 		// Rapidly alternate between stdout and stderr
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{
-			Script: `for i in $(seq 1 1000); do echo "stdout line $i"; echo "stderr line $i" >&2; done`,
+			Script:    `for i in $(seq 1 1000); do echo "stdout line $i"; echo "stderr line $i" >&2; done`,
+			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
 		result := e.Execute(ctx, action)
