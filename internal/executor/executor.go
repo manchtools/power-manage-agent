@@ -21,6 +21,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	"github.com/manchtools/power-manage/sdk/go/verify"
 )
@@ -467,6 +468,17 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 // (sudo/doas + -n flag + absolute-path + backend-installed check)
 // so the agent stays consistent with the rest of the SDK's
 // privilege contract instead of hard-coding "sudo -n".
+//
+// RunAsRoot=false fans the script out to every active graphical
+// desktop session via desktop.ActiveSessions + runAsUserStreaming
+// (#79). Pre-fix this branch silently ran the script as the agent's
+// own UID (root in production) — exactly the bug profile that
+// SystemWide=false suffered for Flatpak. The new contract: an
+// admin who explicitly turns RunAsRoot off gets a per-user
+// execution, NOT a "still root, just without going through sudo"
+// fallback. Empty-set policy matches the Flatpak path: log Warn
+// and return success no-op so the next reconciliation tick retries
+// once a user signs in.
 func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, script string, callback OutputCallback) (*pb.CommandOutput, error) {
 	interpreter := params.Interpreter
 	if interpreter == "" {
@@ -506,7 +518,97 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 		r, err := sysexec.PrivilegedStreaming(ctx, interpreter, args, envVars, params.WorkingDirectory, callback)
 		return toOutput(r), err
 	}
-	return runCmdStreaming(ctx, interpreter, args, envVars, params.WorkingDirectory, callback)
+	// RunAsRoot=false → per-user fan-out.
+	return e.runShellScriptPerUser(ctx, params, interpreter, args, envVars, callback)
+}
+
+// runShellScriptPerUser implements the RunAsRoot=false path: fans
+// the script over every active desktop session, prefixing each
+// streamed line with `[user=<name>] ` so the operator can attribute
+// output. Returns the merged output and the first per-user error
+// encountered (the loop continues on failure so one broken user
+// doesn't block the rest, matching the per-user Flatpak shape).
+//
+// The merged output's ExitCode is 0 if every user succeeded,
+// otherwise the first non-zero exit so the action result can still
+// drive the changed/failed bookkeeping in executeShellStreaming.
+func (e *Executor) runShellScriptPerUser(ctx context.Context, params *pb.ShellParams, interpreter string, args []string, envVars []string, callback OutputCallback) (*pb.CommandOutput, error) {
+	sessions, err := desktop.ActiveSessions(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("enumerate active desktop sessions: %w", err)
+	}
+	if len(sessions) == 0 {
+		e.logger.Warn("shell RunAsRoot=false: no active desktop sessions; per-user run deferred until a user signs in")
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   "skipped: no signed-in desktop users; will run again on next reconciliation",
+		}, nil
+	}
+
+	// Strip HOME / USER from the caller-supplied env baseline —
+	// desktop.EnvFor sets the per-user values inside
+	// runAsUserStreaming, and a duplicate from envVars would only
+	// confuse readers (Go's exec.Cmd takes the last occurrence,
+	// which is the per-user one, but the duplicates make the env
+	// list noisy in audit logs).
+	extraEnv := stripHomeAndUser(envVars)
+
+	merged := &pb.CommandOutput{}
+	var firstFailure error
+	for _, s := range sessions {
+		userPrefix := "[user=" + s.Username + "] "
+		var wrappedCB OutputCallback
+		if callback != nil {
+			wrappedCB = func(streamType sysexec.StreamType, line string, seq int64) {
+				callback(streamType, userPrefix+line, seq)
+			}
+		}
+		out, runErr := runAsUserStreaming(ctx, s, extraEnv, params.WorkingDirectory, interpreter, args, wrappedCB)
+		if out != nil {
+			if out.Stdout != "" {
+				merged.Stdout += userPrefix + out.Stdout
+				if !strings.HasSuffix(out.Stdout, "\n") {
+					merged.Stdout += "\n"
+				}
+			}
+			if out.Stderr != "" {
+				merged.Stderr += userPrefix + out.Stderr
+				if !strings.HasSuffix(out.Stderr, "\n") {
+					merged.Stderr += "\n"
+				}
+			}
+			if out.ExitCode != 0 && merged.ExitCode == 0 {
+				merged.ExitCode = out.ExitCode
+			}
+		}
+		if runErr != nil && firstFailure == nil {
+			firstFailure = fmt.Errorf("user %s: %w", s.Username, runErr)
+		}
+	}
+	return merged, firstFailure
+}
+
+// stripHomeAndUser drops HOME=/USER= entries from envVars. The
+// per-user runner sets these from the session, and leaving the
+// agent-derived defaults in extraEnv would only add noise (Go's
+// exec.Cmd uses last-write-wins so the per-user value still wins,
+// but the duplicates clutter audit logs and confuse reviewers).
+//
+// Allocates a fresh backing array rather than aliasing envVars
+// (envVars[:0:0]) — the [:0:0] form has zero capacity so an append
+// immediately reallocates and the aliasing is moot in practice,
+// but a future tweak toward [:0] or [:0:n] would silently start
+// mutating the caller's slice. Pin "no aliasing" explicitly so the
+// hazard can't creep back in.
+func stripHomeAndUser(envVars []string) []string {
+	out := make([]string, 0, len(envVars))
+	for _, kv := range envVars {
+		if strings.HasPrefix(kv, "HOME=") || strings.HasPrefix(kv, "USER=") {
+			continue
+		}
+		out = append(out, kv)
+	}
+	return out
 }
 
 // executeShellStreaming executes a shell action with optional detection/execution/verification flow.
