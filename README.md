@@ -672,7 +672,11 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-User=power-manage
+# Agent runs as root — LUKS rotation, package management, systemd
+# unit installs, /etc edits, and signed-cert provisioning all need
+# root. Don't change this to a regular user without first auditing
+# every action executor for capability requirements.
+User=root
 ExecStart=/usr/local/bin/power-manage-agent
 Restart=always
 RestartSec=10
