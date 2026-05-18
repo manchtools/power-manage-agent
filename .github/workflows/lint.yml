@@ -1,0 +1,76 @@
+name: Lint
+
+# Static-analysis gate that runs on every PR and on pushes to main.
+# Closes the audit gap where agent CI ran only docker-per-distro
+# integration tests; PR-time `go vet`, `gofmt`, `staticcheck`, and
+# `govulncheck` were missing, which let the kind of issue caught by
+# the prior x/net CVE bump slip in unnoticed.
+
+on:
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/lint.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/lint.yml'
+
+concurrency:
+  group: lint-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  lint:
+    name: gofmt + vet + staticcheck + govulncheck
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+          # Disable workspace mode — agent is not in the parent
+          # workspace's go.work; running with workspace mode on
+          # would either fail or pick up the wrong module roots.
+          # Tracked separately in the workspace tech-debt audit.
+        env:
+          GOWORK: 'off'
+
+      - name: gofmt
+        run: |
+          test -z "$(gofmt -l .)" || (gofmt -l . && exit 1)
+        env:
+          GOWORK: 'off'
+
+      - name: go vet
+        run: go vet ./...
+        env:
+          GOWORK: 'off'
+
+      - name: staticcheck
+        run: |
+          go install honnef.co/go/tools/cmd/staticcheck@latest
+          # SA1019 (deprecated calls into sysservice / sysuser /
+          # sysexec) and U1000 (unused funcs in internal/executor/
+          # cmd.go) are pre-existing tech debt that this workflow's
+          # first run surfaced. Filtered here so the workflow gates
+          # NEW issues immediately — follow-up PRs can remove the
+          # SA1019,U1000 exclusions as the existing call sites are
+          # migrated to the replacement APIs.
+          staticcheck -checks='inherit,-SA1019,-U1000' ./...
+        env:
+          GOWORK: 'off'
+
+      - name: govulncheck
+        run: |
+          go install golang.org/x/vuln/cmd/govulncheck@latest
+          govulncheck ./...
+        env:
+          GOWORK: 'off'
