@@ -306,8 +306,18 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		defer cancel()
 	}
 
-	// Verify action signature before execution (skip for instant actions — they have no params to sign)
-	if e.verifier != nil && !IsInstantAction(action.Type) {
+	// Verify action signature before execution (audit F-31). Every
+	// action — including instant actions REBOOT and SYNC — must
+	// carry a CA-signature. Pre-fix, instant actions skipped this
+	// check entirely, which made the F-02 Asynq exploit chain
+	// (compromised Valkey → forged ActionDispatchPayload with type=
+	// REBOOT) survive even after task envelopes were HMAC'd: a
+	// compromised gateway would still pass an unsigned REBOOT
+	// through. The control server now signs instant actions with
+	// canonical paramsJSON `{}` so the agent's verifier uses the
+	// same (id, type, paramsCanonical) tuple as for regular
+	// actions — no protocol change, just no special-casing.
+	if e.verifier != nil {
 		actionID := getActionID(action)
 		if verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature); verifyErr != nil {
 			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
