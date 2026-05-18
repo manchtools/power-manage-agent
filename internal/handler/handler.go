@@ -189,17 +189,208 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 		h.logger.Error("action failed", "action_id", action.Id.Value, "error", result.Error)
 	}
 
-	// Log output for debugging
+	// Log output for debugging — but truncate + redact (audit F-32).
+	// Shell scripts and configuration content may embed secrets
+	// (LUKS passphrases, API tokens, the AES-GCM `enc:v1:` prefix
+	// the server uses for secrets-at-rest). Truncating to a tail
+	// preview keeps debugging useful for short-output checks
+	// without dumping multi-KB payloads into journald + downstream
+	// log shippers (Loki, journald-to-syslog forwarders, etc.).
 	if result.Output != nil {
 		if result.Output.Stdout != "" {
-			h.logger.Debug("action stdout", "action_id", action.Id.Value, "stdout", result.Output.Stdout)
+			h.logger.Debug("action stdout", "action_id", action.Id.Value, "stdout", sanitizeForLog(result.Output.Stdout))
 		}
 		if result.Output.Stderr != "" {
-			h.logger.Debug("action stderr", "action_id", action.Id.Value, "stderr", result.Output.Stderr)
+			h.logger.Debug("action stderr", "action_id", action.Id.Value, "stderr", sanitizeForLog(result.Output.Stderr))
 		}
 	}
 
 	return result, nil
+}
+
+// maxLogOutputBytes caps each stream-line preview at 256 bytes
+// (audit F-32). Sized to fit a typical "command failed" line + a
+// short diagnostic header without spilling secret-bearing payloads
+// into journald.
+const maxLogOutputBytes = 256
+
+// sanitizeForLog returns a log-safe rendering of an action's
+// stdout/stderr stream: redacts AES-GCM ciphertext markers
+// (`enc:v1:...`) and truncates the result to maxLogOutputBytes.
+// The redaction is a static prefix scan — the same prefix the
+// control server's internal/crypto.Encrypt produces — so any
+// secret-at-rest blob that makes it into agent output never
+// transits journald in plaintext.
+func sanitizeForLog(s string) string {
+	if s == "" {
+		return s
+	}
+	// Redact AES-GCM ciphertext blobs. The encryptor emits the
+	// fixed `enc:v1:` prefix followed by base64 — we replace the
+	// whole token (prefix + base64 chars) with [REDACTED-ENC]
+	// rather than only the prefix, so partial leakage of the
+	// base64 body doesn't slip through.
+	if strings.Contains(s, "enc:v1:") {
+		s = redactEncMarkers(s)
+	}
+	if len(s) > maxLogOutputBytes {
+		s = s[:maxLogOutputBytes] + "... [truncated by agent log filter]"
+	}
+	return s
+}
+
+// redactEncMarkers replaces every `enc:v1:<base64...>` run with
+// `[REDACTED-ENC]`. Base64 chars are A-Z / a-z / 0-9 / + / / / =.
+// We stop the run at any other character or end of string.
+func redactEncMarkers(s string) string {
+	const marker = "enc:v1:"
+	var out strings.Builder
+	out.Grow(len(s))
+	for {
+		idx := strings.Index(s, marker)
+		if idx < 0 {
+			out.WriteString(s)
+			return out.String()
+		}
+		out.WriteString(s[:idx])
+		out.WriteString("[REDACTED-ENC]")
+		// Skip the marker plus the base64 run.
+		i := idx + len(marker)
+		for i < len(s) && isBase64Char(s[i]) {
+			i++
+		}
+		s = s[i:]
+	}
+}
+
+func isBase64Char(b byte) bool {
+	return (b >= 'A' && b <= 'Z') ||
+		(b >= 'a' && b <= 'z') ||
+		(b >= '0' && b <= '9') ||
+		b == '+' || b == '/' || b == '='
+}
+
+// isPathologicalGrepPattern flags regex shapes that are known to
+// drive PCRE / RE2 into catastrophic backtracking (audit F-35).
+// Returns a non-empty reason string when the pattern is rejected.
+//
+// The detector is intentionally conservative — it rejects on
+// structural heuristics rather than trying to actually evaluate
+// catastrophic-backtracking risk (which is undecidable in general).
+// False positives are acceptable here: a rejected pattern returns a
+// clean error to the caller; the worst-case is the operator has to
+// rephrase a query. False negatives are not: a pathological pattern
+// that slips through hangs `journalctl --grep` on the agent and
+// denies log-query service.
+//
+// Rules (each independently disqualifying):
+//   - nested quantifier on a group: `(...)*`, `(...)+`, `(...){n,}`
+//     where the inner group contains its own quantifier (`*`, `+`,
+//     `{n,}`). Classic `(a+)+`, `(a*)*`, `(a{1,})+` shapes.
+//   - overlapping alternation under a quantifier: `(a|a)+`,
+//     `(a|ab)+` — flagged by any `|` inside a quantified group.
+//   - more than 5 unbounded quantifiers (`*`, `+`, `{n,}`) total —
+//     compounds with the above rules to catch staircase patterns.
+func isPathologicalGrepPattern(p string) string {
+	// Count unbounded quantifiers — `*`, `+`, `{n,}`. `\` escapes
+	// the following metachar so we skip a pair when we see one.
+	unbounded := 0
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		if c == '\\' && i+1 < len(p) {
+			i++
+			continue
+		}
+		switch c {
+		case '*', '+':
+			unbounded++
+		case '{':
+			if quantifierUnbounded(p[i:]) {
+				unbounded++
+			}
+		}
+	}
+	if unbounded > 5 {
+		return "too many unbounded quantifiers (max 5)"
+	}
+
+	// Walk groups and look for nested-quantifier / alternation-
+	// under-quantifier shapes.
+	depth := 0
+	type groupState struct {
+		start         int
+		hasAlt        bool
+		hasInnerQuant bool
+	}
+	var stack []groupState
+	for i := 0; i < len(p); i++ {
+		c := p[i]
+		// Skip escapes — `\(` and `\|` are literal characters, not
+		// regex metas.
+		if c == '\\' && i+1 < len(p) {
+			i++
+			continue
+		}
+		switch c {
+		case '(':
+			stack = append(stack, groupState{start: i})
+			depth++
+		case ')':
+			if depth == 0 {
+				continue
+			}
+			top := stack[len(stack)-1]
+			stack = stack[:len(stack)-1]
+			depth--
+			// Is the closing paren followed by an unbounded quantifier?
+			if i+1 < len(p) {
+				next := p[i+1]
+				if next == '*' || next == '+' || (next == '{' && quantifierUnbounded(p[i+1:])) {
+					if top.hasInnerQuant {
+						return "nested unbounded quantifier (catastrophic backtracking shape)"
+					}
+					if top.hasAlt {
+						return "alternation under unbounded quantifier (catastrophic backtracking shape)"
+					}
+				}
+			}
+		case '|':
+			if depth > 0 {
+				stack[len(stack)-1].hasAlt = true
+			}
+		case '*', '+':
+			if depth > 0 {
+				stack[len(stack)-1].hasInnerQuant = true
+			}
+		case '{':
+			if j := strings.IndexByte(p[i:], '}'); j > 0 && quantifierUnbounded(p[i:]) {
+				if depth > 0 {
+					stack[len(stack)-1].hasInnerQuant = true
+				}
+				i += j
+			}
+		}
+	}
+	return ""
+}
+
+// quantifierUnbounded reports whether a `{n,m?}` token starting at
+// p[0] is unbounded — `{n,}` is unbounded; `{n}` and `{n,m}` are
+// bounded.
+func quantifierUnbounded(p string) bool {
+	if len(p) == 0 || p[0] != '{' {
+		return false
+	}
+	j := strings.IndexByte(p, '}')
+	if j <= 0 {
+		return false
+	}
+	body := p[1:j]
+	if !strings.Contains(body, ",") {
+		return false // `{n}` — bounded
+	}
+	parts := strings.SplitN(body, ",", 2)
+	return len(parts) == 2 && parts[1] == "" // `{n,}` — unbounded
 }
 
 // OnActionRemove handles action removal from the server.
@@ -345,12 +536,24 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		}
 	}
 	if query.Grep != "" {
-		// Limit grep pattern length to prevent ReDoS via crafted regex
+		// Length cap + complexity check (audit F-35). The 256-char
+		// length bound stops the most obvious DoS, but doesn't catch
+		// adversarial ReDoS — `(a+)+b` is only 6 chars yet drives the
+		// underlying PCRE engine into exponential backtracking. The
+		// complexity guard refuses patterns whose **structure** is a
+		// known catastrophic-backtracking shape, regardless of length.
 		if len(query.Grep) > 256 {
 			return &pb.LogQueryResult{
 				QueryId: query.QueryId,
 				Success: false,
 				Error:   "grep pattern too long (max 256 characters)",
+			}, nil
+		}
+		if reason := isPathologicalGrepPattern(query.Grep); reason != "" {
+			return &pb.LogQueryResult{
+				QueryId: query.QueryId,
+				Success: false,
+				Error:   "grep pattern rejected: " + reason,
 			}, nil
 		}
 		args = append(args, "--grep", query.Grep)
