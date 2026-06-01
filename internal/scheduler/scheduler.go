@@ -30,9 +30,7 @@ type ActionExecutor interface {
 	Execute(ctx context.Context, action *pb.Action) *pb.ActionResult
 	// ResetUpdateCycle clears the per-cycle AGENT_UPDATE dedup
 	// flag on the executor instance so a new sync cycle can run an
-	// update again. Audit F042 + F048: replaces the previous
-	// package-level executor.ResetAgentUpdateCycle() global, which
-	// silently shared state across multiple executors.
+	// update again (audit F042 + F048).
 	ResetUpdateCycle()
 }
 

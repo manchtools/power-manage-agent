@@ -77,9 +77,6 @@ func main() {
 		case "version", "--version", "-v":
 			fmt.Printf("power-manage-agent %s\n", version)
 			return
-		case "setup", "--setup", "-setup":
-			runSetup(os.Args[2:])
-			return
 		case "query", "--query", "-query":
 			runQuery(os.Args[2:])
 			return
