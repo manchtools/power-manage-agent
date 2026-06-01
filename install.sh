@@ -21,7 +21,6 @@
 #   --pre                   Install the latest prerelease (release candidate) version
 #   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
 #   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
-#   -u, --user USER         Service user name (default: power-manage)
 #   --skip-download         Skip downloading the binary (use existing binary at --binary path)
 #   --uninstall             Remove the agent and all configuration
 #   -h, --help              Show this help message
@@ -34,12 +33,6 @@ GITHUB_REPO="MANCHTOOLS/power-manage-agent"
 # Default values
 DATA_DIR="/var/lib/power-manage"
 BINARY_PATH="/usr/local/bin/power-manage-agent"
-# Legacy service user. The agent now runs as root (the previous
-# power-manage + sudoers escalation model was retired); this constant
-# is kept so the uninstall path can still find and offer to remove a
-# legacy power-manage account on hosts originally installed with the
-# pre-root-mode script. Fresh installs do not create or use this user.
-LEGACY_SERVICE_USER="power-manage"
 SERVICE_NAME="power-manage-agent"
 REGISTRATION_TOKEN=""
 SERVER_URL=""
@@ -82,7 +75,6 @@ Options:
   --pre                   Install the latest prerelease (release candidate) version
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
   -b, --binary PATH       Path to the agent binary (default: /usr/local/bin/power-manage-agent)
-  -u, --user USER         (deprecated, ignored) Agent now runs as root
   --skip-download         Skip downloading the binary (use existing binary at --binary path)
   --uninstall             Remove the agent and all configuration
   -h, --help              Show this help message
@@ -124,31 +116,12 @@ parse_args() {
                 BINARY_PATH="$2"
                 shift 2
                 ;;
-            -u|--user)
-                # Deprecated: agent now runs as root. Keep parsing
-                # the flag so existing operator scripts don't error,
-                # but log a warning and ignore the value.
-                log_warn "--user is deprecated and ignored; agent now runs as root."
-                shift 2
-                ;;
             -v|--version)
                 VERSION="$2"
                 shift 2
                 ;;
             --pre)
                 PRE_RELEASE="true"
-                shift
-                ;;
-            --skip-verify)
-                # Deprecation shim: the agent CLI no longer accepts
-                # -skip-verify and TLS verification cannot be
-                # disabled. Print a clear, actionable message rather
-                # than silently passing the flag to enroll (which
-                # would now fail with an "unknown flag" error and
-                # surprise operators running install scripts written
-                # against the old contract).
-                log_warn "--skip-verify is no longer supported; TLS verification is always enforced."
-                log_warn "Ignoring --skip-verify flag and continuing with TLS verification."
                 shift
                 ;;
             --skip-download)
@@ -347,26 +320,6 @@ create_directories() {
     mkdir -p "$DATA_DIR"
     chown root:root "$DATA_DIR"
     chmod 700 "$DATA_DIR"
-}
-
-# remove_legacy_sudoers cleans up the sudoers / doas drop-ins the
-# previous (pre-root-mode) install script created. Called on fresh
-# installs AND upgrades so an operator on the old layout doesn't end
-# up with both the legacy escalation policy AND a root-mode unit
-# active simultaneously. Safe to call when nothing is there.
-remove_legacy_sudoers() {
-    local removed=""
-    if [[ -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}" ]]; then
-        rm -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}"
-        removed="${removed} /etc/sudoers.d/${LEGACY_SERVICE_USER}"
-    fi
-    if [[ -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf" ]]; then
-        rm -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf"
-        removed="${removed} /etc/doas.d/${LEGACY_SERVICE_USER}.conf"
-    fi
-    if [[ -n "$removed" ]]; then
-        log_info "Removed legacy escalation drop-in(s):${removed}"
-    fi
 }
 
 install_systemd_service() {
@@ -572,17 +525,6 @@ uninstall() {
         systemctl daemon-reload
     fi
 
-    # Remove legacy escalation drop-ins (sudoers / doas) from the
-    # pre-root-mode install layout. Idempotent: silently skipped if
-    # neither file exists.
-    if [[ -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}" ]]; then
-        log_info "Removing legacy sudoers configuration..."
-        rm -f "/etc/sudoers.d/${LEGACY_SERVICE_USER}"
-    fi
-    if [[ -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf" ]]; then
-        log_info "Removing legacy doas configuration..."
-        rm -f "/etc/doas.d/${LEGACY_SERVICE_USER}.conf"
-    fi
     if [[ -f "/etc/sudoers.d/power-manage-luks" ]]; then
         log_info "Removing LUKS sudoers configuration..."
         rm -f "/etc/sudoers.d/power-manage-luks"
@@ -603,20 +545,6 @@ uninstall() {
             rm -rf "$DATA_DIR"
         else
             log_info "Data directory preserved"
-        fi
-    fi
-
-    # Ask about the legacy power-manage user from the pre-root-mode
-    # layout. Skipped if the user doesn't exist (fresh root-mode
-    # installs never create it).
-    if id "$LEGACY_SERVICE_USER" &>/dev/null; then
-        read -p "Remove legacy service user $LEGACY_SERVICE_USER (no longer needed in root mode)? [y/N] " -n 1 -r
-        echo
-        if [[ $REPLY =~ ^[Yy]$ ]]; then
-            log_info "Removing legacy service user..."
-            userdel "$LEGACY_SERVICE_USER"
-        else
-            log_info "Legacy service user preserved"
         fi
     fi
 
@@ -754,7 +682,6 @@ main() {
     log_info "Starting Power Manage Agent installation..."
 
     create_directories
-    remove_legacy_sudoers
     install_systemd_service
     install_desktop_handler
     install_luks_sudoers

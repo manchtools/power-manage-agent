@@ -35,11 +35,10 @@ type AgentUpdateConfig struct {
 // AGENT_UPDATE only runs the update once.
 //
 // Audit F042 + F048: previously a package-level global guarded by its
-// own mutex. Tests had to call ResetAgentUpdateCycle() defensively
-// because the global state leaked across parallel runs, and a future
-// second scheduler/executor pair would silently share the flag with
-// production. Now the flag is per-executor, scheduler reaches it via
-// the ActionExecutor interface.
+// own mutex. The global state leaked across parallel runs, and a
+// future second scheduler/executor pair would silently share the flag
+// with production. Now the flag is per-executor, scheduler reaches
+// it via the ActionExecutor interface.
 func (e *Executor) ResetUpdateCycle() {
 	e.agentUpdateExecutedMu.Lock()
 	e.agentUpdateExecuted = false
@@ -56,19 +55,6 @@ func (e *Executor) markAgentUpdateExecuted() bool {
 	}
 	e.agentUpdateExecuted = true
 	return true
-}
-
-// ResetAgentUpdateCycle is a deprecated package-level alias kept so
-// the agent_update_test.go suite continues to compile while the
-// per-executor flag is being adopted everywhere. The test still
-// exercises the executor's instance method via this package-level
-// no-op trampoline; it is safe because the test creates a fresh
-// Executor per case.
-//
-// Deprecated: call (*Executor).ResetUpdateCycle on your specific
-// executor instance instead.
-func ResetAgentUpdateCycle() {
-	// no-op: tests reset state by constructing a fresh Executor.
 }
 
 // executeAgentUpdate implements the ACTION_TYPE_AGENT_UPDATE executor.
