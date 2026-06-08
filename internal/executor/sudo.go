@@ -54,20 +54,13 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 		}
 	}
 
-	// Generate sudoers content
-	var content string
-	switch params.AccessLevel {
-	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL:
-		content = generateFullSudoConfig(groupName)
-	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_LIMITED:
-		content = generateLimitedSudoConfig(groupName)
-	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_CUSTOM:
-		if params.CustomConfig == "" {
-			return nil, false, fmt.Errorf("custom_config is required when access_level is CUSTOM")
-		}
-		content = generateCustomSudoConfig(groupName, params.CustomConfig)
-	default:
-		return nil, false, fmt.Errorf("unsupported access level: %v", params.AccessLevel)
+	// Generate sudoers content. The switch is extracted into
+	// sudoConfigForParams so unit tests can pin the enum → template
+	// mapping without touching the filesystem / group-membership
+	// work this function does next.
+	content, err := sudoConfigForParams(params, groupName)
+	if err != nil {
+		return nil, false, err
 	}
 
 	// Check idempotency: file content + group membership
@@ -143,6 +136,142 @@ func (e *Executor) removeSudoPolicy(ctx context.Context, groupName, sudoersPath 
 // =============================================================================
 // Sudoers config generators
 // =============================================================================
+
+// sudoConfigForParams maps an AdminPolicyParams to the sudoers content
+// that setupSudoPolicy will write to disk. Extracted from
+// setupSudoPolicy so unit tests can pin the enum → template mapping
+// without standing up the surrounding filesystem / group-membership
+// work.
+//
+// The two TERMINAL_ADMIN_* arms route to passwordless templates
+// designed for pm-tty-* accounts (see manchtools/power-manage-server#70).
+// The pre-existing FULL/LIMITED/CUSTOM arms are unchanged — operator-
+// authored AdminPolicy actions continue to behave exactly as they did
+// before this PR.
+func sudoConfigForParams(params *pb.AdminPolicyParams, groupName string) (string, error) {
+	switch params.AccessLevel {
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_FULL:
+		return generateFullSudoConfig(groupName), nil
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_LIMITED:
+		return generateLimitedSudoConfig(groupName), nil
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_CUSTOM:
+		if params.CustomConfig == "" {
+			return "", fmt.Errorf("custom_config is required when access_level is CUSTOM")
+		}
+		return generateCustomSudoConfig(groupName, params.CustomConfig), nil
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_TERMINAL_ADMIN_LIMITED:
+		return generateTerminalAdminLimitedSudoConfig(groupName), nil
+	case pb.AdminAccessLevel_ADMIN_ACCESS_LEVEL_TERMINAL_ADMIN_FULL:
+		return generateTerminalAdminFullSudoConfig(groupName), nil
+	default:
+		return "", fmt.Errorf("unsupported access level: %v", params.AccessLevel)
+	}
+}
+
+// terminalAdminDefaultsBlock is the Defaults block both TERMINAL_ADMIN
+// templates emit at the top of their sudoers fragment. Per the ADR's
+// T4: requiretty pins TTY-stream input audit; env_reset stops
+// LD_PRELOAD / BASH_ENV / PATH propagation; !lecture skips the
+// operator-confusing first-time prompt; timestamp_timeout=0 forces
+// sudoers re-evaluation on every sudo call so a fresh revocation lands
+// immediately under NOPASSWD.
+const terminalAdminDefaultsBlock = `Defaults requiretty
+Defaults env_reset
+Defaults !lecture
+Defaults timestamp_timeout=0`
+
+// terminalAdminLimitedDenyBlocks are the !-deny rules the LIMITED
+// template emits to close ADR T2 (editor escapes), T3 (shell spawns),
+// and T5 (persistence vectors). Under NOPASSWD an escape vector in
+// the allowlist is unprompted root, so the deny rules are mandatory,
+// not advisory.
+func terminalAdminLimitedDenyBlocks(groupName string) []string {
+	return []string{
+		"",
+		"# Deny editor escapes (vim :!bash, less !sh, etc.) — ADR T2",
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/vim, !/usr/bin/vi, !/usr/bin/vimdiff, !/usr/bin/view, !/usr/bin/nvim", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/emacs, !/usr/bin/emacsclient", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/nano, !/bin/nano", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/less, !/usr/bin/more, !/usr/bin/most", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/ed, !/usr/bin/ex", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/mc, !/usr/bin/joe, !/usr/bin/jed", groupName),
+		"",
+		"# Deny shell spawns — ADR T3",
+		fmt.Sprintf("%%%s ALL=(ALL) !/bin/sh, !/bin/bash, !/bin/dash, !/bin/zsh, !/bin/ksh, !/bin/csh, !/bin/tcsh, !/bin/fish", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/sh, !/usr/bin/bash, !/usr/bin/dash, !/usr/bin/zsh, !/usr/bin/ksh, !/usr/bin/csh, !/usr/bin/tcsh, !/usr/bin/fish", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/env", groupName),
+		"",
+		"# Deny persistence vectors — ADR T5",
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/at, !/usr/bin/atq, !/usr/bin/atrm, !/usr/bin/batch", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/crontab", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/sbin/dpkg-divert, !/usr/bin/dpkg-divert", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/update-alternatives, !/usr/sbin/update-alternatives", groupName),
+	}
+}
+
+// generateTerminalAdminLimitedSudoConfig is the LIMITED template for
+// the server's TerminalAdmin reconciler (#70). The allowlist mirrors
+// the existing generateLimitedSudoConfig content (package management,
+// systemd, network, disk, containers, diagnostics, agent-protection
+// denies) but every rule carries NOPASSWD: and the editor/shell/
+// persistence deny blocks land on top.
+func generateTerminalAdminLimitedSudoConfig(groupName string) string {
+	lines := []string{
+		"# Managed by Power Manage — do not edit manually",
+		fmt.Sprintf("# Passwordless LIMITED sudo for group %s (TerminalAdmin, server #70)", groupName),
+		"",
+		terminalAdminDefaultsBlock,
+		"",
+		"# Package management",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get, /usr/bin/apt-cache, /usr/bin/dpkg", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/dnf, /usr/bin/yum, /usr/bin/rpm", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/pacman", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/zypper", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/flatpak, /usr/bin/snap", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/nix, /usr/bin/nix-env, /usr/bin/nix-store, /usr/bin/nix-channel", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /sbin/apk", groupName),
+		"",
+		"# Service and system management",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/systemctl, /usr/bin/journalctl", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/sbin/reboot, /usr/sbin/shutdown", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/timedatectl, /usr/bin/hostnamectl", groupName),
+		"",
+		"# Network management",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/ip, /usr/bin/nmcli, /usr/bin/networkctl", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/sbin/ufw, /usr/bin/firewall-cmd", groupName),
+		"",
+		"# Disk and storage",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/mount, /usr/bin/umount, /usr/sbin/blkid", groupName),
+		"",
+		"# Containers",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/docker, /usr/bin/podman", groupName),
+		"",
+		"# Diagnostics",
+		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/dmesg", groupName),
+		"",
+		"# Deny modifications to power-manage-agent and sudoers",
+		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/systemctl * power-manage-agent*", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/visudo, !!/usr/sbin/visudo", groupName),
+	}
+	lines = append(lines, terminalAdminLimitedDenyBlocks(groupName)...)
+	return strings.Join(lines, "\n") + "\n"
+}
+
+// generateTerminalAdminFullSudoConfig is the FULL template for
+// TerminalAdmin (#70). Single ALL=(ALL:ALL) NOPASSWD: ALL grant
+// preceded by the same Defaults block as the Limited template — the
+// Defaults block applies regardless of access level.
+func generateTerminalAdminFullSudoConfig(groupName string) string {
+	lines := []string{
+		"# Managed by Power Manage — do not edit manually",
+		fmt.Sprintf("# Passwordless FULL sudo for group %s (TerminalAdmin, server #70)", groupName),
+		"",
+		terminalAdminDefaultsBlock,
+		"",
+		fmt.Sprintf("%%%s ALL=(ALL:ALL) NOPASSWD: ALL", groupName),
+	}
+	return strings.Join(lines, "\n") + "\n"
+}
 
 func generateFullSudoConfig(groupName string) string {
 	lines := []string{
