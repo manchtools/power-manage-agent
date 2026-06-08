@@ -35,7 +35,7 @@ COPY agent/ ./agent/
 # Single-module go.work so `go test ./agent/...` works from /workspace
 # (CI invokes gotestsum from the container's default cwd). Without this
 # Go can't find a module rooted at /workspace.
-RUN printf 'go 1.25.10\n\nuse (\n\t./agent\n)\n' > go.work
+RUN printf 'go 1.25.11\n\nuse (\n\t./agent\n)\n' > go.work
 
 # Pre-download dependencies and install gotestsum for clear failure reporting
 RUN cd agent && go mod download
