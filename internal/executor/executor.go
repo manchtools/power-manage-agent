@@ -505,13 +505,15 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 	// even worse — `envVars` stayed nil, so the child silently
 	// inherited the *full* ambient environment.
 	//
-	// The baseline below is the minimum needed for a useful shell:
-	// PATH (to find common binaries) and LANG/HOME/USER (to keep
-	// locale-aware tools and `~` expansion sane). Anything else the
-	// action needs goes through `params.Environment` and the
-	// IsAllowedEnvVar gate.
+	// PATH is intentionally NOT in this baseline: as of SDK F-31
+	// hardening (sdk #75), sys/exec.RunStreaming refuses any caller-
+	// supplied PATH (hijack-prone) and instead injects its own
+	// sanitized PATH derived from the agent's own environment when
+	// envVars is non-empty. Passing PATH here would be rejected with
+	// ErrBlockedEnvVar. LANG/HOME/USER keep `~`-expansion and
+	// locale-aware tools sane; anything else goes through
+	// `params.Environment` and the IsAllowedEnvVar gate.
 	envVars := []string{
-		"PATH=" + os.Getenv("PATH"),
 		"LANG=" + os.Getenv("LANG"),
 		"HOME=" + os.Getenv("HOME"),
 		"USER=" + os.Getenv("USER"),

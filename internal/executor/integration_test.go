@@ -866,6 +866,87 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 	})
 }
 
+// TestIntegration_User_NoPassword locks down the contract for the
+// UserParams.no_password flag (added in sdk #77, server #327): when
+// the server sets NoPassword=true on a UserParams payload, the agent
+// must NOT generate a temp password, must NOT call chpasswd, and
+// must NOT emit lps.rotations metadata. The account is left in the
+// shadow-locked default state ('!') that useradd produces, so no
+// PAM-protected login path succeeds; root setuid invocations
+// (the agent's terminal session opener) still work because they
+// bypass PAM.
+//
+// Two sub-tests, both as non-system users to exercise the same
+// branch the temp-password code lives in:
+//   - NoPasswordTrue: lps.rotations absent, account locked
+//   - NoPasswordFalse: lps.rotations present (regression guard)
+func TestIntegration_User_NoPassword(t *testing.T) {
+	e := newTestExecutor()
+	ctx := context.Background()
+
+	t.Run("NoPasswordTrue_NoChpasswdNoLpsMetadata", func(t *testing.T) {
+		username := "pmtestnopass"
+		t.Cleanup(func() { cleanupTestUser(t, username) })
+
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_User{User: &pb.UserParams{
+			Username:   username,
+			Shell:      "/usr/sbin/nologin",
+			CreateHome: false,
+			NoPassword: true,
+			Comment:    "no_password flag regression test",
+		}}
+		result := e.Execute(ctx, action)
+		assertSuccess(t, result)
+		if !userExists(username) {
+			t.Fatal("user not created")
+		}
+
+		// L1: no lps.rotations metadata emitted.
+		if result.Metadata != nil && result.Metadata["lps.rotations"] != "" {
+			t.Errorf("expected no lps.rotations metadata when NoPassword=true, got %q",
+				result.Metadata["lps.rotations"])
+		}
+
+		// L2: shadow entry is locked. `passwd -S <user>` second field
+		// is "L" for locked, "P" for active password, "NP" for no
+		// password set at all. useradd leaves a non-system account at
+		// "L" by default (entry starts with "!"), and our skip-block
+		// must not flip it to "P".
+		out, err := sudoRun("passwd", "-S", username).Output()
+		if err != nil {
+			t.Fatalf("passwd -S %s failed: %v", username, err)
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) < 2 {
+			t.Fatalf("unexpected passwd -S output: %q", string(out))
+		}
+		if fields[1] != "L" && fields[1] != "LK" {
+			t.Errorf("expected locked shadow entry (passwd -S field 2 = 'L'/'LK'), got %q (full: %q)",
+				fields[1], string(out))
+		}
+	})
+
+	t.Run("NoPasswordFalse_StillGeneratesPassword", func(t *testing.T) {
+		// Regression guard: the existing temp-password path must still
+		// work when NoPassword is unset / false. If a future commit
+		// accidentally flips the gate, this catches it.
+		username := "pmtestwithpass"
+		t.Cleanup(func() { cleanupTestUser(t, username) })
+
+		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+		action.Params = &pb.Action_User{User: &pb.UserParams{
+			Username: username,
+			Comment:  "no_password=false regression guard",
+		}}
+		result := e.Execute(ctx, action)
+		assertSuccess(t, result)
+		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
+			t.Error("expected lps.rotations metadata when NoPassword=false (default), got none")
+		}
+	})
+}
+
 // =============================================================================
 // Group Tests
 // =============================================================================

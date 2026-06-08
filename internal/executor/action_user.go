@@ -188,9 +188,17 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Generate and set temporary password for non-system users
+	// Generate and set temporary password for non-system users.
+	//
+	// NoPassword opts out of this block entirely — used for
+	// system-managed nologin accounts (pm-tty-*) that are only ever
+	// reached via setuid and would otherwise create an LPS table row
+	// that no PAM path will ever consume. The flag is deliberately
+	// explicit, not derived from Shell == /usr/sbin/nologin: passwords
+	// are good to have for any account that might ever need a
+	// PAM-protected login path. See sdk proto comment on no_password.
 	var metadata map[string]string
-	if !params.SystemUser && !params.Disabled {
+	if !params.NoPassword && !params.SystemUser && !params.Disabled {
 		tempPassword, err := sysuser.GeneratePassword(16, false)
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
