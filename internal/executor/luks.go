@@ -447,12 +447,26 @@ func (e *Executor) reconcileDeviceKey(ctx context.Context, params *pb.Encryption
 	}
 
 	// Enroll new key
-	if desiredType == "tpm" {
+	switch desiredType {
+	case "tpm":
 		if err := e.enrollTpm(ctx, actionID, devicePath); err != nil {
 			return false, fmt.Errorf("enroll TPM: %w", err)
 		}
+		// enrollTpm persists device_key_type="tpm" on success.
+	case "user_passphrase":
+		// No key is enrolled here — the user sets the actual passphrase
+		// via the CLI token flow (cmd_luks.go records the hash). But the
+		// MODE must still be persisted, or localState stays "none" and
+		// every reconcile re-reports changed=true forever (never
+		// converging). enrollTpm persists its mode; mirror that here.
+		st := e.getStore()
+		if st == nil {
+			return false, fmt.Errorf("agent store not configured")
+		}
+		if err := st.SetLuksDeviceKeyType(actionID, "user_passphrase"); err != nil {
+			return false, fmt.Errorf("persist user_passphrase device key type: %w", err)
+		}
 	}
-	// USER_PASSPHRASE: no-op here — user sets it via CLI token flow
 
 	return true, nil
 }
