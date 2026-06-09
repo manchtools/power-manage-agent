@@ -378,7 +378,7 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		return "", fmt.Errorf("unmarshal action: %w", err)
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	// Calculate result hash for change detection (must match scheduler.detectChanges format)
@@ -568,6 +568,12 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		localActions[la.id] = &la
 	}
 	rows.Close()
+	// A cursor error mid-iteration would silently truncate localActions,
+	// mis-classifying still-present actions as new (spurious immediate
+	// re-execution). All other row loops in this file check rows.Err().
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate actions: %w", err)
+	}
 
 	// Identify and load removed actions (for undo), then delete them
 	for localID, la := range localActions {
@@ -611,7 +617,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		// executes new/changed actions immediately via ID lists, not via next_execute_at.
 		// Setting next_execute_at to "now" caused the scheduler's runDueActions ticker
 		// to double-execute actions while the sync execution was still running.
-		now := time.Now()
+		now := time.Now().UTC()
 		nextExecute := s.calculateNextExecute(action, &now, false)
 
 		// Upsert: insert new or update existing (but preserve execution history)
@@ -712,6 +718,9 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		localActions[la.id] = &la
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate actions: %w", err)
+	}
 
 	// Removals: action no longer present on standalone OR grouped.
 	for localID, la := range localActions {
@@ -738,7 +747,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 	}
 
 	// Standalone upserts.
-	now := time.Now()
+	now := time.Now().UTC()
 	for _, action := range standalone {
 		if action.Id == nil {
 			continue
@@ -841,6 +850,11 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		existingGroups[id] = eg
 	}
 	groupRows.Close()
+	// A truncated existingGroups would lose cadence snapshots, re-firing
+	// groups as if brand new.
+	if err := groupRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate action_groups: %w", err)
+	}
 
 	if _, err := tx.Exec("DELETE FROM group_members"); err != nil {
 		return nil, fmt.Errorf("clear group_members: %w", err)

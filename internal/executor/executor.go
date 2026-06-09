@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -747,49 +748,61 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	// lie about Content-Length or use chunked encoding.
 	body := io.LimitReader(resp.Body, maxDownloadSize+1)
 
-	file, err := os.Create(dest)
+	// Download into a temp file in the destination directory, then
+	// atomically rename over dest only on full success. A failed,
+	// partial, or checksum-mismatched download must NOT destroy an
+	// existing file at dest — e.g. a working AppImage being upgraded
+	// (os.Create truncated it in place before, leaving the user with
+	// nothing on any error).
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".download-*")
 	if err != nil {
 		return err
 	}
+	tmpPath := tmp.Name()
+	removeTmp := func() { _ = os.Remove(tmpPath) }
 
-	var written int64
+	hasher := sha256.New()
+	dst := io.Writer(tmp)
 	if expectedChecksum != "" {
-		hasher := sha256.New()
-		reader := io.TeeReader(body, hasher)
-		if written, err = io.Copy(file, reader); err != nil {
-			_ = file.Close()
-			return err
-		}
-		if written > maxDownloadSize {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
-		}
+		dst = io.MultiWriter(tmp, hasher)
+	}
+	written, err := io.Copy(dst, body)
+	if err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return err
+	}
+	if written > maxDownloadSize {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
+	}
+	if expectedChecksum != "" {
 		actual := hex.EncodeToString(hasher.Sum(nil))
-		if actual != expectedChecksum {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
-		}
-	} else {
-		if written, err = io.Copy(file, body); err != nil {
-			_ = file.Close()
-			return err
-		}
-		if written > maxDownloadSize {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
+		// EqualFold + TrimSpace: actual is lowercase hex, but operators
+		// commonly paste uppercase / whitespace-padded hashes. A
+		// case-sensitive compare here rejected an uppercase-but-correct
+		// checksum even though the idempotency skip-check already
+		// normalizes (see action_appimage.go), so installs failed on a
+		// correct file.
+		if !strings.EqualFold(actual, strings.TrimSpace(expectedChecksum)) {
+			_ = tmp.Close()
+			removeTmp()
+			return fmt.Errorf("checksum mismatch: expected %s, got %s", strings.TrimSpace(expectedChecksum), actual)
 		}
 	}
-
-	if err := file.Close(); err != nil {
-		// A late Close() error (fsync failure on a full disk, network
-		// FS hiccup) means the on-disk file is potentially partial.
-		// Remove it so the next run re-downloads instead of silently
-		// treating a truncated file as a valid artifact.
-		os.Remove(dest)
-		return fmt.Errorf("close downloaded file %s: %w", dest, err)
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("fsync downloaded file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		removeTmp()
+		return fmt.Errorf("close downloaded file: %w", err)
+	}
+	if err := os.Rename(tmpPath, dest); err != nil {
+		removeTmp()
+		return fmt.Errorf("install downloaded file to %s: %w", dest, err)
 	}
 	return nil
 }
