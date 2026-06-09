@@ -91,28 +91,27 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "agent.db")
-	db, err := sql.Open("sqlite", dbPath)
+	// Pragmas are set on the DSN so they apply to EVERY connection the
+	// pool opens, not just the first. foreign_keys is per-connection in
+	// SQLite (OFF by default) — setting it via a one-off db.Exec left
+	// freshly-opened pool connections with enforcement OFF, so
+	// ON DELETE CASCADE fired nondeterministically depending on which
+	// connection a statement landed on (audit F-pragma). busy_timeout
+	// lets the CLI subcommands (tty/luks) wait for the daemon's writer
+	// instead of failing immediately with SQLITE_BUSY. journal_mode=WAL
+	// is a persistent file setting but is harmless to repeat per conn.
+	dsn := dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Enable WAL mode. NOTE: the Store also serializes all SQL
-	// through a Go-level RWMutex (s.mu), so WAL's reader/writer
-	// concurrency does not currently translate into actual Go-level
-	// concurrency — writes block reads at the application layer
-	// regardless. WAL is still worth having for crash safety and
-	// fewer fsyncs, but a future pass that drops s.mu in favour of
-	// modernc.org/sqlite's per-conn locking would unlock the real
-	// benefit. Audit F021.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable WAL mode: %w", err)
-	}
-	// Enable foreign key enforcement (OFF by default in SQLite)
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
-	}
+	// NOTE: the Store also serializes all SQL through a Go-level RWMutex
+	// (s.mu), so WAL's reader/writer concurrency does not currently
+	// translate into Go-level concurrency — writes block reads at the
+	// application layer regardless. A future pass that drops s.mu in
+	// favour of modernc.org/sqlite's per-conn locking would unlock the
+	// real benefit. Audit F021.
 
 	goose.SetBaseFS(migrations.FS)
 	// Audit F009: goose's dialect name is the legacy "sqlite3" even
