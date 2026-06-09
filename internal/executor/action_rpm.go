@@ -91,7 +91,11 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
 		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
-			return nil, false, fmt.Errorf("download: %w", err)
+			// Unlike .deb, an .rpm filename has no reliable name field
+			// (the name itself can contain hyphens), so a dead URL leaves
+			// us with no way to identify the installed package to remove.
+			// Surface that explicitly instead of a bare "download" error.
+			return nil, false, fmt.Errorf("cannot determine rpm package to remove: artifact %s is unreachable (%w); re-point the action at a reachable URL or remove the package manually", params.Url, err)
 		}
 		queryOut, _, qErr := queryCmdOutput("rpm", "-qp", "--qf", "%{NAME}", tmpFile.Name())
 		if qErr != nil {

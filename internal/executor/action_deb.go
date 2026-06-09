@@ -105,19 +105,16 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return output, true, err
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// For ABSENT we want to remove a package the operator
-		// previously installed by URL. Downloading the .deb just to
-		// read its Package field is wasteful when it's already gone,
-		// AND it actively breaks the common case where the URL is
-		// dead because the artifact was deleted upstream after the
-		// install (ABSENT then degrades to "download failed" instead
-		// of the desired "already absent"). Use the URL filename's
-		// `name_version_arch.deb` segment as the canonical-name
-		// heuristic — same shape every Debian mirror uses, and the
-		// only field we need is `name`. If the filename doesn't
-		// match, the action is misconfigured and we surface that as
-		// a validation error rather than a silent download attempt.
-		pkgName, err := debPackageNameFromURL(params.Url)
+		// Resolve the package name to remove. Prefer the AUTHORITATIVE
+		// canonical name (download + dpkg-deb), matching the PRESENT
+		// path: a package installed under a Package field that differs
+		// from the URL filename's name segment must still be found, or
+		// flipping the action to ABSENT silently fails to remove it.
+		// Fall back to the URL-filename heuristic only when the download
+		// fails (artifact deleted upstream after install), so ABSENT
+		// still reports "already absent" instead of degrading to a
+		// download error.
+		pkgName, err := e.debAbsentPackageName(ctx, params)
 		if err != nil {
 			return nil, false, err
 		}
@@ -135,6 +132,34 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 	}
 
 	return nil, false, fmt.Errorf("unknown desired state: %v", state)
+}
+
+// debAbsentPackageName resolves the package name to remove for an
+// ABSENT deb action. It prefers the authoritative canonical Package
+// field (download + dpkg-deb), so it agrees with the name the PRESENT
+// path installed under even when the URL filename differs. If the
+// download fails — the common "artifact deleted upstream after the
+// install" case — it falls back to the URL-filename heuristic so the
+// action can still report "already absent" rather than erroring.
+func (e *Executor) debAbsentPackageName(ctx context.Context, params *pb.AppInstallParams) (string, error) {
+	tmpFile, err := os.CreateTemp("", "*.deb")
+	if err != nil {
+		return "", fmt.Errorf("create temp file: %w", err)
+	}
+	defer os.Remove(tmpFile.Name())
+	_ = tmpFile.Close()
+
+	if dlErr := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); dlErr == nil {
+		// Download succeeded — the canonical name is authoritative.
+		if name, nameErr := debPackageName(tmpFile.Name()); nameErr == nil {
+			return name, nil
+		}
+		// dpkg-deb parse failure on a downloaded file is unexpected;
+		// fall through to the URL heuristic rather than hard-failing.
+	}
+	// Download failed (dead URL) or the file was unparseable — best
+	// effort from the URL filename so a stale-URL ABSENT still converges.
+	return debPackageNameFromURL(params.Url)
 }
 
 // debPackageName returns the canonical Package field of the given .deb
