@@ -8,6 +8,11 @@ import (
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
+// The symlink-rejection guard for ~/.ssh (audit F022) lives in the SDK
+// as sysfs.AssertRealDir and is unit-tested there
+// (sdk/go/sys/fs/safe_dir_test.go). setupSSHKeys calls it before the
+// privileged chmod/chown and additionally passes chown -h.
+
 // desiredAccountLocked encodes the single source of truth for whether
 // an account must stay shadow-locked. It MUST agree with createUser's
 // password-skip condition: createUser sets a temp password only when

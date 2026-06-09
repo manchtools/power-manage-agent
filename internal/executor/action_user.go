@@ -583,12 +583,25 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
+	// Refuse to operate on a symlinked (or otherwise non-directory)
+	// .ssh. The target user owns their home directory, so they can
+	// plant ~/.ssh as a symlink to e.g. /etc before this runs; a
+	// path-based chmod/chown would then dereference it and act on the
+	// target. sysfs.AssertRealDir closes that whole class — combined
+	// with the chown -h below it makes the dereference vector
+	// unreachable.
+	if err := sysfs.AssertRealDir(sshDir); err != nil {
+		return false, fmt.Errorf("refusing to configure SSH keys: %w", err)
+	}
+
 	// Set ownership and permissions on .ssh directory. Use the configured
 	// primary group (same preference order as home-directory repair) so
 	// users created with Gid / PrimaryGroup don't end up with the wrong
-	// group on .ssh and fail authorized_keys writes.
+	// group on .ssh and fail authorized_keys writes. -h/--no-dereference
+	// keeps chown acting on the path itself even if it races into a
+	// symlink between the check above and here.
 	ownership := params.Username + ":" + homeGroupFor(params)
-	if _, err := runSudoCmd(ctx, "chown", "--", ownership, sshDir); err != nil {
+	if _, err := runSudoCmd(ctx, "chown", "-h", "--", ownership, sshDir); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
 	if _, err := runSudoCmd(ctx, "chmod", "700", "--", sshDir); err != nil {
@@ -612,7 +625,11 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	// Set ownership on authorized_keys. SafeReplaceFile leaves the
 	// file owned by the agent process (root); a separate chown brings
 	// it back to the target user without re-introducing the tee race.
-	if _, err := runSudoCmd(ctx, "chown", "--", ownership, authKeysFile); err != nil {
+	// -h/--no-dereference: the target user owns the 0700 .ssh dir, so
+	// they could unlink the freshly-written file and plant a symlink
+	// before this chown — without -h that would transfer ownership of
+	// the symlink's target (e.g. /etc/shadow) to the user.
+	if _, err := runSudoCmd(ctx, "chown", "-h", "--", ownership, authKeysFile); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 
