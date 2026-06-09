@@ -80,14 +80,15 @@ func TestGenerateTerminalAdminLimitedSudoConfig_NOPASSWD(t *testing.T) {
 // NOPASSWD.
 func TestGenerateTerminalAdminLimitedSudoConfig_DefaultsBlock(t *testing.T) {
 	out := generateTerminalAdminLimitedSudoConfig(testTerminalAdminGroup)
+	g := "%" + testTerminalAdminGroup
 	for _, want := range []string{
-		"Defaults requiretty",
-		"Defaults env_reset",
-		"Defaults !lecture",
-		"Defaults timestamp_timeout=0",
+		"Defaults:" + g + " requiretty",
+		"Defaults:" + g + " env_reset",
+		"Defaults:" + g + " !lecture",
+		"Defaults:" + g + " timestamp_timeout=0",
 	} {
 		assert.Contains(t, out, want,
-			"ADR T4: Defaults block must include %q", want)
+			"ADR T4: group-scoped Defaults block must include %q", want)
 	}
 }
 
@@ -141,6 +142,62 @@ func TestGenerateTerminalAdminLimitedSudoConfig_DeniesPersistenceVectors(t *test
 	}
 }
 
+// ADR L1/L5 + "Deny modifications to power-manage-agent and sudoers":
+// the agent-protection rules MUST actually deny. In sudoers(5) an EVEN
+// number of '!' operators cancels out (resolving to an ALLOW); only an
+// ODD number negates. So `!!/usr/bin/visudo` GRANTS visudo (sudoers
+// edit → trivial root) and `!!systemctl * power-manage-agent*` GRANTS
+// stopping/disabling the managed agent — the exact opposite of the
+// rule's stated purpose. No reading of the ADR wants visudo granted to
+// a LIMITED terminal admin, so a double-bang must never appear.
+func TestGenerateTerminalAdminLimitedSudoConfig_AgentProtectionIsRealDeny(t *testing.T) {
+	out := generateTerminalAdminLimitedSudoConfig(testTerminalAdminGroup)
+	assert.NotContains(t, out, "!!",
+		"double-bang in sudoers is an even negation = ALLOW; agent/visudo protection must use a single '!' deny")
+	assert.Contains(t, out, "!/usr/bin/systemctl * power-manage-agent*",
+		"LIMITED template must deny controlling the power-manage-agent unit")
+	assert.Contains(t, out, "!/usr/bin/visudo",
+		"LIMITED template must deny visudo (sudoers edit is root escalation)")
+	assert.Contains(t, out, "!/usr/sbin/visudo",
+		"LIMITED template must deny the /usr/sbin/visudo path too")
+}
+
+// The legacy password-bearing LIMITED template carries the identical
+// double-bang bug; there `!!/usr/bin/visudo` actively ADDS visudo to
+// the allowlist (no earlier grant cancels it), so a limited admin with
+// their password can edit sudoers and become full root.
+func TestGenerateLimitedSudoConfig_AgentProtectionIsRealDeny(t *testing.T) {
+	out := generateLimitedSudoConfig(testTerminalAdminGroup)
+	assert.NotContains(t, out, "!!",
+		"double-bang grants the command it claims to deny — legacy LIMITED template must use a single '!'")
+}
+
+// ADR T4 pins the Defaults block to the TerminalAdmin group, not the
+// whole host. A bare `Defaults requiretty` / `timestamp_timeout=0`
+// line inside an /etc/sudoers.d drop-in applies host-globally to every
+// sudo invocation (cron jobs, systemd units, ansible), so deploying one
+// scoped policy would force requiretty on root's non-TTY sudo and strip
+// credential caching for every other admin. The Defaults must be
+// group-scoped: `Defaults:%<group> ...`.
+func TestTerminalAdminDefaults_ScopedToGroup_NotHostGlobal(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		out  string
+	}{
+		{"limited", generateTerminalAdminLimitedSudoConfig(testTerminalAdminGroup)},
+		{"full", generateTerminalAdminFullSudoConfig(testTerminalAdminGroup)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, setting := range []string{"requiretty", "env_reset", "!lecture", "timestamp_timeout=0"} {
+				assert.NotContains(t, tc.out, "Defaults "+setting,
+					"host-global Defaults leaks onto every sudo on the box; scope it to the group")
+				assert.Contains(t, tc.out, "Defaults:%"+testTerminalAdminGroup+" "+setting,
+					"Defaults must be scoped to the TerminalAdmin group")
+			}
+		})
+	}
+}
+
 // =============================================================================
 // generateTerminalAdminFullSudoConfig — passwordless FULL.
 // =============================================================================
@@ -162,14 +219,15 @@ func TestGenerateTerminalAdminFullSudoConfig_NOPASSWD_ALL(t *testing.T) {
 // are the same regardless of access level.
 func TestGenerateTerminalAdminFullSudoConfig_DefaultsBlock(t *testing.T) {
 	out := generateTerminalAdminFullSudoConfig(testTerminalAdminGroup)
+	g := "%" + testTerminalAdminGroup
 	for _, want := range []string{
-		"Defaults requiretty",
-		"Defaults env_reset",
-		"Defaults !lecture",
-		"Defaults timestamp_timeout=0",
+		"Defaults:" + g + " requiretty",
+		"Defaults:" + g + " env_reset",
+		"Defaults:" + g + " !lecture",
+		"Defaults:" + g + " timestamp_timeout=0",
 	} {
 		assert.Contains(t, out, want,
-			"ADR T4: Defaults block must apply to FULL as well — missing %q", want)
+			"ADR T4: group-scoped Defaults block must apply to FULL as well — missing %q", want)
 	}
 }
 
