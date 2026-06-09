@@ -17,6 +17,15 @@ import (
 	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 )
 
+// credentialStore is the slice of *credentials.Store the enrollment
+// handler depends on. Declared as an interface so the costly Load()
+// (64 MiB Argon2id) can be counted/faked in tests.
+type credentialStore interface {
+	Exists() bool
+	Load() (*credentials.Credentials, error)
+	Save(*credentials.Credentials) error
+}
+
 // EnrollHandler implements the Enroll and GetEnrollmentStatus RPCs
 // on the local enrollment socket. All other DeviceAuthService RPCs
 // return Unimplemented.
@@ -25,12 +34,26 @@ type EnrollHandler struct {
 
 	hostname   string
 	version    string
-	credStore  *credentials.Store
+	credStore  credentialStore
 	logger     *slog.Logger
 	onEnrolled func(creds *credentials.Credentials)
 
 	rateMu       sync.Mutex
 	lastAttempts []time.Time
+
+	// enrollMu serializes the whole Enroll body so concurrent requests
+	// (the rate limiter allows up to 5 in flight) can't each pass the
+	// Exists() check, register a duplicate device, race Save (last
+	// write wins, key/cert may mismatch the saved creds), and fire
+	// onEnrolled more than the single-buffer enrollCh can absorb.
+	enrollMu sync.Mutex
+
+	// statusMu guards the cached device id and serializes the one
+	// expensive Load() so a flood of GetEnrollmentStatus calls on the
+	// 0666 socket can't each trigger a 64 MiB Argon2id derivation.
+	statusMu       sync.Mutex
+	cachedDeviceID string
+	statusCached   bool
 }
 
 // NewEnrollHandler creates a handler for enrollment RPCs.
@@ -69,6 +92,12 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 			Error:   "rate limit exceeded, try again later",
 		}), nil
 	}
+
+	// Serialize the rest of enrollment. Up to 5 requests can pass the
+	// rate limiter concurrently; without this they would each pass the
+	// Exists() check below, register a duplicate device, and race Save.
+	h.enrollMu.Lock()
+	defer h.enrollMu.Unlock()
 
 	h.logger.Info("enrollment request received", "server_url", req.Msg.ServerUrl)
 
@@ -146,6 +175,13 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 
 	h.logger.Info("enrollment successful", "device_id", result.DeviceID, "gateway", result.GatewayURL)
 
+	// Prime the status cache so subsequent GetEnrollmentStatus calls
+	// don't re-derive the Argon2id key just to learn the device id.
+	h.statusMu.Lock()
+	h.cachedDeviceID = result.DeviceID
+	h.statusCached = true
+	h.statusMu.Unlock()
+
 	// Notify the main goroutine that enrollment is complete
 	if h.onEnrolled != nil {
 		h.onEnrolled(creds)
@@ -158,7 +194,26 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 }
 
 // GetEnrollmentStatus checks whether the agent is currently enrolled.
+//
+// The enrollment socket is mode 0666, so any local user can call this.
+// credStore.Load() runs a 64 MiB Argon2id derivation, so a naive
+// implementation that loads on every call is a trivial local CPU/memory
+// DoS against the root agent process. We cache the device id after the
+// first successful load and serialize that single load behind statusMu
+// (so a concurrent flood collapses to one derivation, not N).
 func (h *EnrollHandler) GetEnrollmentStatus(_ context.Context, _ *connect.Request[pm.GetEnrollmentStatusRequest]) (*connect.Response[pm.GetEnrollmentStatusResponse], error) {
+	h.statusMu.Lock()
+	defer h.statusMu.Unlock()
+
+	if h.statusCached {
+		return connect.NewResponse(&pm.GetEnrollmentStatusResponse{
+			Enrolled: true,
+			DeviceId: h.cachedDeviceID,
+		}), nil
+	}
+
+	// Cheap stat; never triggers Argon2id. Not cached so a later
+	// enrollment is still observed.
 	if !h.credStore.Exists() {
 		return connect.NewResponse(&pm.GetEnrollmentStatusResponse{
 			Enrolled: false,
@@ -167,12 +222,16 @@ func (h *EnrollHandler) GetEnrollmentStatus(_ context.Context, _ *connect.Reques
 
 	creds, err := h.credStore.Load()
 	if err != nil {
-		// Credentials exist but can't be loaded — treat as not enrolled
+		// Credentials exist but can't be loaded — treat as not enrolled.
+		// Don't cache the failure: a transient decrypt error shouldn't
+		// pin "not enrolled" for the process lifetime.
 		return connect.NewResponse(&pm.GetEnrollmentStatusResponse{
 			Enrolled: false,
 		}), nil
 	}
 
+	h.cachedDeviceID = creds.DeviceID
+	h.statusCached = true
 	return connect.NewResponse(&pm.GetEnrollmentStatusResponse{
 		Enrolled: true,
 		DeviceId: creds.DeviceID,
