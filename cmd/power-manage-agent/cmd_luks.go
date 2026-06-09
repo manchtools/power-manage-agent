@@ -75,6 +75,17 @@ func runLuksURI(rawURI string) {
 func runLuksSetPassphrase(token, dataDir string) {
 	ctx := context.Background()
 
+	// Install the privilege + encryption backends. This CLI runs the
+	// same privileged cryptsetup helpers (WipeTPM / KillSlot /
+	// AddKeyToSlot) as the daemon, but unlike the daemon it never ran
+	// applyBackendOverrides — so without this the SDK stays on its
+	// default sudo backend and every cryptsetup call fails on hosts
+	// where root can't `sudo -n` (openSUSE Defaults targetpw).
+	if err := applyCLIBackends(slog.Default()); err != nil {
+		fmt.Fprintf(os.Stderr, "error: failed to configure privilege backend: %v\n", err)
+		os.Exit(1)
+	}
+
 	// Load agent credentials
 	credStore := credentials.NewStore(dataDir)
 	if !credStore.Exists() {

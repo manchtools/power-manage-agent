@@ -7,6 +7,7 @@ import (
 	"math/rand/v2"
 	"os"
 	osexec "os/exec"
+	"strings"
 	"time"
 
 	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
@@ -32,49 +33,8 @@ func randomBackoff() time.Duration {
 // doas installed). Fail-fast at startup is cheaper than debugging a
 // "permission denied" on the first privileged call hours later.
 func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
-	// Privilege-escalation tool. The agent now runs as root by default
-	// (systemd User=root, see agent/README.md "Runs as root"). When
-	// POWER_MANAGE_PRIVILEGE_BACKEND is unset and we detect uid 0,
-	// pick the no-escalation root backend so privileged calls dispatch
-	// directly without forking sudo (and without depending on per-distro
-	// quirks like openSUSE's default sudoers excluding root). Operators
-	// running the legacy sudoers/doas model can still set the env var
-	// explicitly and the previous behaviour is preserved.
-	var privilegeTool string
-	switch cfg.PrivilegeBackend {
-	case "root":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
-		privilegeTool = ""
-	case "doas":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
-		privilegeTool = "doas"
-	case "sudo":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
-		privilegeTool = "sudo"
-	case "":
-		if os.Geteuid() == 0 {
-			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
-			privilegeTool = ""
-		} else {
-			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
-			privilegeTool = "sudo"
-		}
-	default:
-		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo",
-			"value", cfg.PrivilegeBackend)
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
-		privilegeTool = "sudo"
-	}
-	if privilegeTool == "" {
-		// Root backend has no external tool to look up — Privileged*
-		// dispatchers exec the resolved command directly.
-		logger.Info("privilege backend set", "backend", "root")
-	} else {
-		if _, err := osexec.LookPath(privilegeTool); err != nil {
-			return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
-				privilegeTool, privilegeTool, err)
-		}
-		logger.Info("privilege backend set", "backend", privilegeTool)
+	if err := setPrivilegeBackend(cfg.PrivilegeBackend, logger); err != nil {
+		return err
 	}
 
 	// Service manager. Only systemd has a concrete implementation
@@ -118,11 +78,62 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 	}
 	logger.Info("service backend set", "backend", normalizedServiceBackend(cfg.ServiceBackend))
 
-	// Disk-encryption tooling. Only LUKS is implemented today.
-	// GELI/CGD live on BSD where we don't probe for a specific CLI
-	// binary — the SDK's encryption package handles detection there.
+	setEncryptionBackend(cfg.EncryptionBackend, logger)
+	return nil
+}
+
+// setPrivilegeBackend resolves and installs the SDK privilege backend.
+// The agent now runs as root by default (systemd User=root). When the
+// backend string is empty and we detect uid 0, pick the no-escalation
+// root backend so privileged calls dispatch directly without forking
+// sudo (and without depending on per-distro quirks like openSUSE's
+// default sudoers excluding root). Returns an error if the selected
+// backend's binary isn't on PATH.
+func setPrivilegeBackend(backend string, logger *slog.Logger) error {
+	var privilegeTool string
+	switch backend {
+	case "root":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+		privilegeTool = ""
+	case "doas":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
+		privilegeTool = "doas"
+	case "sudo":
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		privilegeTool = "sudo"
+	case "":
+		if os.Geteuid() == 0 {
+			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+			privilegeTool = ""
+		} else {
+			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+			privilegeTool = "sudo"
+		}
+	default:
+		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo", "value", backend)
+		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		privilegeTool = "sudo"
+	}
+	if privilegeTool == "" {
+		// Root backend has no external tool to look up — Privileged*
+		// dispatchers exec the resolved command directly.
+		logger.Info("privilege backend set", "backend", "root")
+		return nil
+	}
+	if _, err := osexec.LookPath(privilegeTool); err != nil {
+		return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
+			privilegeTool, privilegeTool, err)
+	}
+	logger.Info("privilege backend set", "backend", privilegeTool)
+	return nil
+}
+
+// setEncryptionBackend resolves and installs the SDK encryption backend.
+// Only LUKS is implemented today. GELI/CGD live on BSD where we don't
+// probe for a specific CLI binary.
+func setEncryptionBackend(backend string, logger *slog.Logger) {
 	var encName string
-	switch cfg.EncryptionBackend {
+	switch backend {
 	case "geli":
 		sysenc.SetBackend(sysenc.BackendGELI)
 		encName = "geli"
@@ -133,22 +144,30 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 		sysenc.SetBackend(sysenc.BackendLUKS)
 		encName = "luks"
 	default:
-		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks",
-			"value", cfg.EncryptionBackend)
+		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks", "value", backend)
 		sysenc.SetBackend(sysenc.BackendLUKS)
 		encName = "luks"
 	}
 	if encName == "luks" {
 		if _, err := osexec.LookPath("cryptsetup"); err != nil {
-			// Not fatal — devices without encryption actions assigned
-			// don't need cryptsetup. Warn so operators troubleshooting
-			// a failed encryption action have the context.
-			logger.Warn("luks backend selected but cryptsetup not on PATH; encryption actions will fail",
-				"error", err)
+			logger.Warn("luks backend selected but cryptsetup not on PATH; encryption actions will fail", "error", err)
 		}
 	}
 	logger.Info("encryption backend set", "backend", encName)
+}
 
+// applyCLIBackends installs the privilege + encryption backends for the
+// standalone CLI subcommands (e.g. `luks set-passphrase`). Those run
+// without parseFlags + applyBackendOverrides, so without this they stay
+// on the SDK default sudo backend and the cryptsetup helpers fail on
+// hosts where root can't `sudo -n` (openSUSE Defaults targetpw) — the
+// exact quirk the root backend exists to avoid. The service backend is
+// not needed by these subcommands, so it is intentionally not set here.
+func applyCLIBackends(logger *slog.Logger) error {
+	if err := setPrivilegeBackend(strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND")), logger); err != nil {
+		return err
+	}
+	setEncryptionBackend(strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND")), logger)
 	return nil
 }
 
