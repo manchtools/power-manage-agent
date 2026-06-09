@@ -43,9 +43,8 @@ deploy: build
 	ssh $(SSH_OPTS) $(SSH) 'sudo systemctl stop $(SERVICE) 2>/dev/null; \
 		sudo mv /tmp/$(BINARY) $(REMOTE_BIN) && \
 		sudo chmod +x $(REMOTE_BIN) && \
-		sudo $(REMOTE_BIN) setup --user power-manage && \
 		sudo systemctl start $(SERVICE)'
-	@echo "Deployed $(VERSION) to $(SSH)"
+	@echo "Deployed $(VERSION) to $(SSH) (binary swap only; run 'make install' for a full install)"
 
 install: build
 	ssh $(SSH_OPTS) $(SSH) 'sudo rm -f /tmp/$(BINARY) /tmp/install.sh'
