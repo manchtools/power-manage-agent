@@ -284,6 +284,25 @@ func (e *Executor) Execute(ctx context.Context, action *pb.Action) *pb.ActionRes
 	return e.ExecuteWithStreaming(ctx, action, nil)
 }
 
+// VerifyAction checks the CA signature on an action over the same
+// (actionID, type, paramsCanonical) tuple the control server signs.
+// It returns nil when no verifier is configured (signing disabled) or
+// the signature is valid, and an error when the signature is missing or
+// invalid.
+//
+// Any code path that acts on an action WITHOUT going through
+// ExecuteWithStreaming — e.g. the handler's SYNC instant-action
+// fast-path — MUST call this first. Otherwise a compromised gateway
+// (the F-02 / F-31 threat model) can forge that action type unsigned
+// and the agent will act on it. The fast-path is the reason SYNC
+// previously slipped past verification despite #90's claim to cover it.
+func (e *Executor) VerifyAction(action *pb.Action) error {
+	if e.verifier == nil {
+		return nil
+	}
+	return e.verifier.Verify(getActionID(action), int32(action.Type), action.ParamsCanonical, action.Signature)
+}
+
 // ExecuteWithStreaming runs an action with optional output streaming.
 // The callback is called for each line of output as it's produced (for shell actions).
 func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, callback OutputCallback) *pb.ActionResult {
@@ -317,15 +336,12 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	// canonical paramsJSON `{}` so the agent's verifier uses the
 	// same (id, type, paramsCanonical) tuple as for regular
 	// actions — no protocol change, just no special-casing.
-	if e.verifier != nil {
-		actionID := getActionID(action)
-		if verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature); verifyErr != nil {
-			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
-			result.CompletedAt = timestamppb.Now()
-			result.DurationMs = time.Since(start).Milliseconds()
-			return result
-		}
+	if verifyErr := e.VerifyAction(action); verifyErr != nil {
+		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+		result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
+		result.CompletedAt = timestamppb.Now()
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result
 	}
 
 	var execErr error

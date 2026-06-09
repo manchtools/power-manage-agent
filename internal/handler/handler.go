@@ -3,6 +3,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -131,8 +132,24 @@ func (h *Handler) OnAction(ctx context.Context, action *pb.Action) (*pb.ActionRe
 func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
 	h.logger.Info("received action", "action_id", action.Id.Value, "type", action.Type.String())
 
-	// Handle SYNC instant action directly — trigger sync and return success
+	// Handle SYNC instant action directly — trigger sync and return success.
+	//
+	// The signature MUST be verified here. SYNC returns before
+	// ExecuteWithStreaming, so the executor's verification never runs on
+	// this path; without this check a compromised gateway/Valkey (the
+	// F-31 threat model) could inject an unsigned type=SYNC and force
+	// resyncs at will. #90 removed the executor's instant-action skip
+	// but missed this fast-path, leaving SYNC forgeable.
 	if action.Type == pb.ActionType_ACTION_TYPE_SYNC {
+		if verifyErr := h.executor.VerifyAction(action); verifyErr != nil {
+			h.logger.Warn("rejecting unsigned/tampered SYNC action", "action_id", action.Id.Value, "error", verifyErr)
+			return &pb.ActionResult{
+				ActionId:    action.Id,
+				Status:      pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
+				Error:       fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr),
+				CompletedAt: timestamppb.Now(),
+			}, nil
+		}
 		h.logger.Info("triggering immediate sync via instant action")
 		if h.syncTrigger != nil {
 			select {
