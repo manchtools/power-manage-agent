@@ -239,13 +239,12 @@ func (s *Scheduler) Results() <-chan *ExecutionResult {
 	return s.resultsCh
 }
 
-// AddAction adds or updates an action in the store.
+// AddAction adds or updates an action in the store. The dispatch caller
+// executes the action inline, so SaveAction advances the stored cursor
+// to the next scheduled occurrence (run_on_assign is honored by that
+// inline execution, not by the stored next_execute_at).
 func (s *Scheduler) AddAction(action *pb.Action) error {
-	runOnAssign := false
-	if action.Schedule != nil {
-		runOnAssign = action.Schedule.RunOnAssign
-	}
-	if err := s.store.SaveAction(action, runOnAssign); err != nil {
+	if err := s.store.SaveAction(action); err != nil {
 		// Wrap with the action_id so the caller's "failed to store
 		// action" log line points at the specific action that
 		// failed instead of just the generic class. Audit F030.

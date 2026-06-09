@@ -135,8 +135,17 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// SaveAction stores or updates an action.
-func (s *Store) SaveAction(action *pb.Action, runOnAssign bool) error {
+// SaveAction stores or updates an action dispatched from the server.
+//
+// The dispatch caller (handler.OnAction) executes the action
+// immediately after storing it, so the stored next_execute_at must be
+// the NEXT scheduled occurrence — never "now". Setting it to "now"
+// caused the scheduler's runDueActions ticker to re-run the action a
+// second time, exactly the double-execution the SyncActions standalone
+// path already guards against (see SyncActions' next_execute comment).
+// run_on_assign's "run immediately" intent is satisfied by the caller's
+// inline execution, so it no longer affects the stored cursor.
+func (s *Store) SaveAction(action *pb.Action) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
@@ -145,8 +154,11 @@ func (s *Store) SaveAction(action *pb.Action, runOnAssign bool) error {
 		return fmt.Errorf("marshal action: %w", err)
 	}
 
-	// Calculate next execution time
-	nextExecute := s.calculateNextExecute(action, nil, runOnAssign)
+	// Cursor for the NEXT scheduled run, computed as if the action just
+	// executed now (the caller runs it inline). Passing &now — rather
+	// than nil — is what keeps it in the future for every schedule shape.
+	now := time.Now().UTC()
+	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	_, err = s.db.Exec(`
 		INSERT INTO actions (id, action_json, assigned_at, next_execute_at)
