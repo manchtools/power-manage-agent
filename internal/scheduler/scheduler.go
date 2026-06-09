@@ -184,6 +184,10 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 	s.running = true
 	s.stopCh = make(chan struct{})
+	// Capture stopCh into a local under the lock. The select below
+	// reads this local, never the shared s.stopCh field — so Stop()
+	// mutating s.stopCh can't race the reader (audit F020 regression).
+	stopCh := s.stopCh
 	s.mu.Unlock()
 
 	s.logger.Info("scheduler started")
@@ -199,7 +203,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 		case <-ctx.Done():
 			s.logger.Info("scheduler stopped by context")
 			return
-		case <-s.stopCh:
+		case <-stopCh:
 			s.logger.Info("scheduler stopped")
 			return
 		case <-ticker.C:
@@ -210,8 +214,14 @@ func (s *Scheduler) Start(ctx context.Context) {
 
 // Stop stops the scheduler. Safe to call multiple times and safe to
 // call on a never-Start()'d scheduler — both no-op without panicking.
-// Audit F020: a `close(s.stopCh)` on a nil channel previously panicked
-// when Stop was called before Start (e.g. during error-path shutdown).
+//
+// The `running` flag (set true with stopCh under the same lock in
+// Start, cleared here) is the guard: a pre-Start or repeat Stop sees
+// running=false and returns before touching stopCh, so close() runs at
+// most once on a non-nil channel. We deliberately do NOT nil out
+// s.stopCh — Start reads a local copy, and a stale closed channel is
+// harmless because the next Start() reassigns it (audit F020; the
+// earlier nil-assignment raced Start's select reader).
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
 	defer s.mu.Unlock()
@@ -219,10 +229,7 @@ func (s *Scheduler) Stop() {
 	if !s.running {
 		return
 	}
-	if s.stopCh != nil {
-		close(s.stopCh)
-		s.stopCh = nil
-	}
+	close(s.stopCh)
 	s.running = false
 }
 
