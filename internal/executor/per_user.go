@@ -90,7 +90,11 @@ func runAsUserStreaming(ctx context.Context, s desktop.Session, extraEnv []strin
 	if dir == "" {
 		dir = s.Home
 	}
-	r, err := sysexec.RunStreaming(ctx, runuserPath, full, env, dir, callback)
+	// Run with the target user's curated PATH, not the agent's (root's).
+	// PATH is blocklisted from envVars, so it must be passed as the
+	// trusted child PATH — otherwise the user script inherits root's
+	// PATH and ~/.local/bin is ignored (see desktop.UserPath).
+	r, err := sysexec.RunStreamingChildPath(ctx, runuserPath, full, env, desktop.UserPath(s), dir, callback)
 	return toOutput(r), err
 }
 
