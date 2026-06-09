@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,6 +21,7 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/robfig/cron/v3"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 
 	"github.com/manchtools/power-manage/agent/internal/store/migrations"
@@ -135,6 +137,36 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
+// canonicalProtoJSON marshals m to JSON and strips the per-binary
+// random whitespace protojson injects. protojson deliberately varies
+// insignificant whitespace (seeded from a hash of the running binary)
+// as an anti-pinning measure, so a blob stored by one agent binary can
+// compare byte-unequal to the identical message marshaled by a
+// different binary after a self-update. The store uses these blobs for
+// change detection (SyncActions / SyncStandaloneAndGrouped); without
+// normalization a single self-update would flag EVERY action as changed
+// and re-execute the whole set, resetting all schedules. Compaction
+// yields a stable byte form — protojson's field order is already
+// deterministic, only the whitespace is not.
+func canonicalProtoJSON(m proto.Message) (string, error) {
+	b, err := protojson.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return compactJSON(b), nil
+}
+
+// compactJSON removes insignificant whitespace from JSON, returning the
+// input unchanged if it cannot be parsed (defensive; callers feed it
+// protojson output or previously-stored blobs).
+func compactJSON(b []byte) string {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, b); err != nil {
+		return string(b)
+	}
+	return buf.String()
+}
+
 // SaveAction stores or updates an action dispatched from the server.
 //
 // The dispatch caller (handler.OnAction) executes the action
@@ -149,7 +181,7 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	actionJSON, err := protojson.Marshal(action)
+	actionJSON, err := canonicalProtoJSON(action)
 	if err != nil {
 		return fmt.Errorf("marshal action: %w", err)
 	}
@@ -169,7 +201,7 @@ func (s *Store) SaveAction(action *pb.Action) error {
 				WHEN actions.last_executed_at IS NULL THEN excluded.next_execute_at
 				ELSE actions.next_execute_at
 			END
-	`, action.Id.Value, string(actionJSON), nextExecute)
+	`, action.Id.Value, actionJSON, nextExecute)
 
 	return err
 }
@@ -565,14 +597,14 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 
 		local, exists := localActions[actionID]
 
-		actionJSON, err := protojson.Marshal(action)
+		actionJSON, err := canonicalProtoJSON(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) {
+		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -596,7 +628,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 					THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, string(actionJSON), nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -715,7 +747,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		actionID := action.Id.Value
 		newDesiredState := int32(action.DesiredState)
 
-		actionJSON, err := protojson.Marshal(action)
+		actionJSON, err := canonicalProtoJSON(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
@@ -723,7 +755,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		local, exists := localActions[actionID]
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) || local.isGrouped != 0 {
+		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON || local.isGrouped != 0 {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -743,7 +775,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, string(actionJSON), nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -759,7 +791,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 				continue
 			}
 			actionID := action.Id.Value
-			actionJSON, err := protojson.Marshal(action)
+			actionJSON, err := canonicalProtoJSON(action)
 			if err != nil {
 				return nil, fmt.Errorf("marshal grouped action %s: %w", actionID, err)
 			}
@@ -771,7 +803,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					desired_state = excluded.desired_state,
 					is_grouped = 1,
 					next_execute_at = excluded.next_execute_at
-			`, actionID, string(actionJSON), farFuture, int32(action.DesiredState))
+			`, actionID, actionJSON, farFuture, int32(action.DesiredState))
 			if err != nil {
 				return nil, fmt.Errorf("upsert grouped action %s: %w", actionID, err)
 			}
@@ -827,7 +859,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			continue
 		}
 
-		schedJSON, err := protojson.Marshal(g.Schedule)
+		schedJSON, err := canonicalProtoJSON(g.Schedule)
 		if err != nil {
 			return nil, fmt.Errorf("marshal group schedule for %s: %w", groupID, err)
 		}
@@ -837,7 +869,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		// slot.
 		var nextExecute time.Time
 		var lastExecutedAt sql.NullTime
-		if prior, ok := existingGroups[groupID]; ok && prior.scheduleJSON == string(schedJSON) {
+		if prior, ok := existingGroups[groupID]; ok && compactJSON([]byte(prior.scheduleJSON)) == schedJSON {
 			nextExecute = prior.nextExecuteAt
 			lastExecutedAt = prior.lastExecutedAt
 		} else {
@@ -853,7 +885,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		if _, err := tx.Exec(`
 			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, last_executed_at, next_execute_at)
 			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-		`, groupID, g.SourceLabel, string(schedJSON), lastExecutedAt, nextExecute); err != nil {
+		`, groupID, g.SourceLabel, schedJSON, lastExecutedAt, nextExecute); err != nil {
 			return nil, fmt.Errorf("insert action_group %s: %w", groupID, err)
 		}
 
