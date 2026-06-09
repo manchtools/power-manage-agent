@@ -3,6 +3,7 @@
 package store
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -20,6 +21,7 @@ import (
 	"github.com/pressly/goose/v3"
 	"github.com/robfig/cron/v3"
 	"google.golang.org/protobuf/encoding/protojson"
+	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 
 	"github.com/manchtools/power-manage/agent/internal/store/migrations"
@@ -89,28 +91,27 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	dbPath := filepath.Join(dataDir, "agent.db")
-	db, err := sql.Open("sqlite", dbPath)
+	// Pragmas are set on the DSN so they apply to EVERY connection the
+	// pool opens, not just the first. foreign_keys is per-connection in
+	// SQLite (OFF by default) — setting it via a one-off db.Exec left
+	// freshly-opened pool connections with enforcement OFF, so
+	// ON DELETE CASCADE fired nondeterministically depending on which
+	// connection a statement landed on (audit F-pragma). busy_timeout
+	// lets the CLI subcommands (tty/luks) wait for the daemon's writer
+	// instead of failing immediately with SQLITE_BUSY. journal_mode=WAL
+	// is a persistent file setting but is harmless to repeat per conn.
+	dsn := dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
+	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
 		return nil, fmt.Errorf("open database: %w", err)
 	}
 
-	// Enable WAL mode. NOTE: the Store also serializes all SQL
-	// through a Go-level RWMutex (s.mu), so WAL's reader/writer
-	// concurrency does not currently translate into actual Go-level
-	// concurrency — writes block reads at the application layer
-	// regardless. WAL is still worth having for crash safety and
-	// fewer fsyncs, but a future pass that drops s.mu in favour of
-	// modernc.org/sqlite's per-conn locking would unlock the real
-	// benefit. Audit F021.
-	if _, err := db.Exec("PRAGMA journal_mode=WAL"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable WAL mode: %w", err)
-	}
-	// Enable foreign key enforcement (OFF by default in SQLite)
-	if _, err := db.Exec("PRAGMA foreign_keys=ON"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("enable foreign keys: %w", err)
-	}
+	// NOTE: the Store also serializes all SQL through a Go-level RWMutex
+	// (s.mu), so WAL's reader/writer concurrency does not currently
+	// translate into Go-level concurrency — writes block reads at the
+	// application layer regardless. A future pass that drops s.mu in
+	// favour of modernc.org/sqlite's per-conn locking would unlock the
+	// real benefit. Audit F021.
 
 	goose.SetBaseFS(migrations.FS)
 	// Audit F009: goose's dialect name is the legacy "sqlite3" even
@@ -135,18 +136,60 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// SaveAction stores or updates an action.
-func (s *Store) SaveAction(action *pb.Action, runOnAssign bool) error {
+// canonicalProtoJSON marshals m to JSON and strips the per-binary
+// random whitespace protojson injects. protojson deliberately varies
+// insignificant whitespace (seeded from a hash of the running binary)
+// as an anti-pinning measure, so a blob stored by one agent binary can
+// compare byte-unequal to the identical message marshaled by a
+// different binary after a self-update. The store uses these blobs for
+// change detection (SyncActions / SyncStandaloneAndGrouped); without
+// normalization a single self-update would flag EVERY action as changed
+// and re-execute the whole set, resetting all schedules. Compaction
+// yields a stable byte form — protojson's field order is already
+// deterministic, only the whitespace is not.
+func canonicalProtoJSON(m proto.Message) (string, error) {
+	b, err := protojson.Marshal(m)
+	if err != nil {
+		return "", err
+	}
+	return compactJSON(b), nil
+}
+
+// compactJSON removes insignificant whitespace from JSON, returning the
+// input unchanged if it cannot be parsed (defensive; callers feed it
+// protojson output or previously-stored blobs).
+func compactJSON(b []byte) string {
+	var buf bytes.Buffer
+	if err := json.Compact(&buf, b); err != nil {
+		return string(b)
+	}
+	return buf.String()
+}
+
+// SaveAction stores or updates an action dispatched from the server.
+//
+// The dispatch caller (handler.OnAction) executes the action
+// immediately after storing it, so the stored next_execute_at must be
+// the NEXT scheduled occurrence — never "now". Setting it to "now"
+// caused the scheduler's runDueActions ticker to re-run the action a
+// second time, exactly the double-execution the SyncActions standalone
+// path already guards against (see SyncActions' next_execute comment).
+// run_on_assign's "run immediately" intent is satisfied by the caller's
+// inline execution, so it no longer affects the stored cursor.
+func (s *Store) SaveAction(action *pb.Action) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	actionJSON, err := protojson.Marshal(action)
+	actionJSON, err := canonicalProtoJSON(action)
 	if err != nil {
 		return fmt.Errorf("marshal action: %w", err)
 	}
 
-	// Calculate next execution time
-	nextExecute := s.calculateNextExecute(action, nil, runOnAssign)
+	// Cursor for the NEXT scheduled run, computed as if the action just
+	// executed now (the caller runs it inline). Passing &now — rather
+	// than nil — is what keeps it in the future for every schedule shape.
+	now := time.Now().UTC()
+	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	_, err = s.db.Exec(`
 		INSERT INTO actions (id, action_json, assigned_at, next_execute_at)
@@ -157,7 +200,7 @@ func (s *Store) SaveAction(action *pb.Action, runOnAssign bool) error {
 				WHEN actions.last_executed_at IS NULL THEN excluded.next_execute_at
 				ELSE actions.next_execute_at
 			END
-	`, action.Id.Value, string(actionJSON), nextExecute)
+	`, action.Id.Value, actionJSON, nextExecute)
 
 	return err
 }
@@ -335,7 +378,7 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		return "", fmt.Errorf("unmarshal action: %w", err)
 	}
 
-	now := time.Now()
+	now := time.Now().UTC()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	// Calculate result hash for change detection (must match scheduler.detectChanges format)
@@ -458,6 +501,26 @@ func (s *Store) MarkResultSynced(resultID string) error {
 	return err
 }
 
+// IsResultSynced reports whether the result has already been sent to the
+// server. A missing row counts as "already handled" (true) so a result
+// that was synced-and-cleaned is never re-sent. Used to keep the
+// channel-drain path (sendScheduledResults) from re-sending a result
+// that syncPendingResults already delivered on the same reconnect.
+func (s *Store) IsResultSynced(resultID string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var synced int
+	err := s.db.QueryRow("SELECT synced FROM results WHERE id = ?", resultID).Scan(&synced)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return synced == 1, nil
+}
+
 // HasPriorExecution returns true if the action has more than one recorded execution.
 // This is used to distinguish first-run results (which should always be reported)
 // from subsequent unchanged results (which can be skipped).
@@ -525,6 +588,12 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		localActions[la.id] = &la
 	}
 	rows.Close()
+	// A cursor error mid-iteration would silently truncate localActions,
+	// mis-classifying still-present actions as new (spurious immediate
+	// re-execution). All other row loops in this file check rows.Err().
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate actions: %w", err)
+	}
 
 	// Identify and load removed actions (for undo), then delete them
 	for localID, la := range localActions {
@@ -553,14 +622,14 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 
 		local, exists := localActions[actionID]
 
-		actionJSON, err := protojson.Marshal(action)
+		actionJSON, err := canonicalProtoJSON(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) {
+		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -568,7 +637,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		// executes new/changed actions immediately via ID lists, not via next_execute_at.
 		// Setting next_execute_at to "now" caused the scheduler's runDueActions ticker
 		// to double-execute actions while the sync execution was still running.
-		now := time.Now()
+		now := time.Now().UTC()
 		nextExecute := s.calculateNextExecute(action, &now, false)
 
 		// Upsert: insert new or update existing (but preserve execution history)
@@ -584,7 +653,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 					THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, string(actionJSON), nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -669,6 +738,9 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		localActions[la.id] = &la
 	}
 	rows.Close()
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate actions: %w", err)
+	}
 
 	// Removals: action no longer present on standalone OR grouped.
 	for localID, la := range localActions {
@@ -695,7 +767,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 	}
 
 	// Standalone upserts.
-	now := time.Now()
+	now := time.Now().UTC()
 	for _, action := range standalone {
 		if action.Id == nil {
 			continue
@@ -703,7 +775,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		actionID := action.Id.Value
 		newDesiredState := int32(action.DesiredState)
 
-		actionJSON, err := protojson.Marshal(action)
+		actionJSON, err := canonicalProtoJSON(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
@@ -711,7 +783,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		local, exists := localActions[actionID]
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || local.actionJSON != string(actionJSON) || local.isGrouped != 0 {
+		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON || local.isGrouped != 0 {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -731,7 +803,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, string(actionJSON), nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -747,7 +819,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 				continue
 			}
 			actionID := action.Id.Value
-			actionJSON, err := protojson.Marshal(action)
+			actionJSON, err := canonicalProtoJSON(action)
 			if err != nil {
 				return nil, fmt.Errorf("marshal grouped action %s: %w", actionID, err)
 			}
@@ -759,7 +831,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					desired_state = excluded.desired_state,
 					is_grouped = 1,
 					next_execute_at = excluded.next_execute_at
-			`, actionID, string(actionJSON), farFuture, int32(action.DesiredState))
+			`, actionID, actionJSON, farFuture, int32(action.DesiredState))
 			if err != nil {
 				return nil, fmt.Errorf("upsert grouped action %s: %w", actionID, err)
 			}
@@ -798,6 +870,11 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		existingGroups[id] = eg
 	}
 	groupRows.Close()
+	// A truncated existingGroups would lose cadence snapshots, re-firing
+	// groups as if brand new.
+	if err := groupRows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate action_groups: %w", err)
+	}
 
 	if _, err := tx.Exec("DELETE FROM group_members"); err != nil {
 		return nil, fmt.Errorf("clear group_members: %w", err)
@@ -815,7 +892,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			continue
 		}
 
-		schedJSON, err := protojson.Marshal(g.Schedule)
+		schedJSON, err := canonicalProtoJSON(g.Schedule)
 		if err != nil {
 			return nil, fmt.Errorf("marshal group schedule for %s: %w", groupID, err)
 		}
@@ -825,7 +902,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		// slot.
 		var nextExecute time.Time
 		var lastExecutedAt sql.NullTime
-		if prior, ok := existingGroups[groupID]; ok && prior.scheduleJSON == string(schedJSON) {
+		if prior, ok := existingGroups[groupID]; ok && compactJSON([]byte(prior.scheduleJSON)) == schedJSON {
 			nextExecute = prior.nextExecuteAt
 			lastExecutedAt = prior.lastExecutedAt
 		} else {
@@ -841,7 +918,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		if _, err := tx.Exec(`
 			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, last_executed_at, next_execute_at)
 			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-		`, groupID, g.SourceLabel, string(schedJSON), lastExecutedAt, nextExecute); err != nil {
+		`, groupID, g.SourceLabel, schedJSON, lastExecutedAt, nextExecute); err != nil {
 			return nil, fmt.Errorf("insert action_group %s: %w", groupID, err)
 		}
 

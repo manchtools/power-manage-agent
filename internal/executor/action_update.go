@@ -625,15 +625,19 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 		output.WriteString(cmdOutput.Stderr)
 	}
 
-	// Also run dist-upgrade for held-back packages (still respects holds)
+	// Also run dist-upgrade for held-back packages (still respects holds).
+	// A dist-upgrade failure (e.g. a half-completed kernel transition)
+	// must not be swallowed — joining it into the returned error so the
+	// action reports FAILED instead of a clean SUCCESS with a broken
+	// upgrade underneath.
 	output.WriteString("\n=== Dist-Upgrade ===\n")
-	distOutput, _ := apt.DistUpgrade()
+	distOutput, distErr := apt.DistUpgrade()
 	if distOutput != nil {
 		output.WriteString(distOutput.Stdout)
 		output.WriteString(distOutput.Stderr)
 	}
 
-	return err
+	return errors.Join(err, distErr)
 }
 
 // executeDnfUpgrade performs dnf-specific upgrade.

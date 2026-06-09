@@ -349,9 +349,19 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 		// Update package index only when something changed
 		if changed {
 			apt := pkg.NewAptWithContext(ctx)
-			updateOutput, _ := apt.Update()
+			updateOutput, updateErr := apt.Update()
 			if updateOutput != nil {
 				output.WriteString(updateOutput.Stdout)
+			}
+			if updateErr != nil {
+				// Mirror the dnf/pacman/zypper refresh-failure handling:
+				// a typo'd repo URL or unreadable key fails the post-config
+				// index refresh, but the repository file was still written.
+				// Surface it (don't silently report a clean SUCCESS) while
+				// keeping the configuration that did land.
+				e.logger.Warn("apt PRESENT: failed to refresh package index after repo config",
+					"repo", name, "error", updateErr)
+				output.WriteString(fmt.Sprintf("warning: apt update failed after configuring %s: %v\n", name, updateErr))
 			}
 		}
 

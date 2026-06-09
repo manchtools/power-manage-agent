@@ -291,7 +291,7 @@ func main() {
 		"version", version,
 	)
 
-	runAgent(ctx, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger)
+	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger)
 
 	// Stop background goroutines started during runAgent. The
 	// terminal sweeper would otherwise outlive the agent process in

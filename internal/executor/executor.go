@@ -11,6 +11,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"path/filepath"
 	"regexp"
 	"strings"
 	"sync"
@@ -284,6 +285,25 @@ func (e *Executor) Execute(ctx context.Context, action *pb.Action) *pb.ActionRes
 	return e.ExecuteWithStreaming(ctx, action, nil)
 }
 
+// VerifyAction checks the CA signature on an action over the same
+// (actionID, type, paramsCanonical) tuple the control server signs.
+// It returns nil when no verifier is configured (signing disabled) or
+// the signature is valid, and an error when the signature is missing or
+// invalid.
+//
+// Any code path that acts on an action WITHOUT going through
+// ExecuteWithStreaming — e.g. the handler's SYNC instant-action
+// fast-path — MUST call this first. Otherwise a compromised gateway
+// (the F-02 / F-31 threat model) can forge that action type unsigned
+// and the agent will act on it. The fast-path is the reason SYNC
+// previously slipped past verification despite #90's claim to cover it.
+func (e *Executor) VerifyAction(action *pb.Action) error {
+	if e.verifier == nil {
+		return nil
+	}
+	return e.verifier.Verify(getActionID(action), int32(action.Type), action.ParamsCanonical, action.Signature)
+}
+
 // ExecuteWithStreaming runs an action with optional output streaming.
 // The callback is called for each line of output as it's produced (for shell actions).
 func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, callback OutputCallback) *pb.ActionResult {
@@ -317,15 +337,12 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	// canonical paramsJSON `{}` so the agent's verifier uses the
 	// same (id, type, paramsCanonical) tuple as for regular
 	// actions — no protocol change, just no special-casing.
-	if e.verifier != nil {
-		actionID := getActionID(action)
-		if verifyErr := e.verifier.Verify(actionID, int32(action.Type), action.ParamsCanonical, action.Signature); verifyErr != nil {
-			result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-			result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
-			result.CompletedAt = timestamppb.Now()
-			result.DurationMs = time.Since(start).Milliseconds()
-			return result
-		}
+	if verifyErr := e.VerifyAction(action); verifyErr != nil {
+		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
+		result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
+		result.CompletedAt = timestamppb.Now()
+		result.DurationMs = time.Since(start).Milliseconds()
+		return result
 	}
 
 	var execErr error
@@ -703,8 +720,11 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	return execOutput, verifyOutput, true, nil
 }
 
-// maxDownloadSize is the maximum allowed download size (2 GiB).
-const maxDownloadSize = 2 << 30
+// maxDownloadSize is the maximum allowed download size (2 GiB). It is a
+// var, not a const, only so tests can shrink the cap to exercise the
+// oversize-rejection path without streaming 2 GiB; production never
+// reassigns it.
+var maxDownloadSize int64 = 2 << 30
 
 func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
@@ -731,49 +751,61 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	// lie about Content-Length or use chunked encoding.
 	body := io.LimitReader(resp.Body, maxDownloadSize+1)
 
-	file, err := os.Create(dest)
+	// Download into a temp file in the destination directory, then
+	// atomically rename over dest only on full success. A failed,
+	// partial, or checksum-mismatched download must NOT destroy an
+	// existing file at dest — e.g. a working AppImage being upgraded
+	// (os.Create truncated it in place before, leaving the user with
+	// nothing on any error).
+	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".download-*")
 	if err != nil {
 		return err
 	}
+	tmpPath := tmp.Name()
+	removeTmp := func() { _ = os.Remove(tmpPath) }
 
-	var written int64
+	hasher := sha256.New()
+	dst := io.Writer(tmp)
 	if expectedChecksum != "" {
-		hasher := sha256.New()
-		reader := io.TeeReader(body, hasher)
-		if written, err = io.Copy(file, reader); err != nil {
-			_ = file.Close()
-			return err
-		}
-		if written > maxDownloadSize {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
-		}
+		dst = io.MultiWriter(tmp, hasher)
+	}
+	written, err := io.Copy(dst, body)
+	if err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return err
+	}
+	if written > maxDownloadSize {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
+	}
+	if expectedChecksum != "" {
 		actual := hex.EncodeToString(hasher.Sum(nil))
-		if actual != expectedChecksum {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actual)
-		}
-	} else {
-		if written, err = io.Copy(file, body); err != nil {
-			_ = file.Close()
-			return err
-		}
-		if written > maxDownloadSize {
-			_ = file.Close()
-			os.Remove(dest)
-			return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
+		// EqualFold + TrimSpace: actual is lowercase hex, but operators
+		// commonly paste uppercase / whitespace-padded hashes. A
+		// case-sensitive compare here rejected an uppercase-but-correct
+		// checksum even though the idempotency skip-check already
+		// normalizes (see action_appimage.go), so installs failed on a
+		// correct file.
+		if !strings.EqualFold(actual, strings.TrimSpace(expectedChecksum)) {
+			_ = tmp.Close()
+			removeTmp()
+			return fmt.Errorf("checksum mismatch: expected %s, got %s", strings.TrimSpace(expectedChecksum), actual)
 		}
 	}
-
-	if err := file.Close(); err != nil {
-		// A late Close() error (fsync failure on a full disk, network
-		// FS hiccup) means the on-disk file is potentially partial.
-		// Remove it so the next run re-downloads instead of silently
-		// treating a truncated file as a valid artifact.
-		os.Remove(dest)
-		return fmt.Errorf("close downloaded file %s: %w", dest, err)
+	if err := tmp.Sync(); err != nil {
+		_ = tmp.Close()
+		removeTmp()
+		return fmt.Errorf("fsync downloaded file: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		removeTmp()
+		return fmt.Errorf("close downloaded file: %w", err)
+	}
+	if err := os.Rename(tmpPath, dest); err != nil {
+		removeTmp()
+		return fmt.Errorf("install downloaded file to %s: %w", dest, err)
 	}
 	return nil
 }

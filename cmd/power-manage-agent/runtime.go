@@ -18,7 +18,24 @@ import (
 // runAgent connects to the gateway and processes messages.
 // The agent continues to run scheduled actions even when disconnected.
 // If securityAlert is non-nil, it will be sent to the server after connection.
-func runAgent(ctx context.Context, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
+// reloadCredsForReconnect returns the latest credentials from disk,
+// falling back to `current` if the reload fails. startCertRotation
+// renews the mTLS certificate and persists it to disk, but runAgent
+// holds an in-memory copy loaded once at startup; without reloading it
+// before each reconnect, a reconnect that happens after the old cert
+// expired would keep presenting the stale (expired) cert and fail the
+// mTLS handshake forever, even though a valid renewed cert already sits
+// on disk. A transient reload error must NOT drop the working creds.
+func reloadCredsForReconnect(credStore *credentials.Store, current *credentials.Credentials, logger *slog.Logger) *credentials.Credentials {
+	reloaded, err := credStore.Load()
+	if err != nil {
+		logger.Warn("cert reload: failed to reload credentials before reconnect; using in-memory copy", "error", err)
+		return current
+	}
+	return reloaded
+}
+
+func runAgent(ctx context.Context, credStore *credentials.Store, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
 	// Current sync interval (can be updated by server). Owned by
 	// runAgent — periodicSync receives its initial value as a
 	// stack-local copy and any subsequent updates over a channel.
@@ -34,7 +51,17 @@ func runAgent(ctx context.Context, creds *credentials.Credentials, hostname stri
 	// Exponential backoff for reconnection
 	currentBackoff := randomBackoff()
 
+	// First connection uses the creds passed in (freshly loaded in
+	// main); every reconnect reloads from disk to pick up a rotated
+	// certificate before building the mTLS client.
+	firstConnect := true
+
 	for {
+		if !firstConnect {
+			creds = reloadCredsForReconnect(credStore, creds, logger)
+		}
+		firstConnect = false
+
 		// Reset handler connection state for new connection
 		h.ResetConnection()
 
@@ -257,6 +284,24 @@ func sendScheduledResults(ctx context.Context, client *sdk.Client, sched *schedu
 		case result, ok := <-sched.Results():
 			if !ok {
 				return
+			}
+
+			// Skip results already sent by syncPendingResults on this
+			// same reconnect. An action executed while offline is BOTH
+			// persisted (unsynced) AND buffered in this channel;
+			// syncPendingResults runs first (synchronously, before this
+			// goroutine starts) and sends + marks the stored copy synced.
+			// Without this check the buffered copy is sent a second time,
+			// and the wire ActionResult carries no result id for the
+			// server to dedup on — duplicate result events per offline
+			// execution.
+			if synced, err := sched.IsResultSynced(result.ResultID); err != nil {
+				logger.Warn("failed to check result synced state; sending to be safe",
+					"result_id", result.ResultID, "error", err)
+			} else if synced {
+				logger.Debug("skipping result already synced by syncPendingResults",
+					"result_id", result.ResultID, "action_id", result.ActionID)
+				continue
 			}
 
 			// Skip unchanged results unless this is the first execution of the action

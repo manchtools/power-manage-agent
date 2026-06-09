@@ -214,12 +214,14 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	// `${BinaryPath}.bak` to redirect the backup. The agent runs as
 	// root, so direct file IO works without sudo.
 	//
-	// SafeBackupAndReplace reads the new binary content, mvs current →
-	// .bak under renameat2 (clobbering an existing .bak per the
-	// `removeExistingBackup=true` flag — operators expect the latest
-	// rollback to win), then writes the new binary atomically via
-	// SafeReplaceFile. On any failure the live binary is left intact
-	// because the rename is atomic and the new write happens last.
+	// SafeBackupAndReplace COPIES the current binary → .bak (clobbering
+	// an existing .bak per `removeExistingBackup=true` — operators
+	// expect the latest rollback to win), then writes the new binary
+	// atomically over the live path via SafeReplaceFile. Because the
+	// backup is a copy (not a move), the live binary is the only thing
+	// the final atomic rename touches, so on ANY failure — backup error,
+	// write error, or a crash/power-loss mid-update — the live binary is
+	// left intact rather than absent.
 	bakPath := cfg.BinaryPath + ".bak"
 	newBinary, err := os.ReadFile(tmpPath)
 	if err != nil {

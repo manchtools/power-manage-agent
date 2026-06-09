@@ -50,13 +50,34 @@ func (e *Executor) executeFlatpakSystem(ctx context.Context, params *pb.FlatpakP
 	const systemFlag = "--system"
 	isInstalled := e.isFlatpakInstalled(params.AppId, systemFlag)
 
+	// Pin (mask) runner for this scope; closes over sudo + --system.
+	sysMaskRun := func(args ...string) (*pb.CommandOutput, error) {
+		return runSudoCmd(ctx, "flatpak", append([]string{"mask", systemFlag}, args...)...)
+	}
+
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		if isInstalled {
-			return &pb.CommandOutput{
+			out := &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("flatpak %s is already installed", params.AppId),
-			}, false, nil
+			}
+			// Converge the pin even when already installed — a pin
+			// requested after install, or lost out-of-band, must still
+			// be applied. A pin failure is a real failure.
+			if params.Pin {
+				changed, pinErr := ensureFlatpakMasked(params.AppId, sysMaskRun)
+				if pinErr != nil {
+					out.ExitCode = 1
+					out.Stderr = pinErr.Error()
+					return out, false, pinErr
+				}
+				if changed {
+					out.Stdout += "\npinned"
+				}
+				return out, changed, nil
+			}
+			return out, false, nil
 		}
 
 		if out, err := e.requireWritableFS(ctx); err != nil {
@@ -68,18 +89,17 @@ func (e *Executor) executeFlatpakSystem(ctx context.Context, params *pb.FlatpakP
 			return output, false, fmt.Errorf("flatpak install failed: %w", err)
 		}
 
-		// Pin if requested (mask prevents updates). Audit F056(a) —
-		// guard the dereference so a successful install + successful
-		// pin doesn't segfault on the Stdout += assignment.
+		// Pin if requested (mask prevents updates). Pinning is part of
+		// the requested state, so a pin failure surfaces as a real error
+		// — the install is durable but the action did not reach the
+		// desired state (mirrors action_package.go).
 		if params.Pin {
-			pinOutput, pinErr := runSudoCmd(ctx, "flatpak", "mask", systemFlag, params.AppId)
-			if output == nil {
-				output = &pb.CommandOutput{}
-			}
-			if pinErr != nil {
-				output.Stdout += "\nWarning: failed to pin application: " + pinErr.Error()
-			} else if pinOutput != nil {
-				output.Stdout += "\n" + pinOutput.Stdout
+			if _, pinErr := ensureFlatpakMasked(params.AppId, sysMaskRun); pinErr != nil {
+				if output == nil {
+					output = &pb.CommandOutput{}
+				}
+				output.Stderr += "\n" + pinErr.Error()
+				return output, true, fmt.Errorf("flatpak installed but pin failed: %w", pinErr)
 			}
 		}
 		return output, true, nil
@@ -159,8 +179,27 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 				perUserOut.WriteString("\n")
 			}
 
+			userMaskRun := func(args ...string) (*pb.CommandOutput, error) {
+				return runAsUserCmd(ctx, s, nil, "flatpak", append([]string{"mask", "--user"}, args...)...)
+			}
+
 			if runAsUserCheck(ctx, s, "flatpak", "info", "--user", params.AppId) {
 				line("user=", fmt.Sprintf("flatpak %s already installed; skipped", params.AppId))
+				// Converge the pin even when already installed.
+				if params.Pin {
+					changed, pinErr := ensureFlatpakMasked(params.AppId, userMaskRun)
+					if pinErr != nil {
+						if firstFailure == nil {
+							firstFailure = fmt.Errorf("user %s: %w", s.Username, pinErr)
+						}
+						e.logger.Warn("flatpak PRESENT: per-user pin (mask) failed",
+							"user", s.Username, "app_id", params.AppId, "error", pinErr)
+						line("user=", "pin failed: "+pinErr.Error())
+					} else if changed {
+						anyChanged = true
+						line("user=", "pinned "+params.AppId)
+					}
+				}
 				continue
 			}
 
@@ -180,7 +219,13 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 			line("user=", fmt.Sprintf("installed %s", params.AppId))
 
 			if params.Pin {
-				if _, pinErr := runAsUserCmd(ctx, s, nil, "flatpak", "mask", "--user", params.AppId); pinErr != nil {
+				if _, pinErr := ensureFlatpakMasked(params.AppId, userMaskRun); pinErr != nil {
+					// Pin is part of the requested state: record it as a
+					// failure (firstFailure) so the action reports FAILED,
+					// not a silent success with the app left unpinned.
+					if firstFailure == nil {
+						firstFailure = fmt.Errorf("user %s: install succeeded but %w", s.Username, pinErr)
+					}
 					e.logger.Warn("flatpak PRESENT: per-user pin (mask) failed (install succeeded)",
 						"user", s.Username, "app_id", params.AppId, "error", pinErr)
 					line("user=", "pin failed: "+pinErr.Error())
@@ -249,6 +294,41 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 // isFlatpakInstalled checks if a flatpak app is installed.
 func (e *Executor) isFlatpakInstalled(appId, systemFlag string) bool {
 	return checkCmdSuccess("flatpak", "info", systemFlag, appId)
+}
+
+// flatpakRunner executes `flatpak mask <scope> <args...>` and returns
+// its output. The scope flag (--system / --user) and exec context
+// (sudo vs runuser) are captured by the closure, so ensureFlatpakMasked
+// works identically for the system-wide and per-user paths.
+type flatpakRunner func(args ...string) (*pb.CommandOutput, error)
+
+// flatpakMaskListed reports whether appID appears as an exact entry in
+// the `flatpak mask` listing output.
+func flatpakMaskListed(maskListStdout, appID string) bool {
+	for _, line := range strings.Split(maskListStdout, "\n") {
+		if strings.TrimSpace(line) == appID {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureFlatpakMasked converges the pin (mask) state for appID: it masks
+// the app if it isn't already masked, and reports whether it changed
+// anything. A mask failure is returned as a real error — pinning is part
+// of the requested desired state (mirrors action_package.go's
+// ensurePackagePinned contract), so a failed pin must NOT be reported as
+// a success. This also makes the pin converge on an
+// already-installed-but-unpinned app, which the early-return paths
+// previously skipped entirely.
+func ensureFlatpakMasked(appID string, run flatpakRunner) (bool, error) {
+	if listOut, err := run(); err == nil && listOut != nil && flatpakMaskListed(listOut.Stdout, appID) {
+		return false, nil // already pinned, nothing to do
+	}
+	if _, err := run(appID); err != nil {
+		return false, fmt.Errorf("pin (mask) %s: %w", appID, err)
+	}
+	return true, nil
 }
 
 // repairFlatpak fixes common Flatpak issues:

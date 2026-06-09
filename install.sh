@@ -424,11 +424,22 @@ RestrictSUIDSGID=false
 #     bind privileged ports without setuid.
 #   CAP_NET_ADMIN — firewall control via ufw / firewall-cmd / nft.
 #   CAP_SYS_ADMIN — mount / umount during LUKS operations.
+#   CAP_KILL — signal other-uid (pm-tty-*) process groups when tearing
+#     down terminal sessions; without it the in-process root model's
+#     kill(-pgid, …) / pkill -u returns EPERM and the sweeper degrades
+#     to relying on pty-close SIGHUP, leaking detached/ignoring procs.
+#   CAP_SETFCAP — let dpkg/rpm set file capabilities during package
+#     installs (e.g. iputils, anything shipping +ep file caps).
+#   CAP_NET_RAW — file-cap binaries like ping (and raw-socket children)
+#     exec-fail with EPERM under a bounding set that excludes it.
 #
-# The agent's only listener is the UNIX socket at
+# Since the agent runs as root (User=root), the in-process daemon's own
+# syscalls are also subject to this bounding set — not just its
+# children — so the three caps above are required for the in-process
+# model, not optional. The agent's only listener is the UNIX socket at
 # /run/pm-agent/enroll.sock — it never binds a TCP port itself.
 AmbientCapabilities=CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SETFCAP CAP_NET_RAW
 
 # Allow network access
 PrivateNetwork=false
@@ -674,10 +685,18 @@ main() {
     parse_args "$@"
     check_root
 
-    # Stop the service before updating the binary to avoid in-place update issues
-    stop_service_if_running
-
+    # Download (and atomically stage) the new binary BEFORE stopping the
+    # running agent. download_binary fetches to a temp file in the
+    # destination dir and renames it into place, so replacing the file
+    # does not disturb the still-running process (it holds the old
+    # inode). If the download fails under `set -e`, the script aborts
+    # while the existing agent is still running, instead of leaving the
+    # device offline with a healthy agent stopped and no new binary.
     download_binary
+
+    # Now stop the old instance so enable_and_start_service below brings
+    # up the freshly-installed binary.
+    stop_service_if_running
 
     log_info "Starting Power Manage Agent installation..."
 

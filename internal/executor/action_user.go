@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +74,43 @@ func homeGroupFor(params *pb.UserParams) string {
 		return params.PrimaryGroup
 	}
 	return params.Username
+}
+
+// resolveOwnership turns the action's user/group into the numeric
+// uid/gid an fd-based fchown needs (sysfs.OpenRealDir / FchownNoFollow
+// operate on a descriptor, not a name). It is the numeric counterpart of
+// the "username:homeGroupFor()" string the path-based chown previously
+// took, and mirrors homeGroupFor's preference order exactly so .ssh
+// ownership stays identical to the home-directory chown:
+//   - numeric GID (or numeric PrimaryGroup) is used as a literal GID,
+//     matching how chown treats an all-numeric group token (no name
+//     lookup, so it works even if no group with that name exists);
+//   - otherwise the group name is resolved via the group database;
+//   - the default (no Gid, no PrimaryGroup) resolves the matching group
+//     named after the user, exactly as homeGroupFor returns.
+func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
+	u, err := user.Lookup(params.Username)
+	if err != nil {
+		return 0, 0, fmt.Errorf("look up user %s: %w", params.Username, err)
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse uid %q for %s: %w", u.Uid, params.Username, err)
+	}
+
+	group := homeGroupFor(params)
+	if n, convErr := strconv.Atoi(group); convErr == nil {
+		return uid, n, nil
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return 0, 0, fmt.Errorf("look up group %s: %w", group, err)
+	}
+	gid, err = strconv.Atoi(g.Gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse gid %q for group %s: %w", g.Gid, group, err)
+	}
+	return uid, gid, nil
 }
 
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
@@ -264,6 +303,18 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, metadata, nil
 }
 
+// desiredAccountLocked reports whether the account described by params
+// must remain shadow-locked (no PAM login path). It is the single
+// source of truth shared between createUser and updateUser, and MUST
+// mirror createUser's password-skip condition: createUser sets a temp
+// password only when none of no_password / system_user / disabled is
+// set, leaving the account at the useradd '!' default otherwise. An
+// account with no password must never be unlocked — unlocking a
+// hash-less account yields a passwordless login path.
+func desiredAccountLocked(params *pb.UserParams) bool {
+	return params.Disabled || params.NoPassword || params.SystemUser
+}
+
 // updateUser modifies an existing user account.
 func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, bool, error) {
 	// Get current user state
@@ -358,8 +409,18 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Handle disabled/locked state - only change if different
-	desiredLocked := params.Disabled
+	// Handle disabled/locked state - only change if different.
+	//
+	// desiredAccountLocked (not raw params.Disabled) is the source of
+	// truth: a no_password or system_user account got NO password at
+	// create time and sits at the shadow-locked default ('!'). Driving
+	// the decision off Disabled alone would compute desiredLocked=false
+	// for such an account, see currentInfo.Locked=true, and run
+	// `usermod -U` — stripping the '!' and producing a PASSWORDLESS
+	// login path (the no_password / pm-tty-* regression). Unlock is only
+	// correct for an account that actually has a password hash to
+	// restore.
+	desiredLocked := desiredAccountLocked(params)
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
 			if lockResult, err := sysuser.Lock(ctx, params.Username); err != nil {
@@ -561,15 +622,34 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
-	// Set ownership and permissions on .ssh directory. Use the configured
-	// primary group (same preference order as home-directory repair) so
-	// users created with Gid / PrimaryGroup don't end up with the wrong
-	// group on .ssh and fail authorized_keys writes.
-	ownership := params.Username + ":" + homeGroupFor(params)
-	if _, err := runSudoCmd(ctx, "chown", "--", ownership, sshDir); err != nil {
+	// Open ~/.ssh through an O_NOFOLLOW directory handle and apply
+	// ownership + permissions through the FD (fchown/fchmod), never
+	// through the path. The target user owns their home dir, so they can
+	// swap ~/.ssh for a symlink to e.g. /etc; a path-based chmod/chown
+	// re-resolves the path on every call and would dereference the link,
+	// retargeting a root-run chmod onto its target. chmod has no -h, so
+	// the prior "AssertRealDir + chown -h" left exactly that hole open
+	// (and was itself check-then-use). Operating on the opened inode
+	// removes the whole class: OpenRealDir fails outright if ~/.ssh is a
+	// symlink or not a directory, and a later swap of the path cannot
+	// redirect operations on the FD. Ownership uses the same preference
+	// order as the home-directory repair (resolveOwnership mirrors
+	// homeGroupFor). The agent runs as root, so the FD-based calls need
+	// no sudo.
+	sshFd, err := sysfs.OpenRealDir(sshDir)
+	if err != nil {
+		return false, fmt.Errorf("refusing to configure SSH keys: %w", err)
+	}
+	defer sshFd.Close()
+
+	uid, gid, err := resolveOwnership(params)
+	if err != nil {
+		return false, fmt.Errorf("resolve .ssh ownership: %w", err)
+	}
+	if err := sshFd.Chown(uid, gid); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "700", "--", sshDir); err != nil {
+	if err := sshFd.Chmod(0o700); err != nil {
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
@@ -587,10 +667,16 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
 
-	// Set ownership on authorized_keys. SafeReplaceFile leaves the
-	// file owned by the agent process (root); a separate chown brings
-	// it back to the target user without re-introducing the tee race.
-	if _, err := runSudoCmd(ctx, "chown", "--", ownership, authKeysFile); err != nil {
+	// Hand authorized_keys back to the target user. SafeReplaceFile left
+	// it owned by the agent process (root). Use the FD-based
+	// FchownNoFollow rather than a path chown: the user owns the 0700
+	// .ssh dir, so they could unlink the freshly-written file and plant a
+	// symlink before this runs. An O_NOFOLLOW open refuses the symlink
+	// outright (surfacing the tampering) instead of transferring
+	// ownership of its target (e.g. /etc/shadow) to the user — stronger
+	// than the previous `chown -h`, which would silently chown the
+	// planted link itself.
+	if err := sysfs.FchownNoFollow(authKeysFile, uid, gid); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 

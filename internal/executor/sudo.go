@@ -175,10 +175,23 @@ func sudoConfigForParams(params *pb.AdminPolicyParams, groupName string) (string
 // operator-confusing first-time prompt; timestamp_timeout=0 forces
 // sudoers re-evaluation on every sudo call so a fresh revocation lands
 // immediately under NOPASSWD.
-const terminalAdminDefaultsBlock = `Defaults requiretty
-Defaults env_reset
-Defaults !lecture
-Defaults timestamp_timeout=0`
+//
+// The Defaults are scoped to the group (`Defaults:%group`), NOT bare.
+// A bare `Defaults` line in an /etc/sudoers.d drop-in applies host-
+// globally to every sudo invocation on the box — so a bare requiretty
+// would break root's non-TTY sudo (cron, systemd units, ansible) and a
+// bare timestamp_timeout=0 would strip credential caching for every
+// other admin. The ADR's threat model only concerns the TerminalAdmin
+// group, so the per-group binding is the correct scope.
+func terminalAdminDefaultsBlock(groupName string) string {
+	g := "%" + groupName
+	return strings.Join([]string{
+		"Defaults:" + g + " requiretty",
+		"Defaults:" + g + " env_reset",
+		"Defaults:" + g + " !lecture",
+		"Defaults:" + g + " timestamp_timeout=0",
+	}, "\n")
+}
 
 // terminalAdminLimitedDenyBlocks are the !-deny rules the LIMITED
 // template emits to close ADR T2 (editor escapes), T3 (shell spawns),
@@ -220,7 +233,7 @@ func generateTerminalAdminLimitedSudoConfig(groupName string) string {
 		"# Managed by Power Manage — do not edit manually",
 		fmt.Sprintf("# Passwordless LIMITED sudo for group %s (TerminalAdmin, server #70)", groupName),
 		"",
-		terminalAdminDefaultsBlock,
+		terminalAdminDefaultsBlock(groupName),
 		"",
 		"# Package management",
 		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/apt, /usr/bin/apt-get, /usr/bin/apt-cache, /usr/bin/dpkg", groupName),
@@ -250,8 +263,8 @@ func generateTerminalAdminLimitedSudoConfig(groupName string) string {
 		fmt.Sprintf("%%%s ALL=(ALL) NOPASSWD: /usr/bin/dmesg", groupName),
 		"",
 		"# Deny modifications to power-manage-agent and sudoers",
-		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/systemctl * power-manage-agent*", groupName),
-		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/visudo, !!/usr/sbin/visudo", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/systemctl * power-manage-agent*", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/visudo, !/usr/sbin/visudo", groupName),
 	}
 	lines = append(lines, terminalAdminLimitedDenyBlocks(groupName)...)
 	return strings.Join(lines, "\n") + "\n"
@@ -266,7 +279,7 @@ func generateTerminalAdminFullSudoConfig(groupName string) string {
 		"# Managed by Power Manage — do not edit manually",
 		fmt.Sprintf("# Passwordless FULL sudo for group %s (TerminalAdmin, server #70)", groupName),
 		"",
-		terminalAdminDefaultsBlock,
+		terminalAdminDefaultsBlock(groupName),
 		"",
 		fmt.Sprintf("%%%s ALL=(ALL:ALL) NOPASSWD: ALL", groupName),
 	}
@@ -315,8 +328,8 @@ func generateLimitedSudoConfig(groupName string) string {
 		fmt.Sprintf("%%%s ALL=(ALL) /usr/bin/dmesg", groupName),
 		"",
 		"# Deny modifications to power-manage-agent and sudoers",
-		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/systemctl * power-manage-agent*", groupName),
-		fmt.Sprintf("%%%s ALL=(ALL) !!/usr/bin/visudo, !!/usr/sbin/visudo", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/systemctl * power-manage-agent*", groupName),
+		fmt.Sprintf("%%%s ALL=(ALL) !/usr/bin/visudo, !/usr/sbin/visudo", groupName),
 	}
 	return strings.Join(lines, "\n") + "\n"
 }

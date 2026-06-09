@@ -3,6 +3,7 @@ package handler
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"strconv"
 	"strings"
@@ -131,8 +132,36 @@ func (h *Handler) OnAction(ctx context.Context, action *pb.Action) (*pb.ActionRe
 func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
 	h.logger.Info("received action", "action_id", action.Id.Value, "type", action.Type.String())
 
-	// Handle SYNC instant action directly — trigger sync and return success
+	// Handle SYNC instant action directly — trigger sync and return success.
+	//
+	// The signature MUST be verified here. SYNC returns before
+	// ExecuteWithStreaming, so the executor's verification never runs on
+	// this path; without this check a compromised gateway/Valkey (the
+	// F-31 threat model) could inject an unsigned type=SYNC and force
+	// resyncs at will. #90 removed the executor's instant-action skip
+	// but missed this fast-path, leaving SYNC forgeable.
+	//
+	// VerifyAction signs over the (id, type, params_canonical) tuple, so
+	// it is the action's TYPE binding — not any inspection of the params
+	// here — that makes SYNC safe: a signature minted for a non-SYNC
+	// action cannot be lifted onto a type=SYNC envelope (the type is part
+	// of the signed bytes), and the server only ever signs `{}` for an
+	// instant action. We therefore intentionally do NOT parse or assert
+	// on action.ParamsCanonical on this path: doing so would not add
+	// security (the signature already covers it) and would risk diverging
+	// from the server's canonical form. The cross-repo gap where the
+	// signature covers params_canonical but execution reads the typed
+	// proto oneof is tracked separately (sdk#82).
 	if action.Type == pb.ActionType_ACTION_TYPE_SYNC {
+		if verifyErr := h.executor.VerifyAction(action); verifyErr != nil {
+			h.logger.Warn("rejecting unsigned/tampered SYNC action", "action_id", action.Id.Value, "error", verifyErr)
+			return &pb.ActionResult{
+				ActionId:    action.Id,
+				Status:      pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
+				Error:       fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr),
+				CompletedAt: timestamppb.Now(),
+			}, nil
+		}
 		h.logger.Info("triggering immediate sync via instant action")
 		if h.syncTrigger != nil {
 			select {
