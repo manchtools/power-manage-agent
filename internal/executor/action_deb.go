@@ -150,15 +150,20 @@ func (e *Executor) debAbsentPackageName(ctx context.Context, params *pb.AppInsta
 	_ = tmpFile.Close()
 
 	if dlErr := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); dlErr == nil {
-		// Download succeeded — the canonical name is authoritative.
-		if name, nameErr := debPackageName(tmpFile.Name()); nameErr == nil {
-			return name, nil
+		// Download (and checksum) succeeded, so the file is exactly what
+		// the action specified. The canonical name is authoritative; a
+		// parse failure here is a real corruption/format error, NOT a
+		// stale URL — surface it rather than guessing from the URL
+		// filename, which could target (and remove) the wrong package.
+		name, nameErr := debPackageName(tmpFile.Name())
+		if nameErr != nil {
+			return "", fmt.Errorf("download succeeded but dpkg-deb could not read the package name: %w", nameErr)
 		}
-		// dpkg-deb parse failure on a downloaded file is unexpected;
-		// fall through to the URL heuristic rather than hard-failing.
+		return name, nil
 	}
-	// Download failed (dead URL) or the file was unparseable — best
-	// effort from the URL filename so a stale-URL ABSENT still converges.
+	// Download failed (dead URL — artifact deleted upstream after the
+	// install) — best effort from the URL filename so a stale-URL ABSENT
+	// still converges to "already absent".
 	return debPackageNameFromURL(params.Url)
 }
 
