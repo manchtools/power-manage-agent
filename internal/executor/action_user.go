@@ -264,6 +264,18 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, metadata, nil
 }
 
+// desiredAccountLocked reports whether the account described by params
+// must remain shadow-locked (no PAM login path). It is the single
+// source of truth shared between createUser and updateUser, and MUST
+// mirror createUser's password-skip condition: createUser sets a temp
+// password only when none of no_password / system_user / disabled is
+// set, leaving the account at the useradd '!' default otherwise. An
+// account with no password must never be unlocked — unlocking a
+// hash-less account yields a passwordless login path.
+func desiredAccountLocked(params *pb.UserParams) bool {
+	return params.Disabled || params.NoPassword || params.SystemUser
+}
+
 // updateUser modifies an existing user account.
 func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, bool, error) {
 	// Get current user state
@@ -358,8 +370,18 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Handle disabled/locked state - only change if different
-	desiredLocked := params.Disabled
+	// Handle disabled/locked state - only change if different.
+	//
+	// desiredAccountLocked (not raw params.Disabled) is the source of
+	// truth: a no_password or system_user account got NO password at
+	// create time and sits at the shadow-locked default ('!'). Driving
+	// the decision off Disabled alone would compute desiredLocked=false
+	// for such an account, see currentInfo.Locked=true, and run
+	// `usermod -U` — stripping the '!' and producing a PASSWORDLESS
+	// login path (the no_password / pm-tty-* regression). Unlock is only
+	// correct for an account that actually has a password hash to
+	// restore.
+	desiredLocked := desiredAccountLocked(params)
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
 			if lockResult, err := sysuser.Lock(ctx, params.Username); err != nil {
