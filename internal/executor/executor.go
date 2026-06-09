@@ -720,8 +720,11 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 	return execOutput, verifyOutput, true, nil
 }
 
-// maxDownloadSize is the maximum allowed download size (2 GiB).
-const maxDownloadSize = 2 << 30
+// maxDownloadSize is the maximum allowed download size (2 GiB). It is a
+// var, not a const, only so tests can shrink the cap to exercise the
+// oversize-rejection path without streaming 2 GiB; production never
+// reassigns it.
+var maxDownloadSize int64 = 2 << 30
 
 func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)

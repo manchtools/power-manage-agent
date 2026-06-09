@@ -7,7 +7,9 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
 
@@ -72,6 +74,43 @@ func homeGroupFor(params *pb.UserParams) string {
 		return params.PrimaryGroup
 	}
 	return params.Username
+}
+
+// resolveOwnership turns the action's user/group into the numeric
+// uid/gid an fd-based fchown needs (sysfs.OpenRealDir / FchownNoFollow
+// operate on a descriptor, not a name). It is the numeric counterpart of
+// the "username:homeGroupFor()" string the path-based chown previously
+// took, and mirrors homeGroupFor's preference order exactly so .ssh
+// ownership stays identical to the home-directory chown:
+//   - numeric GID (or numeric PrimaryGroup) is used as a literal GID,
+//     matching how chown treats an all-numeric group token (no name
+//     lookup, so it works even if no group with that name exists);
+//   - otherwise the group name is resolved via the group database;
+//   - the default (no Gid, no PrimaryGroup) resolves the matching group
+//     named after the user, exactly as homeGroupFor returns.
+func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
+	u, err := user.Lookup(params.Username)
+	if err != nil {
+		return 0, 0, fmt.Errorf("look up user %s: %w", params.Username, err)
+	}
+	uid, err = strconv.Atoi(u.Uid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse uid %q for %s: %w", u.Uid, params.Username, err)
+	}
+
+	group := homeGroupFor(params)
+	if n, convErr := strconv.Atoi(group); convErr == nil {
+		return uid, n, nil
+	}
+	g, err := user.LookupGroup(group)
+	if err != nil {
+		return 0, 0, fmt.Errorf("look up group %s: %w", group, err)
+	}
+	gid, err = strconv.Atoi(g.Gid)
+	if err != nil {
+		return 0, 0, fmt.Errorf("parse gid %q for group %s: %w", g.Gid, group, err)
+	}
+	return uid, gid, nil
 }
 
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
@@ -583,28 +622,34 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
-	// Refuse to operate on a symlinked (or otherwise non-directory)
-	// .ssh. The target user owns their home directory, so they can
-	// plant ~/.ssh as a symlink to e.g. /etc before this runs; a
-	// path-based chmod/chown would then dereference it and act on the
-	// target. sysfs.AssertRealDir closes that whole class — combined
-	// with the chown -h below it makes the dereference vector
-	// unreachable.
-	if err := sysfs.AssertRealDir(sshDir); err != nil {
+	// Open ~/.ssh through an O_NOFOLLOW directory handle and apply
+	// ownership + permissions through the FD (fchown/fchmod), never
+	// through the path. The target user owns their home dir, so they can
+	// swap ~/.ssh for a symlink to e.g. /etc; a path-based chmod/chown
+	// re-resolves the path on every call and would dereference the link,
+	// retargeting a root-run chmod onto its target. chmod has no -h, so
+	// the prior "AssertRealDir + chown -h" left exactly that hole open
+	// (and was itself check-then-use). Operating on the opened inode
+	// removes the whole class: OpenRealDir fails outright if ~/.ssh is a
+	// symlink or not a directory, and a later swap of the path cannot
+	// redirect operations on the FD. Ownership uses the same preference
+	// order as the home-directory repair (resolveOwnership mirrors
+	// homeGroupFor). The agent runs as root, so the FD-based calls need
+	// no sudo.
+	sshFd, err := sysfs.OpenRealDir(sshDir)
+	if err != nil {
 		return false, fmt.Errorf("refusing to configure SSH keys: %w", err)
 	}
+	defer sshFd.Close()
 
-	// Set ownership and permissions on .ssh directory. Use the configured
-	// primary group (same preference order as home-directory repair) so
-	// users created with Gid / PrimaryGroup don't end up with the wrong
-	// group on .ssh and fail authorized_keys writes. -h/--no-dereference
-	// keeps chown acting on the path itself even if it races into a
-	// symlink between the check above and here.
-	ownership := params.Username + ":" + homeGroupFor(params)
-	if _, err := runSudoCmd(ctx, "chown", "-h", "--", ownership, sshDir); err != nil {
+	uid, gid, err := resolveOwnership(params)
+	if err != nil {
+		return false, fmt.Errorf("resolve .ssh ownership: %w", err)
+	}
+	if err := sshFd.Chown(uid, gid); err != nil {
 		return false, fmt.Errorf("failed to set .ssh ownership: %w", err)
 	}
-	if _, err := runSudoCmd(ctx, "chmod", "700", "--", sshDir); err != nil {
+	if err := sshFd.Chmod(0o700); err != nil {
 		return false, fmt.Errorf("failed to set .ssh permissions: %w", err)
 	}
 
@@ -622,14 +667,16 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
 
-	// Set ownership on authorized_keys. SafeReplaceFile leaves the
-	// file owned by the agent process (root); a separate chown brings
-	// it back to the target user without re-introducing the tee race.
-	// -h/--no-dereference: the target user owns the 0700 .ssh dir, so
-	// they could unlink the freshly-written file and plant a symlink
-	// before this chown — without -h that would transfer ownership of
-	// the symlink's target (e.g. /etc/shadow) to the user.
-	if _, err := runSudoCmd(ctx, "chown", "-h", "--", ownership, authKeysFile); err != nil {
+	// Hand authorized_keys back to the target user. SafeReplaceFile left
+	// it owned by the agent process (root). Use the FD-based
+	// FchownNoFollow rather than a path chown: the user owns the 0700
+	// .ssh dir, so they could unlink the freshly-written file and plant a
+	// symlink before this runs. An O_NOFOLLOW open refuses the symlink
+	// outright (surfacing the tampering) instead of transferring
+	// ownership of its target (e.g. /etc/shadow) to the user — stronger
+	// than the previous `chown -h`, which would silently chown the
+	// planted link itself.
+	if err := sysfs.FchownNoFollow(authKeysFile, uid, gid); err != nil {
 		return false, fmt.Errorf("failed to set authorized_keys ownership: %w", err)
 	}
 

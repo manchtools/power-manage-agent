@@ -140,6 +140,18 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 	// F-31 threat model) could inject an unsigned type=SYNC and force
 	// resyncs at will. #90 removed the executor's instant-action skip
 	// but missed this fast-path, leaving SYNC forgeable.
+	//
+	// VerifyAction signs over the (id, type, params_canonical) tuple, so
+	// it is the action's TYPE binding — not any inspection of the params
+	// here — that makes SYNC safe: a signature minted for a non-SYNC
+	// action cannot be lifted onto a type=SYNC envelope (the type is part
+	// of the signed bytes), and the server only ever signs `{}` for an
+	// instant action. We therefore intentionally do NOT parse or assert
+	// on action.ParamsCanonical on this path: doing so would not add
+	// security (the signature already covers it) and would risk diverging
+	// from the server's canonical form. The cross-repo gap where the
+	// signature covers params_canonical but execution reads the typed
+	// proto oneof is tracked separately (sdk#82).
 	if action.Type == pb.ActionType_ACTION_TYPE_SYNC {
 		if verifyErr := h.executor.VerifyAction(action); verifyErr != nil {
 			h.logger.Warn("rejecting unsigned/tampered SYNC action", "action_id", action.Id.Value, "error", verifyErr)

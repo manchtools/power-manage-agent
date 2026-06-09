@@ -1,17 +1,60 @@
 package executor
 
 import (
+	"os/user"
+	"strconv"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
-// The symlink-rejection guard for ~/.ssh (audit F022) lives in the SDK
-// as sysfs.AssertRealDir and is unit-tested there
-// (sdk/go/sys/fs/safe_dir_test.go). setupSSHKeys calls it before the
-// privileged chmod/chown and additionally passes chown -h.
+// The ~/.ssh TOCTOU (audit F022) is closed by FD-based ops: setupSSHKeys
+// opens .ssh via sysfs.OpenRealDir (O_NOFOLLOW|O_DIRECTORY) and applies
+// ownership/mode through the FD (fchown/fchmod), and hands authorized_keys
+// back via sysfs.FchownNoFollow. The symlink/non-dir rejection and the
+// fd-acts-on-the-opened-inode property are unit-tested in the SDK
+// (sdk/go/sys/fs/safe_fd_unix_test.go). resolveOwnership — the numeric
+// uid/gid those FD calls require — is tested below against homeGroupFor.
+
+// resolveOwnership must produce the numeric ids equivalent to the
+// "username:homeGroupFor()" string the path-based chown previously used,
+// mirroring homeGroupFor's preference order. We anchor on the test
+// runner's own account (guaranteed present in the user/group database)
+// so the lookups resolve deterministically without root.
+func TestResolveOwnership_MirrorsHomeGroupFor(t *testing.T) {
+	cur, err := user.Current()
+	require.NoError(t, err)
+	wantUID, err := strconv.Atoi(cur.Uid)
+	require.NoError(t, err)
+	wantPrimaryGID, err := strconv.Atoi(cur.Gid)
+	require.NoError(t, err)
+
+	t.Run("numeric Gid is used as a literal GID (no name lookup)", func(t *testing.T) {
+		// 4242 need not exist as a named group; chown treats a numeric
+		// token literally, and so must resolveOwnership.
+		uid, gid, err := resolveOwnership(&pb.UserParams{Username: cur.Username, Gid: 4242})
+		require.NoError(t, err)
+		assert.Equal(t, wantUID, uid)
+		assert.Equal(t, 4242, gid)
+	})
+
+	t.Run("named PrimaryGroup is resolved via the group database", func(t *testing.T) {
+		grp, err := user.LookupGroupId(cur.Gid)
+		require.NoError(t, err)
+		uid, gid, err := resolveOwnership(&pb.UserParams{Username: cur.Username, PrimaryGroup: grp.Name})
+		require.NoError(t, err)
+		assert.Equal(t, wantUID, uid)
+		assert.Equal(t, wantPrimaryGID, gid)
+	})
+
+	t.Run("unknown user is an error, not a silent uid 0", func(t *testing.T) {
+		_, _, err := resolveOwnership(&pb.UserParams{Username: "pm-definitely-no-such-user-xyz"})
+		assert.Error(t, err, "a failed user lookup must error so .ssh is never chowned to root")
+	})
+}
 
 // desiredAccountLocked encodes the single source of truth for whether
 // an account must stay shadow-locked. It MUST agree with createUser's
