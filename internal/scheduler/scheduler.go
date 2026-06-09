@@ -522,6 +522,11 @@ func (s *Scheduler) MarkResultSynced(resultID string) error {
 	return s.store.MarkResultSynced(resultID)
 }
 
+// IsResultSynced reports whether a result has already been sent.
+func (s *Scheduler) IsResultSynced(resultID string) (bool, error) {
+	return s.store.IsResultSynced(resultID)
+}
+
 // ForceExecute immediately executes an action regardless of schedule.
 func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.ActionResult, error) {
 	s.executor.ResetUpdateCycle()

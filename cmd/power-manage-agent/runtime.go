@@ -286,6 +286,24 @@ func sendScheduledResults(ctx context.Context, client *sdk.Client, sched *schedu
 				return
 			}
 
+			// Skip results already sent by syncPendingResults on this
+			// same reconnect. An action executed while offline is BOTH
+			// persisted (unsynced) AND buffered in this channel;
+			// syncPendingResults runs first (synchronously, before this
+			// goroutine starts) and sends + marks the stored copy synced.
+			// Without this check the buffered copy is sent a second time,
+			// and the wire ActionResult carries no result id for the
+			// server to dedup on — duplicate result events per offline
+			// execution.
+			if synced, err := sched.IsResultSynced(result.ResultID); err != nil {
+				logger.Warn("failed to check result synced state; sending to be safe",
+					"result_id", result.ResultID, "error", err)
+			} else if synced {
+				logger.Debug("skipping result already synced by syncPendingResults",
+					"result_id", result.ResultID, "action_id", result.ActionID)
+				continue
+			}
+
 			// Skip unchanged results unless this is the first execution of the action
 			if !result.HasChanges && sched.HasPriorExecution(result.ActionID) {
 				logger.Debug("skipping unchanged result (not first run)",

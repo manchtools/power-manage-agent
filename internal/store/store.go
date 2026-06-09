@@ -501,6 +501,26 @@ func (s *Store) MarkResultSynced(resultID string) error {
 	return err
 }
 
+// IsResultSynced reports whether the result has already been sent to the
+// server. A missing row counts as "already handled" (true) so a result
+// that was synced-and-cleaned is never re-sent. Used to keep the
+// channel-drain path (sendScheduledResults) from re-sending a result
+// that syncPendingResults already delivered on the same reconnect.
+func (s *Store) IsResultSynced(resultID string) (bool, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+
+	var synced int
+	err := s.db.QueryRow("SELECT synced FROM results WHERE id = ?", resultID).Scan(&synced)
+	if errors.Is(err, sql.ErrNoRows) {
+		return true, nil
+	}
+	if err != nil {
+		return false, err
+	}
+	return synced == 1, nil
+}
+
 // HasPriorExecution returns true if the action has more than one recorded execution.
 // This is used to distinguish first-run results (which should always be reported)
 // from subsequent unchanged results (which can be skipped).
