@@ -43,6 +43,37 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 		}
 	}
 
+	// Validate the login shell when explicitly set. usermod -s does NOT
+	// restrict the value to /etc/shells, so an arbitrary binary here would
+	// be a persistence/escalation primitive for an operator who can drive a
+	// user action. Reject anything not on the system allowlist before it
+	// reaches useradd/usermod argv. The empty-shell case falls through to
+	// the SDK-trusted defaults (/bin/bash, /usr/sbin/nologin) chosen below.
+	if params.Shell != "" {
+		if err := sysuser.ValidateLoginShell(params.Shell); err != nil {
+			return nil, false, nil, fmt.Errorf("invalid login shell: %w", err)
+		}
+	}
+
+	// Validate the GECOS/comment: it becomes a colon-delimited field in
+	// /etc/passwd, so ':' or a newline would corrupt or forge a record.
+	if params.Comment != "" {
+		if err := sysuser.ValidateComment(params.Comment); err != nil {
+			return nil, false, nil, fmt.Errorf("invalid comment: %w", err)
+		}
+	}
+
+	// Validate a named primary group before it reaches `useradd/usermod -g`.
+	// GroupEnsureExists validates internally, but its failure is only
+	// logged — without this an invalid or flag-shaped group name would
+	// still be appended to argv. (Numeric Gid takes precedence and is not
+	// affected.)
+	if params.PrimaryGroup != "" {
+		if !sysuser.IsValidName(params.PrimaryGroup) {
+			return nil, false, nil, fmt.Errorf("invalid primary group %q: must start with a lowercase letter and contain only [a-z0-9_-], max 32 chars", params.PrimaryGroup)
+		}
+	}
+
 	// Repair filesystem if mounted read-only
 	if out, err := e.requireWritableFS(ctx); err != nil {
 		return out, false, nil, err
