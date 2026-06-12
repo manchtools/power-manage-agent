@@ -391,13 +391,17 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		resultHash = hex.EncodeToString(h.Sum(nil))
 	}
 
-	// Store the result
+	// Store the result. CommandOutput is a proto message, so it is
+	// serialised with protojson (via canonicalProtoJSON — stable bytes),
+	// never stdlib encoding/json, which works only by snake-case-tag luck
+	// and breaks on any future oneof/enum/int64 field.
 	var outputJSON []byte
 	if result.Output != nil {
-		var err error
-		outputJSON, err = json.Marshal(result.Output)
+		s, err := canonicalProtoJSON(result.Output)
 		if err != nil {
 			slog.Warn("failed to marshal execution output", "error", err)
+		} else {
+			outputJSON = []byte(s)
 		}
 	}
 
@@ -482,7 +486,10 @@ func (s *Store) GetUnsyncedResults() ([]*StoredResult, error) {
 
 		if outputJSON.Valid && outputJSON.String != "" {
 			r.Output = &pb.CommandOutput{}
-			if err := json.Unmarshal([]byte(outputJSON.String), r.Output); err != nil {
+			// protojson is the matching codec for the proto written above;
+			// it also accepts the legacy snake_case stdlib-json shape, so
+			// results stored before this change still decode.
+			if err := protojson.Unmarshal([]byte(outputJSON.String), r.Output); err != nil {
 				slog.Warn("failed to unmarshal stored command output", "result_id", r.ID, "error", err)
 			}
 		}
