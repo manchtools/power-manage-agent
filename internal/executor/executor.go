@@ -17,6 +17,7 @@ import (
 	"sync"
 	"time"
 
+	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
@@ -283,44 +284,64 @@ func (e *Executor) getActionStore() ActionStore {
 	return e.actionStore
 }
 
-// Execute runs an action and returns the result.
-func (e *Executor) Execute(ctx context.Context, action *pb.Action) *pb.ActionResult {
-	return e.ExecuteWithStreaming(ctx, action, nil)
+// ExecuteEnvelope runs a previously-VERIFIED action envelope and returns the
+// result. Callers must pass only an envelope returned by VerifyEnvelope — the
+// executed bytes must be the verified bytes (sdk#82).
+func (e *Executor) ExecuteEnvelope(ctx context.Context, env *pb.SignedActionEnvelope) *pb.ActionResult {
+	return e.ExecuteWithStreaming(ctx, env, nil)
 }
 
-// VerifyAction checks the CA signature on an action over the same
-// (actionID, type, paramsCanonical) tuple the control server signs.
-// It returns nil when no verifier is configured (signing disabled) or
-// the signature is valid, and an error when the signature is missing or
-// invalid.
+// VerifyEnvelope is the single verify-then-unmarshal seam every execution
+// path funnels through (sdk#82). It verifies the CA signature over the EXACT
+// envelope bytes it received and, on success, unmarshals THOSE SAME bytes
+// into a SignedActionEnvelope — so the message that executes is byte-for-byte
+// the message that was verified. A compromised gateway/Valkey relay cannot
+// flip desired_state, swap params, change the timeout/schedule, lift the type
+// onto SYNC, or retarget the device under a still-valid signature, because
+// every one of those fields is inside the signed bytes.
 //
-// Any code path that acts on an action WITHOUT going through
-// ExecuteWithStreaming — e.g. the handler's SYNC instant-action
-// fast-path — MUST call this first. Otherwise a compromised gateway
-// (the F-02 / F-31 threat model) can forge that action type unsigned
-// and the agent will act on it. The fast-path is the reason SYNC
-// previously slipped past verification despite #90's claim to cover it.
-func (e *Executor) VerifyAction(action *pb.Action) error {
+// Fail-closed: a nil verifier returns an error rather than passing the
+// envelope through unverified. In production the agent always has a verifier
+// (the CA cert is required at startup); a nil verifier means misconfiguration
+// or a test that forgot to wire one, and either way must NOT become a silent
+// "execute everything unsigned" hole. The caller must treat any error here as
+// a hard refusal and never execute.
+func (e *Executor) VerifyEnvelope(envelopeBytes, signature []byte) (*pb.SignedActionEnvelope, error) {
 	if e.verifier == nil {
-		return nil
+		return nil, fmt.Errorf("no action verifier configured; refusing to execute unverified action")
 	}
-	return e.verifier.Verify(getActionID(action), int32(action.Type), action.ParamsCanonical, action.Signature)
+	if err := e.verifier.Verify(envelopeBytes, signature); err != nil {
+		return nil, err
+	}
+	env := &pb.SignedActionEnvelope{}
+	if err := proto.Unmarshal(envelopeBytes, env); err != nil {
+		return nil, fmt.Errorf("unmarshal verified envelope: %w", err)
+	}
+	return env, nil
 }
 
-// ExecuteWithStreaming runs an action with optional output streaming.
-// The callback is called for each line of output as it's produced (for shell actions).
-func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, callback OutputCallback) *pb.ActionResult {
+// ExecuteWithStreaming runs a VERIFIED action envelope with optional output
+// streaming. The callback is called for each line of output as it's produced
+// (for shell actions).
+//
+// Signature verification is NOT done here — it happens in VerifyEnvelope,
+// which the caller MUST run first and whose returned envelope is the only
+// thing this method should ever receive. Passing a hand-built (unverified)
+// envelope is a caller bug: the whole point of sdk#82 is that the executed
+// bytes are the verified bytes. WHAT runs (type, params, desired_state,
+// timeout) is read exclusively off env.
+func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActionEnvelope, callback OutputCallback) *pb.ActionResult {
 	start := e.now()
 
 	result := &pb.ActionResult{
-		ActionId: action.Id,
+		ActionId: env.GetActionId(),
 		Status:   pb.ExecutionStatus_EXECUTION_STATUS_RUNNING,
 		Changed:  true, // Default to true; scheduler may override based on output comparison
 	}
 
 	// Apply timeout. Default to 1 hour for script actions to prevent infinite loops.
-	timeout := action.TimeoutSeconds
-	if timeout <= 0 && (action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN) {
+	timeout := env.GetTimeoutSeconds()
+	if timeout <= 0 && (env.ActionType == pb.ActionType_ACTION_TYPE_SHELL || env.ActionType == pb.ActionType_ACTION_TYPE_SCRIPT_RUN) {
 		timeout = defaultScriptTimeout
 	}
 	if timeout > 0 {
@@ -329,106 +350,87 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		defer cancel()
 	}
 
-	// Verify action signature before execution (audit F-31). Every
-	// action — including instant actions REBOOT and SYNC — must
-	// carry a CA-signature. Pre-fix, instant actions skipped this
-	// check entirely, which made the F-02 Asynq exploit chain
-	// (compromised Valkey → forged ActionDispatchPayload with type=
-	// REBOOT) survive even after task envelopes were HMAC'd: a
-	// compromised gateway would still pass an unsigned REBOOT
-	// through. The control server now signs instant actions with
-	// canonical paramsJSON `{}` so the agent's verifier uses the
-	// same (id, type, paramsCanonical) tuple as for regular
-	// actions — no protocol change, just no special-casing.
-	if verifyErr := e.VerifyAction(action); verifyErr != nil {
-		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-		result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
-		result.CompletedAt = timestamppb.Now()
-		result.DurationMs = e.now().Sub(start).Milliseconds()
-		return result
-	}
-
 	var execErr error
 	var output *pb.CommandOutput
 
-	switch action.Type {
+	switch env.ActionType {
 	case pb.ActionType_ACTION_TYPE_PACKAGE:
 		var changed bool
-		output, changed, execErr = e.executePackage(ctx, action.GetPackage(), action.DesiredState)
+		output, changed, execErr = e.executePackage(ctx, env.GetPackage(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_UPDATE:
 		var changed bool
-		output, changed, execErr = e.executeUpdate(ctx, action.GetUpdate())
+		output, changed, execErr = e.executeUpdate(ctx, env.GetUpdate())
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_APP_IMAGE:
 		var changed bool
-		output, changed, execErr = e.executeAppImage(ctx, action.GetApp(), action.DesiredState)
+		output, changed, execErr = e.executeAppImage(ctx, env.GetApp(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_FLATPAK:
 		var changed bool
-		output, changed, execErr = e.executeFlatpak(ctx, action.GetFlatpak(), action.DesiredState)
+		output, changed, execErr = e.executeFlatpak(ctx, env.GetFlatpak(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_DEB:
 		var changed bool
-		output, changed, execErr = e.executeDeb(ctx, action.GetApp(), action.DesiredState)
+		output, changed, execErr = e.executeDeb(ctx, env.GetApp(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_RPM:
 		var changed bool
-		output, changed, execErr = e.executeRpm(ctx, action.GetApp(), action.DesiredState)
+		output, changed, execErr = e.executeRpm(ctx, env.GetApp(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SHELL, pb.ActionType_ACTION_TYPE_SCRIPT_RUN:
 		var detectionOutput *pb.CommandOutput
 		var changed bool
-		output, detectionOutput, changed, execErr = e.executeShellStreaming(ctx, action.GetShell(), callback)
+		output, detectionOutput, changed, execErr = e.executeShellStreaming(ctx, env.GetShell(), callback)
 		result.Changed = changed
 		result.DetectionOutput = detectionOutput
-		if action.GetShell().GetIsCompliance() {
+		if env.GetShell().GetIsCompliance() {
 			result.Compliant = detectionOutput != nil && detectionOutput.ExitCode == 0 && execErr == nil
 		}
 	case pb.ActionType_ACTION_TYPE_SERVICE:
 		var changed bool
-		output, changed, execErr = e.executeService(ctx, action.GetService())
+		output, changed, execErr = e.executeService(ctx, env.GetService())
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_FILE:
 		var changed bool
-		output, changed, execErr = e.executeFile(ctx, action.GetFile(), action.DesiredState)
+		output, changed, execErr = e.executeFile(ctx, env.GetFile(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_DIRECTORY:
 		var changed bool
-		output, changed, execErr = e.executeDirectory(ctx, action.GetDirectory(), action.DesiredState)
+		output, changed, execErr = e.executeDirectory(ctx, env.GetDirectory(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REPOSITORY:
 		var changed bool
-		output, changed, execErr = e.executeRepository(ctx, action.GetRepository(), action.DesiredState)
+		output, changed, execErr = e.executeRepository(ctx, env.GetRepository(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_USER:
 		var changed bool
 		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeUser(ctx, action.GetUser(), action.DesiredState)
+		output, changed, metadata, execErr = e.executeUser(ctx, env.GetUser(), env.DesiredState)
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
 	case pb.ActionType_ACTION_TYPE_GROUP:
 		var changed bool
-		output, changed, execErr = e.executeGroup(ctx, action.GetGroup(), action.DesiredState)
+		output, changed, execErr = e.executeGroup(ctx, env.GetGroup(), env.DesiredState)
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSH:
 		var changed bool
-		output, changed, execErr = e.executeSsh(ctx, action.GetSsh(), action.DesiredState, getActionID(action))
+		output, changed, execErr = e.executeSsh(ctx, env.GetSsh(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_SSHD:
 		var changed bool
-		output, changed, execErr = e.executeSshd(ctx, action.GetSshd(), action.DesiredState, getActionID(action))
+		output, changed, execErr = e.executeSshd(ctx, env.GetSshd(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_ADMIN_POLICY:
 		var changed bool
-		output, changed, execErr = e.executeSudo(ctx, action.GetAdminPolicy(), action.DesiredState, getActionID(action))
+		output, changed, execErr = e.executeSudo(ctx, env.GetAdminPolicy(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_LPS:
 		var changed bool
 		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeLps(ctx, action.GetLps(), action.DesiredState, getActionID(action))
+		output, changed, metadata, execErr = e.executeLps(ctx, env.GetLps(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
@@ -436,23 +438,23 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 	case pb.ActionType_ACTION_TYPE_ENCRYPTION:
 		var changed bool
 		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeLuks(ctx, action.GetEncryption(), action.DesiredState, getActionID(action))
+		output, changed, metadata, execErr = e.executeLuks(ctx, env.GetEncryption(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata
 		}
 	case pb.ActionType_ACTION_TYPE_WIFI:
 		var changed bool
-		output, changed, execErr = e.executeWifi(ctx, action.GetWifi(), action.DesiredState, getActionID(action))
+		output, changed, execErr = e.executeWifi(ctx, env.GetWifi(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)
 	case pb.ActionType_ACTION_TYPE_AGENT_UPDATE:
 		var changed bool
-		output, changed, execErr = e.executeAgentUpdate(ctx, action.GetAgentUpdate())
+		output, changed, execErr = e.executeAgentUpdate(ctx, env.GetAgentUpdate())
 		result.Changed = changed
 	default:
-		execErr = fmt.Errorf("unsupported action type: %v", action.Type)
+		execErr = fmt.Errorf("unsupported action type: %v", env.ActionType)
 	}
 
 	result.Output = output
@@ -476,7 +478,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 
 	// For shell/script actions, non-zero exit codes indicate failure
 	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
-		if action.Type == pb.ActionType_ACTION_TYPE_SHELL || action.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
+		if env.ActionType == pb.ActionType_ACTION_TYPE_SHELL || env.ActionType == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
 			if result.DetectionOutput != nil && result.DetectionOutput.ExitCode != 0 {
 				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 				result.Error = fmt.Sprintf("script exited with code %d", result.DetectionOutput.ExitCode)

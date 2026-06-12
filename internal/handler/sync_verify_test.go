@@ -20,12 +20,10 @@ import (
 	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
-// syncCanonicalParams is the canonical params the control server signs
-// for an instant action — `{}` (see the executor verification comment
-// and server action_dispatch.go). The agent verifies SYNC against the
-// same bytes.
-var syncCanonicalParams = []byte("{}")
-
+// testCAAndSigner returns a self-signed CA cert (PEM) and a matching
+// ActionSigner. The agent's verifier is built from the same cert, so a
+// signature minted here verifies on the agent side — and a signature minted
+// by any OTHER key (or no signature) is rejected.
 func testCAAndSigner(t *testing.T) ([]byte, *verify.ActionSigner) {
 	t.Helper()
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
@@ -43,67 +41,156 @@ func testCAAndSigner(t *testing.T) ([]byte, *verify.ActionSigner) {
 	return certPEM, verify.NewActionSigner(key)
 }
 
-func syncAction(id string) *pb.Action {
-	return &pb.Action{Id: &pb.ActionId{Value: id}, Type: pb.ActionType_ACTION_TYPE_SYNC}
+// signEnvelope marshals env into its deterministic wire bytes and signs
+// those bytes with the CA signer, returning the bytes the agent receives
+// (envelope) and the CA signature over them. The agent MUST verify over,
+// and unmarshal-then-execute, THESE SAME bytes (sdk#82).
+func signEnvelope(t *testing.T, signer *verify.ActionSigner, env *pb.SignedActionEnvelope) (envelope []byte, signature []byte) {
+	t.Helper()
+	envBytes, err := verify.MarshalEnvelope(env)
+	require.NoError(t, err)
+	sig, err := signer.Sign(envBytes)
+	require.NoError(t, err)
+	return envBytes, sig
 }
 
-// The SYNC instant action returns before ExecuteWithStreaming, so the
-// handler — not the executor — is the only thing that can enforce the
-// CA signature on this path. An UNSIGNED SYNC from a compromised
-// gateway must be rejected and must NOT trigger a resync; a properly
-// signed SYNC must succeed and fire the trigger exactly once.
-func TestOnAction_SyncEnforcesSignature(t *testing.T) {
-	caPEM, signer := testCAAndSigner(t)
+// newVerifierHandler builds a handler whose executor verifies against the
+// given CA, with a buffered sync trigger so the test can assert how many
+// times a resync was enqueued.
+func newVerifierHandler(t *testing.T, caPEM []byte) (*Handler, chan struct{}) {
+	t.Helper()
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
-
 	syncTrigger := make(chan struct{}, 1)
 	h := NewHandler(slog.Default(), executor.NewExecutor(verifier), nil, nil, syncTrigger)
-
-	t.Run("unsigned SYNC is rejected and does not trigger sync", func(t *testing.T) {
-		res, err := h.OnAction(context.Background(), syncAction("01HSYNCUNSIGNED"))
-		require.NoError(t, err)
-		assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
-			"unsigned SYNC from a compromised gateway must be refused")
-		assert.Len(t, syncTrigger, 0, "a rejected SYNC must not enqueue a resync")
-	})
-
-	t.Run("validly signed SYNC succeeds and triggers exactly one sync", func(t *testing.T) {
-		a := syncAction("01HSYNCSIGNED")
-		sig, err := signer.Sign(a.Id.Value, int32(a.Type), syncCanonicalParams)
-		require.NoError(t, err)
-		a.ParamsCanonical = syncCanonicalParams
-		a.Signature = sig
-
-		res, err := h.OnAction(context.Background(), a)
-		require.NoError(t, err)
-		assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS, res.Status)
-		assert.Len(t, syncTrigger, 1, "a signed SYNC must enqueue exactly one resync")
-	})
-
-	t.Run("tampered SYNC (id swapped after signing) is rejected", func(t *testing.T) {
-		a := syncAction("01HSYNCORIGINAL")
-		sig, err := signer.Sign(a.Id.Value, int32(a.Type), syncCanonicalParams)
-		require.NoError(t, err)
-		a.ParamsCanonical = syncCanonicalParams
-		a.Signature = sig
-		a.Id = &pb.ActionId{Value: "01HSYNCSWAPPED"} // signature no longer matches id
-
-		res, err := h.OnAction(context.Background(), a)
-		require.NoError(t, err)
-		assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status)
-	})
+	return h, syncTrigger
 }
 
-// When no verifier is configured (signing disabled), VerifyAction is a
-// no-op and SYNC continues to work — the fast-path must not hard-require
-// a signature in deployments that haven't enabled action signing.
-func TestOnAction_SyncWithoutVerifierStillWorks(t *testing.T) {
+// TestOnAction_UnsignedDispatchRefusedAndNoSync pins the fail-closed
+// invariant on the wire path: a dispatch with no signature (the shape a
+// compromised gateway/Valkey could inject) is refused, and — critically —
+// a SYNC payload delivered without a valid signature must NOT trigger a
+// resync. The envelope-binding is what makes SYNC safe; without a verified
+// envelope the handler must do nothing.
+func TestOnAction_UnsignedDispatchRefusedAndNoSync(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	h, syncTrigger := newVerifierHandler(t, caPEM)
+
+	// Build a real SYNC envelope and its bytes, but deliver it with an
+	// EMPTY signature. The handler must reject it and not fire sync.
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSYNCUNSIGNED"},
+		ActionType: pb.ActionType_ACTION_TYPE_SYNC,
+	}
+	envBytes, err := verify.MarshalEnvelope(env)
+	require.NoError(t, err)
+
+	res, err := h.OnAction(context.Background(), envBytes, nil)
+	require.NoError(t, err)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+		"an unsigned dispatch must be refused")
+	assert.Len(t, syncTrigger, 0, "a refused SYNC must not enqueue a resync")
+
+	// Belt-and-braces: a non-empty but WRONG-key signature is also refused.
+	// Sign different bytes so the signature is structurally valid but does
+	// not match envBytes.
+	_, wrongSig := signEnvelope(t, signer, &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HDIFFERENT"},
+		ActionType: pb.ActionType_ACTION_TYPE_SYNC,
+	})
+	res2, err := h.OnAction(context.Background(), envBytes, wrongSig)
+	require.NoError(t, err)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res2.Status,
+		"a signature over different bytes must be refused")
+	assert.Len(t, syncTrigger, 0, "a refused SYNC must not enqueue a resync")
+}
+
+// TestOnAction_ValidSyncTriggersExactlyOnce pins that a properly signed
+// SYNC envelope triggers a resync exactly once and reports SUCCESS.
+func TestOnAction_ValidSyncTriggersExactlyOnce(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	h, syncTrigger := newVerifierHandler(t, caPEM)
+
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSYNCSIGNED"},
+		ActionType: pb.ActionType_ACTION_TYPE_SYNC,
+	}
+	envBytes, sig := signEnvelope(t, signer, env)
+
+	res, err := h.OnAction(context.Background(), envBytes, sig)
+	require.NoError(t, err)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS, res.Status)
+	assert.Len(t, syncTrigger, 1, "a signed SYNC must enqueue exactly one resync")
+}
+
+// TestOnAction_NonSyncEnvelopeNeverTriggersSync pins that the type binding
+// lives in the SIGNED envelope: a validly signed REBOOT envelope delivered
+// on OnAction must NOT be treated as a SYNC, even though it travels the same
+// dispatch path. A compromised relay cannot lift a non-SYNC signature onto a
+// SYNC because the type is inside the signed bytes. (REBOOT is an instant
+// action that does not reach the executor's typed switch here; the load-
+// bearing assertion is that NO resync is enqueued.)
+func TestOnAction_NonSyncEnvelopeNeverTriggersSync(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	h, syncTrigger := newVerifierHandler(t, caPEM)
+
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HREBOOT"},
+		ActionType: pb.ActionType_ACTION_TYPE_REBOOT,
+	}
+	envBytes, sig := signEnvelope(t, signer, env)
+
+	_, err := h.OnAction(context.Background(), envBytes, sig)
+	require.NoError(t, err)
+	assert.Len(t, syncTrigger, 0,
+		"a non-SYNC envelope must never enqueue a resync — the type is bound")
+}
+
+// TestOnAction_ParamsTamperRefused pins the params-binding invariant: sign a
+// SHELL envelope (script "true"), then flip one byte of the envelope bytes
+// before delivery. Verification over the tampered bytes must fail, so the
+// handler returns FAILED and the script is never executed.
+func TestOnAction_ParamsTamperRefused(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	h, _ := newVerifierHandler(t, caPEM)
+
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSHELLTAMPER"},
+		ActionType: pb.ActionType_ACTION_TYPE_SHELL,
+		Params:     &pb.SignedActionEnvelope_Shell{Shell: &pb.ShellParams{Script: "true", RunAsRoot: true}},
+	}
+	envBytes, sig := signEnvelope(t, signer, env)
+
+	// Flip a byte. The signature was minted over the original bytes, so the
+	// tampered bytes will not verify.
+	tampered := make([]byte, len(envBytes))
+	copy(tampered, envBytes)
+	tampered[len(tampered)/2] ^= 0xFF
+
+	res, err := h.OnAction(context.Background(), tampered, sig)
+	require.NoError(t, err)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+		"tampered envelope bytes must be refused before any execution")
+}
+
+// TestOnAction_NoVerifierIsFailClosed pins that an executor with no verifier
+// refuses every dispatch — the agent must always carry a verifier (the CA
+// cert is required at startup). A nil-verifier deployment must never become a
+// silent "execute everything unsigned" hole.
+func TestOnAction_NoVerifierIsFailClosed(t *testing.T) {
+	_, signer := testCAAndSigner(t)
 	syncTrigger := make(chan struct{}, 1)
 	h := NewHandler(slog.Default(), executor.NewExecutor(nil), nil, nil, syncTrigger)
 
-	res, err := h.OnAction(context.Background(), syncAction("01HSYNCNOVERIFIER"))
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSYNCNOVERIFIER"},
+		ActionType: pb.ActionType_ACTION_TYPE_SYNC,
+	}
+	envBytes, sig := signEnvelope(t, signer, env)
+
+	res, err := h.OnAction(context.Background(), envBytes, sig)
 	require.NoError(t, err)
-	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS, res.Status)
-	assert.Len(t, syncTrigger, 1)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+		"a handler with no verifier must fail closed")
+	assert.Len(t, syncTrigger, 0, "no verifier means no SYNC may fire")
 }

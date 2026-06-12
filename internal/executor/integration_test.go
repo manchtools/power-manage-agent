@@ -69,6 +69,54 @@ func makeAction(t *testing.T, actionType pb.ActionType, state pb.DesiredState) *
 	}
 }
 
+// actionToEnvelope converts a test *pb.Action into the SignedActionEnvelope
+// the executor now consumes (sdk#82). The integration suite exercises the
+// execute* helpers directly with a no-verifier executor, so these envelopes
+// are run via ExecuteEnvelope (which does not verify) — the verify-then-
+// execute binding itself is covered by the unit charter in
+// execute_verified_envelope_test.go. This helper carries id, type,
+// desired_state, timeout, and the typed param oneof across to the envelope.
+func actionToEnvelope(a *pb.Action) *pb.SignedActionEnvelope {
+	env := &pb.SignedActionEnvelope{
+		ActionId:       a.Id,
+		ActionType:     a.Type,
+		DesiredState:   a.DesiredState,
+		TimeoutSeconds: a.TimeoutSeconds,
+		Schedule:       a.Schedule,
+	}
+	switch p := a.Params.(type) {
+	case *pb.Action_Package:
+		env.Params = &pb.SignedActionEnvelope_Package{Package: p.Package}
+	case *pb.Action_App:
+		env.Params = &pb.SignedActionEnvelope_App{App: p.App}
+	case *pb.Action_Shell:
+		env.Params = &pb.SignedActionEnvelope_Shell{Shell: p.Shell}
+	case *pb.Action_Service:
+		env.Params = &pb.SignedActionEnvelope_Service{Service: p.Service}
+	case *pb.Action_File:
+		env.Params = &pb.SignedActionEnvelope_File{File: p.File}
+	case *pb.Action_Update:
+		env.Params = &pb.SignedActionEnvelope_Update{Update: p.Update}
+	case *pb.Action_Repository:
+		env.Params = &pb.SignedActionEnvelope_Repository{Repository: p.Repository}
+	case *pb.Action_Directory:
+		env.Params = &pb.SignedActionEnvelope_Directory{Directory: p.Directory}
+	case *pb.Action_User:
+		env.Params = &pb.SignedActionEnvelope_User{User: p.User}
+	case *pb.Action_Ssh:
+		env.Params = &pb.SignedActionEnvelope_Ssh{Ssh: p.Ssh}
+	case *pb.Action_Sshd:
+		env.Params = &pb.SignedActionEnvelope_Sshd{Sshd: p.Sshd}
+	case *pb.Action_AdminPolicy:
+		env.Params = &pb.SignedActionEnvelope_AdminPolicy{AdminPolicy: p.AdminPolicy}
+	case *pb.Action_Lps:
+		env.Params = &pb.SignedActionEnvelope_Lps{Lps: p.Lps}
+	case *pb.Action_Group:
+		env.Params = &pb.SignedActionEnvelope_Group{Group: p.Group}
+	}
+	return env
+}
+
 func assertSuccess(t *testing.T, result *pb.ActionResult) {
 	t.Helper()
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
@@ -332,7 +380,7 @@ func TestIntegration_Package(t *testing.T) {
 	t.Run("Install", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !checkCmdSuccess("dpkg", "-s", "sl") {
@@ -343,7 +391,7 @@ func TestIntegration_Package(t *testing.T) {
 	t.Run("InstallIdempotent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -351,7 +399,7 @@ func TestIntegration_Package(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if checkCmdSuccess("dpkg", "-s", "sl") {
@@ -362,7 +410,7 @@ func TestIntegration_Package(t *testing.T) {
 	t.Run("RemoveNotInstalled", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -370,7 +418,7 @@ func TestIntegration_Package(t *testing.T) {
 	t.Run("InstallNonExistent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "this-package-does-not-exist-xyz"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 
@@ -383,7 +431,7 @@ func TestIntegration_Package(t *testing.T) {
 		}
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-		result := nopm.Execute(ctx, action)
+		result := nopm.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -400,7 +448,7 @@ func TestIntegration_Package_GracefulSkip(t *testing.T) {
 	t.Run("DnfNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 		if !strings.Contains(safeStdout(result), "skipped") {
@@ -411,7 +459,7 @@ func TestIntegration_Package_GracefulSkip(t *testing.T) {
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -419,7 +467,7 @@ func TestIntegration_Package_GracefulSkip(t *testing.T) {
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -437,7 +485,7 @@ func TestIntegration_Update(t *testing.T) {
 	t.Run("AptUpgrade", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_UPDATE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Update{Update: &pb.UpdateParams{}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -462,7 +510,7 @@ func TestIntegration_Shell(t *testing.T) {
 	t.Run("BasicScript", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "echo hello", RunAsRoot: true}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !strings.Contains(safeStdout(result), "hello") {
 			t.Errorf("expected 'hello' in stdout, got: %s", safeStdout(result))
@@ -472,7 +520,7 @@ func TestIntegration_Shell(t *testing.T) {
 	t.Run("NonZeroExit", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Shell{Shell: &pb.ShellParams{Script: "exit 42", RunAsRoot: true}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// Non-zero exit codes are treated as failures for shell actions.
 		// The exit code is captured in the output.
 		if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
@@ -489,7 +537,7 @@ func TestIntegration_Shell(t *testing.T) {
 			Script:    "whoami",
 			RunAsRoot: true,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !strings.Contains(safeStdout(result), "root") {
 			t.Errorf("expected 'root' in stdout, got: %s", safeStdout(result))
@@ -503,7 +551,7 @@ func TestIntegration_Shell(t *testing.T) {
 			Environment: map[string]string{"MY_TEST_VAR": "test123"},
 			RunAsRoot:   true,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !strings.Contains(safeStdout(result), "test123") {
 			t.Errorf("expected 'test123' in stdout, got: %s", safeStdout(result))
@@ -517,7 +565,7 @@ func TestIntegration_Shell(t *testing.T) {
 			WorkingDirectory: "/tmp",
 			RunAsRoot:        true,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !strings.Contains(safeStdout(result), "/tmp") {
 			t.Errorf("expected '/tmp' in stdout, got: %s", safeStdout(result))
@@ -547,7 +595,7 @@ func TestIntegration_File(t *testing.T) {
 			Owner:   "root",
 			Group:   "root",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 
@@ -569,7 +617,7 @@ func TestIntegration_File(t *testing.T) {
 			Owner:   "root",
 			Group:   "root",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -584,7 +632,7 @@ func TestIntegration_File(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_FILE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_File{File: &pb.FileParams{Path: testFile}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if _, err := os.Stat(testFile); !os.IsNotExist(err) {
@@ -595,7 +643,7 @@ func TestIntegration_File(t *testing.T) {
 	t.Run("RemoveAbsent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_FILE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_File{File: &pb.FileParams{Path: testFile}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -613,7 +661,7 @@ func TestIntegration_File(t *testing.T) {
 			Content:      "# managed block\n",
 			ManagedBlock: true,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 
@@ -647,7 +695,7 @@ func TestIntegration_Directory(t *testing.T) {
 			Path: testDir,
 			Mode: "0755",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		info, err := os.Stat(testDir)
@@ -665,7 +713,7 @@ func TestIntegration_Directory(t *testing.T) {
 			Path: testDir,
 			Mode: "0755",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -677,7 +725,7 @@ func TestIntegration_Directory(t *testing.T) {
 			Path:      deepDir,
 			Recursive: true,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if _, err := os.Stat(deepDir); err != nil {
@@ -688,7 +736,7 @@ func TestIntegration_Directory(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: testDir}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if _, err := os.Stat(testDir); !os.IsNotExist(err) {
@@ -699,7 +747,7 @@ func TestIntegration_Directory(t *testing.T) {
 	t.Run("ProtectedPath", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: "/usr"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -721,7 +769,7 @@ func TestIntegration_User(t *testing.T) {
 			Username: username,
 			Comment:  "Integration Test User",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !userExists(username) {
@@ -739,7 +787,7 @@ func TestIntegration_User(t *testing.T) {
 			Username: username,
 			Comment:  "Integration Test User",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -750,7 +798,7 @@ func TestIntegration_User(t *testing.T) {
 			Username: username,
 			Shell:    "/bin/sh",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		info, err := sysuser.Get(username)
@@ -765,7 +813,7 @@ func TestIntegration_User(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: username}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if userExists(username) {
@@ -776,7 +824,7 @@ func TestIntegration_User(t *testing.T) {
 	t.Run("RemoveAbsent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: username}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -789,7 +837,7 @@ func TestIntegration_User(t *testing.T) {
 		}
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: "power-manage"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !userExists("power-manage") {
 			t.Error("power-manage user was deleted despite protection")
@@ -828,7 +876,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 			CreateHome: false,
 			Comment:    "regression test for create_home false",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !userExists(username) {
 			t.Fatal("user not created")
@@ -853,7 +901,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 			CreateHome: true,
 			Comment:    "regression test for create_home true",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !userExists(username) {
 			t.Fatal("user not created")
@@ -897,7 +945,7 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 			NoPassword: true,
 			Comment:    "no_password flag regression test",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if !userExists(username) {
 			t.Fatal("user not created")
@@ -940,7 +988,7 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 			Username: username,
 			Comment:  "no_password=false regression guard",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
 			t.Error("expected lps.rotations metadata when NoPassword=false (default), got none")
@@ -966,7 +1014,7 @@ func TestIntegration_Group(t *testing.T) {
 	t.Run("Create", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: groupName}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !groupExists(groupName) {
@@ -977,7 +1025,7 @@ func TestIntegration_Group(t *testing.T) {
 	t.Run("CreateIdempotent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: groupName}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -990,7 +1038,7 @@ func TestIntegration_Group(t *testing.T) {
 			Name:    groupName,
 			Members: []string{"pmgrpuser1", "pmgrpuser2"},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !userInGroup("pmgrpuser1", groupName) {
@@ -1010,7 +1058,7 @@ func TestIntegration_Group(t *testing.T) {
 			Name:    groupName,
 			Members: []string{},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !groupExists(groupName) {
@@ -1027,7 +1075,7 @@ func TestIntegration_Group(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: groupName}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if groupExists(groupName) {
@@ -1042,7 +1090,7 @@ func TestIntegration_Group(t *testing.T) {
 		}
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: "power-manage"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !groupExists("power-manage") {
 			t.Error("power-manage group was deleted despite protection")
@@ -1076,7 +1124,7 @@ func TestIntegration_Sudo(t *testing.T) {
 				Users:       []string{"pmsudouser"},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 
@@ -1101,7 +1149,7 @@ func TestIntegration_Sudo(t *testing.T) {
 				Users:       []string{"pmsudouser"},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1116,7 +1164,7 @@ func TestIntegration_Sudo(t *testing.T) {
 				Users:       []string{"pmsudouser"},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		filePath := sudoersFilePath(actionID)
@@ -1157,7 +1205,7 @@ func TestIntegration_SSH(t *testing.T) {
 				AllowPassword: false,
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		configPath := sshConfigPath(actionID)
@@ -1180,7 +1228,7 @@ func TestIntegration_SSH(t *testing.T) {
 				AllowPassword: false,
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1194,7 +1242,7 @@ func TestIntegration_SSH(t *testing.T) {
 				Users: []string{"pmsshuser"},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		configPath := sshConfigPath(actionID)
@@ -1230,7 +1278,7 @@ func TestIntegration_SSHD(t *testing.T) {
 				},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !sudoFileExists(configPath) {
@@ -1251,7 +1299,7 @@ func TestIntegration_SSHD(t *testing.T) {
 				},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1263,7 +1311,7 @@ func TestIntegration_SSHD(t *testing.T) {
 			DesiredState: pb.DesiredState_DESIRED_STATE_ABSENT,
 			Params:       &pb.Action_Sshd{Sshd: &pb.SshdParams{Priority: priority}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if sudoFileExists(configPath) {
@@ -1286,7 +1334,7 @@ func TestIntegration_Systemd(t *testing.T) {
 			UnitName:     "power-manage-agent",
 			DesiredState: pb.ServiceUnitState_SERVICE_UNIT_STATE_STOPPED,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 
@@ -1309,7 +1357,7 @@ WantedBy=multi-user.target
 			UnitName:    unitName,
 			UnitContent: unitContent,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// daemon-reload fails without systemd PID 1, so status is FAILED.
 		// But the unit file itself should still be written before daemon-reload.
 		assertFailed(t, result)
@@ -1347,7 +1395,7 @@ func TestIntegration_LPS(t *testing.T) {
 				RotationIntervalDays: 365,
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
@@ -1367,7 +1415,7 @@ func TestIntegration_LPS(t *testing.T) {
 				RotationIntervalDays: 365,
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1381,7 +1429,7 @@ func TestIntegration_LPS(t *testing.T) {
 				Usernames: []string{username},
 			}},
 		}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		states, err := e.store.GetLpsState(actionID)
@@ -1417,7 +1465,7 @@ func TestIntegration_Deb(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/pm-testpkg_1.0.0_all.deb",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !checkCmdSuccess("dpkg", "-s", "pm-testpkg") {
@@ -1433,7 +1481,7 @@ func TestIntegration_Deb(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: "http://example.com/pm-notinstalled_1.0.0_all.deb",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1466,7 +1514,7 @@ func TestIntegration_AppImage(t *testing.T) {
 			ChecksumSha256: checksumHex,
 			InstallPath:    installDir,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		fullPath := filepath.Join(installDir, fileName)
@@ -1486,7 +1534,7 @@ func TestIntegration_AppImage(t *testing.T) {
 			Url:         ts.URL + "/" + fileName,
 			InstallPath: installDir,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1497,7 +1545,7 @@ func TestIntegration_AppImage(t *testing.T) {
 			Url:         ts.URL + "/" + fileName,
 			InstallPath: installDir,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		fullPath := filepath.Join(installDir, fileName)
@@ -1533,7 +1581,7 @@ func TestIntegration_Repository(t *testing.T) {
 				Trusted:      true,
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		sourcesFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.sources", repoName)
@@ -1550,7 +1598,7 @@ func TestIntegration_Repository(t *testing.T) {
 				Url: "https://example.com/apt",
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		sourcesFile := fmt.Sprintf("/etc/apt/sources.list.d/%s.sources", repoName)
@@ -1574,7 +1622,7 @@ func TestIntegration_Package_Dnf(t *testing.T) {
 	t.Run("Install", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !isRpmInstalled("tree") {
@@ -1585,7 +1633,7 @@ func TestIntegration_Package_Dnf(t *testing.T) {
 	t.Run("InstallIdempotent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1593,7 +1641,7 @@ func TestIntegration_Package_Dnf(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if isRpmInstalled("tree") {
@@ -1604,7 +1652,7 @@ func TestIntegration_Package_Dnf(t *testing.T) {
 	t.Run("InstallNonExistent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "this-package-does-not-exist-xyz"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -1617,7 +1665,7 @@ func TestIntegration_Package_GracefulSkip_Dnf(t *testing.T) {
 	t.Run("AptNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1625,7 +1673,7 @@ func TestIntegration_Package_GracefulSkip_Dnf(t *testing.T) {
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1633,7 +1681,7 @@ func TestIntegration_Package_GracefulSkip_Dnf(t *testing.T) {
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1647,7 +1695,7 @@ func TestIntegration_Update_Dnf(t *testing.T) {
 	t.Run("DnfUpgrade", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_UPDATE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Update{Update: &pb.UpdateParams{}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -1673,7 +1721,7 @@ func TestIntegration_Repository_Dnf(t *testing.T) {
 				Gpgcheck:    false,
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		repoFile := fmt.Sprintf("/etc/yum.repos.d/%s.repo", repoName)
@@ -1690,7 +1738,7 @@ func TestIntegration_Repository_Dnf(t *testing.T) {
 				Baseurl: "https://example.com/repo",
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		repoFile := fmt.Sprintf("/etc/yum.repos.d/%s.repo", repoName)
@@ -1726,7 +1774,7 @@ func TestIntegration_Rpm(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !isRpmInstalled("pmtestrpm") {
@@ -1744,7 +1792,7 @@ func TestIntegration_Rpm(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1764,7 +1812,7 @@ func TestIntegration_Rpm(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if isRpmInstalled("pmtestrpm") {
@@ -1784,7 +1832,7 @@ func TestIntegration_Rpm(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1804,7 +1852,7 @@ func TestIntegration_Package_Pacman(t *testing.T) {
 	t.Run("Install", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !isPacmanInstalled("tree") {
@@ -1815,7 +1863,7 @@ func TestIntegration_Package_Pacman(t *testing.T) {
 	t.Run("InstallIdempotent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1823,7 +1871,7 @@ func TestIntegration_Package_Pacman(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if isPacmanInstalled("tree") {
@@ -1834,7 +1882,7 @@ func TestIntegration_Package_Pacman(t *testing.T) {
 	t.Run("InstallNonExistent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "this-package-does-not-exist-xyz"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -1847,7 +1895,7 @@ func TestIntegration_Package_GracefulSkip_Pacman(t *testing.T) {
 	t.Run("AptNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1855,7 +1903,7 @@ func TestIntegration_Package_GracefulSkip_Pacman(t *testing.T) {
 	t.Run("DnfNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1863,7 +1911,7 @@ func TestIntegration_Package_GracefulSkip_Pacman(t *testing.T) {
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1877,7 +1925,7 @@ func TestIntegration_Update_Pacman(t *testing.T) {
 	t.Run("PacmanUpgrade", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_UPDATE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Update{Update: &pb.UpdateParams{}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -1906,7 +1954,7 @@ func TestIntegration_Repository_Pacman(t *testing.T) {
 				SigLevel: "Optional TrustAll",
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		content, err := os.ReadFile("/etc/pacman.conf")
@@ -1926,7 +1974,7 @@ func TestIntegration_Repository_Pacman(t *testing.T) {
 				Server: "https://example.com/$repo/os/$arch",
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		content, err := os.ReadFile("/etc/pacman.conf")
@@ -1953,7 +2001,7 @@ func TestIntegration_Package_Zypper(t *testing.T) {
 	t.Run("Install", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if !isRpmInstalled("tree") {
@@ -1964,7 +2012,7 @@ func TestIntegration_Package_Zypper(t *testing.T) {
 	t.Run("InstallIdempotent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -1972,7 +2020,7 @@ func TestIntegration_Package_Zypper(t *testing.T) {
 	t.Run("Remove", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
 		if isRpmInstalled("tree") {
@@ -1983,7 +2031,7 @@ func TestIntegration_Package_Zypper(t *testing.T) {
 	t.Run("InstallNonExistent", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "this-package-does-not-exist-xyz"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -1996,7 +2044,7 @@ func TestIntegration_Package_GracefulSkip_Zypper(t *testing.T) {
 	t.Run("AptNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -2004,7 +2052,7 @@ func TestIntegration_Package_GracefulSkip_Zypper(t *testing.T) {
 	t.Run("DnfNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -2012,7 +2060,7 @@ func TestIntegration_Package_GracefulSkip_Zypper(t *testing.T) {
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
@@ -2026,7 +2074,7 @@ func TestIntegration_Update_Zypper(t *testing.T) {
 	t.Run("ZypperUpdate", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_UPDATE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Update{Update: &pb.UpdateParams{}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -2052,7 +2100,7 @@ func TestIntegration_Repository_Zypper(t *testing.T) {
 				Gpgcheck:    false,
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		// Verify repo exists
@@ -2069,7 +2117,7 @@ func TestIntegration_Repository_Zypper(t *testing.T) {
 				Url: "https://example.com/repo",
 			},
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -2149,7 +2197,7 @@ func TestIntegration_EdgeCase_AptLock(t *testing.T) {
 	// so we verify the install succeeded, not that lock files are gone.
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	if !checkCmdSuccess("dpkg", "-s", "sl") {
 		t.Error("sl not installed after locked-DB repair")
@@ -2173,7 +2221,7 @@ func TestIntegration_EdgeCase_PacmanLock(t *testing.T) {
 
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	if !isPacmanInstalled("tree") {
 		t.Error("tree not installed after locked-DB repair")
@@ -2197,7 +2245,7 @@ func TestIntegration_EdgeCase_ZypperLock(t *testing.T) {
 
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	if !isRpmInstalled("tree") {
 		t.Error("tree not installed after locked-DB repair")
@@ -2220,7 +2268,7 @@ func TestIntegration_EdgeCase_DnfStaleHistory(t *testing.T) {
 	// install succeeds. This tests the repair code path even if no corruption exists.
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "tree"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	if !isRpmInstalled("tree") {
 		t.Error("tree not installed after dnf repair path")
@@ -2254,7 +2302,7 @@ func TestIntegration_EdgeCase_LpsNoPriorState(t *testing.T) {
 			Complexity:           pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_ALPHANUMERIC,
 		}},
 	}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 
 	// Verify state was persisted in SQLite
@@ -2313,7 +2361,7 @@ func TestIntegration_EdgeCase_MissingSudoersDir(t *testing.T) {
 			Users:       []string{"pmsudoedge"},
 		}},
 	}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// The executor writes via tee — if /etc/sudoers.d doesn't exist, tee fails.
 	// This is expected to fail since the executor doesn't create the parent dir for sudoers files.
 	assertFailed(t, result)
@@ -2346,7 +2394,7 @@ func TestIntegration_EdgeCase_MissingSshdConfigDir(t *testing.T) {
 			},
 		}},
 	}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// SSHD executor calls createDirectory() with recursive=true before writing.
 	// The directory should be re-created and config written.
 	assertSuccess(t, result)
@@ -2373,7 +2421,7 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 			Url:         ts.URL + "/test.AppImage",
 			InstallPath: t.TempDir(),
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "500") {
 			t.Errorf("expected error to mention 500, got: %s", result.Error)
@@ -2388,7 +2436,7 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test-1.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "500") {
 			t.Errorf("expected error to mention 500, got: %s", result.Error)
@@ -2401,7 +2449,7 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test.deb",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "500") {
 			t.Errorf("expected error to mention 500, got: %s", result.Error)
@@ -2421,7 +2469,7 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 			Url:         ts.URL + "/test.AppImage",
 			InstallPath: t.TempDir(),
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "404") {
 			t.Errorf("expected error to mention 404, got: %s", result.Error)
@@ -2436,7 +2484,7 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test-1.0-1.noarch.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "404") {
 			t.Errorf("expected error to mention 404, got: %s", result.Error)
@@ -2449,7 +2497,7 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test.deb",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "404") {
 			t.Errorf("expected error to mention 404, got: %s", result.Error)
@@ -2475,7 +2523,7 @@ func TestIntegration_EdgeCase_DownloadChecksumMismatch(t *testing.T) {
 		InstallPath:    installDir,
 		ChecksumSha256: wrongChecksum,
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertFailed(t, result)
 	if !strings.Contains(result.Error, "checksum") {
 		t.Errorf("expected checksum error, got: %s", result.Error)
@@ -2505,7 +2553,7 @@ func TestIntegration_EdgeCase_DownloadTimeout(t *testing.T) {
 	// Set a 1-second timeout on the action
 	action.TimeoutSeconds = 1
 
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// Should be TIMEOUT status (executor.go:253 checks context.DeadlineExceeded)
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT {
 		t.Errorf("expected TIMEOUT status, got %s (error: %s)", result.Status, result.Error)
@@ -2543,7 +2591,7 @@ func TestIntegration_EdgeCase_NilParams(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			action := makeAction(t, tt.actionType, pb.DesiredState_DESIRED_STATE_PRESENT)
 			action.Params = nil // Force nil params
-			result := e.Execute(ctx, action)
+			result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 			assertFailed(t, result)
 			if !strings.Contains(result.Error, "required") {
 				t.Errorf("expected 'required' in error, got: %s", result.Error)
@@ -2559,7 +2607,7 @@ func TestIntegration_EdgeCase_InvalidUsername(t *testing.T) {
 	t.Run("StartsWithDigit", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: "123bad"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "invalid username") {
 			t.Errorf("expected 'invalid username' error, got: %s", result.Error)
@@ -2569,7 +2617,7 @@ func TestIntegration_EdgeCase_InvalidUsername(t *testing.T) {
 	t.Run("TooLong", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: strings.Repeat("a", 33)}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "invalid username") {
 			t.Errorf("expected 'invalid username' error, got: %s", result.Error)
@@ -2579,7 +2627,7 @@ func TestIntegration_EdgeCase_InvalidUsername(t *testing.T) {
 	t.Run("SpecialChars", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: "bad!user"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "invalid username") {
 			t.Errorf("expected 'invalid username' error, got: %s", result.Error)
@@ -2589,7 +2637,7 @@ func TestIntegration_EdgeCase_InvalidUsername(t *testing.T) {
 	t.Run("Empty", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: ""}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -2604,7 +2652,7 @@ func TestIntegration_EdgeCase_InvalidPaths(t *testing.T) {
 			Path:    "relative/path/file.txt",
 			Content: "test",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "absolute") {
 			t.Errorf("expected 'absolute' in error, got: %s", result.Error)
@@ -2614,7 +2662,7 @@ func TestIntegration_EdgeCase_InvalidPaths(t *testing.T) {
 	t.Run("ProtectedDirDelete_Etc", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: "/etc"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "protected") {
 			t.Errorf("expected 'protected' in error, got: %s", result.Error)
@@ -2624,7 +2672,7 @@ func TestIntegration_EdgeCase_InvalidPaths(t *testing.T) {
 	t.Run("ProtectedDirDelete_Root", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: "/"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "protected") {
 			t.Errorf("expected 'protected' in error, got: %s", result.Error)
@@ -2634,7 +2682,7 @@ func TestIntegration_EdgeCase_InvalidPaths(t *testing.T) {
 	t.Run("ProtectedDirDelete_Usr", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: "/usr"}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 		if !strings.Contains(result.Error, "protected") {
 			t.Errorf("expected 'protected' in error, got: %s", result.Error)
@@ -2644,7 +2692,7 @@ func TestIntegration_EdgeCase_InvalidPaths(t *testing.T) {
 	t.Run("EmptyDirectoryPath", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DIRECTORY, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Directory{Directory: &pb.DirectoryParams{Path: ""}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -2681,7 +2729,7 @@ func TestIntegration_EdgeCase_DiskFull(t *testing.T) {
 		Path:    filepath.Join(mountPoint, "testfile.txt"),
 		Content: strings.Repeat("data", 1024), // 4KB of data
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// Should fail gracefully — no crash, just an error
 	assertFailed(t, result)
 }
@@ -2720,7 +2768,7 @@ func TestIntegration_EdgeCase_ReadOnlyMount(t *testing.T) {
 		Path:    filepath.Join(mountPoint, "testfile.txt"),
 		Content: "should not be written",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// Should fail gracefully
 	assertFailed(t, result)
 }
@@ -2744,7 +2792,7 @@ func TestIntegration_EdgeCase_UserExistsDifferentShell(t *testing.T) {
 		Username: username,
 		Shell:    "/usr/sbin/nologin",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	assertChanged(t, result, true)
 
@@ -2769,7 +2817,7 @@ func TestIntegration_EdgeCase_FileExistsDifferentPerms(t *testing.T) {
 		Content: "original",
 		Mode:    "0644",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	assertChanged(t, result, true)
 
@@ -2800,7 +2848,7 @@ func TestIntegration_EdgeCase_FileExistsAsDirectory(t *testing.T) {
 		Path:    dirPath,
 		Content: "content",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 }
 
@@ -2816,7 +2864,7 @@ func TestIntegration_EdgeCase_EmptyFileContent(t *testing.T) {
 		Path:    filePath,
 		Content: "",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 
 	// File should exist and be empty
@@ -2856,7 +2904,7 @@ func TestIntegration_EdgeCase_SymlinkCircular(t *testing.T) {
 			Path:    linkPath,
 			Content: "test content\n",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// The executor should either succeed (writing through the resolved path)
 		// or fail gracefully — it must not panic
 		if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
@@ -2885,7 +2933,7 @@ func TestIntegration_EdgeCase_SymlinkCircular(t *testing.T) {
 			Path:    linkA,
 			Content: "test content\n",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// Must not panic — either succeeds or fails with error
 		if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
 			result.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
@@ -2905,7 +2953,7 @@ func TestIntegration_EdgeCase_SymlinkCircular(t *testing.T) {
 		// and detect /etc/passwd as the real target
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_FILE, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_File{File: &pb.FileParams{Path: linkPath}}
-		_ = e.Execute(ctx, action)
+		_ = e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// /etc/passwd should still exist regardless of outcome
 		if _, err := os.Stat("/etc/passwd"); err != nil {
 			t.Fatal("CRITICAL: /etc/passwd was deleted!")
@@ -2925,7 +2973,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 			Url:         "http://this-domain-does-not-exist-xyzzy.invalid/app.AppImage",
 			InstallPath: "/tmp/pm-edge-dns",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 
@@ -2935,7 +2983,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: "http://this-domain-does-not-exist-xyzzy.invalid/pkg.deb",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 
@@ -2947,7 +2995,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: "http://this-domain-does-not-exist-xyzzy.invalid/pkg.rpm",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
 	})
 }
@@ -2971,7 +3019,7 @@ func TestIntegration_EdgeCase_HTTPSCertError(t *testing.T) {
 		Url:         ts.URL + "/test.AppImage",
 		InstallPath: "/tmp/pm-edge-tls",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertFailed(t, result)
 
 	// Verify no partial file was left behind
@@ -3009,7 +3057,7 @@ func TestIntegration_EdgeCase_PartialAppImage(t *testing.T) {
 		ChecksumSha256: checksumHex,
 		InstallPath:    installDir,
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	assertChanged(t, result, true)
 
@@ -3036,7 +3084,7 @@ func TestIntegration_EdgeCase_ShellTimeout(t *testing.T) {
 	}}
 	action.TimeoutSeconds = 2
 
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT {
 		t.Errorf("expected TIMEOUT, got %s (error: %s)", result.Status, result.Error)
 	}
@@ -3061,7 +3109,7 @@ func TestIntegration_EdgeCase_UserDeleteWhileLoggedIn(t *testing.T) {
 	// Now try to remove the user — killUserSessions should handle the active process
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_ABSENT)
 	action.Params = &pb.Action_User{User: &pb.UserParams{Username: username}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 	assertChanged(t, result, true)
 
@@ -3089,7 +3137,7 @@ func TestIntegration_EdgeCase_GroupIsPrimaryGroup(t *testing.T) {
 	// Try to delete the group while it's still the user's primary group
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_ABSENT)
 	action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: groupName}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 
 	// groupdel should fail because the group is a primary group
 	assertFailed(t, result)
@@ -3113,7 +3161,7 @@ func TestIntegration_EdgeCase_BinaryFileContent(t *testing.T) {
 			Path:    filePath,
 			Content: content,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		data, err := os.ReadFile(filePath)
@@ -3137,7 +3185,7 @@ func TestIntegration_EdgeCase_BinaryFileContent(t *testing.T) {
 			Path:    filePath,
 			Content: content,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		data, err := os.ReadFile(filePath)
@@ -3161,7 +3209,7 @@ func TestIntegration_EdgeCase_BinaryFileContent(t *testing.T) {
 			Path:    filePath,
 			Content: content,
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 
 		info, err := os.Stat(filePath)
@@ -3200,7 +3248,7 @@ func TestIntegration_EdgeCase_ImmutableFile(t *testing.T) {
 		Path:    filePath,
 		Content: "modified\n",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// Should fail because file is immutable (mv -f to immutable target fails)
 	assertFailed(t, result)
 
@@ -3244,7 +3292,7 @@ func TestIntegration_EdgeCase_BrokenSudoersFile(t *testing.T) {
 			Users:       []string{"pmedgesudo"},
 		}},
 	}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// The executor writes its own file independently — should succeed
 	assertSuccess(t, result)
 
@@ -3285,7 +3333,7 @@ func TestIntegration_EdgeCase_SSHDirWrongPermissions(t *testing.T) {
 		Username:          username,
 		SshAuthorizedKeys: []string{"ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABgQ test@test"},
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 
 	// Verify .ssh directory permissions are now 700
@@ -3331,7 +3379,7 @@ func TestIntegration_EdgeCase_VeryLongFilePath(t *testing.T) {
 		Path:    longPath,
 		Content: "test\n",
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 
 	// Linux PATH_MAX is 4096 — this should either succeed (path fits) or
 	// fail gracefully with an error (if filesystem rejects it)
@@ -3353,7 +3401,7 @@ func TestIntegration_EdgeCase_VeryLongFilePath(t *testing.T) {
 			Path:    tooLong,
 			Content: "test\n",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// Should fail — path too long for Linux VFS
 		assertFailed(t, result)
 	})
@@ -3378,7 +3426,7 @@ func TestIntegration_EdgeCase_PackagePinConflict(t *testing.T) {
 		Name: "sl",
 		Pin:  true,
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 
 	// Run again — should be idempotent (already pinned)
@@ -3387,7 +3435,7 @@ func TestIntegration_EdgeCase_PackagePinConflict(t *testing.T) {
 		Name: "sl",
 		Pin:  true,
 	}}
-	result2 := e.Execute(ctx, action2)
+	result2 := e.ExecuteEnvelope(ctx, actionToEnvelope(action2))
 	assertSuccess(t, result2)
 	assertChanged(t, result2, false)
 }
@@ -3414,7 +3462,7 @@ func TestIntegration_EdgeCase_InterruptedDpkg(t *testing.T) {
 	// Attempt to install a package — repairApt should clean up and recover
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertSuccess(t, result)
 
 	t.Cleanup(func() {
@@ -3443,7 +3491,7 @@ func TestIntegration_EdgeCase_SystemdInvalidUnit(t *testing.T) {
 			UnitName:    unitName,
 			UnitContent: "THIS IS NOT VALID SYSTEMD UNIT CONTENT\n[[[invalid\n",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// The unit file is written, but daemon-reload fails without systemd
 		// In a real system, systemd would parse the invalid unit and the start would fail
 		// In container: daemon-reload fails → FAILED status
@@ -3462,7 +3510,7 @@ func TestIntegration_EdgeCase_SystemdInvalidUnit(t *testing.T) {
 			UnitName:    unitName,
 			UnitContent: "",
 		}}
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		// With empty UnitContent, the executor skips unit file writing and
 		// goes straight to enable/start logic. Without systemd, this may vary.
 		// The key is that it doesn't crash.
@@ -3495,7 +3543,7 @@ func TestIntegration_EdgeCase_ConcurrentFileWrites(t *testing.T) {
 				Path:    filePath,
 				Content: content,
 			}}
-			result := e.Execute(ctx, action)
+			result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 			if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
 				errors <- fmt.Sprintf("goroutine %d failed: %s", idx, result.Error)
 			}
@@ -3545,7 +3593,7 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 
@@ -3557,7 +3605,7 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 
@@ -3569,7 +3617,7 @@ func TestIntegration_EdgeCase_LargeShellOutput(t *testing.T) {
 			RunAsRoot: true,
 		}}
 		action.TimeoutSeconds = 30
-		result := e.Execute(ctx, action)
+		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 	})
 }
@@ -3598,7 +3646,7 @@ func TestIntegration_EdgeCase_RepositoryExpiredGPGKey(t *testing.T) {
 			GpgKeyUrl:    "https://this-domain-does-not-exist-xyzzy.invalid/key.gpg",
 		},
 	}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	// Should fail because the GPG key can't be downloaded
 	assertFailed(t, result)
 }
@@ -3647,7 +3695,7 @@ Description: Package with broken postinst
 	// Now try to install a normal package — repairApt should run dpkg --configure -a
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}
-	result := e.Execute(ctx, action)
+	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 
 	// The repair may or may not fully succeed depending on how broken things are,
 	// but the executor should not crash
