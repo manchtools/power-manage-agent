@@ -30,13 +30,17 @@ func (e *Executor) requireWritableFS(ctx context.Context) (*pb.CommandOutput, er
 // validActionIDRegex matches only safe alphanumeric characters for action IDs.
 var validActionIDRegex = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 
-// getActionID extracts the action ID string from an action, returning "" if nil or invalid.
-
-func getActionID(action *pb.Action) string {
-	if action == nil || action.Id == nil {
+// envActionID extracts the action ID string from a verified envelope,
+// returning "" if nil or invalid. The id is read off the SIGNED envelope —
+// the same bytes that were verified — so the id used to derive on-disk paths
+// and Linux group names (action_ssh.go etc.) is the authenticated one, not an
+// advisory wire field. The alphanumeric/length validation is defense in depth
+// against an id that slips path-meaningful characters into those derivations.
+func envActionID(env *pb.SignedActionEnvelope) string {
+	if env == nil || env.GetActionId() == nil {
 		return ""
 	}
-	id := action.Id.Value
+	id := env.GetActionId().GetValue()
 	if id == "" || len(id) > 64 || !validActionIDRegex.MatchString(id) {
 		return ""
 	}

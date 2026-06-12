@@ -126,45 +126,45 @@ func (h *Handler) ResetConnection() {
 
 // OnAction handles action dispatch from the server.
 // Actions are stored locally and executed on schedule for drift prevention.
-func (h *Handler) OnAction(ctx context.Context, action *pb.Action) (*pb.ActionResult, error) {
-	return h.OnActionWithStreaming(ctx, action, nil)
+func (h *Handler) OnAction(ctx context.Context, envelope []byte, signature []byte) (*pb.ActionResult, error) {
+	return h.OnActionWithStreaming(ctx, envelope, signature, nil)
 }
 
 // OnActionWithStreaming handles action dispatch with optional output streaming.
 // The sendChunk callback is called for each line of output during execution.
-func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
-	h.logger.Info("received action", "action_id", action.Id.Value, "type", action.Type.String())
+//
+// The handler receives the SIGNED envelope bytes and the CA signature. It
+// verifies the signature over those bytes and unmarshals THOSE SAME bytes
+// into a SignedActionEnvelope (VerifyEnvelope) BEFORE any side effect — no
+// storing, no sync trigger, no execution happens on an unverified envelope
+// (sdk#82). Verification is fail-closed: any verify/unmarshal error returns a
+// FAILED result and nothing runs.
+func (h *Handler) OnActionWithStreaming(ctx context.Context, envelope []byte, signature []byte, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
+	// Verify FIRST. The verified envelope is the only thing we act on; we read
+	// the type/id/params off it, never off any advisory wire field. A failure
+	// here is a hard refusal — return FAILED and do not store, sync, or run.
+	env, err := h.executor.VerifyEnvelope(envelope, signature)
+	if err != nil {
+		h.logger.Warn("refusing to execute unsigned/tampered action", "error", err)
+		return &pb.ActionResult{
+			Status:      pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
+			Error:       fmt.Sprintf("refusing to execute unsigned/tampered action: %v", err),
+			CompletedAt: timestamppb.Now(),
+		}, nil
+	}
+
+	actionID := env.GetActionId().GetValue()
+	h.logger.Info("received action", "action_id", actionID, "type", env.GetActionType().String())
 
 	// Handle SYNC instant action directly — trigger sync and return success.
 	//
-	// The signature MUST be verified here. SYNC returns before
-	// ExecuteWithStreaming, so the executor's verification never runs on
-	// this path; without this check a compromised gateway/Valkey (the
-	// F-31 threat model) could inject an unsigned type=SYNC and force
-	// resyncs at will. #90 removed the executor's instant-action skip
-	// but missed this fast-path, leaving SYNC forgeable.
-	//
-	// VerifyAction signs over the (id, type, params_canonical) tuple, so
-	// it is the action's TYPE binding — not any inspection of the params
-	// here — that makes SYNC safe: a signature minted for a non-SYNC
-	// action cannot be lifted onto a type=SYNC envelope (the type is part
-	// of the signed bytes), and the server only ever signs `{}` for an
-	// instant action. We therefore intentionally do NOT parse or assert
-	// on action.ParamsCanonical on this path: doing so would not add
-	// security (the signature already covers it) and would risk diverging
-	// from the server's canonical form. The cross-repo gap where the
-	// signature covers params_canonical but execution reads the typed
-	// proto oneof is tracked separately (sdk#82).
-	if action.Type == pb.ActionType_ACTION_TYPE_SYNC {
-		if verifyErr := h.executor.VerifyAction(action); verifyErr != nil {
-			h.logger.Warn("rejecting unsigned/tampered SYNC action", "action_id", action.Id.Value, "error", verifyErr)
-			return &pb.ActionResult{
-				ActionId:    action.Id,
-				Status:      pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
-				Error:       fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr),
-				CompletedAt: timestamppb.Now(),
-			}, nil
-		}
+	// Safe because the type is bound INSIDE the verified envelope: a signature
+	// minted for a non-SYNC action cannot be lifted onto a SYNC envelope, and
+	// a non-SYNC envelope delivered here can never reach this branch. SYNC
+	// returns before the executor's typed switch, so verifying the envelope
+	// up front is the only thing that can enforce the CA signature on this
+	// path — which we now always do above.
+	if env.GetActionType() == pb.ActionType_ACTION_TYPE_SYNC {
 		h.logger.Info("triggering immediate sync via instant action")
 		if h.syncTrigger != nil {
 			select {
@@ -175,26 +175,38 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 			}
 		}
 		return &pb.ActionResult{
-			ActionId:    action.Id,
+			ActionId:    env.GetActionId(),
 			Status:      pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
 			CompletedAt: timestamppb.Now(),
 			Output:      &pb.CommandOutput{Stdout: "Sync triggered"},
 		}, nil
 	}
 
-	// Store the action for scheduled execution (skip for instant and one-off actions)
-	if h.scheduler != nil && !executor.IsInstantAction(action.Type) && action.Type != pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
-		if err := h.scheduler.AddAction(action); err != nil {
-			h.logger.Error("failed to store action", "action_id", action.Id.Value, "error", err)
+	// Store the action for scheduled execution (skip for instant and one-off
+	// actions). The stored wire Action carries the verified envelope bytes +
+	// signature so the offline scheduler re-verifies and executes the SAME
+	// bytes later; the typed oneof on the stored Action is advisory only.
+	if h.scheduler != nil && !executor.IsInstantAction(env.GetActionType()) && env.GetActionType() != pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
+		stored := &pb.Action{
+			Id:             env.GetActionId(),
+			Type:           env.GetActionType(),
+			DesiredState:   env.GetDesiredState(),
+			TimeoutSeconds: env.GetTimeoutSeconds(),
+			Schedule:       env.GetSchedule(),
+			SignedEnvelope: envelope,
+			Signature:      signature,
+		}
+		if err := h.scheduler.AddAction(stored); err != nil {
+			h.logger.Error("failed to store action", "action_id", actionID, "error", err)
 		} else {
-			h.logger.Info("action stored for scheduled execution", "action_id", action.Id.Value)
+			h.logger.Info("action stored for scheduled execution", "action_id", actionID)
 		}
 	}
 
 	// Create output callback if sendChunk is provided
 	var outputCallback executor.OutputCallback
 	if sendChunk != nil {
-		executionID := action.Id.Value
+		executionID := actionID
 		outputCallback = func(streamType sysexec.StreamType, line string, seq int64) {
 			chunk := &pb.OutputChunk{
 				ExecutionId: executionID,
@@ -208,17 +220,17 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 		}
 	}
 
-	// Execute with streaming support
-	result := h.executor.ExecuteWithStreaming(ctx, action, outputCallback)
+	// Execute the VERIFIED envelope with streaming support.
+	result := h.executor.ExecuteWithStreaming(ctx, env, outputCallback)
 
 	h.logger.Info("action completed",
-		"action_id", action.Id.Value,
+		"action_id", actionID,
 		"status", result.Status.String(),
 		"duration_ms", result.DurationMs,
 	)
 
 	if result.Error != "" {
-		h.logger.Error("action failed", "action_id", action.Id.Value, "error", result.Error)
+		h.logger.Error("action failed", "action_id", actionID, "error", result.Error)
 	}
 
 	// Log output for debugging — but truncate + redact (audit F-32).
@@ -230,10 +242,10 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, action *pb.Action, 
 	// log shippers (Loki, journald-to-syslog forwarders, etc.).
 	if result.Output != nil {
 		if result.Output.Stdout != "" {
-			h.logger.Debug("action stdout", "action_id", action.Id.Value, "stdout", sanitizeForLog(result.Output.Stdout))
+			h.logger.Debug("action stdout", "action_id", actionID, "stdout", sanitizeForLog(result.Output.Stdout))
 		}
 		if result.Output.Stderr != "" {
-			h.logger.Debug("action stderr", "action_id", action.Id.Value, "stderr", sanitizeForLog(result.Output.Stderr))
+			h.logger.Debug("action stderr", "action_id", actionID, "stderr", sanitizeForLog(result.Output.Stderr))
 		}
 	}
 

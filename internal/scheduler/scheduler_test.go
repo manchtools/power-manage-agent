@@ -2,28 +2,90 @@ package scheduler
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
 	"log/slog"
+	"math/big"
 	"sync"
 	"testing"
 	"time"
 
+	"google.golang.org/protobuf/proto"
+
 	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
-// mockExecutor records all Execute calls for test assertions.
+// testSigner is the per-process CA signer used by makeTestAction to mint a
+// real SignedActionEnvelope for every stored action, and the matching
+// ActionVerifier the mock executor uses. WHAT runs is the verified envelope,
+// so test actions must carry a genuine signature — an unsigned test action
+// would (correctly) be refused by the scheduler's verify-then-execute path.
+var (
+	testSigner   *verify.ActionSigner
+	testVerifier *verify.ActionVerifier
+)
+
+func init() {
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		panic(err)
+	}
+	tmpl := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "scheduler-test-ca"},
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+		BasicConstraintsValid: true,
+		IsCA:                  true,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
+	if err != nil {
+		panic(err)
+	}
+	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	testSigner = verify.NewActionSigner(key)
+	v, err := verify.NewActionVerifier(certPEM)
+	if err != nil {
+		panic(err)
+	}
+	testVerifier = v
+}
+
+// mockExecutor records executed envelopes for test assertions. It verifies
+// envelope bytes against the test CA exactly like the real executor, so a
+// tampered or unsigned envelope returns an error from VerifyEnvelope and the
+// scheduler refuses to execute it.
 type mockExecutor struct {
 	mu     sync.Mutex
-	calls  []*pb.Action
+	calls  []*pb.SignedActionEnvelope
 	resets int
 }
 
-func (m *mockExecutor) Execute(_ context.Context, action *pb.Action) *pb.ActionResult {
+// VerifyEnvelope mirrors the real executor: verify the CA signature over the
+// exact bytes, then unmarshal THOSE bytes into a SignedActionEnvelope.
+func (m *mockExecutor) VerifyEnvelope(envelopeBytes, signature []byte) (*pb.SignedActionEnvelope, error) {
+	if err := testVerifier.Verify(envelopeBytes, signature); err != nil {
+		return nil, err
+	}
+	env := &pb.SignedActionEnvelope{}
+	if err := proto.Unmarshal(envelopeBytes, env); err != nil {
+		return nil, err
+	}
+	return env, nil
+}
+
+// ExecuteEnvelope records the verified envelope the scheduler asked to run.
+func (m *mockExecutor) ExecuteEnvelope(_ context.Context, env *pb.SignedActionEnvelope) *pb.ActionResult {
 	m.mu.Lock()
-	m.calls = append(m.calls, action)
+	m.calls = append(m.calls, env)
 	m.mu.Unlock()
 	return &pb.ActionResult{
-		ActionId: action.Id,
+		ActionId: env.GetActionId(),
 		Status:   pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
 	}
 }
@@ -38,10 +100,10 @@ func (m *mockExecutor) ResetUpdateCycle() {
 	m.mu.Unlock()
 }
 
-func (m *mockExecutor) getCalls() []*pb.Action {
+func (m *mockExecutor) getCalls() []*pb.SignedActionEnvelope {
 	m.mu.Lock()
 	defer m.mu.Unlock()
-	cp := make([]*pb.Action, len(m.calls))
+	cp := make([]*pb.SignedActionEnvelope, len(m.calls))
 	copy(cp, m.calls)
 	return cp
 }
@@ -69,12 +131,49 @@ func newTestScheduler(t *testing.T) (*Scheduler, *mockExecutor) {
 	return sched, mock
 }
 
+// makeTestAction builds an action and signs a matching SignedActionEnvelope,
+// stamping signed_envelope + signature onto the wire Action. The stored
+// action therefore carries the bytes the scheduler verifies and executes.
 func makeTestAction(id string, actionType pb.ActionType, state pb.DesiredState) *pb.Action {
-	return &pb.Action{
+	a := &pb.Action{
 		Id:           &pb.ActionId{Value: id},
 		Type:         actionType,
 		DesiredState: state,
 	}
+	signTestAction(a)
+	return a
+}
+
+// signTestAction builds the SignedActionEnvelope from an action's fields
+// (id, type, desired_state, params) and stamps the signed bytes + signature
+// onto the action, mirroring the server's dbActionToWireAction.
+func signTestAction(a *pb.Action) {
+	env := &pb.SignedActionEnvelope{
+		ActionId:     a.Id,
+		ActionType:   a.Type,
+		DesiredState: a.DesiredState,
+	}
+	// Copy the action's typed param oneof into the envelope. The envelope
+	// oneof's wrapper interface is unexported in the generated package, so
+	// the assignment must happen here where the concrete wrapper type binds
+	// directly to the Params field. Only the param types used by scheduler
+	// tests are handled.
+	switch p := a.Params.(type) {
+	case *pb.Action_AdminPolicy:
+		env.Params = &pb.SignedActionEnvelope_AdminPolicy{AdminPolicy: p.AdminPolicy}
+	case *pb.Action_Shell:
+		env.Params = &pb.SignedActionEnvelope_Shell{Shell: p.Shell}
+	}
+	b, err := verify.MarshalEnvelope(env)
+	if err != nil {
+		panic(err)
+	}
+	sig, err := testSigner.Sign(b)
+	if err != nil {
+		panic(err)
+	}
+	a.SignedEnvelope = b
+	a.Signature = sig
 }
 
 // ---------------------------------------------------------------------------
@@ -134,11 +233,11 @@ func TestRemoveAction_PolicyActionReverted(t *testing.T) {
 	if len(calls) != 1 {
 		t.Fatalf("expected 1 executor call (revert), got %d", len(calls))
 	}
-	if calls[0].DesiredState != pb.DesiredState_DESIRED_STATE_ABSENT {
-		t.Errorf("expected ABSENT desired state, got %s", calls[0].DesiredState)
+	if calls[0].GetDesiredState() != pb.DesiredState_DESIRED_STATE_ABSENT {
+		t.Errorf("expected ABSENT desired state, got %s", calls[0].GetDesiredState())
 	}
-	if calls[0].Type != pb.ActionType_ACTION_TYPE_SSH {
-		t.Errorf("expected SSH type, got %s", calls[0].Type)
+	if calls[0].GetActionType() != pb.ActionType_ACTION_TYPE_SSH {
+		t.Errorf("expected SSH type, got %s", calls[0].GetActionType())
 	}
 
 	// Verify the action was removed from the store
@@ -229,11 +328,11 @@ func TestRemoveAction_AllPolicyTypes(t *testing.T) {
 			if len(calls) != 1 {
 				t.Fatalf("expected 1 revert call, got %d", len(calls))
 			}
-			if calls[0].DesiredState != pb.DesiredState_DESIRED_STATE_ABSENT {
-				t.Errorf("expected ABSENT, got %s", calls[0].DesiredState)
+			if calls[0].GetDesiredState() != pb.DesiredState_DESIRED_STATE_ABSENT {
+				t.Errorf("expected ABSENT, got %s", calls[0].GetDesiredState())
 			}
-			if calls[0].Type != tt.actionType {
-				t.Errorf("expected %s, got %s", tt.actionType, calls[0].Type)
+			if calls[0].GetActionType() != tt.actionType {
+				t.Errorf("expected %s, got %s", tt.actionType, calls[0].GetActionType())
 			}
 		})
 	}
@@ -288,17 +387,17 @@ func TestSyncActions_PolicyActionRevertedOnRemoval(t *testing.T) {
 
 	// Should have exactly 1 call — the SSH revert with ABSENT
 	// (no execute calls for pkg since it's unchanged)
-	var revertCalls []*pb.Action
+	var revertCalls []*pb.SignedActionEnvelope
 	for _, c := range calls {
-		if c.DesiredState == pb.DesiredState_DESIRED_STATE_ABSENT {
+		if c.GetDesiredState() == pb.DesiredState_DESIRED_STATE_ABSENT {
 			revertCalls = append(revertCalls, c)
 		}
 	}
 	if len(revertCalls) != 1 {
 		t.Fatalf("expected 1 revert call, got %d (total calls: %d)", len(revertCalls), len(calls))
 	}
-	if revertCalls[0].Type != pb.ActionType_ACTION_TYPE_SSH {
-		t.Errorf("expected SSH revert, got %s", revertCalls[0].Type)
+	if revertCalls[0].GetActionType() != pb.ActionType_ACTION_TYPE_SSH {
+		t.Errorf("expected SSH revert, got %s", revertCalls[0].GetActionType())
 	}
 }
 
@@ -320,8 +419,8 @@ func TestSyncActions_NonPolicyActionNotRevertedOnRemoval(t *testing.T) {
 
 	calls := mock.getCalls()
 	for _, c := range calls {
-		if c.DesiredState == pb.DesiredState_DESIRED_STATE_ABSENT {
-			t.Errorf("unexpected ABSENT revert call for type %s", c.Type)
+		if c.GetDesiredState() == pb.DesiredState_DESIRED_STATE_ABSENT {
+			t.Errorf("unexpected ABSENT revert call for type %s", c.GetActionType())
 		}
 	}
 
@@ -360,8 +459,8 @@ func TestSyncActions_MultiplePolicyActionsReverted(t *testing.T) {
 	calls := mock.getCalls()
 	revertedTypes := make(map[pb.ActionType]bool)
 	for _, c := range calls {
-		if c.DesiredState == pb.DesiredState_DESIRED_STATE_ABSENT {
-			revertedTypes[c.Type] = true
+		if c.GetDesiredState() == pb.DesiredState_DESIRED_STATE_ABSENT {
+			revertedTypes[c.GetActionType()] = true
 		}
 	}
 
@@ -388,7 +487,9 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	sched, mock := newTestScheduler(t)
 	ctx := context.Background()
 
-	// Assign a sudo action with parameters
+	// Assign a sudo action with parameters. Sign a matching envelope so the
+	// revert path can verify the stored bytes and recover the params it must
+	// preserve into the ABSENT revert envelope.
 	sudoAction := &pb.Action{
 		Id:           &pb.ActionId{Value: "sudo-params"},
 		Type:         pb.ActionType_ACTION_TYPE_ADMIN_POLICY,
@@ -400,6 +501,7 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 			},
 		},
 	}
+	signTestAction(sudoAction)
 	if err := sched.SyncActions(ctx, []*pb.Action{sudoAction}, nil, true); err != nil {
 		t.Fatal(err)
 	}
@@ -411,9 +513,9 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	}
 
 	calls := mock.getCalls()
-	var revertCall *pb.Action
+	var revertCall *pb.SignedActionEnvelope
 	for _, c := range calls {
-		if c.DesiredState == pb.DesiredState_DESIRED_STATE_ABSENT {
+		if c.GetDesiredState() == pb.DesiredState_DESIRED_STATE_ABSENT {
 			revertCall = c
 			break
 		}
@@ -423,8 +525,8 @@ func TestSyncActions_RevertPreservesActionFields(t *testing.T) {
 	}
 
 	// Verify the reverted action preserves the original type and parameters
-	if revertCall.Type != pb.ActionType_ACTION_TYPE_ADMIN_POLICY {
-		t.Errorf("expected SUDO type, got %s", revertCall.Type)
+	if revertCall.GetActionType() != pb.ActionType_ACTION_TYPE_ADMIN_POLICY {
+		t.Errorf("expected SUDO type, got %s", revertCall.GetActionType())
 	}
 	sudo := revertCall.GetAdminPolicy()
 	if sudo == nil {
@@ -473,8 +575,8 @@ func TestRunDueActions_GroupRunOnAssign_OrdersMembers(t *testing.T) {
 	}
 	wantOrder := []string{"g-a1", "g-a2", "g-a3"}
 	for i, want := range wantOrder {
-		if calls[i].Id.Value != want {
-			t.Errorf("call %d: expected %q got %q", i, want, calls[i].Id.Value)
+		if calls[i].GetActionId().GetValue() != want {
+			t.Errorf("call %d: expected %q got %q", i, want, calls[i].GetActionId().GetValue())
 		}
 	}
 }
@@ -550,7 +652,7 @@ func TestRunDueActions_GroupAllowsDuplicateMembers(t *testing.T) {
 	if len(calls) != 3 {
 		t.Fatalf("expected 3 calls (dup-action runs twice), got %d", len(calls))
 	}
-	gotOrder := []string{calls[0].Id.Value, calls[1].Id.Value, calls[2].Id.Value}
+	gotOrder := []string{calls[0].GetActionId().GetValue(), calls[1].GetActionId().GetValue(), calls[2].GetActionId().GetValue()}
 	wantOrder := []string{"dup-action", "other", "dup-action"}
 	for i, want := range wantOrder {
 		if gotOrder[i] != want {
@@ -716,4 +818,108 @@ func TestSetMaintenanceWindow_PersistsAcrossSchedulerRestart(t *testing.T) {
 func weekdayToken(idx int) string {
 	tokens := [7]string{"sun", "mon", "tue", "wed", "thu", "fri", "sat"}
 	return tokens[idx]
+}
+
+// ---------------------------------------------------------------------------
+// Verify-then-execute the verified envelope (sdk#82)
+// ---------------------------------------------------------------------------
+
+// TestExecuteAction_RunsVerifiedEnvelope pins that the scheduler verifies the
+// stored SignedEnvelope and executes THAT verified envelope. A synced action
+// that carries a valid signature runs, and the executed envelope carries the
+// signed type/id — i.e. WHAT runs is the verified envelope, not the wire
+// Action's advisory typed oneof.
+func TestExecuteAction_RunsVerifiedEnvelope(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	// makeTestAction signs a real envelope. Store it, then force-execute.
+	action := makeTestAction("forced-good", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	if err := sched.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	mock.reset()
+
+	res, err := sched.ForceExecute(ctx, "forced-good")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || res.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
+		t.Fatalf("expected SUCCESS from a validly signed action, got %v", res)
+	}
+
+	calls := mock.getCalls()
+	if len(calls) != 1 {
+		t.Fatalf("expected exactly 1 envelope execution, got %d", len(calls))
+	}
+	if calls[0].GetActionId().GetValue() != "forced-good" {
+		t.Errorf("executed envelope id = %q, want forced-good", calls[0].GetActionId().GetValue())
+	}
+	if calls[0].GetActionType() != pb.ActionType_ACTION_TYPE_SHELL {
+		t.Errorf("executed envelope type = %s, want SHELL", calls[0].GetActionType())
+	}
+}
+
+// TestExecuteAction_RefusesTamperedEnvelope pins the fail-closed invariant in
+// the scheduler: a stored action whose SignedEnvelope has been tampered (a
+// byte flipped after signing) is refused — the executor's ExecuteEnvelope is
+// NEVER called, and the recorded result is FAILED. This is the offline-
+// scheduler analogue of the wire-path tamper rejection: a compromised local
+// store (or a relay that wrote bad bytes) cannot drive execution.
+func TestExecuteAction_RefusesTamperedEnvelope(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	action := makeTestAction("forced-tampered", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	// Flip a byte of the signed envelope so the signature no longer matches.
+	tampered := make([]byte, len(action.SignedEnvelope))
+	copy(tampered, action.SignedEnvelope)
+	tampered[len(tampered)/2] ^= 0xFF
+	action.SignedEnvelope = tampered
+
+	if err := sched.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	mock.reset()
+
+	res, err := sched.ForceExecute(ctx, "forced-tampered")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || res.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
+		t.Fatalf("expected FAILED for a tampered envelope, got %v", res)
+	}
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("a tampered envelope must NOT reach the executor, got %d calls", got)
+	}
+}
+
+// TestExecuteAction_RefusesEmptySignature pins that a synced action with NO
+// signature at all (empty SignedEnvelope/Signature — e.g. a downgraded or
+// forged store row) is refused before execution.
+func TestExecuteAction_RefusesEmptySignature(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	action := &pb.Action{
+		Id:           &pb.ActionId{Value: "forced-unsigned"},
+		Type:         pb.ActionType_ACTION_TYPE_SHELL,
+		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
+		// No SignedEnvelope, no Signature.
+	}
+	if err := sched.AddAction(action); err != nil {
+		t.Fatal(err)
+	}
+	mock.reset()
+
+	res, err := sched.ForceExecute(ctx, "forced-unsigned")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res == nil || res.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
+		t.Fatalf("expected FAILED for an unsigned action, got %v", res)
+	}
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("an unsigned action must NOT reach the executor, got %d calls", got)
+	}
 }

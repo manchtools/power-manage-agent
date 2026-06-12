@@ -26,8 +26,21 @@ const (
 )
 
 // ActionExecutor is the interface for executing actions.
+//
+// The scheduler decides WHEN to run (per-action / per-group schedule,
+// maintenance window) but WHAT runs is always the verified envelope: it
+// verifies the stored signed bytes via VerifyEnvelope and executes the
+// returned SignedActionEnvelope via ExecuteEnvelope (sdk#82). There is no
+// path that executes a wire *pb.Action's advisory typed oneof directly.
 type ActionExecutor interface {
-	Execute(ctx context.Context, action *pb.Action) *pb.ActionResult
+	// VerifyEnvelope verifies the CA signature over the exact envelope bytes
+	// and unmarshals THOSE SAME bytes into a SignedActionEnvelope. It is
+	// fail-closed: any verify/unmarshal error (or a missing verifier) returns
+	// an error and the caller must NOT execute.
+	VerifyEnvelope(envelopeBytes, signature []byte) (*pb.SignedActionEnvelope, error)
+	// ExecuteEnvelope runs a previously-VERIFIED envelope and returns the
+	// result. Callers must pass only an envelope returned by VerifyEnvelope.
+	ExecuteEnvelope(ctx context.Context, env *pb.SignedActionEnvelope) *pb.ActionResult
 	// ResetUpdateCycle clears the per-cycle AGENT_UPDATE dedup
 	// flag on the executor instance so a new sync cycle can run an
 	// update again (audit F042 + F048).
@@ -402,6 +415,29 @@ func (s *Scheduler) executeGroup(ctx context.Context, g store.StoredActionGroup)
 	}
 }
 
+// verifyAndExecute is the single verify-then-execute seam the scheduler runs
+// for every stored action (sdk#82). It verifies the action's stored signed
+// envelope bytes and executes the VERIFIED envelope. On any verify/unmarshal
+// failure — tampered store row, missing signature, no verifier — it returns a
+// FAILED result and does NOT call the executor. The scheduler reads the wire
+// Action only for WHEN/grouping metadata; WHAT runs is the verified envelope.
+func (s *Scheduler) verifyAndExecute(ctx context.Context, action *pb.Action) *pb.ActionResult {
+	env, err := s.executor.VerifyEnvelope(action.GetSignedEnvelope(), action.GetSignature())
+	if err != nil {
+		s.logger.Warn("refusing to run unsigned/tampered stored action",
+			"action_id", action.GetId().GetValue(),
+			"type", action.GetType().String(),
+			"error", err,
+		)
+		return &pb.ActionResult{
+			ActionId: action.GetId(),
+			Status:   pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
+			Error:    fmt.Sprintf("refusing to execute unsigned/tampered action: %v", err),
+		}
+	}
+	return s.executor.ExecuteEnvelope(ctx, env)
+}
+
 // executeAction executes a single action and records the result.
 func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredAction) {
 	action := stored.Action
@@ -411,8 +447,8 @@ func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredActio
 		"type", action.Type.String(),
 	)
 
-	// Execute the action
-	result := s.executor.Execute(ctx, action)
+	// Verify the stored signed envelope and execute THOSE bytes.
+	result := s.verifyAndExecute(ctx, action)
 
 	// If context was cancelled, don't record or send results
 	if ctx.Err() != nil {
@@ -541,7 +577,7 @@ func (s *Scheduler) ForceExecute(ctx context.Context, actionID string) (*pb.Acti
 		return nil, nil
 	}
 
-	result := s.executor.Execute(ctx, stored.Action)
+	result := s.verifyAndExecute(ctx, stored.Action)
 	hasChanges := s.detectChanges(stored, result)
 
 	if _, err := s.store.RecordExecution(actionID, result, hasChanges); err != nil {
@@ -684,13 +720,33 @@ func shouldRevertOnUnassign(actionType pb.ActionType) bool {
 	}
 }
 
-// revertAction executes an action with DESIRED_STATE_ABSENT to clean up its
-// effects. This is best-effort — failures are logged but do not block removal.
+// revertAction executes a policy action's cleanup with DESIRED_STATE_ABSENT.
+// This is best-effort — failures are logged but do not block removal.
+//
+// Revert is the one path that does NOT run a server-signed desired_state: the
+// server never signs an ABSENT envelope for an action it is unassigning, so
+// the agent synthesizes the ABSENT run locally. To stay faithful to sdk#82 we
+// still source the params (and id/type/timeout/schedule) from the VERIFIED
+// envelope — we verify the stored signed bytes, take the authenticated params
+// from them, and only locally override desired_state to ABSENT. We never lift
+// the unverified wire Action's typed oneof. If the stored envelope fails to
+// verify (tampered/unsigned store row) we refuse to run the revert rather
+// than execute attacker-controlled params under a privileged cleanup.
 func (s *Scheduler) revertAction(ctx context.Context, action *pb.Action) {
-	reverted := proto.Clone(action).(*pb.Action)
+	env, err := s.executor.VerifyEnvelope(action.GetSignedEnvelope(), action.GetSignature())
+	if err != nil {
+		s.logger.Warn("refusing to revert unsigned/tampered action",
+			"action_id", action.GetId().GetValue(),
+			"type", action.GetType().String(),
+			"error", err,
+		)
+		return
+	}
+
+	reverted := proto.Clone(env).(*pb.SignedActionEnvelope)
 	reverted.DesiredState = pb.DesiredState_DESIRED_STATE_ABSENT
 
-	result := s.executor.Execute(ctx, reverted)
+	result := s.executor.ExecuteEnvelope(ctx, reverted)
 	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
 		s.logger.Warn("failed to revert action",
 			"action_id", action.Id.Value,
