@@ -379,6 +379,7 @@ func TestIntegration_Package(t *testing.T) {
 			httpClient: e.httpClient,
 			pkgManager: nil,
 			logger:     e.logger,
+			now:        e.now,
 		}
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{Name: "sl"}}

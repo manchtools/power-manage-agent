@@ -65,6 +65,7 @@ func newTestHandlerWithTTY(t *testing.T, ttyEnabled bool) (*Handler, *fakeSender
 		logger:      slog.Default(),
 		connectedCh: make(chan struct{}),
 		store:       st,
+		now:         time.Now,
 	}
 	sender := &fakeSender{}
 	h.SetTerminalSender(sender)
@@ -83,6 +84,7 @@ func addTestSession(h *Handler, id, ttyUser string, lastActivity time.Time) *ter
 		ttyUser:      ttyUser,
 		state:        sessionStateActive,
 		lastActivity: lastActivity,
+		now:          time.Now,
 	}
 	h.mu.Lock()
 	h.terminals[id] = ts
@@ -202,6 +204,7 @@ func TestTerminal_SetTerminalSender_AppliesDefaults(t *testing.T) {
 	h := &Handler{
 		logger:      slog.Default(),
 		connectedCh: make(chan struct{}),
+		now:         time.Now,
 	}
 	h.SetTerminalSender(&fakeSender{})
 
@@ -225,6 +228,7 @@ func TestTerminal_SetTerminalSender_DoesNotResetExistingValues(t *testing.T) {
 		connectedCh:         make(chan struct{}),
 		terminalLimit:       7,
 		terminalIdleTimeout: 5 * time.Minute,
+		now:                 time.Now,
 	}
 	h.SetTerminalSender(&fakeSender{})
 
@@ -328,6 +332,7 @@ func TestTerminal_Start_RejectsWhenStoreMissing(t *testing.T) {
 	h := &Handler{
 		logger:      slog.Default(),
 		connectedCh: make(chan struct{}),
+		now:         time.Now,
 		// intentionally no store
 	}
 	sender := &fakeSender{}
@@ -375,6 +380,7 @@ func TestTerminal_CloseDuringStart_MarksStoppingButLeavesRegistryEntry(t *testin
 		ttyUser: "pm-tty-test",
 		state:   sessionStateStarting,
 		cancel:  wrappedCancel,
+		now:     time.Now,
 	}
 	h.mu.Lock()
 	h.terminals["01ABC"] = ts
@@ -422,6 +428,7 @@ func TestTerminal_SnapshotTerminalSender_ReturnsLatest(t *testing.T) {
 	h := &Handler{
 		logger:      slog.Default(),
 		connectedCh: make(chan struct{}),
+		now:         time.Now,
 	}
 	if got := h.snapshotTerminalSender(); got != nil {
 		t.Errorf("snapshot before SetTerminalSender = %v, want nil", got)

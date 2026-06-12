@@ -432,10 +432,12 @@ func clearUpdateState(dataDir string) {
 // Parameters:
 //   - dataDir: agent data directory containing update/state.json + update/
 //   - logger: structured logger
+//   - now: clock seam (pass time.Now in production); injected so the
+//     24h stale-tmp cutoff is deterministically testable.
 func CheckStartupUpdateState(dataDir string, logger interface {
 	Info(string, ...any)
 	Warn(string, ...any)
-}) {
+}, now func() time.Time) {
 	phase, _, err := readUpdateState(dataDir)
 	if err != nil {
 		logger.Warn("failed to read update state", "error", err)
@@ -466,7 +468,7 @@ func CheckStartupUpdateState(dataDir string, logger interface {
 		}
 		return
 	}
-	cutoff := time.Now().Add(-24 * time.Hour)
+	cutoff := now().Add(-24 * time.Hour)
 	for _, entry := range entries {
 		name := entry.Name()
 		if !strings.HasPrefix(name, "agent-update-") || !strings.HasSuffix(name, ".tmp") {
@@ -481,6 +483,6 @@ func CheckStartupUpdateState(dataDir string, logger interface {
 			logger.Warn("failed to remove stale update tmp file", "path", path, "error", err)
 			continue
 		}
-		logger.Info("removed stale update tmp file", "path", path, "age", time.Since(info.ModTime()).Round(time.Second))
+		logger.Info("removed stale update tmp file", "path", path, "age", now().Sub(info.ModTime()).Round(time.Second))
 	}
 }

@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
@@ -177,7 +178,7 @@ func TestMarkAgentUpdateExecuted(t *testing.T) {
 	// F042 + F048). Construct a fresh Executor for the test and
 	// exercise the methods directly instead of the deprecated
 	// package-level globals.
-	e := &Executor{}
+	e := &Executor{now: time.Now}
 
 	// First call should succeed
 	if !e.markAgentUpdateExecuted() {
@@ -201,7 +202,7 @@ func TestCheckStartupUpdateState_CleansStaleState(t *testing.T) {
 	writeStateForTest(t, dir, "staged", "2026.04.01")
 
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, logger)
+	CheckStartupUpdateState(dir, logger, time.Now)
 
 	// State should be cleared
 	phase, _, _ := readUpdateState(dir)
@@ -218,7 +219,7 @@ func TestCheckStartupUpdateState_NoState(t *testing.T) {
 	dir := t.TempDir()
 
 	logger := &testLogger{}
-	CheckStartupUpdateState(dir, logger)
+	CheckStartupUpdateState(dir, logger, time.Now)
 
 	// No logs expected
 	if len(logger.infos) > 0 || len(logger.warns) > 0 {

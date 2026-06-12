@@ -35,7 +35,7 @@ func reloadCredsForReconnect(credStore *credentials.Store, current *credentials.
 	return reloaded
 }
 
-func runAgent(ctx context.Context, credStore *credentials.Store, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger) {
+func runAgent(ctx context.Context, credStore *credentials.Store, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger, now func() time.Time) {
 	// Current sync interval (can be updated by server). Owned by
 	// runAgent — periodicSync receives its initial value as a
 	// stack-local copy and any subsequent updates over a channel.
@@ -145,7 +145,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// child reports during the session so the parent's
 		// `syncInterval` carries the latest value into the next
 		// reconnect attempt.
-		connStart := time.Now()
+		connStart := now()
 		streamErr := waitForStreamEnd(streamDone, intervalUpdatesOut, &syncInterval)
 		err = streamErr
 
@@ -169,7 +169,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		}
 
 		// Reset backoff if the connection was stable (lasted longer than the backoff interval)
-		if time.Since(connStart) > currentBackoff {
+		if now().Sub(connStart) > currentBackoff {
 			currentBackoff = randomBackoff()
 		}
 

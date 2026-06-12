@@ -259,7 +259,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 				rotations := []lpsRotationEntry{{
 					Username:  params.Username,
 					Password:  tempPassword,
-					RotatedAt: time.Now().UTC().Format(time.RFC3339),
+					RotatedAt: e.now().UTC().Format(time.RFC3339),
 					Reason:    "user_created",
 				}}
 				rotationsJSON, err := json.Marshal(rotations)

@@ -6,6 +6,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
@@ -30,7 +31,7 @@ func (c *countingStore) Load() (*credentials.Credentials, error) {
 func (c *countingStore) Save(*credentials.Credentials) error { return nil }
 
 func newStatusHandler(store credentialStore) *EnrollHandler {
-	return &EnrollHandler{credStore: store, logger: slog.Default()}
+	return &EnrollHandler{credStore: store, logger: slog.Default(), now: time.Now}
 }
 
 // GetEnrollmentStatus must not run credStore.Load() (a 64 MiB Argon2id

@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"strings"
 	"testing"
+	"time"
 )
 
 // TestRecordLuksTimestampFailure_EscalatesAtThreshold pins the
@@ -17,7 +18,7 @@ import (
 // stuck-rotation hazard.
 func TestRecordLuksTimestampFailure_EscalatesAtThreshold(t *testing.T) {
 	var buf bytes.Buffer
-	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), now: time.Now}
 
 	const actionID = "01HXTEST0000000000000ABCDE"
 	for i := 1; i <= luksTimestampFailureThreshold+1; i++ {
@@ -64,7 +65,7 @@ func TestRecordLuksTimestampFailure_EscalatesAtThreshold(t *testing.T) {
 // doesn't leave the next genuine failure already at Error level.
 func TestClearLuksTimestampFailures_ResetsCounter(t *testing.T) {
 	var buf bytes.Buffer
-	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), now: time.Now}
 
 	const actionID = "01HXTEST0000000000000ABCDE"
 
@@ -95,7 +96,7 @@ func TestClearLuksTimestampFailures_ResetsCounter(t *testing.T) {
 // cross-contaminate each other's escalation state.
 func TestRecordLuksTimestampFailure_PerActionIsolation(t *testing.T) {
 	var buf bytes.Buffer
-	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))}
+	e := &Executor{logger: slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), now: time.Now}
 
 	// Action A fails (threshold-1) times — still at Warn.
 	for i := 1; i < luksTimestampFailureThreshold; i++ {

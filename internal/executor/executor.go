@@ -187,6 +187,8 @@ type Executor struct {
 	// to miss when buried in journald Warn-level lines.
 	luksTimestampFailMu    sync.Mutex
 	luksTimestampFailCount map[string]int
+
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
 }
 
 // NewExecutor creates a new action executor.
@@ -225,6 +227,7 @@ func NewExecutor(verifier *verify.ActionVerifier) *Executor {
 		pkgManager: pm,
 		verifier:   verifier,
 		logger:     logger,
+		now:        time.Now,
 	}
 }
 
@@ -307,7 +310,7 @@ func (e *Executor) VerifyAction(action *pb.Action) error {
 // ExecuteWithStreaming runs an action with optional output streaming.
 // The callback is called for each line of output as it's produced (for shell actions).
 func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, callback OutputCallback) *pb.ActionResult {
-	start := time.Now()
+	start := e.now()
 
 	result := &pb.ActionResult{
 		ActionId: action.Id,
@@ -341,7 +344,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = fmt.Sprintf("refusing to execute unsigned/tampered action: %v", verifyErr)
 		result.CompletedAt = timestamppb.Now()
-		result.DurationMs = time.Since(start).Milliseconds()
+		result.DurationMs = e.now().Sub(start).Milliseconds()
 		return result
 	}
 
@@ -454,7 +457,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, action *pb.Action, 
 
 	result.Output = output
 	result.CompletedAt = timestamppb.Now()
-	result.DurationMs = time.Since(start).Milliseconds()
+	result.DurationMs = e.now().Sub(start).Milliseconds()
 
 	// Check context errors first - distinguish between timeout and cancellation
 	switch {

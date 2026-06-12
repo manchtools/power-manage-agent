@@ -350,7 +350,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	if params.RotationIntervalDays > 0 {
 		// No previous rotation recorded — set the timestamp and skip.
 		if localState.LastRotatedAt.IsZero() {
-			if err := st.SetLuksLastRotatedAt(actionID, time.Now()); err != nil {
+			if err := st.SetLuksLastRotatedAt(actionID, e.now().UTC()); err != nil {
 				// First-rotation timestamp persistence failed.
 				// Subsequent ticks re-enter this branch and re-skip
 				// rotation, so rotation never starts. Track
@@ -363,7 +363,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 			return false, nil
 		}
 		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour
-		if time.Since(localState.LastRotatedAt) < intervalDuration {
+		if e.now().Sub(localState.LastRotatedAt) < intervalDuration {
 			return false, nil
 		}
 	}
@@ -415,7 +415,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	// next tick believes nothing rotated and re-rotates — a hot loop
 	// that churns LUKS slots. Track consecutive failures so the
 	// buried-Warn case escalates to Error after the threshold (#80).
-	if err := st.SetLuksLastRotatedAt(actionID, time.Now().UTC()); err != nil {
+	if err := st.SetLuksLastRotatedAt(actionID, e.now().UTC()); err != nil {
 		e.recordLuksTimestampFailure(actionID, "post_rotation", err)
 	} else {
 		e.clearLuksTimestampFailures(actionID)

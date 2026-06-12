@@ -94,7 +94,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		storedState := userStates[username]
 
 		// Determine if rotation is needed
-		rotate, reason := shouldRotateLps(storedState, params, username)
+		rotate, reason := shouldRotateLps(storedState, params, username, e.now().UTC())
 		if !rotate {
 			output.WriteString(fmt.Sprintf("LPS: %s — password up to date\n", username))
 			continue
@@ -132,7 +132,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 		rotatedUsers = append(rotatedUsers, username)
 
-		now := time.Now().UTC()
+		now := e.now().UTC()
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
 		// Update per-user state in SQLite
@@ -237,8 +237,9 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 }
 
 // shouldRotateLps determines if a password rotation is needed for a user and returns the reason.
-func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username string) (bool, string) {
-	now := time.Now().UTC()
+// now is the caller's clock reading (UTC); injecting it keeps rotation decisions
+// deterministically testable with a fixed clock.
+func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username string, now time.Time) (bool, string) {
 
 	// No state = first run
 	if state == nil {

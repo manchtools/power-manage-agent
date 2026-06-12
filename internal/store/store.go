@@ -37,8 +37,9 @@ var cronParser = cron.NewParser(cron.Minute | cron.Hour | cron.Dom | cron.Month 
 
 // Store manages persistent storage for actions and execution results.
 type Store struct {
-	db *sql.DB
-	mu sync.RWMutex
+	db  *sql.DB
+	mu  sync.RWMutex
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
 }
 
 // StoredAction represents an action stored locally on the agent.
@@ -128,7 +129,7 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
-	return &Store{db: db}, nil
+	return &Store{db: db, now: time.Now}, nil
 }
 
 // Close closes the database connection.
@@ -188,7 +189,7 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	// Cursor for the NEXT scheduled run, computed as if the action just
 	// executed now (the caller runs it inline). Passing &now — rather
 	// than nil — is what keeps it in the future for every schedule shape.
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	_, err = s.db.Exec(`
@@ -275,7 +276,7 @@ func (s *Store) GetDueActions(ctx context.Context) ([]*StoredAction, error) {
 		FROM actions
 		WHERE next_execute_at <= ? AND is_grouped = 0
 		ORDER BY next_execute_at ASC
-	`, time.Now().UTC())
+	`, s.now().UTC())
 	if err != nil {
 		return nil, err
 	}
@@ -378,7 +379,7 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		return "", fmt.Errorf("unmarshal action: %w", err)
 	}
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
 	// Calculate result hash for change detection (must match scheduler.detectChanges format)
@@ -538,7 +539,7 @@ func (s *Store) CleanupOldResults(retention time.Duration) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := time.Now().Add(-retention)
+	cutoff := s.now().Add(-retention)
 	_, err := s.db.Exec("DELETE FROM results WHERE synced = 1 AND executed_at < ?", cutoff)
 	return err
 }
@@ -637,7 +638,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		// executes new/changed actions immediately via ID lists, not via next_execute_at.
 		// Setting next_execute_at to "now" caused the scheduler's runDueActions ticker
 		// to double-execute actions while the sync execution was still running.
-		now := time.Now().UTC()
+		now := s.now().UTC()
 		nextExecute := s.calculateNextExecute(action, &now, false)
 
 		// Upsert: insert new or update existing (but preserve execution history)
@@ -767,7 +768,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 	}
 
 	// Standalone upserts.
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	for _, action := range standalone {
 		if action.Id == nil {
 			continue
@@ -912,7 +913,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 				lastExec = &t
 				lastExecutedAt = prior.lastExecutedAt
 			}
-			nextExecute = calculateNextExecuteFromSchedule(g.Schedule, lastExec, false)
+			nextExecute = calculateNextExecuteFromSchedule(g.Schedule, lastExec, false, s.now())
 		}
 
 		if _, err := tx.Exec(`
@@ -955,7 +956,7 @@ func (s *Store) GetDueGroups(ctx context.Context) ([]StoredActionGroup, error) {
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	now := time.Now().UTC()
+	now := s.now().UTC()
 	rows, err := s.db.QueryContext(ctx, `
 		SELECT id, source_label, schedule_json, last_executed_at, next_execute_at
 		FROM action_groups
@@ -1073,7 +1074,7 @@ func (s *Store) MarkGroupExecuted(groupID string, executedAt time.Time) error {
 		return fmt.Errorf("unmarshal group schedule: %w", err)
 	}
 	executedUTC := executedAt.UTC()
-	next := calculateNextExecuteFromSchedule(&sched, &executedUTC, false)
+	next := calculateNextExecuteFromSchedule(&sched, &executedUTC, false, s.now())
 
 	_, err := s.db.Exec(`
 		UPDATE action_groups SET last_executed_at = ?, next_execute_at = ?
@@ -1085,8 +1086,10 @@ func (s *Store) MarkGroupExecuted(groupID string, executedAt time.Time) error {
 // calculateNextExecuteFromSchedule mirrors calculateNextExecute but
 // works directly on an ActionSchedule pointer so groups can use it
 // without faking a pb.Action.
-func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted *time.Time, runImmediately bool) time.Time {
-	now := time.Now().UTC()
+// now is the caller's clock reading; it is normalised to UTC here so callers
+// can pass a bare reading and the schedule math stays deterministically testable.
+func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted *time.Time, runImmediately bool, now time.Time) time.Time {
+	now = now.UTC()
 	if runImmediately && lastExecuted == nil {
 		return now
 	}
@@ -1142,7 +1145,7 @@ func (s *Store) GetAllActionIDs() ([]string, error) {
 // calculateNextExecute determines when an action should next be executed.
 // All returned times are in UTC to ensure correct SQLite comparisons.
 func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time, runImmediately bool) time.Time {
-	now := time.Now().UTC()
+	now := s.now().UTC()
 
 	// Run immediately if requested and never executed
 	if runImmediately && lastExecuted == nil {
@@ -1232,7 +1235,7 @@ func (s *Store) SetLuksOwnershipTaken(actionID, devicePath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	now := time.Now().UTC().Format(time.RFC3339)
+	now := s.now().UTC().Format(time.RFC3339)
 	_, err := s.db.Exec(`
 		INSERT INTO luks_state (action_id, device_path, ownership_taken, device_key_type, last_rotated_at)
 		VALUES (?, ?, TRUE, 'none', ?)

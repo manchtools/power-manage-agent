@@ -479,6 +479,52 @@ func TestRunDueActions_GroupRunOnAssign_OrdersMembers(t *testing.T) {
 	}
 }
 
+// TestRunDueActions_MaintenanceWindowGatedByInjectedClock pins that the
+// offline scheduler's maintenance-window gate is evaluated against the
+// INJECTED clock, not the wall clock: the same due action defers when the
+// injected time is outside the window and fires when it is inside. This
+// is the security-relevant property of the clock seam — an agent that
+// ignored its maintenance window (or read the wrong clock) could run
+// disruptive actions at a forbidden time.
+func TestRunDueActions_MaintenanceWindowGatedByInjectedClock(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	// A RunOnAssign group is due on the next tick (see
+	// TestRunDueActions_GroupRunOnAssign_OrdersMembers).
+	a := makeTestAction("mw-a", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	group := &pb.ActionGroup{
+		SourceLabel: "action_set:mw",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true, IntervalHours: 8},
+		Actions:     []*pb.Action{a},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{group}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// Allow only Monday 02:00–03:00 (device-local).
+	sched.SetMaintenanceWindow(&pb.MaintenanceWindow{
+		Schedule: []*pb.MaintenanceWindowEntry{{Days: []string{"mon"}, Allow: "02:00-03:00"}},
+	})
+
+	// 2024-01-01 is a Monday. Clock at 12:00 local is OUTSIDE the window:
+	// the due dispatch must defer (next_execute_at is not advanced), so
+	// the executor is never called.
+	sched.now = func() time.Time { return time.Date(2024, 1, 1, 12, 0, 0, 0, time.Local) }
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("window closed per injected clock: expected 0 executions, got %d", got)
+	}
+
+	// Move the injected clock INSIDE the window (Monday 02:30 local).
+	// The still-due action now fires exactly once.
+	sched.now = func() time.Time { return time.Date(2024, 1, 1, 2, 30, 0, 0, time.Local) }
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 1 {
+		t.Fatalf("window open per injected clock: expected 1 execution, got %d", got)
+	}
+}
+
 // Same action id can appear at multiple positions within a group (e.g.
 // AAA in two sets that compose the same definition). Each occurrence
 // dispatches the executor — idempotent action contracts absorb the cost.

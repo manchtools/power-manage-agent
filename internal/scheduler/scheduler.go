@@ -47,6 +47,8 @@ type Scheduler struct {
 	executor ActionExecutor
 	logger   *slog.Logger
 
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
+
 	// mu guards Start/Stop transitions only. resultsCh is set once
 	// at construction in New() and is read on the receiver side
 	// without the lock — the lock here exists purely to make the
@@ -86,6 +88,7 @@ func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Sche
 		store:    store,
 		executor: executor,
 		logger:   logger,
+		now:      time.Now,
 		// resultsCh buffer is sized for typical tick volume (one
 		// channel write per scheduled action result). When full,
 		// executeAction logs a Warn and continues — the result is
@@ -310,7 +313,7 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 	// the spec — admins hitting "reboot now" expect immediate
 	// execution.
 	window := s.activeWindow()
-	if !maintenance.IsAllowed(window, time.Now().Local()) {
+	if !maintenance.IsAllowed(window, s.now().Local()) {
 		s.logger.Info("maintenance window closed; deferring due dispatches",
 			"standalone", len(actions),
 			"groups", len(groups),
@@ -393,7 +396,7 @@ func (s *Scheduler) executeGroup(ctx context.Context, g store.StoredActionGroup)
 	}
 
 	// Mark the group as fired so its next_execute_at advances.
-	if err := s.store.MarkGroupExecuted(g.ID, time.Now()); err != nil {
+	if err := s.store.MarkGroupExecuted(g.ID, s.now()); err != nil {
 		s.logger.Error("failed to mark group executed",
 			"group_id", g.ID, "error", err)
 	}
@@ -461,7 +464,7 @@ func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredActio
 		ActionID:   action.Id.Value,
 		Result:     result,
 		HasChanges: hasChanges,
-		ExecutedAt: time.Now(),
+		ExecutedAt: s.now(),
 	}:
 	default:
 		s.logger.Warn("result channel full, dropping result",

@@ -4,6 +4,7 @@ import (
 	"context"
 	"log/slog"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -27,7 +28,7 @@ func TestReconcileDeviceKey_UserPassphrasePersistsModeAndConverges(t *testing.T)
 	const devicePath = "/dev/mapper/test"
 	require.NoError(t, st.SetLuksOwnershipTaken(actionID, devicePath))
 
-	e := &Executor{logger: slog.Default()}
+	e := &Executor{logger: slog.Default(), now: time.Now}
 	e.SetStore(st)
 
 	params := &pb.EncryptionParams{
