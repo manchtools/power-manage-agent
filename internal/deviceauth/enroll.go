@@ -54,6 +54,8 @@ type EnrollHandler struct {
 	statusMu       sync.Mutex
 	cachedDeviceID string
 	statusCached   bool
+
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
 }
 
 // NewEnrollHandler creates a handler for enrollment RPCs.
@@ -65,6 +67,7 @@ func NewEnrollHandler(hostname, version string, credStore *credentials.Store, lo
 		credStore:  credStore,
 		logger:     logger,
 		onEnrolled: onEnrolled,
+		now:        time.Now,
 	}
 }
 
@@ -72,7 +75,7 @@ func NewEnrollHandler(hostname, version string, credStore *credentials.Store, lo
 func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.EnrollRequest]) (*connect.Response[pm.EnrollResponse], error) {
 	// Rate limiting: max 5 attempts per minute
 	h.rateMu.Lock()
-	now := time.Now()
+	now := h.now()
 	cutoff := now.Add(-1 * time.Minute)
 	var recent []time.Time
 	for _, t := range h.lastAttempts {

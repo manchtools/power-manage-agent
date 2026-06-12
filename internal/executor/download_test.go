@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -28,7 +29,7 @@ func TestDownloadFile(t *testing.T) {
 		_, _ = w.Write(content)
 	}))
 	defer srv.Close()
-	e := &Executor{httpClient: srv.Client()}
+	e := &Executor{httpClient: srv.Client(), now: time.Now}
 	ctx := context.Background()
 
 	// Operators paste uppercase / whitespace-padded sha256 hashes; a
@@ -90,7 +91,7 @@ func TestDownloadFile_OversizeRejectedAndLeavesDestIntact(t *testing.T) {
 	maxDownloadSize = 16
 	t.Cleanup(func() { maxDownloadSize = orig })
 
-	e := &Executor{httpClient: srv.Client()}
+	e := &Executor{httpClient: srv.Client(), now: time.Now}
 	dest := filepath.Join(t.TempDir(), "app")
 	require.NoError(t, os.WriteFile(dest, []byte("WORKING"), 0o755))
 

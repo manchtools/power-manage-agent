@@ -46,6 +46,8 @@ type Handler struct {
 	terminalIdleTimeout    time.Duration
 	terminalSweeperStarted bool
 	terminalSweeperStop    chan struct{} // closed by StopTerminalSweeper to stop the sweep loop
+
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
 }
 
 // NewHandler creates a new stream handler.
@@ -57,6 +59,7 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 		store:       st,
 		syncTrigger: syncTrigger,
 		connectedCh: make(chan struct{}),
+		now:         time.Now,
 	}
 }
 

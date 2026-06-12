@@ -111,7 +111,7 @@ func main() {
 	}
 
 	// Clean up stale update state from a previous cycle (if any).
-	executor.CheckStartupUpdateState(cfg.DataDir, logger)
+	executor.CheckStartupUpdateState(cfg.DataDir, logger, time.Now)
 
 	// Get hostname
 	hostname, err := os.Hostname()
@@ -291,7 +291,7 @@ func main() {
 		"version", version,
 	)
 
-	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger)
+	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger, time.Now)
 
 	// Stop background goroutines started during runAgent. The
 	// terminal sweeper would otherwise outlive the agent process in

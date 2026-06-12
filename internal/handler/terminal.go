@@ -90,11 +90,13 @@ type terminalSession struct {
 	tempHome     string             // "" during sessionStateStarting
 	cancel       context.CancelFunc // bound to a sessionCtx that gates both start prep and the I/O loop
 	lastActivity time.Time
+
+	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
 }
 
 func (ts *terminalSession) touch() {
 	ts.mu.Lock()
-	ts.lastActivity = time.Now()
+	ts.lastActivity = ts.now()
 	ts.mu.Unlock()
 }
 
@@ -265,6 +267,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		sender:  sender,
 		state:   sessionStateStarting,
 		cancel:  cancel,
+		now:     time.Now,
 	}
 	ts.touch()
 
@@ -437,7 +440,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 // touchLocked is the lock-free variant of touch, used when the caller
 // already holds ts.mu (e.g. inside the activation transition).
 func (ts *terminalSession) touchLocked() {
-	ts.lastActivity = time.Now()
+	ts.lastActivity = ts.now()
 }
 
 // OnTerminalInput writes the bytes to the named session's PTY. Unknown
@@ -743,7 +746,7 @@ func (h *Handler) sweepIdleTerminals() {
 	if timeout == 0 {
 		timeout = defaultTerminalIdleTimeout
 	}
-	cutoff := time.Now().Add(-timeout)
+	cutoff := h.now().Add(-timeout)
 	var idle []string
 	for id, ts := range h.terminals {
 		if ts == nil {
