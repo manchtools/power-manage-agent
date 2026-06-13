@@ -427,13 +427,16 @@ func isPathologicalGrepPattern(p string) string {
 						return "alternation under unbounded quantifier (catastrophic backtracking shape)"
 					}
 				}
-				// Bounded `{n}`/`{n,m}` repetition (n >= 2) of a group that
-				// itself contains an unbounded quantifier is degree-n polynomial
+				// Bounded `{n}`/`{n,m}` repetition of a group that itself
+				// contains an unbounded quantifier is degree-N polynomial
 				// backtracking — `(.*a){11}` is catastrophic even though `{11}`
-				// is "bounded". (Alternation under a BOUNDED repeat is fine —
-				// bounded branching — so only hasInnerQuant qualifies here.)
+				// is "bounded". The UPPER bound drives the worst case, so
+				// `(.*a){1,11}` is just as bad as `(.*a){11}` (lo=1 is
+				// irrelevant). Flag when the max repetition count is >= 2.
+				// (Alternation under a BOUNDED repeat is fine — bounded
+				// branching — so only hasInnerQuant qualifies here.)
 				if next == '{' && top.hasInnerQuant {
-					if n, ok := boundedRepeatLowerBound(p[i+1:]); ok && n >= 2 {
+					if _, hi, ok := boundedRepeatBounds(p[i+1:]); ok && hi >= 2 {
 						return "bounded repetition of an unbounded group (catastrophic backtracking shape)"
 					}
 				}
@@ -458,32 +461,43 @@ func isPathologicalGrepPattern(p string) string {
 	return ""
 }
 
-// boundedRepeatLowerBound parses a BOUNDED `{n}` or `{n,m}` token starting at
-// p[0] and returns its lower bound n. Returns ok=false for a non-quantifier, a
-// malformed token, or an unbounded `{n,}` (those are handled by
-// quantifierUnbounded). Used to flag `(...inner-unbounded...){n}` shapes where
-// repeating n times yields degree-n polynomial backtracking.
-func boundedRepeatLowerBound(p string) (int, bool) {
+// boundedRepeatBounds parses a BOUNDED `{n}` or `{n,m}` token starting at p[0]
+// and returns (lo, hi, ok). For `{n}`, lo==hi==n. Returns ok=false for a
+// non-quantifier, a malformed token, or an unbounded `{n,}` (those are handled
+// by quantifierUnbounded). The HI bound is what drives worst-case backtracking
+// when the repeated group contains an unbounded quantifier — `(...){1,1000}`
+// can still try up to 1000 repetitions.
+func boundedRepeatBounds(p string) (lo, hi int, ok bool) {
 	if len(p) == 0 || p[0] != '{' {
-		return 0, false
+		return 0, 0, false
 	}
 	j := strings.IndexByte(p, '}')
 	if j <= 0 {
-		return 0, false
+		return 0, 0, false
 	}
 	body := p[1:j]
 	if strings.HasSuffix(body, ",") {
-		return 0, false // `{n,}` — unbounded
+		return 0, 0, false // `{n,}` — unbounded
 	}
-	nStr := body
-	if k := strings.IndexByte(body, ','); k >= 0 {
-		nStr = body[:k] // `{n,m}` — use the lower bound n
+	k := strings.IndexByte(body, ',')
+	if k < 0 {
+		// `{n}` — lo == hi == n
+		n, err := strconv.Atoi(strings.TrimSpace(body))
+		if err != nil {
+			return 0, 0, false
+		}
+		return n, n, true
 	}
-	n, err := strconv.Atoi(strings.TrimSpace(nStr))
+	// `{n,m}` — lo = n, hi = m
+	n, err := strconv.Atoi(strings.TrimSpace(body[:k]))
 	if err != nil {
-		return 0, false
+		return 0, 0, false
 	}
-	return n, true
+	m, err := strconv.Atoi(strings.TrimSpace(body[k+1:]))
+	if err != nil {
+		return 0, 0, false
+	}
+	return n, m, true
 }
 
 // quantifierUnbounded reports whether a `{n,m?}` token starting at

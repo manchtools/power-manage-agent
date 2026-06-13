@@ -112,6 +112,7 @@ func TestIsPathologicalGrepPattern_IndependentReDoSCorpus(t *testing.T) {
 	corpus := []string{
 		`(\d+)*$`,       // digit-class nested unbounded
 		`(.*a){11}`,     // bounded-but-staircase repetition of a greedy group
+		`(.*a){1,11}`,   // {lo,hi} with lo=1 but hi=11 — the UPPER bound drives backtracking
 		`([a-zA-Z]+)*$`, // classic evil regex
 		`(x+x+)+y`,      // overlapping unbounded inner quantifiers
 		`(a|aa)+$`,      // ambiguous alternation under +
