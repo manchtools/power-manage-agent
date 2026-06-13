@@ -102,6 +102,31 @@ func TestIsPathologicalGrepPattern(t *testing.T) {
 	}
 }
 
+// TestIsPathologicalGrepPattern_IndependentReDoSCorpus feeds known
+// catastrophic-backtracking shapes sourced from a published ReDoS corpus
+// (intent), NOT mirrored from the detector's own rules in handler.go — this
+// breaks the circularity where invalid cases are derived from the rule under
+// test. It also includes one shape that must trip the >5-unbounded-quantifier
+// counter ALONE (no nesting/alternation) and one that trips nesting alone.
+func TestIsPathologicalGrepPattern_IndependentReDoSCorpus(t *testing.T) {
+	corpus := []string{
+		`(\d+)*$`,       // digit-class nested unbounded
+		`(.*a){11}`,     // bounded-but-staircase repetition of a greedy group
+		`([a-zA-Z]+)*$`, // classic evil regex
+		`(x+x+)+y`,      // overlapping unbounded inner quantifiers
+		`(a|aa)+$`,      // ambiguous alternation under +
+		`((a)*)*`,       // nested-star nesting
+		`a*b*c*d*e*f*`,  // 6 unbounded quantifiers, NO nesting — trips the counter alone
+		`(ab+)+`,        // nesting with <=5 total quantifiers — trips nesting alone
+	}
+	for _, p := range corpus {
+		t.Run(p, func(t *testing.T) {
+			assert.NotEqual(t, "", isPathologicalGrepPattern(p),
+				"pattern %q from the ReDoS corpus must be rejected", p)
+		})
+	}
+}
+
 func TestQuantifierUnbounded(t *testing.T) {
 	cases := []struct {
 		in   string
