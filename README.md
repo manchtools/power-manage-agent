@@ -575,6 +575,26 @@ The agent prevents actions from modifying its own infrastructure:
 - **Trust roots — control server vs gateway asymmetry**: Every gateway-bound RPC validates the gateway certificate against the **internal CA** that signed the agent's own certificate (i.e., `WithMTLSFromPEM`). The Control Server's `RenewCertificate` RPC is the one exception: it validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because the control server typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
 - **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id
 
+### Root Stream-RPC Verification (WS4)
+
+The agent runs as root, and the Gateway/Valkey relay is **untrusted for
+origination**. So beyond signed actions, the four root stream-RPCs are verified
+fail-closed against the CA certificate **before any root work**:
+
+| RPC | Verified before | Refusal |
+|-----|-----------------|---------|
+| `OnQuery` (osquery, incl. raw SQL) | invoking osquery | `Success=false`, error "refusing to execute unsigned/tampered query" |
+| `OnLogQuery` (journalctl) | building any journalctl invocation | "refusing to execute unsigned/tampered log query" |
+| `OnRevokeLuksDeviceKey` (slot-7 wipe) | touching the key store | "refusing to revoke unsigned/tampered LUKS device key" |
+| `OnRequestInventory` (server-originated) | running osquery | returns no inventory |
+
+Each verifies the Control Server's signature over the message's canonical bytes
+under that surface's disjoint domain. **Raw SQL is permitted only when signed**
+(an unsigned/tampered raw query never reaches osquery); the message is validated
+at the boundary first. A missing verifier fails closed (production always has
+one — the CA cert is required at startup). Agent-initiated periodic inventory
+collection is the agent's own decision and needs no signature.
+
 ### Enrollment Rate Limiting
 
 The enrollment socket limits enrollment attempts to 5 per minute using a sliding window. This prevents brute-force token guessing via the local socket.

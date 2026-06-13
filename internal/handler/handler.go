@@ -20,13 +20,35 @@ import (
 	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 	"github.com/manchtools/power-manage/sdk/go/sys/inventory"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	"github.com/manchtools/power-manage/sdk/go/validate"
 )
+
+// streamValidator validates incoming stream-RPC messages at the agent boundary
+// (validate → verify-signature → execute). The control server already validates
+// before dispatch; this is defense-in-depth so a malformed message is rejected
+// before any signature/root work.
+var streamValidator = validate.NewValidator()
+
+// runCommand is the seam through which OnLogQuery shells out to journalctl.
+// It defaults to sysexec.Run and is overridable from tests so the WS4 charter
+// can record the args journalctl would receive — and assert it is NOT invoked
+// when a log query's signature is missing or invalid.
+var runCommand = sysexec.Run
+
+// osqueryRunner is the minimal osquery surface the handler uses. Declared as an
+// interface (vs the concrete *osquery.Registry) so tests can inject a fake that
+// records calls — letting the WS4 charter assert "osquery was NOT invoked" when
+// a stream-RPC signature is missing/invalid. *osquery.Registry satisfies it.
+type osqueryRunner interface {
+	Query(query *pb.OSQuery) (*pb.OSQueryResult, error)
+	QueryTable(tableName string) ([]*pb.OSQueryRow, error)
+}
 
 // Handler implements the SDK StreamHandler interface.
 type Handler struct {
 	logger       *slog.Logger
 	executor     *executor.Executor
-	osquery      *osquery.Registry // nil if osquery is not installed
+	osquery      osqueryRunner // nil if osquery is not installed
 	scheduler    *scheduler.Scheduler
 	store        *store.Store
 	syncTrigger  chan<- struct{} // triggers an immediate action sync (for SYNC instant action)
@@ -66,7 +88,7 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 // getOsquery returns the osquery registry, initializing it lazily on first use.
 // If osquery was not found previously, it re-checks so that osquery installed
 // after the agent started is detected without requiring a restart.
-func (h *Handler) getOsquery() *osquery.Registry {
+func (h *Handler) getOsquery() osqueryRunner {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 
@@ -82,6 +104,14 @@ func (h *Handler) getOsquery() *osquery.Registry {
 	h.osquery = registry
 	h.logger.Info("osquery detected and initialized")
 	return registry
+}
+
+// setOsqueryForTest injects a fake osquery runner so tests can assert whether a
+// stream-RPC reached osquery (call-count) under a missing/invalid signature.
+func (h *Handler) setOsqueryForTest(r osqueryRunner) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.osquery = r
 }
 
 // OnWelcome handles the welcome message from the server.
@@ -397,6 +427,19 @@ func isPathologicalGrepPattern(p string) string {
 						return "alternation under unbounded quantifier (catastrophic backtracking shape)"
 					}
 				}
+				// Bounded `{n}`/`{n,m}` repetition of a group that itself
+				// contains an unbounded quantifier is degree-N polynomial
+				// backtracking — `(.*a){11}` is catastrophic even though `{11}`
+				// is "bounded". The UPPER bound drives the worst case, so
+				// `(.*a){1,11}` is just as bad as `(.*a){11}` (lo=1 is
+				// irrelevant). Flag when the max repetition count is >= 2.
+				// (Alternation under a BOUNDED repeat is fine — bounded
+				// branching — so only hasInnerQuant qualifies here.)
+				if next == '{' && top.hasInnerQuant {
+					if _, hi, ok := boundedRepeatBounds(p[i+1:]); ok && hi >= 2 {
+						return "bounded repetition of an unbounded group (catastrophic backtracking shape)"
+					}
+				}
 			}
 		case '|':
 			if depth > 0 {
@@ -416,6 +459,45 @@ func isPathologicalGrepPattern(p string) string {
 		}
 	}
 	return ""
+}
+
+// boundedRepeatBounds parses a BOUNDED `{n}` or `{n,m}` token starting at p[0]
+// and returns (lo, hi, ok). For `{n}`, lo==hi==n. Returns ok=false for a
+// non-quantifier, a malformed token, or an unbounded `{n,}` (those are handled
+// by quantifierUnbounded). The HI bound is what drives worst-case backtracking
+// when the repeated group contains an unbounded quantifier — `(...){1,1000}`
+// can still try up to 1000 repetitions.
+func boundedRepeatBounds(p string) (lo, hi int, ok bool) {
+	if len(p) == 0 || p[0] != '{' {
+		return 0, 0, false
+	}
+	j := strings.IndexByte(p, '}')
+	if j <= 0 {
+		return 0, 0, false
+	}
+	body := p[1:j]
+	if strings.HasSuffix(body, ",") {
+		return 0, 0, false // `{n,}` — unbounded
+	}
+	k := strings.IndexByte(body, ',')
+	if k < 0 {
+		// `{n}` — lo == hi == n
+		n, err := strconv.Atoi(strings.TrimSpace(body))
+		if err != nil {
+			return 0, 0, false
+		}
+		return n, n, true
+	}
+	// `{n,m}` — lo = n, hi = m
+	n, err := strconv.Atoi(strings.TrimSpace(body[:k]))
+	if err != nil {
+		return 0, 0, false
+	}
+	m, err := strconv.Atoi(strings.TrimSpace(body[k+1:]))
+	if err != nil {
+		return 0, 0, false
+	}
+	return n, m, true
 }
 
 // quantifierUnbounded reports whether a `{n,m?}` token starting at
@@ -454,6 +536,24 @@ func (h *Handler) OnActionRemove(ctx context.Context, actionID string) error {
 // OnQuery handles OS queries from the server.
 func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error) {
 	h.logger.Info("received query", "query_id", query.QueryId, "table", query.Table)
+
+	// Validate at the boundary (validate → verify → execute).
+	if msg, ok := validate.Struct(streamValidator, query); !ok {
+		h.logger.Warn("rejecting invalid query", "query_id", query.GetQueryId(), "error", msg)
+		return &pb.OSQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil
+	}
+
+	// WS4: verify the CA signature before ANY osquery execution (incl. raw SQL).
+	// Fail-closed — a missing/tampered/wrong-domain signature, or no verifier,
+	// is refused and osquery is never invoked.
+	if err := h.executor.VerifyOSQuery(query); err != nil {
+		h.logger.Warn("refusing unsigned/tampered query", "query_id", query.GetQueryId(), "error", err)
+		return &pb.OSQueryResult{
+			QueryId: query.GetQueryId(),
+			Success: false,
+			Error:   "refusing to execute unsigned/tampered query: " + err.Error(),
+		}, nil
+	}
 
 	// Check if osquery is available (lazy init — detects installs without restart)
 	oq := h.getOsquery()
@@ -529,8 +629,18 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 
 // OnRevokeLuksDeviceKey handles a LUKS device-bound key revocation request from the server.
 // Implements sdk.LuksHandler.
-func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (bool, string) {
+func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, req *pb.RevokeLuksDeviceKey) (bool, string) {
+	actionID := req.GetActionId()
 	h.logger.Info("received LUKS device key revocation", "action_id", actionID)
+
+	// WS4: the slot-7 device-key wipe is destructive and irreversible — verify
+	// the CA signature binding action_id before touching the executor.
+	// Fail-closed (incl. nil verifier).
+	if err := h.executor.VerifyRevokeLuksDeviceKey(req); err != nil {
+		h.logger.Error("refusing unsigned/tampered LUKS device key revocation", "action_id", actionID, "error", err)
+		return false, "refusing to revoke unsigned/tampered LUKS device key: " + err.Error()
+	}
+
 	success, errMsg := h.executor.RevokeLuksDeviceKey(ctx, actionID)
 	if !success {
 		h.logger.Error("LUKS device key revocation failed", "action_id", actionID, "error", errMsg)
@@ -544,6 +654,23 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, actionID string) (b
 // Implements sdk.LogQueryHandler.
 func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQueryResult, error) {
 	h.logger.Info("received log query", "query_id", query.QueryId, "unit", query.Unit)
+
+	// Validate at the boundary (validate → verify → execute).
+	if msg, ok := validate.Struct(streamValidator, query); !ok {
+		h.logger.Warn("rejecting invalid log query", "query_id", query.GetQueryId(), "error", msg)
+		return &pb.LogQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil
+	}
+
+	// WS4: journalctl runs as root — verify the CA signature before building any
+	// journalctl invocation. Fail-closed.
+	if err := h.executor.VerifyLogQuery(query); err != nil {
+		h.logger.Warn("refusing unsigned/tampered log query", "query_id", query.GetQueryId(), "error", err)
+		return &pb.LogQueryResult{
+			QueryId: query.GetQueryId(),
+			Success: false,
+			Error:   "refusing to execute unsigned/tampered log query: " + err.Error(),
+		}, nil
+	}
 
 	args := []string{"--no-pager"}
 
@@ -606,7 +733,7 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		args = append(args, "-k")
 	}
 
-	result, err := sysexec.Run(ctx, "journalctl", args...)
+	result, err := runCommand(ctx, "journalctl", args...)
 	if err != nil {
 		// journalctl's human-readable failure message is on stderr;
 		// surface that to the caller rather than the bare Go error.
@@ -637,6 +764,22 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		Success: true,
 		Logs:    logs,
 	}, nil
+}
+
+// OnRequestInventory handles a SERVER-originated inventory collection request.
+// Implements sdk.InventoryHandler. The request is verified fail-closed before
+// any osquery runs (WS4) — a compromised gateway cannot forge it. The
+// agent-initiated periodic path calls CollectInventory directly and needs no
+// signature.
+func (h *Handler) OnRequestInventory(ctx context.Context, req *pb.RequestInventory) *pb.DeviceInventory {
+	// WS4: a server-originated request runs osquery as root — verify the CA
+	// signature before collecting. Fail-closed (incl. nil verifier): a forged
+	// request from a compromised gateway returns nil and never runs osquery.
+	if err := h.executor.VerifyRequestInventory(req); err != nil {
+		h.logger.Warn("refusing unsigned/tampered inventory request", "query_id", req.GetQueryId(), "error", err)
+		return nil
+	}
+	return h.CollectInventory(ctx)
 }
 
 // CollectInventory gathers device inventory from two sources:
@@ -770,9 +913,15 @@ func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.I
 
 // supplementWithOsquery queries osquery for richer inventory data and overrides
 // baseline tables where osquery provides the same data.
-func (h *Handler) supplementWithOsquery(oq *osquery.Registry, baseline map[string]*pb.InventoryTable) {
-	// osquery tables that override baseline
-	coreTables := []string{
+// inventoryCoreTables and inventoryPackageTables are the FIXED, hardcoded set
+// of osquery tables CollectInventory may query. They are never derived from a
+// server-supplied request (a RequestInventory carries no table field) — this is
+// what bounds the blast radius of an inventory request. Declared at package
+// scope so a test can read them and assert that CollectInventory queries
+// exactly this union (self-discovering: adding a table here keeps the test
+// green; querying a table NOT here fails it).
+var (
+	inventoryCoreTables = []string{
 		"system_info",
 		"os_version",
 		"kernel_info",
@@ -783,13 +932,19 @@ func (h *Handler) supplementWithOsquery(oq *osquery.Registry, baseline map[strin
 		"pci_devices",
 		"memory_info",
 	}
-
-	// Package tables (best-effort)
-	packageTables := []string{
+	inventoryPackageTables = []string{
 		"deb_packages",
 		"rpm_packages",
 		"python_packages",
 	}
+)
+
+func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*pb.InventoryTable) {
+	// osquery tables that override baseline
+	coreTables := inventoryCoreTables
+
+	// Package tables (best-effort)
+	packageTables := inventoryPackageTables
 
 	for _, tableName := range coreTables {
 		rows, err := oq.QueryTable(tableName)
