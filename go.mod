@@ -29,7 +29,7 @@ require (
 // it. There is no automatic floating tag — that's intentional, because
 // SDK proto/Go API drifts between commits should be reviewable in the
 // same PR as the agent change that consumes them.
-replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260613181723-1ad0db61fb70
+replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260613220456-3fe7f61ef851
 
 require (
 	github.com/creack/pty v1.1.24 // indirect

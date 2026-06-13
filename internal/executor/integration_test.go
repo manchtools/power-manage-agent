@@ -2839,17 +2839,34 @@ func TestIntegration_EdgeCase_FileExistsAsDirectory(t *testing.T) {
 	os.MkdirAll(dirPath, 0755)
 	t.Cleanup(func() { sudoRemoveAll(dirPath) })
 
-	// Try to create a file where a directory exists.
-	// The executor uses atomicWriteFile which writes to .pm-tmp then mv.
-	// If target is a directory, mv moves the file INTO the directory.
-	// The executor doesn't detect this and reports success.
+	// Writing a FILE to a path that already exists as a DIRECTORY must
+	// FAIL cleanly. The previous atomicWriteFile shelled out to `mv`,
+	// which silently moved the temp file INTO the directory and reported
+	// success — a latent bug this test used to pin. The fd-based safe
+	// writer (WS6 #2) renames the temp over the target, and the kernel
+	// refuses to replace a directory with a non-directory, so the type
+	// conflict is surfaced instead of mishandled.
 	action := makeAction(t, pb.ActionType_ACTION_TYPE_FILE, pb.DesiredState_DESIRED_STATE_PRESENT)
 	action.Params = &pb.Action_File{File: &pb.FileParams{
 		Path:    dirPath,
 		Content: "content",
 	}}
 	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-	assertSuccess(t, result)
+	assertFailed(t, result)
+
+	// The directory is left intact — not replaced, and no temp file was
+	// moved inside it.
+	info, err := os.Stat(dirPath)
+	if err != nil || !info.IsDir() {
+		t.Fatalf("directory should be left intact, got info=%v err=%v", info, err)
+	}
+	entries, err := os.ReadDir(dirPath)
+	if err != nil {
+		t.Fatalf("read dir: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("directory should remain empty, found %d entries (a temp file moved inside?)", len(entries))
+	}
 }
 
 func TestIntegration_EdgeCase_EmptyFileContent(t *testing.T) {

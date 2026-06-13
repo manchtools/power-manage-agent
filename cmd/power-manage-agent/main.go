@@ -16,6 +16,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/handler"
+	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/store"
 	"github.com/manchtools/power-manage/sdk/go/logging"
@@ -212,6 +213,20 @@ func main() {
 	}
 	defer actionStore.Close()
 
+	// Start the LUKS passphrase daemon (WS6 #1/#19). It listens on a
+	// world-connectable unix socket; an unprivileged user runs
+	// `power-manage-agent luks set-passphrase` and the root agent performs
+	// the cryptsetup work with its OWN credentials, authorized by the
+	// server-issued token — replacing the old NOPASSWD sudoers rule +
+	// attacker-controllable --data-dir. The gateway session is wired in
+	// per connection (SetSession/ClearSession) inside runAgent.
+	luksDaemon := luksd.NewDaemon(luksd.DefaultSocketPath, actionStore, luksd.NewSysencEnroller(), logger)
+	go func() {
+		if err := luksDaemon.Start(ctx); err != nil {
+			logger.Error("LUKS passphrase daemon failed", "error", err)
+		}
+	}()
+
 	// Initialize action signature verifier from the CA certificate (required)
 	var actionVerifier *verify.ActionVerifier
 	if len(creds.CACert) > 0 {
@@ -291,7 +306,7 @@ func main() {
 		"version", version,
 	)
 
-	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, logger, time.Now)
+	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, luksDaemon, logger, time.Now)
 
 	// Stop background goroutines started during runAgent. The
 	// terminal sweeper would otherwise outlive the agent process in

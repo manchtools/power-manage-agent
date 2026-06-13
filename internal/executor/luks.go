@@ -154,8 +154,16 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 
 	var output strings.Builder
 
-	// Load local state
-	localState, _ := st.GetLuksState(actionID)
+	// Load local state. WS6 #13: a read failure here must fail closed,
+	// not be mistaken for "first run". Swallowing the error (the previous
+	// `localState, _ :=`) would drive the agent to re-detect the volume
+	// and re-take ownership / re-add keys against a volume it may already
+	// manage — the exact destructive path the state row exists to prevent.
+	// Mirrors removeLuksManagement's fail-closed state read.
+	localState, err := st.GetLuksState(actionID)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("get luks state: %w", err)
+	}
 
 	// Determine device path
 	var devicePath string

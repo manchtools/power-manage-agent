@@ -7,7 +7,6 @@ import (
 	"math/rand/v2"
 	"os"
 	osexec "os/exec"
-	"strings"
 	"time"
 
 	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
@@ -154,21 +153,6 @@ func setEncryptionBackend(backend string, logger *slog.Logger) {
 		}
 	}
 	logger.Info("encryption backend set", "backend", encName)
-}
-
-// applyCLIBackends installs the privilege + encryption backends for the
-// standalone CLI subcommands (e.g. `luks set-passphrase`). Those run
-// without parseFlags + applyBackendOverrides, so without this they stay
-// on the SDK default sudo backend and the cryptsetup helpers fail on
-// hosts where root can't `sudo -n` (openSUSE Defaults targetpw) — the
-// exact quirk the root backend exists to avoid. The service backend is
-// not needed by these subcommands, so it is intentionally not set here.
-func applyCLIBackends(logger *slog.Logger) error {
-	if err := setPrivilegeBackend(strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND")), logger); err != nil {
-		return err
-	}
-	setEncryptionBackend(strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND")), logger)
-	return nil
 }
 
 // normalizedServiceBackend returns the canonical name for logging so
