@@ -6,8 +6,8 @@
 package executor
 
 import (
-	"bytes"
 	"context"
+	"os/exec"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
@@ -34,9 +34,19 @@ func runAsUserCmd(ctx context.Context, s desktop.Session, extraEnv []string, nam
 	if err != nil {
 		return nil, err
 	}
-	var stdout, stderr bytes.Buffer
-	cmd.Stdout = &stdout
-	cmd.Stderr = &stderr
+	return runCapturedCapped(cmd)
+}
+
+// runCapturedCapped runs cmd, capturing stdout/stderr through the SDK's
+// MaxOutputBytes-bounded buffer so a child emitting unbounded output
+// cannot exhaust the root agent's memory (WS6 #14). Truncated streams
+// carry the "[output truncated]" marker. Extracted so the cap is testable
+// without runuser/root.
+func runCapturedCapped(cmd *exec.Cmd) (*pb.CommandOutput, error) {
+	stdout := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
+	stderr := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
+	cmd.Stdout = stdout
+	cmd.Stderr = stderr
 	runErr := cmd.Run()
 	out := &pb.CommandOutput{
 		Stdout: stdout.String(),

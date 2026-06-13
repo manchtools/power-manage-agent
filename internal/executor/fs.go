@@ -3,6 +3,9 @@ package executor
 
 import (
 	"context"
+	"fmt"
+	"os"
+	"strconv"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
@@ -47,9 +50,37 @@ func createDirectory(ctx context.Context, path string, recursive bool) error {
 	return sysfs.Mkdir(ctx, path, recursive)
 }
 
-// createDirectoryWithPermissions creates a directory with the specified mode and ownership.
+// createDirectoryWithPermissions creates a directory and applies its mode
+// and ownership through the fd-based, no-follow helper (WS6 #5). The old
+// path-based chmod/chown (sysfs.MkdirWithPermissions) re-resolved the path
+// and would dereference a final-component symlink swapped in after mkdir,
+// redirecting a root chmod/chown onto the target. Here the perms are
+// applied via an O_NOFOLLOW|O_DIRECTORY fd, so a swapped-in symlink aborts
+// the operation (ELOOP) instead.
 func createDirectoryWithPermissions(ctx context.Context, path, mode, owner, group string, recursive bool) error {
-	return sysfs.MkdirWithPermissions(ctx, path, mode, owner, group, recursive)
+	if err := sysfs.Mkdir(ctx, path, recursive); err != nil {
+		return fmt.Errorf("create directory: %w", err)
+	}
+	if mode == "" && owner == "" && group == "" {
+		return nil
+	}
+	uid, gid := -1, -1
+	if owner != "" || group != "" {
+		var err error
+		uid, gid, err = sysfs.ResolveOwnership(owner, group)
+		if err != nil {
+			return err
+		}
+	}
+	perm := os.FileMode(0o755) // deterministic default when mode is unspecified
+	if mode != "" {
+		v, err := strconv.ParseUint(mode, 8, 32)
+		if err != nil {
+			return fmt.Errorf("invalid directory mode %q: %w", mode, err)
+		}
+		perm = os.FileMode(v)
+	}
+	return sysfs.SetDirPermissionsNoFollow(path, perm, uid, gid)
 }
 
 // removeDirectory removes a directory and its contents.

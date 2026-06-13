@@ -10,6 +10,7 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/handler"
+	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sdk "github.com/manchtools/power-manage/sdk/go"
@@ -35,7 +36,7 @@ func reloadCredsForReconnect(credStore *credentials.Store, current *credentials.
 	return reloaded
 }
 
-func runAgent(ctx context.Context, credStore *credentials.Store, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, logger *slog.Logger, now func() time.Time) {
+func runAgent(ctx context.Context, credStore *credentials.Store, creds *credentials.Credentials, hostname string, h *handler.Handler, sched *scheduler.Scheduler, syncTrigger <-chan struct{}, securityAlert *pendingSecurityAlert, luksDaemon *luksd.Daemon, logger *slog.Logger, now func() time.Time) {
 	// Current sync interval (can be updated by server). Owned by
 	// runAgent — periodicSync receives its initial value as a
 	// stack-local copy and any subsequent updates over a channel.
@@ -91,6 +92,13 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 
 		// Wire LUKS key store to the current client for this connection session
 		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
+
+		// Wire the LUKS passphrase daemon to this connection so it can
+		// validate tokens and fetch managed keys over the agent's own
+		// authenticated stream (WS6 #1/#19).
+		if luksDaemon != nil {
+			luksDaemon.SetSession(client)
+		}
 
 		// Wire the terminal sender so the handler's terminal session
 		// goroutines can push TerminalOutput / TerminalStateChange
@@ -152,6 +160,9 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
 		h.Executor().SetLuksKeyStore(nil)
+		if luksDaemon != nil {
+			luksDaemon.ClearSession()
+		}
 		<-syncDone
 		<-resultsDone
 

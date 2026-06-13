@@ -113,11 +113,12 @@ curl -fsSL https://your-server/install.sh | sudo bash -s -- \
 The install script:
 1. Downloads and installs the agent binary (verifies SHA256 against the publisher's `SHA256SUMS`)
 2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
-3. Removes any leftover `/etc/sudoers.d/power-manage` or `/etc/doas.d/power-manage.conf` from a previous (pre-root-mode) install
+3. Removes any leftover `/etc/sudoers.d/power-manage`, `/etc/sudoers.d/power-manage-luks`, or `/etc/doas.d/power-manage.conf` from a previous (pre-root-mode) install
 4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
 5. Installs the desktop URI handler for browser-launched enrollment
-6. Installs the LUKS sudoers rule so any local user can run `power-manage-agent luks set-passphrase ...` without a password prompt
-7. Enrolls via the enrollment socket if `--server` and `--token` were provided
+6. Enrolls via the enrollment socket if `--server` and `--token` were provided
+
+There is **no LUKS sudoers rule** — `power-manage-agent luks set-passphrase` is an unprivileged client to the root agent's LUKS daemon socket (see [LUKS passphrase daemon](#luks-passphrase-daemon)).
 
 The legacy `--user` flag is accepted but ignored — the agent runs as root and no service user is created.
 
@@ -450,6 +451,32 @@ The agent communicates with the server via bidirectional stream messages (`GetLu
 **Desired State:**
 - `PRESENT`: Take ownership of the LUKS volume, rotate the managed passphrase if the interval has elapsed
 - `ABSENT`: Remove LUKS state tracking (does not modify the LUKS volume itself)
+
+#### LUKS passphrase daemon
+
+When `device_bound_key_type` is `USER_PASSPHRASE`, the user sets their slot-7
+passphrase with `power-manage-agent luks set-passphrase --token <token>`. This
+command is **unprivileged** and requires **no sudo / sudoers rule**: it is a
+thin client to a root daemon the agent runs in-process on a Unix socket at
+`/run/pm-agent/luks.sock` (mode 0666, created under the unit's
+`RuntimeDirectory=pm-agent`).
+
+The client sends **only** `{token, passphrase}`. The root agent then, with its
+**own** credentials over its **own** authenticated gateway connection:
+
+1. validates (and consumes) the server-issued token — it is **device-bound,
+   single-use, and short-TTL**; authorization is the token, **never** the local
+   OS user of the socket peer (so AD/SSSD logins are unaffected);
+2. enforces the passphrase **policy and reuse** rules server-side (the
+   unprivileged client cannot read the root-owned reuse history);
+3. fetches the managed key and runs `cryptsetup` directly — no `--data-dir`, no
+   sudo.
+
+This replaces the previous model, where the command ran under a
+`NOPASSWD: ... luks set-passphrase *` sudoers rule with an
+attacker-controllable `--data-dir` flag — a local privilege escalation (any
+local user could point root's `cryptsetup` at a forged credential store and a
+hostile gateway). The token, not the local user, is the sole authority.
 
 ### Repository (`REPOSITORY`)
 

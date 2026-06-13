@@ -129,6 +129,25 @@ func New(dataDir string) (*Store, error) {
 		return nil, fmt.Errorf("run migrations: %w", err)
 	}
 
+	// WS6 #10: the DB holds action secrets (PSK, WiFi/EAP keys, LUKS
+	// passphrase hashes). MkdirAll/sql.Open only set modes on CREATE, so a
+	// data dir that already existed with a wider mode (distro package,
+	// prior umask) and the umask-derived 0644 on agent.db would leave the
+	// secrets group/world-readable. Re-assert 0600 on the DB and its
+	// WAL/SHM sidecars (created by the migrations above) and 0700 on the
+	// data dir. Sidecars may be absent after a checkpoint — tolerate
+	// ENOENT, surface anything else.
+	if err := os.Chmod(dataDir, 0o700); err != nil {
+		db.Close()
+		return nil, fmt.Errorf("restrict data dir mode: %w", err)
+	}
+	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
+		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
+			db.Close()
+			return nil, fmt.Errorf("restrict %s mode: %w", filepath.Base(p), err)
+		}
+	}
+
 	return &Store{db: db, now: time.Now}, nil
 }
 

@@ -588,62 +588,17 @@ EOF
     log_info "Desktop URI handler installed"
 }
 
-install_luks_sudoers() {
-    local sudoers_file="/etc/sudoers.d/power-manage-luks"
-
-    log_info "Installing LUKS sudoers rule..."
-
-    # Validate BINARY_PATH before interpolating it into a NOPASSWD
-    # sudoers rule. The rule grants passwordless root for anything
-    # matching "$BINARY_PATH luks *", so a malicious or malformed
-    # path is a privilege-escalation hazard:
-    #   - Must be absolute (anchors the sudoers pattern; relative
-    #     paths in sudoers are a non-starter).
-    #   - Must contain only characters that are safe both in a file
-    #     path and in a sudoers Cmnd_Alias: letters, digits,
-    #     `/._-`. Notably no spaces (sudoers tokenizer), no quotes,
-    #     no commas, no wildcards of our own.
-    if [[ "$BINARY_PATH" != /* ]]; then
-        log_error "BINARY_PATH ($BINARY_PATH) must be absolute to install sudoers rule"
-        exit 1
-    fi
-    if [[ ! "$BINARY_PATH" =~ ^/[A-Za-z0-9/._-]+$ ]]; then
-        log_error "BINARY_PATH ($BINARY_PATH) contains characters unsafe for sudoers; must match /[A-Za-z0-9/._-]+"
-        exit 1
-    fi
-
-    # Unquoted heredoc so $BINARY_PATH expands — the rule must match
-    # the actual binary location, which differs when the operator
-    # passes --binary.
-    #
-    # The previous rule used "luks *" which auto-elevated ANY
-    # future luks subcommand the agent might add. Replaced with an
-    # explicit "luks set-passphrase *" entry so only the currently-
-    # documented subcommand is privileged. New subcommands need a
-    # conscious sudoers update (and review) before they can run
-    # without a password — forward-compatible defense in depth.
-    cat > "$sudoers_file" <<EOF
-# Allow all users to run the LUKS set-passphrase command without
-# password. The wildcard at the end matches the variable arguments
-# (--token, --data-dir, the token value itself) without granting
-# any other luks subcommand the same privilege.
-ALL ALL=(root) NOPASSWD: ${BINARY_PATH} luks set-passphrase *
-EOF
-
-    chmod 440 "$sudoers_file"
-
-    # Validate sudoers syntax. Fail-closed: if visudo rejects the
-    # generated file, remove it AND fail the install. Continuing
-    # the install after visudo rejection used to leave the host in
-    # a state where LUKS actions would prompt for a password (no
-    # sudoers rule in effect) — surprising and undebuggable.
-    if ! visudo -c -f "$sudoers_file" &>/dev/null; then
-        log_error "Invalid sudoers syntax in $sudoers_file; removing and aborting install"
-        rm -f "$sudoers_file"
-        exit 1
-    fi
-    log_info "LUKS sudoers rule installed"
-}
+# NOTE: the LUKS set-passphrase flow no longer uses a sudoers rule (WS6
+# #1/#19). The agent runs as root and exposes an in-process daemon socket
+# at /run/pm-agent/luks.sock (created at runtime under the unit's
+# RuntimeDirectory=pm-agent). The unprivileged `power-manage-agent luks
+# set-passphrase` client sends only {token, passphrase} to that socket;
+# the root agent performs the cryptsetup work with its own credentials,
+# authorized by the server-issued device-bound, single-use token. The old
+# `ALL ALL=(root) NOPASSWD: <binary> luks set-passphrase *` rule (with an
+# attacker-controllable --data-dir) is removed entirely. The uninstall
+# path still deletes /etc/sudoers.d/power-manage-luks to clean it up on
+# upgrade from a pre-WS6 install.
 
 show_status() {
     echo ""
@@ -703,7 +658,6 @@ main() {
     create_directories
     install_systemd_service
     install_desktop_handler
-    install_luks_sudoers
 
     enable_and_start_service
 

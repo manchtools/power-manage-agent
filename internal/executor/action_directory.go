@@ -28,6 +28,21 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
+		// WS6 #6: protected-path guard, symmetric with ABSENT. Without it
+		// a PRESENT action could chmod/chown a protected system directory
+		// or anything under a protected prefix — e.g. `chmod 0777
+		// /etc/sudoers.d` (world-writable sudoers dir → privesc) or relax
+		// /var/lib/<service>. Mirror ABSENT exactly: refuse the top-level
+		// denylist AND the whole protected subtree, on both the resolved
+		// path and the cleaned input (so a symlinked protected dir can't
+		// slip past resolution). The FILE action still creates its own
+		// parent dirs under /etc/*.d via createDirectory, so managed config
+		// files are unaffected.
+		if isProtectedPath(cleanPath) || isProtectedPath(filepath.Clean(params.Path)) ||
+			sysfs.IsUnderProtectedPrefix(cleanPath) || sysfs.IsUnderProtectedPrefix(filepath.Clean(params.Path)) {
+			return nil, false, fmt.Errorf("refusing to manage protected system path: %s (resolved from %s)", cleanPath, params.Path)
+		}
+
 		// Check if directory already exists with correct mode and ownership
 		if e.directoryMatchesDesired(cleanPath, params) {
 			return &pb.CommandOutput{
@@ -52,21 +67,27 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
+		// Safety check FIRST (before the existence probe): refuse to delete
+		// a protected system directory or anything UNDER a security-
+		// relevant prefix. WS6 #12 widens the old top-level-only denylist
+		// (isProtectedPath) to deny-by-default across whole subtrees
+		// (sysfs.IsUnderProtectedPrefix), so /etc/sudoers.d, /home/<user>,
+		// /var/lib/<x>, /boot/efi, … can no longer slip through to rm -rf.
+		// Checking before os.Stat also refuses regardless of existence and
+		// avoids leaking whether a protected path is present. Both the
+		// resolved path and the cleaned input are checked so a symlinked
+		// protected directory can't slip past resolution.
+		if isProtectedPath(cleanPath) || isProtectedPath(filepath.Clean(params.Path)) ||
+			sysfs.IsUnderProtectedPrefix(cleanPath) || sysfs.IsUnderProtectedPrefix(filepath.Clean(params.Path)) {
+			return nil, false, fmt.Errorf("refusing to delete protected system path: %s (resolved from %s)", cleanPath, params.Path)
+		}
+
 		// Check if directory already doesn't exist
 		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("directory %s does not exist, nothing to remove", cleanPath),
 			}, false, nil
-		}
-
-		// Safety check: refuse to delete protected system directories.
-		// Check both the resolved path (after sysfs.ResolveAndValidatePath
-		// followed any symlinks) AND the cleaned input path, so that
-		// a symlinked protected directory can't be removed by aiming
-		// at the symlink and slipping past via resolution.
-		if isProtectedPath(cleanPath) || isProtectedPath(filepath.Clean(params.Path)) {
-			return nil, false, fmt.Errorf("refusing to delete protected system path: %s (resolved from %s)", cleanPath, params.Path)
 		}
 
 		// Repair filesystem if mounted read-only

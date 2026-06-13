@@ -2,25 +2,26 @@
 package main
 
 import (
-	"context"
 	"flag"
 	"fmt"
-	"log/slog"
 	"net/url"
 	"os"
 	"strings"
 
-	"github.com/manchtools/power-manage/agent/internal/credentials"
-	"github.com/manchtools/power-manage/agent/internal/store"
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
+	"github.com/manchtools/power-manage/agent/internal/luksd"
 
 	"golang.org/x/term"
 )
 
 // runLuks handles the "luks" subcommand.
 // Usage: power-manage-agent luks set-passphrase --token XXX
+//
+// This CLI is UNPRIVILEGED (WS6 #1/#19). It collects the passphrase and
+// hands {token, passphrase} to the root agent's LUKS daemon socket, which
+// performs all privileged cryptsetup work with its own credentials. There
+// is no --data-dir flag and no sudoers rule: the old design ran this under
+// NOPASSWD sudo with an attacker-controllable --data-dir, letting any
+// local user point root's cryptsetup at a forged store + hostile gateway.
 func runLuks(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: power-manage-agent luks set-passphrase --token <token>")
@@ -31,7 +32,6 @@ func runLuks(args []string) {
 	case "set-passphrase":
 		fs := flag.NewFlagSet("luks set-passphrase", flag.ExitOnError)
 		token := fs.String("token", "", "One-time LUKS passphrase token")
-		dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Data directory for credentials")
 		fs.Parse(args[1:])
 
 		if *token == "" {
@@ -40,7 +40,7 @@ func runLuks(args []string) {
 			os.Exit(1)
 		}
 
-		runLuksSetPassphrase(*token, *dataDir)
+		runLuksSetPassphrase(*token)
 	default:
 		fmt.Fprintf(os.Stderr, "unknown luks subcommand: %s\n", args[0])
 		fmt.Fprintln(os.Stderr, "usage: power-manage-agent luks set-passphrase --token <token>")
@@ -63,7 +63,7 @@ func runLuksURI(rawURI string) {
 		os.Exit(1)
 	}
 
-	runLuksSetPassphrase(token, credentials.DefaultDataDir)
+	runLuksSetPassphrase(token)
 
 	// Wait for Enter before closing (launched via desktop handler, terminal would close)
 	fmt.Println("\nPress Enter to close...")
@@ -71,91 +71,25 @@ func runLuksURI(rawURI string) {
 	os.Exit(0)
 }
 
-// runLuksSetPassphrase interactively sets a user passphrase on the LUKS device-bound key slot.
-func runLuksSetPassphrase(token, dataDir string) {
-	ctx := context.Background()
-
-	// Install the privilege + encryption backends. This CLI runs the
-	// same privileged cryptsetup helpers (WipeTPM / KillSlot /
-	// AddKeyToSlot) as the daemon, but unlike the daemon it never ran
-	// applyBackendOverrides — so without this the SDK stays on its
-	// default sudo backend and every cryptsetup call fails on hosts
-	// where root can't `sudo -n` (openSUSE Defaults targetpw).
-	if err := applyCLIBackends(slog.Default()); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to configure privilege backend: %v\n", err)
+// runLuksSetPassphrase collects the passphrase and submits it to the root
+// LUKS daemon over the unix socket. All token validation, policy/reuse
+// enforcement, and cryptsetup work happen daemon-side.
+func runLuksSetPassphrase(token string) {
+	client := luksd.NewClient(luksd.DefaultSocketPath)
+	if err := client.SetPassphrase(token, promptPassphrase); err != nil {
+		fmt.Fprintf(os.Stderr, "error: %v\n", err)
 		os.Exit(1)
 	}
+	fmt.Println("LUKS passphrase set successfully.")
+}
 
-	// Load agent credentials
-	credStore := credentials.NewStore(dataDir)
-	if !credStore.Exists() {
-		fmt.Fprintln(os.Stderr, "error: agent is not registered. Run the agent first.")
-		os.Exit(1)
-	}
-	creds, err := credStore.Load()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to load credentials: %v\n", err)
-		os.Exit(1)
-	}
-
-	// Connect to gateway via mTLS. rc10 refuses http:// here too —
-	// the luks-setup command path is production-only (ships via the
-	// packaged binary on managed devices), so an http:// gateway
-	// would mean the stored credentials are stale or tampered.
-	if strings.HasPrefix(creds.GatewayAddr, "http://") {
-		fmt.Fprintf(os.Stderr, "error: refusing h2c gateway URL (%s) — agent requires https:// for gateway connections\n", creds.GatewayAddr)
-		os.Exit(1)
-	}
-	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to configure mTLS: %v\n", err)
-		os.Exit(1)
-	}
-	client := sdk.NewClient(creds.GatewayAddr,
-		mtlsOpt,
-		sdk.WithAuth(creds.DeviceID, ""),
-	)
-
-	// Validate token — server returns action details and complexity requirements
-	result, err := client.ValidateLuksToken(ctx, token)
-	if err != nil {
-		fmt.Fprintln(os.Stderr, "error: token is invalid or has expired. Generate a new one from the web UI.")
-		os.Exit(1)
-	}
-
-	// Map proto complexity to SDK complexity
-	var complexity sysenc.Complexity
-	switch result.Complexity {
-	case pm.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_ALPHANUMERIC:
-		complexity = sysenc.ComplexityAlphanumeric
-	case pm.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX:
-		complexity = sysenc.ComplexityComplex
-	default:
-		complexity = sysenc.ComplexityNone
-	}
-
-	minLength := int(result.MinLength)
-	if minLength < 16 {
-		minLength = 16
-	}
-
-	// Load passphrase history for reuse check
-	agentStore, err := store.New(dataDir)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to open agent store: %v\n", err)
-		os.Exit(1)
-	}
-	defer agentStore.Close()
-
-	recentHashes, err := agentStore.GetLuksPassphraseHashes(result.ActionID)
-	if err != nil {
-		slog.Warn("failed to get LUKS passphrase hashes", "action_id", result.ActionID, "error", err)
-	}
-
-	// Interactive passphrase prompt (up to 3 attempts)
+// promptPassphrase interactively reads and confirms a passphrase (up to 3
+// attempts for a matching pair). It applies only a basic length floor as
+// UX — the daemon is the authority on complexity and reuse. Returns an
+// empty string (no error) when the user fails to provide a matching
+// passphrase, so the client refuses to contact the daemon.
+func promptPassphrase() (string, error) {
 	const maxAttempts = 3
-	var passphrase string
-
 	for attempt := 1; attempt <= maxAttempts; attempt++ {
 		remaining := maxAttempts - attempt
 
@@ -163,16 +97,14 @@ func runLuksSetPassphrase(token, dataDir string) {
 		pw1, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to read passphrase: %v\n", err)
-			os.Exit(1)
+			return "", fmt.Errorf("failed to read passphrase: %w", err)
 		}
 
 		fmt.Print("Confirm passphrase: ")
 		pw2, err := term.ReadPassword(int(os.Stdin.Fd()))
 		fmt.Println()
 		if err != nil {
-			fmt.Fprintf(os.Stderr, "error: failed to read confirmation: %v\n", err)
-			os.Exit(1)
+			return "", fmt.Errorf("failed to read confirmation: %w", err)
 		}
 
 		if string(pw1) != string(pw2) {
@@ -183,109 +115,18 @@ func runLuksSetPassphrase(token, dataDir string) {
 		}
 
 		candidate := string(pw1)
-
-		// Validate complexity
-		if validationErr := sysenc.ValidatePassphrase(candidate, minLength, complexity); validationErr != "" {
+		// Basic length floor for UX so an obviously-too-short passphrase
+		// does not consume the one-time token; the daemon enforces the
+		// authoritative minimum and complexity.
+		if len(candidate) < 16 {
 			if remaining > 0 {
-				fmt.Printf("%s %d attempt(s) remaining.\n", validationErr, remaining)
+				fmt.Printf("Passphrase must be at least 16 characters. %d attempt(s) remaining.\n", remaining)
 			}
 			continue
 		}
-
-		// Check reuse
-		if sysenc.IsRecentlyUsed(candidate, recentHashes) {
-			if remaining > 0 {
-				fmt.Printf("This passphrase was used recently. Choose a different one. %d attempt(s) remaining.\n", remaining)
-			}
-			continue
-		}
-
-		passphrase = candidate
-		break
+		return candidate, nil
 	}
 
-	if passphrase == "" {
-		fmt.Fprintln(os.Stderr, "Too many failed attempts.")
-		os.Exit(1)
-	}
-
-	// Connect stream for GetLuksKey (stream-based request-response)
-	if err := client.Connect(ctx); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to connect to gateway: %v\n", err)
-		os.Exit(1)
-	}
-	defer client.Close()
-
-	hostname, err := os.Hostname()
-	if err != nil {
-		slog.Warn("failed to get hostname", "error", err)
-	}
-	if err := client.SendHello(ctx, hostname, version); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to send hello: %v\n", err)
-		os.Exit(1)
-	}
-
-	stopReceiver := client.StartReceiver(ctx)
-	defer stopReceiver()
-
-	// Get managed passphrase from server (in memory only)
-	managedKey, err := client.GetLuksKey(ctx, result.ActionID)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to get managed key: %v\n", err)
-		os.Exit(1)
-	}
-
-	devicePath := result.DevicePath
-
-	// Check current device key type and revoke if needed
-	localState, _ := agentStore.GetLuksState(result.ActionID)
-	if localState != nil && localState.DeviceKeyType != "none" {
-		fmt.Println("Revoking current device-bound key...")
-		switch localState.DeviceKeyType {
-		case "tpm":
-			if err := sysenc.WipeTPM(ctx, devicePath, managedKey); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to wipe TPM key: %v\n", err)
-				os.Exit(1)
-			}
-		case "user_passphrase":
-			if err := sysenc.KillSlot(ctx, devicePath, 7, managedKey); err != nil {
-				fmt.Fprintf(os.Stderr, "error: failed to remove existing passphrase: %v\n", err)
-				os.Exit(1)
-			}
-		}
-	}
-
-	// Add user passphrase to slot 7
-	fmt.Println("Setting LUKS passphrase...")
-	if err := sysenc.AddKeyToSlot(ctx, devicePath, 7, managedKey, passphrase); err != nil {
-		fmt.Fprintf(os.Stderr, "error: failed to set passphrase: %v\nManaged key may have been rotated.\n", err)
-		os.Exit(1)
-	}
-
-	// Update local state. Bundle-A fail-closed: a failure here would
-	// leave the on-disk state row claiming device_key_type=tpm/none
-	// while LUKS slot 7 actually carries the user's passphrase. The
-	// next reconcileDeviceKey tick would then see the divergence and
-	// re-enroll TPM, wiping what the user just set. Surface the error
-	// to stderr and exit non-zero so the operator can rerun.
-	if err := agentStore.SetLuksDeviceKeyType(result.ActionID, "user_passphrase"); err != nil {
-		slog.Error("failed to persist LUKS device key type after slot-7 enrollment",
-			"action_id", result.ActionID, "error", err)
-		fmt.Fprintf(os.Stderr, "error: failed to update local LUKS state: %v\n", err)
-		fmt.Fprintln(os.Stderr, "warning: passphrase is set on the device but local state is stale; rerun this command to recover")
-		os.Exit(1)
-	}
-
-	// Store passphrase hash for reuse prevention (keeps last 3).
-	// Same fail-closed reasoning as above: a missed history append
-	// lets the user immediately re-pick the same passphrase next
-	// rotation, defeating the reuse check.
-	if err := agentStore.AddLuksPassphraseHash(result.ActionID, sysenc.HashPassphrase(passphrase)); err != nil {
-		slog.Error("failed to persist LUKS passphrase hash after slot-7 enrollment",
-			"action_id", result.ActionID, "error", err)
-		fmt.Fprintf(os.Stderr, "error: failed to update LUKS passphrase history: %v\n", err)
-		os.Exit(1)
-	}
-
-	fmt.Println("LUKS passphrase set successfully.")
+	fmt.Fprintln(os.Stderr, "Too many failed attempts.")
+	return "", nil
 }
