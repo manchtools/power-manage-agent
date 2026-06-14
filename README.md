@@ -690,13 +690,18 @@ journalctl -u power-manage-agent -f
 
 ## Auto-Update
 
-The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload carries, per architecture, an HTTPS `binary_url` and the **CA-signed `expected_sha256`** of that binary.
+The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload carries, per architecture, an HTTPS `binary_url` and an integrity source. The action is CA-signed, so its fields cannot be tampered in transit.
 
-### Authenticity: CA-signed hash, not a same-origin checksum (WS7)
+### Integrity: your choice of `checksum_url` (default) or a pinned `expected_sha256`
 
-The integrity gate is `expected_sha256`, which travels **inside the CA-signed action**. The agent verifies the downloaded binary against that hash — a value bound to the control server's signature — **not** against a checksum file fetched from the binary's own (untrusted) download origin. A compromised mirror or a man-in-the-middle on the download cannot vouch for a tampered binary: it cannot forge the CA signature over `expected_sha256`. `binary_url` must be HTTPS.
+Each arch must provide **at least one** of:
 
-> Binary code-signing is a future enhancement; this interim model binds the hash to the existing enrolled-CA trust root. Any future signing key must be operator-pinnable, never a hardcoded project key. Signing of the *release* `SHA256SUMS` (the initial-install integrity, separate from self-update) is tracked separately.
+- **`checksum_url`** (default) — a `SHA256SUMS` file the agent fetches and verifies the binary against. This is the **hands-off** option: point `binary_url` + `checksum_url` at your `releases/latest/...` assets and the fleet tracks new releases with no per-release action change. Authenticity here is **origin-trust** (TLS + your release host).
+- **`expected_sha256`** (opt-in) — an exact, lowercase-hex hash. When set it **overrides** `checksum_url` and is the authoritative gate: it travels inside the CA-signed action, so the agent verifies against a hash bound to the control server's signature, not a file from the download origin. Use it to **pin an exact binary** (staged rollouts) or for stronger authenticity. The trade-off: a new version means updating + re-signing the action, so it's opt-in, not the default.
+
+`binary_url` (and `checksum_url`, when used) must be HTTPS. An action with neither integrity source is rejected at create time and by the agent.
+
+> **Accepted risk (default mode):** with `checksum_url`, a compromised download origin serving a malicious binary *and* a matching checksum file would not be detected — the checksum is self-attesting. The control plane provides ease of use, not artifact provenance. If you need a stronger guarantee: pin `expected_sha256`, host `checksum_url` on a **separate host** from the binary, or — since this is open source — **build and distribute the binaries yourself** and pin hashes as you require. Binary code-signing and signing of the release `SHA256SUMS` are possible future backstops, not current guarantees.
 
 ### Anti-rollback
 
@@ -704,7 +709,7 @@ The agent refuses a candidate **older** than the running version (`vYYYY.MM.PP` 
 
 ### Update Process
 
-1. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp` and verify its SHA256 against the CA-signed `expected_sha256` (no checksum file is fetched or trusted)
+1. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp` and verify its SHA256 against the pinned `expected_sha256` if set, otherwise against the hash from `checksum_url`
 2. Run `<tmpPath> version`, compare with running — skip if same; refuse a downgrade unless `allow_downgrade`
 3. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
