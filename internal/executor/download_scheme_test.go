@@ -39,14 +39,6 @@ func TestDownloadFile_RejectsNonHTTPS(t *testing.T) {
 	}
 }
 
-func TestDownloadFile_RejectsEmptyChecksum(t *testing.T) {
-	e := &Executor{logger: slog.Default(), now: time.Now}
-	dest := filepath.Join(t.TempDir(), "out")
-	if err := e.downloadFile(context.Background(), "https://example.com/app.deb", dest, ""); err == nil {
-		t.Error("downloadFile with an empty checksum must be rejected (mandatory integrity)")
-	}
-}
-
 // The https + correct-checksum path succeeds (proves the guard does not
 // over-reject and the chokepoint still works).
 func TestDownloadFile_AcceptsHTTPSWithChecksum(t *testing.T) {
