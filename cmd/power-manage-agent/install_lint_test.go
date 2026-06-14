@@ -40,6 +40,23 @@ func TestInstall_DesktopHandlerOptIn(t *testing.T) {
 	}
 }
 
+// WS9 #3: the install flow must NOT pass the registration token on argv
+// (visible via /proc/<pid>/cmdline). It must deliver it via -token-file,
+// created mode 0600.
+func TestInstall_TokenDeliveredViaFileNotArgv(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+
+	if strings.Contains(sh, "-token=$REGISTRATION_TOKEN") {
+		t.Error("install.sh must not pass the registration token on argv; use -token-file")
+	}
+	if !strings.Contains(sh, "-token-file=") {
+		t.Error("install.sh enrollment must deliver the token via -token-file")
+	}
+	if !strings.Contains(sh, `chmod 600 "$token_file"`) {
+		t.Error("the install.sh token file must be created mode 0600")
+	}
+}
+
 // WS7 #9: every capability in the systemd unit's CapabilityBoundingSet
 // must carry a justification comment. Self-discovering: a cap added
 // without a comment fails this test.

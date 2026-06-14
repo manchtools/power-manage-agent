@@ -47,21 +47,33 @@ The agent supports two enrollment methods:
 
 1. The install script starts the agent as a systemd service
 2. The unenrolled agent opens an **enrollment socket** at `/run/pm-agent/enroll.sock` (mode 0666, any local user can connect)
-3. A regular user runs `power-manage-agent enroll -server=URL -token=TOKEN`
+3. A regular user runs `power-manage-agent enroll -server=URL -token-file=PATH` (or `PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL`)
 4. The CLI sends an `Enroll` RPC to the agent over the unix socket
 5. The agent calls the **Control Server** `Register` RPC with the token and a locally-generated CSR
 6. The Control Server validates the token, signs the certificate, and returns credentials
 7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and connects to the gateway
 
-> **Trust boundary.** The enrollment socket is intentionally
-> world-accessible (mode `0666`); the security boundary is the
-> registration token, which is validated by the Control Server.
-> The agent applies a **global** rate limit of 5 enrollment attempts
-> per minute across all local callers, so any local user can briefly
-> prevent a legitimate enrollment by flooding the socket with bad
-> tokens. This is acceptable for a self-hosted MDM — the admin who
-> runs the install script will retry — but it is not suitable for
-> adversarial multi-tenant hosts.
+> **Trust boundary (deliberate self-service design).** The enrollment
+> socket is intentionally world-accessible (mode `0666`) so a **non-root
+> user can enroll their own corporate/BYOD device without sudo** — that
+> is the whole point of the socket. The security boundary is the
+> registration **token**, validated by the Control Server; an admin who
+> does *not* want self-service can pre-enroll devices with a bulk
+> registration token instead. The agent applies a **global** rate limit
+> of 5 enrollment attempts per minute, so a local user can briefly
+> disrupt a legitimate enrollment by flooding bad tokens — acceptable for
+> a self-hosted MDM, not for adversarial multi-tenant hosts.
+>
+> **Hardening (WS9).** `server_url` must be **https** (cleartext/opaque
+> URLs are refused before any network call). Token delivery is via
+> `-token-file` or the `PM_REGISTRATION_TOKEN` env var; passing `-token`
+> on argv still works but warns (it leaks via `/proc/<pid>/cmdline`).
+> Optionally the operator can pass an out-of-band **CA fingerprint pin**
+> (`-pin`, or `&pin=` in a `power-manage://` URI): the agent verifies the
+> Control Server CA matches the pin before trusting it, defending against
+> a first-enrollment trust-anchor swap. Without a pin, first enrollment
+> is trust-on-first-use — an accepted residual mitigated by enroll-at-
+> install plus short-lived, single-use, revocable tokens. See ADR 0013.
 
 ```
                                   ┌─────────────────────────┐

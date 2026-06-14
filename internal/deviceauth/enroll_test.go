@@ -18,6 +18,7 @@ import (
 	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
+	sdk "github.com/manchtools/power-manage/sdk/go"
 )
 
 // mockRegisterService implements the Register RPC of ControlServiceHandler.
@@ -34,14 +35,23 @@ func (m *mockRegisterService) Register(ctx context.Context, req *connect.Request
 	return nil, connect.NewError(connect.CodeUnimplemented, nil)
 }
 
+// startMockControlServer starts an httptest TLS control server (the
+// agent enforces https-only enrollment, so a plain-http test server
+// would be rejected by the gate before RegisterAgent runs).
 func startMockControlServer(t *testing.T, mock *mockRegisterService) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
 	path, handler := pmv1connect.NewControlServiceHandler(mock)
 	mux.Handle(path, handler)
-	srv := httptest.NewServer(mux)
+	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
 	return srv
+}
+
+// trustServer returns the registerOpts that make sdk.RegisterAgent trust
+// the httptest TLS server's self-signed certificate.
+func trustServer(srv *httptest.Server) []sdk.ClientOption {
+	return []sdk.ClientOption{sdk.WithHTTPClient(srv.Client())}
 }
 
 func TestEnroll_Success(t *testing.T) {
@@ -64,6 +74,7 @@ func TestEnroll_Success(t *testing.T) {
 	handler := NewEnrollHandler("test-host", "dev", credStore, logger, func(creds *credentials.Credentials) {
 		enrolledCreds = creds
 	})
+	handler.registerOpts = trustServer(srv)
 
 	resp, err := handler.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
 		ServerUrl: srv.URL,
@@ -136,6 +147,7 @@ func TestEnroll_RegistrationFails(t *testing.T) {
 	credStore := credentials.NewStore(t.TempDir())
 	logger := slog.Default()
 	handler := NewEnrollHandler("test-host", "dev", credStore, logger, nil)
+	handler.registerOpts = trustServer(srv)
 
 	resp, err := handler.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
 		ServerUrl: srv.URL,
@@ -196,6 +208,7 @@ func TestEnrollServer_EndToEnd(t *testing.T) {
 	enrollHandler := NewEnrollHandler("test-host", "dev", credStore, logger, func(creds *credentials.Credentials) {
 		enrollCh <- creds
 	})
+	enrollHandler.registerOpts = trustServer(controlSrv)
 
 	socketPath := filepath.Join(t.TempDir(), "enroll.sock")
 	enrollServer := NewEnrollServer(enrollHandler, socketPath, logger)

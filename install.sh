@@ -472,20 +472,30 @@ enroll_agent() {
     if [[ -z "$REGISTRATION_TOKEN" ]] || [[ -z "$SERVER_URL" ]]; then
         log_warn "No registration token or server URL provided, skipping enrollment"
         log_info "You can enroll later by running (no sudo required):"
-        log_info "  $BINARY_PATH enroll -server=<URL> -token=<TOKEN>"
+        log_info "  $BINARY_PATH enroll -server=<URL> -token-file=<PATH>"
         return
     fi
 
     log_info "Enrolling agent with server via socket..."
 
+    # Deliver the token via a 0600 file, NOT on argv: process arguments
+    # are world-readable via /proc/<pid>/cmdline, so `-token=…` would leak
+    # the registration token to any local user for the life of the call.
+    local token_file
+    token_file="$(mktemp)"
+    chmod 600 "$token_file"
+    # Remove the token file on any return path (success, failure, signal).
+    trap 'rm -f "$token_file"' RETURN
+    printf '%s' "$REGISTRATION_TOKEN" > "$token_file"
+
     # Build the enrollment command as an array so arguments are passed
     # one-per-element and bash does not word-split, glob, or re-tokenise
-    # user-supplied values such as SERVER_URL or REGISTRATION_TOKEN.
+    # user-supplied values such as SERVER_URL.
     local -a enroll_cmd=(
         "$BINARY_PATH"
         "enroll"
         "-server=$SERVER_URL"
-        "-token=$REGISTRATION_TOKEN"
+        "-token-file=$token_file"
     )
 
     # Wait for the enrollment socket to become available (agent needs to start first)
@@ -507,8 +517,7 @@ enroll_agent() {
     else
         log_error "Agent enrollment failed"
         log_info "You can try again later by running:"
-        # printf %q quotes each argument safely for copy-paste.
-        log_info "  $(printf '%q ' "${enroll_cmd[@]}")"
+        log_info "  $BINARY_PATH enroll -server=$SERVER_URL -token-file=<PATH>"
         return 1
     fi
 }
