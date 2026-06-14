@@ -732,6 +732,19 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 var maxDownloadSize int64 = 2 << 30
 
 func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
+	// WS7 #2: https-only + mandatory integrity, fail-closed before any
+	// network. Rejects http, file, ftp, and scheme-relative (//host/x)
+	// URLs, and an empty checksum (which would install a binary whose only
+	// authenticity is TLS to a possibly-compromised origin). deb/rpm/
+	// appimage all route through here, so this is the single download
+	// chokepoint; the proto + server already require a checksum, this is
+	// the agent-side defense-in-depth.
+	if err := validateHTTPS(url); err != nil {
+		return fmt.Errorf("download rejected: %w", err)
+	}
+	if expectedChecksum == "" {
+		return fmt.Errorf("download rejected: a checksum is required for %s", url)
+	}
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
 	if err != nil {
 		return err

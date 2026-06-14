@@ -1,7 +1,6 @@
 package executor
 
 import (
-	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -13,6 +12,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 
@@ -63,16 +63,18 @@ func (e *Executor) markAgentUpdateExecuted() bool {
 //  1. Check if another AGENT_UPDATE already ran this cycle → skip
 //  2. Look up AgentUpdateArch for own architecture
 //  3. If no entry → skip (success, no changes)
-//  4. Validate URLs are HTTPS
-//  5. Download checksum file, extract checksum for binary filename
-//  6. Download binary to temp file, verify SHA256
-//  7. Run ./agent-new version → extract version string
-//  8. Compare with running version → skip if same
-//  9. Run ./agent-new self-test → subprocess validates connectivity
+//  4. Validate the binary URL is HTTPS
+//  5. Download binary to temp file, verify SHA256 against the CA-signed
+//     expected_sha256 (WS7 #1 — NOT a same-origin checksum file)
+//  6. Run ./agent-new version → extract version string
+//  7. Compare with running version → skip if same; refuse a downgrade
+//     unless allow_downgrade is set on the signed action (anti-rollback)
+//  8. Run ./agent-new self-test → subprocess validates connectivity
 //     (credentials load, mTLS, stream, SyncActions). If it fails,
 //     the old binary stays untouched.
-//  10. Atomically swap binary (cp → chmod → mv)
-//  11. Signal graceful shutdown (systemd restarts with new binary)
+//  9. Atomically swap binary via SafeBackupAndReplace (O_NOFOLLOW +
+//     renameat2; copies the old binary to .bak first)
+//  10. Signal graceful shutdown (systemd restarts with new binary)
 //
 // Retry behavior: if the self-test fails, the update is reported as
 // EXECUTION_STATUS_FAILED and the old binary continues running. There is no
@@ -100,20 +102,26 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return &pb.CommandOutput{Stdout: fmt.Sprintf("No update entry for architecture %s", runtime.GOARCH)}, false, nil
 	}
 
-	// Step 3: Validate HTTPS
+	// Step 3: Validate the binary URL is HTTPS (fail-closed before any
+	// network).
 	if err := validateHTTPS(arch.BinaryUrl); err != nil {
 		return nil, false, fmt.Errorf("binary URL validation: %w", err)
 	}
-	if err := validateHTTPS(arch.ChecksumUrl); err != nil {
-		return nil, false, fmt.Errorf("checksum URL validation: %w", err)
-	}
 
-	// Step 4: Download checksum file and extract checksum for our binary.
-	// Use url.Parse to strip query parameters (e.g. S3 presigned URLs).
-	binaryFilename := extractFilename(arch.BinaryUrl)
-	expectedChecksum, err := downloadAndExtractChecksum(ctx, e.httpClient, arch.ChecksumUrl, binaryFilename)
-	if err != nil {
-		return nil, false, fmt.Errorf("download checksum: %w", err)
+	// Step 4: The AUTHORITATIVE integrity gate is the CA-signed
+	// expected_sha256 (WS7 #1). It rides inside the signed action, so a
+	// compromised download origin — or a checksum file fetched from that
+	// same origin — cannot vouch for a tampered binary. We deliberately do
+	// NOT download or trust a same-origin checksum file; checksum_url is
+	// retained on the action only as operator-facing metadata.
+	expectedChecksum := strings.ToLower(arch.ExpectedSha256)
+	// Defense-in-depth: the server + proto require expected_sha256, but
+	// fail closed here too rather than downloading and reporting a
+	// confusing "expected , got <hash>" mismatch. (This path uses
+	// downloadToFile, not the downloadFile chokepoint, so the guard must
+	// live here.)
+	if expectedChecksum == "" {
+		return nil, false, fmt.Errorf("agent update rejected: expected_sha256 is empty in the signed action")
 	}
 
 	// Step 5: Download binary to temp file in DataDir (agent-owned).
@@ -139,8 +147,8 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 	tmpFile.Close()
 
-	if actualChecksum != expectedChecksum {
-		return nil, false, fmt.Errorf("checksum mismatch: expected %s, got %s", expectedChecksum, actualChecksum)
+	if !strings.EqualFold(actualChecksum, expectedChecksum) {
+		return nil, false, fmt.Errorf("checksum mismatch: binary does not match CA-signed expected_sha256 (expected %s, got %s)", expectedChecksum, actualChecksum)
 	}
 
 	// Make executable
@@ -154,10 +162,30 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("version check on downloaded binary: %w", err)
 	}
 
-	// Step 7: Compare versions — skip if same
+	// Step 7: Compare versions — skip if same (fast exact-string path).
 	if newVersion == cfg.Version {
 		e.logger.Info("agent is already at the latest version", "version", cfg.Version)
 		return &pb.CommandOutput{Stdout: fmt.Sprintf("Already at version %s", cfg.Version)}, false, nil
+	}
+
+	// Anti-rollback (WS7 #7): refuse a candidate that is older than the
+	// running version unless the signed action explicitly allows a
+	// downgrade. An unparseable version fails CLOSED — never treated as
+	// newer. allow_downgrade rides inside the CA-signed action, so a
+	// downgrade is an explicit, authenticated operator decision.
+	if !params.AllowDowngrade {
+		cmp, cmpErr := compareAgentVersion(cfg.Version, newVersion)
+		if cmpErr != nil {
+			return nil, false, fmt.Errorf("refusing update: cannot compare versions (running %q, candidate %q): %w", cfg.Version, newVersion, cmpErr)
+		}
+		if cmp > 0 {
+			return nil, false, fmt.Errorf("refusing downgrade: candidate %s is older than running %s (set allow_downgrade on the action to override)", newVersion, cfg.Version)
+		}
+		if cmp == 0 {
+			// Semantically equal despite differing strings — nothing to do.
+			e.logger.Info("agent is already at an equivalent version", "running", cfg.Version, "candidate", newVersion)
+			return &pb.CommandOutput{Stdout: fmt.Sprintf("Already at version %s", cfg.Version)}, false, nil
+		}
 	}
 
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
@@ -191,9 +219,11 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	e.logger.Info("self-test passed", "output", selfTestResult.Stdout)
 
 	// Step 9: Self-test passed — swap the binary. The old binary is
-	// still running in memory, so this is safe. Use atomic
-	// cp → chmod → mv so the live path is only updated after the
-	// new file is fully written and executable.
+	// still running in memory, so this is safe. The swap goes through the
+	// SDK's SafeBackupAndReplace (O_NOFOLLOW + renameat2), so the live
+	// path is only updated after the new file is fully written, and a
+	// symlink-replacement race on the live path or the .bak cannot
+	// redirect the write.
 	//
 	// Before the swap, save the currently-installed binary to a
 	// `.bak` sibling so an operator can roll back manually with
@@ -246,13 +276,48 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	return &pb.CommandOutput{Stdout: stdout}, true, nil
 }
 
-// extractFilename returns the filename from a URL, stripping query parameters.
-func extractFilename(rawURL string) string {
-	u, err := url.Parse(rawURL)
+// compareAgentVersion compares two vYYYY.MM.PP version strings and returns
+// -1 if a < b, 0 if equal, +1 if a > b. The leading "v" is optional. A
+// version that does not parse to exactly three numeric components is an
+// error — callers MUST treat that as fail-closed (never "newer"), so a
+// malformed candidate cannot bypass anti-rollback (WS7 #7).
+func compareAgentVersion(a, b string) (int, error) {
+	pa, err := parseAgentVersion(a)
 	if err != nil {
-		return filepath.Base(rawURL)
+		return 0, err
 	}
-	return filepath.Base(u.Path)
+	pb, err := parseAgentVersion(b)
+	if err != nil {
+		return 0, err
+	}
+	for i := 0; i < len(pa); i++ {
+		if pa[i] != pb[i] {
+			if pa[i] < pb[i] {
+				return -1, nil
+			}
+			return 1, nil
+		}
+	}
+	return 0, nil
+}
+
+// parseAgentVersion parses "vYYYY.MM.PP" (leading v optional) into its
+// three numeric components.
+func parseAgentVersion(v string) ([3]int, error) {
+	var out [3]int
+	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
+	parts := strings.Split(v, ".")
+	if len(parts) != 3 {
+		return out, fmt.Errorf("invalid version %q: want vYYYY.MM.PP", v)
+	}
+	for i, p := range parts {
+		n, err := strconv.Atoi(p)
+		if err != nil {
+			return out, fmt.Errorf("invalid version component %q in %q: %w", p, v, err)
+		}
+		out[i] = n
+	}
+	return out, nil
 }
 
 // getArchEntry returns the AgentUpdateArch for the current runtime architecture.
@@ -277,61 +342,6 @@ func validateHTTPS(rawURL string) error {
 		return fmt.Errorf("URL must use HTTPS, got %q", u.Scheme)
 	}
 	return nil
-}
-
-// downloadAndExtractChecksum downloads a SHA256SUMS-style file and extracts
-// the checksum for the given filename. Format: "<hex>  <filename>" or "<hex> <filename>".
-func downloadAndExtractChecksum(ctx context.Context, client *http.Client, checksumURL, filename string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	// Parse SHA256SUMS format: each line is "<hex>  <filename>" or "<hex> <filename>"
-	scanner := bufio.NewScanner(resp.Body)
-	for scanner.Scan() {
-		line := strings.TrimSpace(scanner.Text())
-		if line == "" {
-			continue
-		}
-
-		// Split on whitespace (double-space or single-space)
-		parts := strings.Fields(line)
-		if len(parts) != 2 {
-			continue
-		}
-
-		checksumHex := parts[0]
-		name := parts[1]
-
-		// Strip leading "./" or "*" prefix from filename (common in SHA256SUMS)
-		name = strings.TrimPrefix(name, "./")
-		name = strings.TrimPrefix(name, "*")
-
-		if name == filename {
-			// Validate it looks like a hex SHA256
-			if len(checksumHex) != 64 {
-				return "", fmt.Errorf("invalid checksum length for %s: %d", filename, len(checksumHex))
-			}
-			return strings.ToLower(checksumHex), nil
-		}
-	}
-
-	if err := scanner.Err(); err != nil {
-		return "", fmt.Errorf("read checksum file: %w", err)
-	}
-
-	return "", fmt.Errorf("checksum for %q not found in checksum file", filename)
 }
 
 // downloadToFile downloads a URL to a file and returns the SHA256 hex checksum.

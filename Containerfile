@@ -27,8 +27,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     systemd \
     && rm -rf /var/lib/apt/lists/*
 
-# Create data directory for agent credentials
-RUN mkdir -p /var/lib/power-manage
+# Create data directory for agent credentials. chmod 700 to match
+# install.sh (WS7 #10): the dir holds action secrets and the agent store,
+# so it must not be group/world-readable.
+RUN mkdir -p /var/lib/power-manage && chmod 700 /var/lib/power-manage
 
 COPY --from=builder /power-manage-agent /usr/local/bin/power-manage-agent
 

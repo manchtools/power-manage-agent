@@ -115,8 +115,9 @@ The install script:
 2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
 3. Removes any leftover `/etc/sudoers.d/power-manage`, `/etc/sudoers.d/power-manage-luks`, or `/etc/doas.d/power-manage.conf` from a previous (pre-root-mode) install
 4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
-5. Installs the desktop URI handler for browser-launched enrollment
-6. Enrolls via the enrollment socket if `--server` and `--token` were provided
+5. Enrolls via the enrollment socket if `--server` and `--token` were provided
+
+The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links (WS7 #4). When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
 
 There is **no LUKS sudoers rule** — `power-manage-agent luks set-passphrase` is an unprivileged client to the root agent's LUKS daemon socket (see [LUKS passphrase daemon](#luks-passphrase-daemon)).
 
@@ -158,6 +159,8 @@ power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_T
 
 The agent supports a `power-manage://` URI scheme for easy enrollment from the web UI.
 When clicked, the desktop handler launches the agent which tries socket enrollment first (no sudo), falling back to direct registration.
+
+> The desktop handler that registers this scheme is **opt-in** (`--enable-uri-handler`, off by default — WS7 #4). The CLI invocation below works regardless; only the clickable browser-link registration requires the handler.
 
 ```bash
 power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
@@ -401,13 +404,15 @@ Download and install standalone application binaries.
 
 | Field | Description |
 |-------|-------------|
-| `url` | Download URL |
-| `checksum_sha256` | Optional SHA256 checksum for verification |
+| `url` | Download URL — **HTTPS only** |
+| `checksum_sha256` | **Mandatory** SHA256 checksum (64 lowercase hex) — the download is rejected without it |
 | `install_path` | Installation path |
 
 **Desired State:**
 - `PRESENT`: Download and install the application
 - `ABSENT`: Remove the installed file
+
+> **Mandatory integrity (WS7):** `url` must be HTTPS and `checksum_sha256` is required for all download-and-install actions (`APP_IMAGE`/`DEB`/`RPM`). Without a checksum the only authenticity would be TLS to a possibly-compromised origin, so the agent fails closed.
 
 ### DEB Package (`DEB`)
 
@@ -415,7 +420,8 @@ Install or remove Debian packages directly from URLs.
 
 | Field | Description |
 |-------|-------------|
-| `url` | Download URL for the .deb file |
+| `url` | Download URL for the .deb file — **HTTPS only** |
+| `checksum_sha256` | **Mandatory** SHA256 checksum (64 lowercase hex) |
 
 **Desired State:**
 - `PRESENT`: Download and install with `dpkg`
@@ -427,7 +433,8 @@ Install or remove RPM packages directly from URLs.
 
 | Field | Description |
 |-------|-------------|
-| `url` | Download URL for the .rpm file |
+| `url` | Download URL for the .rpm file — **HTTPS only** |
+| `checksum_sha256` | **Mandatory** SHA256 checksum (64 lowercase hex) |
 
 **Desired State:**
 - `PRESENT`: Download and install with `rpm`
@@ -683,25 +690,34 @@ journalctl -u power-manage-agent -f
 
 ## Auto-Update
 
-The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload contains architecture-specific binary URLs and SHA256SUMS URLs.
+The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload carries, per architecture, an HTTPS `binary_url` and the **CA-signed `expected_sha256`** of that binary.
+
+### Authenticity: CA-signed hash, not a same-origin checksum (WS7)
+
+The integrity gate is `expected_sha256`, which travels **inside the CA-signed action**. The agent verifies the downloaded binary against that hash — a value bound to the control server's signature — **not** against a checksum file fetched from the binary's own (untrusted) download origin. A compromised mirror or a man-in-the-middle on the download cannot vouch for a tampered binary: it cannot forge the CA signature over `expected_sha256`. `binary_url` must be HTTPS.
+
+> Binary code-signing is a future enhancement; this interim model binds the hash to the existing enrolled-CA trust root. Any future signing key must be operator-pinnable, never a hardcoded project key. Signing of the *release* `SHA256SUMS` (the initial-install integrity, separate from self-update) is tracked separately.
+
+### Anti-rollback
+
+The agent refuses a candidate **older** than the running version (`vYYYY.MM.PP` comparison); an unparseable version fails closed (never treated as newer). A downgrade requires the signed action to set `allow_downgrade` — the bypass is an explicit, authenticated operator decision, also inside the CA-signed payload.
 
 ### Update Process
 
-1. Download SHA256SUMS file, extract checksum for this binary's filename
-2. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp`, verify SHA256
-3. Run `<tmpPath> version` on the staged binary to extract the new version string, compare with running — skip if same
-4. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
+1. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp` and verify its SHA256 against the CA-signed `expected_sha256` (no checksum file is fetched or trusted)
+2. Run `<tmpPath> version`, compare with running — skip if same; refuse a downgrade unless `allow_downgrade`
+3. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
    - Establishes an mTLS connection to the gateway
    - Sends `Hello`, waits for `Welcome` (proves bidirectional stream)
    - Calls `SyncActions` (proves unary RPC works)
    - Exits 0 on success, 1 on any failure
-5. If the self-test exits 0: atomically swap the live binary (`cp → chmod → mv`) and trigger graceful shutdown. Systemd restarts with the new binary.
-6. If the self-test fails: report the action as `EXECUTION_STATUS_FAILED` and leave the live binary untouched.
+4. If the self-test exits 0: swap the live binary via `SafeBackupAndReplace` (O_NOFOLLOW + renameat2; the previous binary is copied to `<BinaryPath>.bak` first) and trigger graceful shutdown. Systemd restarts with the new binary.
+5. If the self-test fails: report the action as `EXECUTION_STATUS_FAILED` and leave the live binary untouched.
 
 ### Validate-before-swap
 
-The old binary is **never replaced** until the new binary proves it can connect, sync, and handle the protocol. There is no backup/rollback mechanism — there's nothing to roll back because the swap only happens after validation.
+The old binary is **never replaced** until the new binary proves it can connect, sync, and handle the protocol. The previous binary is kept at `<BinaryPath>.bak` for manual rollback if the new one fails to start after restart (a case the self-test cannot catch).
 
 ### Retry behavior
 

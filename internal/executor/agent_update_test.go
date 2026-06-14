@@ -55,39 +55,6 @@ func TestGetArchEntry_NilForMissing(t *testing.T) {
 	}
 }
 
-func TestDownloadAndExtractChecksum(t *testing.T) {
-	checksumContent := "abc123def456  some-other-binary\n" +
-		"deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567  power-manage-agent-linux-amd64\n" +
-		"1111111122222222333333334444444455555555666666667777777788888888  power-manage-agent-linux-arm64\n"
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(checksumContent))
-	}))
-	defer srv.Close()
-
-	client := srv.Client()
-
-	checksum, err := downloadAndExtractChecksum(context.Background(), client, srv.URL+"/SHA256SUMS", "power-manage-agent-linux-amd64")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if checksum != "deadbeef0123456789abcdef0123456789abcdef0123456789abcdef01234567" {
-		t.Errorf("unexpected checksum: %s", checksum)
-	}
-}
-
-func TestDownloadAndExtractChecksum_NotFound(t *testing.T) {
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte("abc123  other-binary\n"))
-	}))
-	defer srv.Close()
-
-	_, err := downloadAndExtractChecksum(context.Background(), srv.Client(), srv.URL+"/SHA256SUMS", "nonexistent")
-	if err == nil {
-		t.Error("expected error for missing binary in checksum file")
-	}
-}
-
 func TestDownloadToFile(t *testing.T) {
 	content := []byte("test binary content")
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -227,38 +194,6 @@ func TestCheckStartupUpdateState_NoState(t *testing.T) {
 	}
 }
 
-func TestDownloadAndExtractChecksum_WithPrefixes(t *testing.T) {
-	// Test with "./" and "*" prefixes (common in SHA256SUMS files)
-	checksumContent := fmt.Sprintf(
-		"%s  ./my-binary\n%s  *other-binary\n",
-		"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
-		"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
-	)
-
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write([]byte(checksumContent))
-	}))
-	defer srv.Close()
-
-	// Should find "my-binary" even with "./" prefix
-	checksum, err := downloadAndExtractChecksum(context.Background(), srv.Client(), srv.URL+"/SHA256SUMS", "my-binary")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if checksum != "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa" {
-		t.Errorf("unexpected checksum: %s", checksum)
-	}
-
-	// Should find "other-binary" even with "*" prefix
-	checksum, err = downloadAndExtractChecksum(context.Background(), srv.Client(), srv.URL+"/SHA256SUMS", "other-binary")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if checksum != "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb" {
-		t.Errorf("unexpected checksum: %s", checksum)
-	}
-}
-
 func TestGetBinaryVersion(t *testing.T) {
 	// Create a fake binary that prints a version
 	dir := t.TempDir()
@@ -288,24 +223,6 @@ func TestGetBinaryVersion_Empty(t *testing.T) {
 	_, err = getBinaryVersion(script)
 	if err == nil {
 		t.Error("expected error for empty version output")
-	}
-}
-
-func TestExtractFilename(t *testing.T) {
-	tests := []struct {
-		url  string
-		want string
-	}{
-		{"https://github.com/org/repo/releases/latest/download/agent-linux-amd64", "agent-linux-amd64"},
-		{"https://s3.amazonaws.com/bucket/agent-linux-amd64?X-Amz-Signature=abc&token=xyz", "agent-linux-amd64"},
-		{"https://example.com/path/to/binary?v=2", "binary"},
-		{"https://example.com/binary", "binary"},
-	}
-	for _, tt := range tests {
-		got := extractFilename(tt.url)
-		if got != tt.want {
-			t.Errorf("extractFilename(%q) = %q, want %q", tt.url, got, tt.want)
-		}
 	}
 }
 
@@ -358,4 +275,22 @@ func (l *testLogger) Warn(msg string, args ...any) {
 
 func (l *testLogger) Error(msg string, args ...any) {
 	l.errors = append(l.errors, msg)
+}
+
+// TestNoStaleSwapComment is a self-discovering guard against the WS7 #8
+// stale comment: the agent-update flow no longer does cp → chmod → mv, it
+// uses SafeBackupAndReplace. Pins the source so a future edit can't
+// reintroduce the misleading description.
+func TestNoStaleSwapComment(t *testing.T) {
+	src, err := os.ReadFile("agent_update.go")
+	if err != nil {
+		t.Fatalf("read agent_update.go: %v", err)
+	}
+	s := string(src)
+	if strings.Contains(s, "cp → chmod → mv") {
+		t.Error("agent_update.go still describes the swap as 'cp → chmod → mv'; it uses SafeBackupAndReplace")
+	}
+	if !strings.Contains(s, "SafeBackupAndReplace") {
+		t.Error("agent_update.go should document the swap goes through SafeBackupAndReplace")
+	}
 }
