@@ -14,7 +14,16 @@ import (
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/pkg"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
+
+// rpmImportArgs builds `rpm --import -- <ref>` so a flag-shaped GPG key
+// ref can never be reparsed as an option to `rpm --import`. The ref's
+// grammar is enforced upstream by pkg.ValidateGpgKeyRef in
+// validateRepositoryParams; this is the argv-shape half of that guard.
+func rpmImportArgs(ref string) []string {
+	return sysexec.SeparatePositionals([]string{"--import"}, ref)
+}
 
 // executeRepository configures an external package repository.
 func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -560,7 +569,7 @@ func (e *Executor) executeDnfRepository(ctx context.Context, name string, repo *
 		// Import GPG key if provided.
 		// rpm --import is idempotent - re-importing an existing key is a no-op.
 		if repo.Gpgkey != "" {
-			keyOutput, keyErr := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, keyErr := runSudoCmd(ctx, "rpm", rpmImportArgs(repo.Gpgkey)...)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
 			}
@@ -770,7 +779,7 @@ func (e *Executor) executeZypperRepository(ctx context.Context, name string, rep
 
 		// Import GPG key if provided
 		if repo.Gpgkey != "" {
-			keyOutput, keyErr := runSudoCmd(ctx, "rpm", "--import", repo.Gpgkey)
+			keyOutput, keyErr := runSudoCmd(ctx, "rpm", rpmImportArgs(repo.Gpgkey)...)
 			if keyOutput != nil && keyOutput.Stdout != "" {
 				output.WriteString(keyOutput.Stdout)
 			}

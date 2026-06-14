@@ -18,7 +18,11 @@ var errReadOnlyFS = errors.New("filesystem is read-only")
 // requireWritableFS checks if the filesystem is writable and attempts repair if not.
 // Returns nil, nil if writable. Returns (output, error) if repair failed.
 func (e *Executor) requireWritableFS(ctx context.Context) (*pb.CommandOutput, error) {
-	if e.repairFilesystem(ctx) {
+	repair := e.repairFilesystem
+	if e.repairFS != nil {
+		repair = e.repairFS
+	}
+	if repair(ctx) {
 		return nil, nil
 	}
 	return &pb.CommandOutput{

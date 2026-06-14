@@ -499,6 +499,8 @@ Manage package manager repositories.
 
 Only one repository type should be set per action. The matching type is determined by the detected package manager.
 
+**Argument hardening:** `dnf.baseurl` / `zypper.url` / `pacman.server` must be **HTTPS** (these fetch root-installed packages, so the transport is the trust boundary); `apt.url` is exempt because apt's security is the gpg-signed Release file. `dnf`/`zypper` `gpgkey` refs are restricted to an https URL, a `file:///abs` path, or an absolute path (never a flag, `http://`, or rpm `ext::` transport) and are imported via `rpm --import -- <ref>`. `gpgcheck` is an **operator choice** — an https mirror with `gpgcheck=false` is permitted (the transport is still verified; package-signature verification is the operator's call, mirroring the auto-update `checksum_url` posture). See ADR 0012.
+
 **Desired State:**
 - `PRESENT`: Add or update the repository configuration
 - `ABSENT`: Remove the repository configuration and GPG keys
@@ -628,6 +630,25 @@ under that surface's disjoint domain. **Raw SQL is permitted only when signed**
 at the boundary first. A missing verifier fails closed (production always has
 one — the CA cert is required at startup). Agent-initiated periodic inventory
 collection is the agent's own decision and needs no signature.
+
+### Package / Repository Argument Hardening (WS8)
+
+Every value that reaches a package-manager `argv` is validated against its
+intent before the command runs, and positionals are passed after an explicit
+`--` end-of-options separator (via the SDK's `exec.SeparatePositionals`) so a
+flag-shaped value can never be reparsed as an option:
+
+| Surface | Validation | Argv |
+|---------|-----------|------|
+| `RPM` `%{NAME}` (read off the downloaded `.rpm`) | `pkg.ValidateRpmPackageName` — a crafted `.rpm` cannot name itself `--eval=%{lua:…}` | `rpm -q -- <name>`, `rpm -e -- <name>` |
+| `RPM`/`DEB`/`APP_IMAGE` artifact | https + non-empty checksum, fail-closed **before** any privileged remount or download | — |
+| dnf/zypper/pacman base URL | `pkg.ValidateRepoBaseURL` (https + host) | written to the repo config |
+| dnf/zypper GPG key ref | `pkg.ValidateGpgKeyRef` (https / `file://` abs / abs path) | `rpm --import -- <ref>` |
+| `FLATPAK` app-id / remote | `pkg.ValidatePackageName` / `pkg.ValidateRemoteName`, **before** dispatch | `flatpak install … -- <remote> <appId>` |
+
+A self-discovering test walks every string field of each repository proto and
+fails closed if a newly-added field forgets its config-injection guard. See
+ADR 0012.
 
 ### Enrollment Rate Limiting
 
