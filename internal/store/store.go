@@ -643,7 +643,11 @@ func (s *Store) CleanupOldResults(retention time.Duration) (unsyncedEvicted int,
 	//    losses too. SQLite "LIMIT -1 OFFSET n" = "all rows after the newest n".
 	const overflow = `id IN (SELECT id FROM results ORDER BY executed_at DESC LIMIT -1 OFFSET ?)`
 	var capUnsynced int
-	if cerr := s.db.QueryRow("SELECT COUNT(*) FROM results WHERE synced = 0 AND "+overflow, maxResultRows).Scan(&capUnsynced); cerr == nil {
+	if cerr := s.db.QueryRow("SELECT COUNT(*) FROM results WHERE synced = 0 AND "+overflow, maxResultRows).Scan(&capUnsynced); cerr != nil {
+		// Don't swallow it: a failed count means the warning would under-report
+		// dropped-before-delivery results. The cap DELETE below still runs.
+		slog.Warn("failed to count unsynced rows in the results overflow set; eviction warning may underreport losses", "error", cerr)
+	} else {
 		unsyncedEvicted += capUnsynced
 	}
 	if _, err := s.db.Exec("DELETE FROM results WHERE "+overflow, maxResultRows); err != nil {
