@@ -194,3 +194,55 @@ func TestOnAction_NoVerifierIsFailClosed(t *testing.T) {
 		"a handler with no verifier must fail closed")
 	assert.Len(t, syncTrigger, 0, "no verifier means no SYNC may fire")
 }
+
+// TestOnActionWithStreaming_MalformedEnvelopeNoPanic pins the WS15 #2 intent on
+// the agent's real streaming dispatch surface (the method the SDK Client calls):
+// a malformed "Action" on the wire — garbage envelope bytes that fail signature
+// verification / proto-unmarshal, an absent envelope, or a nil signature — must
+// be REFUSED with a FAILED ActionResult and never crash the handler. Intent: an
+// Action on the wire carries a signed envelope; one that doesn't is malformed
+// and is fail-closed, not dereferenced. (The action-signing-envelope refactor
+// closed the original nil-Id deref; this is the regression guard.)
+func TestOnActionWithStreaming_MalformedEnvelopeNoPanic(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+
+	// A real, validly signed envelope for the "correct" leg.
+	good := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSTREAMGOODACTION00000A"},
+		ActionType: pb.ActionType_ACTION_TYPE_SYNC,
+	}
+	goodBytes, goodSig := signEnvelope(t, signer, good)
+
+	cases := []struct {
+		name     string
+		envelope []byte
+		sig      []byte
+		wantFail bool
+	}{
+		{"correct: signed SYNC envelope", goodBytes, goodSig, false},
+		{"absent: nil envelope + nil signature", nil, nil, true},
+		{"absent: empty envelope bytes", []byte{}, []byte("sig"), true},
+		{"present-but-wrong: garbage bytes that are not a valid envelope", []byte{0xff, 0x00, 0x13, 0x37, 0xde, 0xad}, []byte("sig"), true},
+		{"present-but-wrong: real bytes, no signature", goodBytes, nil, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h, _ := newVerifierHandler(t, caPEM)
+			var res *pb.ActionResult
+			var err error
+			// Must not panic on any malformed input.
+			require.NotPanics(t, func() {
+				res, err = h.OnActionWithStreaming(context.Background(), tc.envelope, tc.sig, nil)
+			})
+			require.NoError(t, err, "dispatch must be non-fatal (no returned error)")
+			require.NotNil(t, res, "a result must always be returned")
+			if tc.wantFail {
+				assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+					"a malformed/unsigned Action must be refused, not executed")
+			} else {
+				assert.NotEqual(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+					"a validly signed envelope must not be rejected as malformed")
+			}
+		})
+	}
+}

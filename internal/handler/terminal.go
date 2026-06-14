@@ -35,7 +35,28 @@ const (
 	// hard-coded so it cannot be overridden from the gateway side.
 	terminalActivatedShell   = "/bin/bash"
 	terminalDeactivatedShell = "/usr/sbin/nologin"
+
+	// maxTerminalDimension is the inclusive upper bound for a PTY column /
+	// row count. It is the largest value representable in the uint16 the
+	// kernel winsize ABI uses; anything above it would wrap when narrowed
+	// (65536 -> 0, 65537 -> 1) and produce a degenerate PTY.
+	maxTerminalDimension = 65535
 )
+
+// validateDims enforces the PTY dimension contract — 0 < dim <= 65535 —
+// BEFORE the uint16 narrowing in OnTerminalStart / OnTerminalResize. A zero
+// dimension is absent; a value above 65535 wraps under uint16. Sourced from
+// the wire intent (proto's gt=0,lte=65535), not from any artifact, because
+// the agent's Receive path runs no protovalidate.
+func validateDims(cols, rows uint32) error {
+	if cols == 0 || cols > maxTerminalDimension {
+		return fmt.Errorf("invalid terminal dimensions: cols=%d (must be 1..%d)", cols, maxTerminalDimension)
+	}
+	if rows == 0 || rows > maxTerminalDimension {
+		return fmt.Errorf("invalid terminal dimensions: rows=%d (must be 1..%d)", rows, maxTerminalDimension)
+	}
+	return nil
+}
 
 // TerminalSender is the subset of the SDK Client that the terminal
 // handler needs to push messages back to the gateway. The agent's
@@ -241,6 +262,16 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	if !enabled {
 		logger.Info("terminal start rejected: tty disabled on device")
 		h.failTerminalStart(ctx, sender, req.SessionId, "terminal sessions are disabled on this device")
+		return nil
+	}
+
+	// Validate the PTY dimensions BEFORE any narrowing to uint16. A value of
+	// 0 or > 65535 would otherwise wrap (65536 -> 0, 65537 -> 1) into a
+	// degenerate PTY. Reject with a clear reason rather than silently
+	// allocating a 0xN / 1xN terminal.
+	if err := validateDims(req.Cols, req.Rows); err != nil {
+		logger.Warn("terminal start rejected: bad dimensions", "cols", req.Cols, "rows", req.Rows)
+		h.failTerminalStart(ctx, sender, req.SessionId, err.Error())
 		return nil
 	}
 
@@ -473,6 +504,14 @@ func (h *Handler) OnTerminalInput(ctx context.Context, req *pb.TerminalInput) er
 
 // OnTerminalResize forwards a TIOCSWINSZ to the session's PTY.
 func (h *Handler) OnTerminalResize(ctx context.Context, req *pb.TerminalResize) error {
+	// Reject out-of-range dimensions before the uint16 narrowing below, so a
+	// Cols/Rows >= 65536 can never reach sess.Resize as a truncated value
+	// (65536 -> 0). Non-fatal: log and no-op, like an unknown session.
+	if err := validateDims(req.Cols, req.Rows); err != nil {
+		h.logger.Warn("ignoring terminal resize with bad dimensions",
+			"session_id", req.SessionId, "cols", req.Cols, "rows", req.Rows)
+		return nil
+	}
 	ts := h.lookupTerminal(req.SessionId)
 	if ts == nil {
 		h.logger.Debug("terminal resize for unknown session", "session_id", req.SessionId)

@@ -225,6 +225,45 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	return err
 }
 
+// MarkActionStarted advances an action's next_execute_at by one interval
+// BEFORE the executor runs, so a crash between executor.Execute and
+// RecordExecution does not leave the action due and re-dispatch it on the next
+// boot (a second apply of a non-idempotent action). RecordExecution later
+// writes the authoritative cursor (computed from the same schedule), so the
+// marker is a best-effort in-flight guard, not the source of truth. It does
+// NOT touch last_executed_at — only the due cursor — so change-detection and
+// result recording are unaffected. A missing action is a no-op (it may have
+// been removed by a concurrent sync).
+func (s *Store) MarkActionStarted(actionID string) error {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var actionJSON string
+	err := s.db.QueryRow("SELECT action_json FROM actions WHERE id = ?", actionID).Scan(&actionJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get action: %w", err)
+	}
+
+	action := &pb.Action{}
+	if err := protojson.Unmarshal([]byte(actionJSON), action); err != nil {
+		return fmt.Errorf("unmarshal action: %w", err)
+	}
+
+	// Compute the cursor as if the action just executed now — one interval
+	// ahead, clamped — so a crash mid-execute does not re-run it this interval.
+	now := s.now().UTC()
+	nextExecute := s.calculateNextExecute(action, &now, false)
+
+	_, err = s.db.Exec(
+		"UPDATE actions SET next_execute_at = ? WHERE id = ?",
+		nextExecute, actionID,
+	)
+	return err
+}
+
 // RemoveAction removes an action from the store.
 func (s *Store) RemoveAction(actionID string) error {
 	s.mu.Lock()
@@ -1123,7 +1162,7 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.UTC().Add(8 * time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
 	}
 	if schedule.RunOnAssign && lastExecuted == nil {
 		return now
@@ -1142,7 +1181,22 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
+	d := time.Duration(interval) * time.Hour
+	return clampInterval(lastExecuted.UTC().Add(d), now, d)
+}
+
+// clampInterval bounds an interval-derived next-execute cursor to at most
+// now+interval. A future-dated lastExecuted (from a transient forward clock
+// excursion that was later corrected back) would otherwise push the cursor
+// arbitrarily far ahead and silently suppress drift-prevention indefinitely.
+// Clamping caps the suppression at one interval. Cron cursors are derived from
+// now and so are already bounded; only the interval path needs the clamp.
+func clampInterval(computed, now time.Time, interval time.Duration) time.Time {
+	ceiling := now.UTC().Add(interval)
+	if computed.After(ceiling) {
+		return ceiling
+	}
+	return computed
 }
 
 // GetAllActionIDs returns the IDs of all stored actions.
@@ -1185,7 +1239,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.UTC().Add(8 * time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
 	}
 
 	// Check for run_on_assign
@@ -1213,7 +1267,8 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
+	d := time.Duration(interval) * time.Hour
+	return clampInterval(lastExecuted.UTC().Add(d), now, d)
 }
 
 // =============================================================================
