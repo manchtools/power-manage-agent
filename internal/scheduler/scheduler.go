@@ -391,9 +391,14 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 		s.executeGroup(ctx, g)
 	}
 
-	// Cleanup old results periodically.
-	if err := s.store.CleanupOldResults(ResultRetention); err != nil {
+	// Cleanup old results periodically. Bounds the table independently of sync
+	// state (WS13 #6): unsynced eviction means undelivered results were dropped
+	// to protect local disk — surface it loudly.
+	if unsyncedEvicted, err := s.store.CleanupOldResults(ResultRetention); err != nil {
 		s.logger.Warn("failed to cleanup old results", "error", err)
+	} else if unsyncedEvicted > 0 {
+		s.logger.Warn("evicted UNSYNCED results to bound the offline store; undelivered results were dropped",
+			"count", unsyncedEvicted)
 	}
 }
 
