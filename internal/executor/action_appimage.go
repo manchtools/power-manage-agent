@@ -50,15 +50,16 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	// directly, so a URL like "https://evil.example/../../etc/" or
 	// a malformed input could produce a path-meaningful filename
 	// and either escape installPath or land on an unexpected name.
-	// Require a parseable https/http URL with a non-empty host;
-	// derive the filename from a path segment that has no slashes
-	// or other directory components.
+	// Require a parseable HTTPS URL with a non-empty host (WS7 #2:
+	// https-only — the previous code also allowed http://); derive the
+	// filename from a path segment that has no slashes or other directory
+	// components.
 	parsedURL, err := url.Parse(strings.TrimSpace(params.Url))
 	if err != nil ||
-		(parsedURL.Scheme != "https" && parsedURL.Scheme != "http") ||
+		parsedURL.Scheme != "https" ||
 		parsedURL.Opaque != "" ||
 		parsedURL.Host == "" {
-		return nil, false, fmt.Errorf("invalid appimage URL: %q", params.Url)
+		return nil, false, fmt.Errorf("invalid appimage URL (must be https): %q", params.Url)
 	}
 	filename := filepath.Base(parsedURL.Path)
 	// Reject ".." too — filepath.Base of e.g. https://x.example/.. returns

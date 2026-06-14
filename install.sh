@@ -39,6 +39,11 @@ SERVER_URL=""
 SKIP_DOWNLOAD=""
 PRE_RELEASE=""
 VERSION="latest"
+# WS7 #4: the power-manage:// desktop URI handler is OPT-IN and OFF by
+# default — an unconditional handler exposes the root-capable binary to
+# drive-by browser links. Enable with --enable-uri-handler or
+# POWER_MANAGE_ENABLE_URI_HANDLER=true.
+ENABLE_URI_HANDLER="${POWER_MANAGE_ENABLE_URI_HANDLER:-false}"
 
 # Colors for output
 RED='\033[0;31m'
@@ -126,6 +131,10 @@ parse_args() {
                 ;;
             --skip-download)
                 SKIP_DOWNLOAD="true"
+                shift
+                ;;
+            --enable-uri-handler)
+                ENABLE_URI_HANDLER="true"
                 shift
                 ;;
             --uninstall)
@@ -562,17 +571,24 @@ uninstall() {
     log_info "Uninstall complete"
 }
 
+# install_desktop_handler registers the power-manage:// URI scheme so a
+# browser link can launch `power-manage-agent luks set-passphrase`. It is
+# OPT-IN (--enable-uri-handler / POWER_MANAGE_ENABLE_URI_HANDLER=true) and
+# OFF by default: an unconditional handler exposes the root-capable binary
+# to drive-by links (WS7 #4). The entry sets Terminal=false so a malicious
+# link cannot silently auto-spawn a terminal; operators who enable the
+# handler get a non-auto-launching entry.
 install_desktop_handler() {
     local desktop_file="/usr/share/applications/power-manage-agent.desktop"
 
-    log_info "Installing desktop URI handler..."
+    log_info "Installing desktop URI handler (opt-in)..."
 
     cat > "$desktop_file" << EOF
 [Desktop Entry]
 Name=Power Manage Agent
 Comment=Power Manage device agent
 Exec=$BINARY_PATH %u
-Terminal=true
+Terminal=false
 Type=Application
 MimeType=x-scheme-handler/power-manage;
 NoDisplay=true
@@ -657,7 +673,13 @@ main() {
 
     create_directories
     install_systemd_service
-    install_desktop_handler
+    # WS7 #4: opt-in only — the URI handler exposes the root-capable binary
+    # to drive-by power-manage:// links, so it is not installed by default.
+    if [[ "$ENABLE_URI_HANDLER" == "true" ]]; then
+        install_desktop_handler
+    else
+        log_info "Skipping power-manage:// URI handler (enable with --enable-uri-handler)"
+    fi
 
     enable_and_start_service
 

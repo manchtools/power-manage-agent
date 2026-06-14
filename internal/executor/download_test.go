@@ -21,7 +21,8 @@ func TestDownloadFile(t *testing.T) {
 	sum := sha256.Sum256(content)
 	hexSum := hex.EncodeToString(sum[:])
 
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// downloadFile is https-only (WS7 #2), so the test server must be TLS.
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path == "/404" {
 			w.WriteHeader(http.StatusNotFound)
 			return
@@ -42,11 +43,13 @@ func TestDownloadFile(t *testing.T) {
 	})
 
 	// A failed download must not destroy an existing file at dest — the
-	// previous os.Create truncated it in place before downloading.
+	// previous os.Create truncated it in place before downloading. A
+	// valid-format checksum is passed so the 404 (not the mandatory-
+	// checksum guard) is what fails the download.
 	t.Run("failed download leaves the existing file intact", func(t *testing.T) {
 		dest := filepath.Join(t.TempDir(), "app")
 		require.NoError(t, os.WriteFile(dest, []byte("WORKING"), 0o755))
-		require.Error(t, e.downloadFile(ctx, srv.URL+"/404", dest, ""))
+		require.Error(t, e.downloadFile(ctx, srv.URL+"/404", dest, hexSum))
 		got, _ := os.ReadFile(dest)
 		assert.Equal(t, []byte("WORKING"), got, "existing file must survive a failed re-download")
 	})
@@ -74,7 +77,7 @@ func TestDownloadFile(t *testing.T) {
 // test seam so the branch is reachable without streaming 2 GiB.
 func TestDownloadFile_OversizeRejectedAndLeavesDestIntact(t *testing.T) {
 	oversize := make([]byte, 200)
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		// Flush after the first write so the response goes out chunked
 		// with NO Content-Length — this bypasses the early ContentLength
 		// check and forces the rewritten streamed-size guard (written >
@@ -95,7 +98,11 @@ func TestDownloadFile_OversizeRejectedAndLeavesDestIntact(t *testing.T) {
 	dest := filepath.Join(t.TempDir(), "app")
 	require.NoError(t, os.WriteFile(dest, []byte("WORKING"), 0o755))
 
-	err := e.downloadFile(context.Background(), srv.URL+"/ok", dest, "")
+	// A valid-format checksum is supplied so the size guard (not the
+	// mandatory-checksum guard) is what rejects the oversize body; the
+	// streamed-size check fires during io.Copy, before checksum compare.
+	dummyChecksum := strings.Repeat("a", 64)
+	err := e.downloadFile(context.Background(), srv.URL+"/ok", dest, dummyChecksum)
 	require.Error(t, err, "a body over the cap must be rejected")
 	assert.Contains(t, err.Error(), "maximum size")
 	got, _ := os.ReadFile(dest)

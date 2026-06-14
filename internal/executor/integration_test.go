@@ -6,6 +6,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/sha256"
+	"crypto/tls"
 	"encoding/hex"
 	"fmt"
 	"io"
@@ -45,6 +46,12 @@ func init() {
 
 func newTestExecutor() *Executor {
 	e := NewExecutor(nil)
+	// Downloads are https-only (WS7 #2). The test file servers
+	// (startFileServer) are TLS with self-signed certs, so trust any cert
+	// here — this is integration-test-only code.
+	e.httpClient = &http.Client{
+		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
+	}
 	tmpDir, err := os.MkdirTemp("", "pm-executor-test-*")
 	if err != nil {
 		panic("failed to create temp dir: " + err.Error())
@@ -257,6 +264,9 @@ echo "test" > %{buildroot}/usr/share/pmtestrpm/marker
 	return data
 }
 
+// startFileServer serves the given files over HTTPS. Downloads are
+// https-only (WS7 #2), so this is a TLS server; the test executor's
+// httpClient (newTestExecutor) skips cert verification to trust it.
 func startFileServer(t *testing.T, files map[string][]byte) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -266,7 +276,7 @@ func startFileServer(t *testing.T, files map[string][]byte) *httptest.Server {
 			w.Write(body)
 		})
 	}
-	ts := httptest.NewServer(mux)
+	ts := httptest.NewTLSServer(mux)
 	t.Cleanup(ts.Close)
 	return ts
 }
@@ -1463,7 +1473,8 @@ func TestIntegration_Deb(t *testing.T) {
 
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DEB, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: ts.URL + "/pm-testpkg_1.0.0_all.deb",
+			Url:            ts.URL + "/pm-testpkg_1.0.0_all.deb",
+			ChecksumSha256: sha256hex(debData),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -1772,7 +1783,8 @@ func TestIntegration_Rpm(t *testing.T) {
 
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url:            ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			ChecksumSha256: sha256hex(rpmData),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -1790,7 +1802,8 @@ func TestIntegration_Rpm(t *testing.T) {
 
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url:            ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			ChecksumSha256: sha256hex(rpmData),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -1810,7 +1823,8 @@ func TestIntegration_Rpm(t *testing.T) {
 
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url:            ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			ChecksumSha256: sha256hex(rpmData),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -1830,7 +1844,8 @@ func TestIntegration_Rpm(t *testing.T) {
 
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_ABSENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			Url:            ts.URL + "/pmtestrpm-1.0.0-1.noarch.rpm",
+			ChecksumSha256: sha256hex(rpmData),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -2143,7 +2158,9 @@ func skipIfNotPrivileged(t *testing.T) {
 // startFailingServer returns an httptest server that returns the given status code.
 func startFailingServer(t *testing.T, statusCode int) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	// TLS: downloads are https-only (WS7 #2); the test executor trusts the
+	// self-signed cert (newTestExecutor).
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(statusCode)
 		w.Write([]byte(http.StatusText(statusCode)))
 	}))
@@ -2151,10 +2168,10 @@ func startFailingServer(t *testing.T, statusCode int) *httptest.Server {
 	return ts
 }
 
-// startSlowServer returns an httptest server that delays before responding.
+// startSlowServer returns an httptest TLS server that delays before responding.
 func startSlowServer(t *testing.T, delay time.Duration) *httptest.Server {
 	t.Helper()
-	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		time.Sleep(delay)
 		w.Write([]byte("slow response"))
 	}))
@@ -2987,7 +3004,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 	t.Run("AppImage", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_APP_IMAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url:         "http://this-domain-does-not-exist-xyzzy.invalid/app.AppImage",
+			Url:         "https://this-domain-does-not-exist-xyzzy.invalid/app.AppImage",
 			InstallPath: "/tmp/pm-edge-dns",
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
@@ -2998,7 +3015,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 		skipIfNoApt(t)
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DEB, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: "http://this-domain-does-not-exist-xyzzy.invalid/pkg.deb",
+			Url: "https://this-domain-does-not-exist-xyzzy.invalid/pkg.deb",
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -3010,7 +3027,7 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 		}
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url: "http://this-domain-does-not-exist-xyzzy.invalid/pkg.rpm",
+			Url: "https://this-domain-does-not-exist-xyzzy.invalid/pkg.rpm",
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -3022,6 +3039,12 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 func TestIntegration_EdgeCase_HTTPSCertError(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
+
+	// Override newTestExecutor's trust-all test client with a normal
+	// verifying client: this test specifically asserts that an untrusted
+	// (self-signed) cert is REJECTED, which the shared insecure test
+	// client would otherwise accept.
+	e.httpClient = &http.Client{}
 
 	// Create an HTTPS server with a self-signed cert (httptest.NewTLSServer)
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
