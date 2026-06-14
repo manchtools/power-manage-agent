@@ -225,6 +225,14 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	return err
 }
 
+// MarkActionStarted advances an action's next_execute_at by one interval
+// BEFORE the executor runs, so a crash between execute and RecordExecution
+// does not leave the action due and re-dispatch it on the next boot. RecordExecution
+// later writes the authoritative cursor. RED-PHASE STUB (no-op).
+func (s *Store) MarkActionStarted(actionID string) error {
+	return nil
+}
+
 // RemoveAction removes an action from the store.
 func (s *Store) RemoveAction(actionID string) error {
 	s.mu.Lock()
@@ -1123,7 +1131,7 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.UTC().Add(8 * time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
 	}
 	if schedule.RunOnAssign && lastExecuted == nil {
 		return now
@@ -1142,7 +1150,22 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
+	d := time.Duration(interval) * time.Hour
+	return clampInterval(lastExecuted.UTC().Add(d), now, d)
+}
+
+// clampInterval bounds an interval-derived next-execute cursor to at most
+// now+interval. A future-dated lastExecuted (from a transient forward clock
+// excursion that was later corrected back) would otherwise push the cursor
+// arbitrarily far ahead and silently suppress drift-prevention indefinitely.
+// Clamping caps the suppression at one interval. Cron cursors are derived from
+// now and so are already bounded; only the interval path needs the clamp.
+func clampInterval(computed, now time.Time, interval time.Duration) time.Time {
+	ceiling := now.UTC().Add(interval)
+	if computed.After(ceiling) {
+		return ceiling
+	}
+	return computed
 }
 
 // GetAllActionIDs returns the IDs of all stored actions.
@@ -1185,7 +1208,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if lastExecuted == nil {
 			return now
 		}
-		return lastExecuted.UTC().Add(8 * time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
 	}
 
 	// Check for run_on_assign
@@ -1213,7 +1236,8 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 	if lastExecuted == nil {
 		return now
 	}
-	return lastExecuted.UTC().Add(time.Duration(interval) * time.Hour)
+	d := time.Duration(interval) * time.Hour
+	return clampInterval(lastExecuted.UTC().Add(d), now, d)
 }
 
 // =============================================================================
