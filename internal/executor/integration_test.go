@@ -3040,6 +3040,12 @@ func TestIntegration_EdgeCase_HTTPSCertError(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
 
+	// Override newTestExecutor's trust-all test client with a normal
+	// verifying client: this test specifically asserts that an untrusted
+	// (self-signed) cert is REJECTED, which the shared insecure test
+	// client would otherwise accept.
+	e.httpClient = &http.Client{}
+
 	// Create an HTTPS server with a self-signed cert (httptest.NewTLSServer)
 	ts := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Write([]byte("fake appimage content"))
