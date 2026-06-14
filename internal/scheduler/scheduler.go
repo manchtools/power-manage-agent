@@ -77,11 +77,17 @@ type Scheduler struct {
 	// is safe to read/write without the lock from any goroutine.
 	resultsCh chan *ExecutionResult
 
-	// windowMu guards window. Separate from mu so a long Sync that
-	// also holds mu cannot block runDueActions' window check on a
-	// scheduler that's already started.
+	// windowMu guards window and windowDecodeFailed. Separate from mu so a
+	// long Sync that also holds mu cannot block runDueActions' window check
+	// on a scheduler that's already started.
 	windowMu sync.RWMutex
 	window   *pb.MaintenanceWindow
+	// windowDecodeFailed is the fail-CLOSED sentinel: set when a PERSISTED
+	// maintenance window existed at boot but could not be proto-decoded
+	// (tampered/corrupt). While set, dispatchAllowed denies every moment —
+	// deny-until-next-sync — so a corrupt persisted gate can never silently
+	// unconstrain the agent. Cleared by the next SetMaintenanceWindow.
+	windowDecodeFailed bool
 }
 
 // ExecutionResult contains the result of a scheduled execution.
@@ -111,8 +117,14 @@ func New(store *store.Store, executor ActionExecutor, logger *slog.Logger) *Sche
 		resultsCh: make(chan *ExecutionResult, 100),
 	}
 	if w, err := loadMaintenanceWindow(store); err != nil {
-		logger.Warn("failed to load persisted maintenance window; defaulting to no constraint",
+		// FAIL CLOSED. A persisted window existed but could not be decoded
+		// (corrupt/tampered settings row). Leaving s.window nil would make
+		// IsAllowed(nil, t) == true and UNCONSTRAIN dispatch — the opposite
+		// of what an unreadable freeze should do. Set the deny-until-sync
+		// sentinel instead; the next SetMaintenanceWindow clears it.
+		logger.Error("persisted maintenance window could not be decoded; failing CLOSED (denying dispatch until next sync)",
 			"error", err)
+		s.windowDecodeFailed = true
 	} else {
 		s.window = w
 	}
@@ -132,6 +144,10 @@ func (s *Scheduler) SetMaintenanceWindow(w *pb.MaintenanceWindow) {
 	}
 	s.windowMu.Lock()
 	s.window = normalized
+	// A successful sync replaces whatever was on disk, so the corrupt-window
+	// deny sentinel (if any) no longer applies — clear it. This is what makes
+	// the fail-closed posture "until next sync" rather than a permanent brick.
+	s.windowDecodeFailed = false
 	s.windowMu.Unlock()
 	if err := storeMaintenanceWindow(s.store, normalized); err != nil {
 		s.logger.Warn("failed to persist maintenance window; in-memory only", "error", err)
@@ -144,6 +160,22 @@ func (s *Scheduler) activeWindow() *pb.MaintenanceWindow {
 	s.windowMu.RLock()
 	defer s.windowMu.RUnlock()
 	return s.window
+}
+
+// dispatchAllowed reports whether scheduled dispatch may run at t. It is the
+// single gate consulted by runDueActions and the fail-closed sentinel point: a
+// corrupt persisted window denies here until the next sync. The flag and the
+// window are read under one lock so the deny sentinel and the window snapshot
+// cannot race apart.
+func (s *Scheduler) dispatchAllowed(t time.Time) bool {
+	s.windowMu.RLock()
+	failed := s.windowDecodeFailed
+	window := s.window
+	s.windowMu.RUnlock()
+	if failed {
+		return false
+	}
+	return maintenance.IsAllowed(window, t)
 }
 
 // loadMaintenanceWindow restores the persisted window from settings.
@@ -325,8 +357,7 @@ func (s *Scheduler) runDueActions(ctx context.Context) {
 	// the gateway and bypass this scheduler entirely. That matches
 	// the spec — admins hitting "reboot now" expect immediate
 	// execution.
-	window := s.activeWindow()
-	if !maintenance.IsAllowed(window, s.now().Local()) {
+	if !s.dispatchAllowed(s.now().Local()) {
 		s.logger.Info("maintenance window closed; deferring due dispatches",
 			"standalone", len(actions),
 			"groups", len(groups),
