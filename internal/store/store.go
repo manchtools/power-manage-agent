@@ -226,11 +226,42 @@ func (s *Store) SaveAction(action *pb.Action) error {
 }
 
 // MarkActionStarted advances an action's next_execute_at by one interval
-// BEFORE the executor runs, so a crash between execute and RecordExecution
-// does not leave the action due and re-dispatch it on the next boot. RecordExecution
-// later writes the authoritative cursor. RED-PHASE STUB (no-op).
+// BEFORE the executor runs, so a crash between executor.Execute and
+// RecordExecution does not leave the action due and re-dispatch it on the next
+// boot (a second apply of a non-idempotent action). RecordExecution later
+// writes the authoritative cursor (computed from the same schedule), so the
+// marker is a best-effort in-flight guard, not the source of truth. It does
+// NOT touch last_executed_at — only the due cursor — so change-detection and
+// result recording are unaffected. A missing action is a no-op (it may have
+// been removed by a concurrent sync).
 func (s *Store) MarkActionStarted(actionID string) error {
-	return nil
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	var actionJSON string
+	err := s.db.QueryRow("SELECT action_json FROM actions WHERE id = ?", actionID).Scan(&actionJSON)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("get action: %w", err)
+	}
+
+	action := &pb.Action{}
+	if err := protojson.Unmarshal([]byte(actionJSON), action); err != nil {
+		return fmt.Errorf("unmarshal action: %w", err)
+	}
+
+	// Compute the cursor as if the action just executed now — one interval
+	// ahead, clamped — so a crash mid-execute does not re-run it this interval.
+	now := s.now().UTC()
+	nextExecute := s.calculateNextExecute(action, &now, false)
+
+	_, err = s.db.Exec(
+		"UPDATE actions SET next_execute_at = ? WHERE id = ?",
+		nextExecute, actionID,
+	)
+	return err
 }
 
 // RemoveAction removes an action from the store.

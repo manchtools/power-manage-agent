@@ -478,6 +478,15 @@ func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredActio
 		"type", action.Type.String(),
 	)
 
+	// Advance the due cursor BEFORE executing. If the agent crashes between
+	// here and RecordExecution, the action is no longer due on the next boot,
+	// so a non-idempotent action is not silently applied twice. RecordExecution
+	// writes the authoritative cursor on success; this is the in-flight guard.
+	if err := s.store.MarkActionStarted(action.Id.Value); err != nil {
+		s.logger.Warn("failed to mark action started; proceeding without crash-replay guard",
+			"action_id", action.Id.Value, "error", err)
+	}
+
 	// Verify the stored signed envelope and execute THOSE bytes.
 	result := s.verifyAndExecute(ctx, action)
 
