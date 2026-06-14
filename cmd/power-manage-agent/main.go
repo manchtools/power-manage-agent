@@ -295,7 +295,7 @@ func main() {
 
 	// Start certificate rotation goroutine
 	if creds.ControlAddr != "" {
-		go startCertRotation(ctx, credStore, hostname, logger)
+		go startCertRotation(ctx, credStore, hostname, logger, time.Now)
 	}
 
 	// Run the agent

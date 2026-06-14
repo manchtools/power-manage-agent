@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
@@ -56,6 +57,12 @@ type EnrollHandler struct {
 	statusCached   bool
 
 	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
+
+	// registerOpts are extra ClientOptions passed to sdk.RegisterAgent.
+	// nil in production (RegisterAgent then uses its bounded default
+	// client). Tests set this to point RegisterAgent at an httptest TLS
+	// control server it can trust.
+	registerOpts []sdk.ClientOption
 }
 
 // NewEnrollHandler creates a handler for enrollment RPCs.
@@ -69,6 +76,15 @@ func NewEnrollHandler(hostname, version string, credStore *credentials.Store, lo
 		onEnrolled: onEnrolled,
 		now:        time.Now,
 	}
+}
+
+// normalizePin canonicalizes an operator-supplied CA fingerprint pin for
+// comparison: it strips surrounding whitespace and colons (openssl prints
+// the fingerprint uppercase and colon-separated). Case is handled by
+// EqualFold at the comparison site, so a pin pasted in any common form
+// matches the lowercase-hex value derived from the server CA.
+func normalizePin(pin string) string {
+	return strings.ReplaceAll(strings.TrimSpace(pin), ":", "")
 }
 
 // Enroll registers the agent with the PM server using the provided token.
@@ -111,6 +127,17 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
+	// https-only gate (WS9 #2/#16): refuse a cleartext or malformed
+	// control-plane URL BEFORE any CSR generation or network call. The
+	// agent has no trust anchor yet, so a non-TLS endpoint would let a
+	// MITM substitute the gateway URL and a malicious CA.
+	if err := sdk.ValidateHTTPSURL(req.Msg.ServerUrl); err != nil {
+		return connect.NewResponse(&pm.EnrollResponse{
+			Success: false,
+			Error:   fmt.Sprintf("server_url must be an https URL: %v", err),
+		}), nil
+	}
+
 	// (The SkipVerify rejection check that lived here was removed
 	// once the SDK dropped the proto field — see SDK PR. The wire
 	// format now has no path to request a TLS bypass; outdated
@@ -141,7 +168,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 	}
 
 	// Register via control server RPC.
-	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM)
+	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM, h.registerOpts...)
 	if err != nil {
 		h.logger.Error("registration failed", "error", err)
 		return connect.NewResponse(&pm.EnrollResponse{
@@ -156,6 +183,31 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 			Success: false,
 			Error:   "server did not provide mTLS certificates",
 		}), nil
+	}
+
+	// Optional out-of-band CA-pin verification (WS9 #5): if the operator
+	// supplied a fingerprint pin, the CA returned by registration MUST
+	// match it before we adopt it as the trust anchor. Fail closed on a
+	// mismatch — no Save, no callback, no status-cache prime — so a
+	// first-enrollment trust-anchor swap is refused. The pin is
+	// normalized (colons stripped) and compared case-insensitively, since
+	// operators paste it from tools like openssl (uppercase, colon-sep).
+	if pin := normalizePin(req.Msg.CaFingerprintPin); pin != "" {
+		got, fpErr := pmcrypto.CAFingerprintFromPEM(result.CACert)
+		if fpErr != nil {
+			return connect.NewResponse(&pm.EnrollResponse{
+				Success: false,
+				Error:   fmt.Sprintf("cannot fingerprint server CA: %v", fpErr),
+			}), nil
+		}
+		if !strings.EqualFold(got, pin) {
+			h.logger.Error("enrollment CA fingerprint mismatch — refusing to trust server CA",
+				"expected_pin", pin, "server_ca_fingerprint", got)
+			return connect.NewResponse(&pm.EnrollResponse{
+				Success: false,
+				Error:   "CA fingerprint mismatch: the server CA does not match the pinned fingerprint",
+			}), nil
+		}
 	}
 
 	creds := &credentials.Credentials{

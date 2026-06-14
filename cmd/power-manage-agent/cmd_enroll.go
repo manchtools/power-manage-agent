@@ -47,7 +47,35 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	return &registrationURI{
 		ServerURL: fmt.Sprintf("https://%s", parsed.Host),
 		Token:     token,
+		// Optional out-of-band CA fingerprint pin. Any tls=/skip-verify=
+		// query params are intentionally ignored — ServerURL is always
+		// normalized to https, there is no TLS-bypass path.
+		Pin: parsed.Query().Get("pin"),
 	}, nil
+}
+
+// resolveEnrollToken resolves the registration token, preferring secure
+// delivery: a -token-file read from disk, then the PM_REGISTRATION_TOKEN
+// environment variable, and only as a last resort the -token argv flag —
+// which is warned against because process arguments are world-readable
+// via /proc/<pid>/cmdline (finding #3). Returns "" when no source
+// provided a token.
+func resolveEnrollToken(flagToken, tokenFile, envToken string) (string, error) {
+	if tokenFile != "" {
+		b, err := os.ReadFile(tokenFile)
+		if err != nil {
+			return "", fmt.Errorf("read token file %s: %w", tokenFile, err)
+		}
+		return strings.TrimSpace(string(b)), nil
+	}
+	if envToken != "" {
+		return strings.TrimSpace(envToken), nil
+	}
+	if flagToken != "" {
+		fmt.Fprintln(os.Stderr, "warning: passing -token on the command line is insecure (visible in /proc/<pid>/cmdline); prefer -token-file or the PM_REGISTRATION_TOKEN environment variable")
+		return strings.TrimSpace(flagToken), nil
+	}
+	return "", nil
 }
 
 // runEnroll handles the "enroll" subcommand.
@@ -56,29 +84,52 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 //	power-manage-agent enroll 'power-manage://server:port?token=xxx'
 func runEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
-	token := fs.String("token", "", "Registration token")
+	token := fs.String("token", "", "Registration token (INSECURE on argv; prefer -token-file or PM_REGISTRATION_TOKEN)")
+	tokenFile := fs.String("token-file", "", "Path to a file containing the registration token (preferred over -token)")
 	server := fs.String("server", "", "Control server URL")
+	pin := fs.String("pin", "", "Optional CA fingerprint pin (SHA-256 hex of the control CA) verified before trusting the server CA")
 	socketPath := fs.String("socket", deviceauth.EnrollSocketPath, "Agent enrollment socket")
 	fs.Parse(args)
+
+	caPin := *pin
+	fromURI := false
 
 	// Accept power-manage:// URI as positional arg
 	if fs.NArg() > 0 {
 		arg := fs.Arg(0)
 		if strings.HasPrefix(arg, "power-manage://") {
-			if parsed, err := parseRegistrationURI(arg); err == nil {
-				*server = parsed.ServerURL
-				*token = parsed.Token
-			} else {
+			parsed, err := parseRegistrationURI(arg)
+			if err != nil {
 				fmt.Fprintf(os.Stderr, "error: %v\n", err)
 				os.Exit(1)
 			}
+			*server = parsed.ServerURL
+			*token = parsed.Token
+			if parsed.Pin != "" {
+				caPin = parsed.Pin
+			}
+			fromURI = true
 		}
 	}
 
-	if *token == "" || *server == "" {
-		fmt.Fprintln(os.Stderr, "error: -server and -token are required")
-		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token=TOKEN")
-		fmt.Fprintln(os.Stderr, "   or: power-manage-agent enroll 'power-manage://server:port?token=xxx'")
+	// Resolve the token. The URI carries its own token; otherwise prefer
+	// the secure -token-file / PM_REGISTRATION_TOKEN sources over -token
+	// argv (which leaks via /proc/<pid>/cmdline, #3).
+	resolvedToken := *token
+	if !fromURI {
+		rt, err := resolveEnrollToken(*token, *tokenFile, os.Getenv("PM_REGISTRATION_TOKEN"))
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error: %v\n", err)
+			os.Exit(1)
+		}
+		resolvedToken = rt
+	}
+
+	if resolvedToken == "" || *server == "" {
+		fmt.Fprintln(os.Stderr, "error: a control server URL and a registration token are required")
+		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token-file=PATH")
+		fmt.Fprintln(os.Stderr, "   or: PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL")
+		fmt.Fprintln(os.Stderr, "   or: power-manage-agent enroll 'power-manage://server:port?token=xxx&pin=…'")
 		os.Exit(1)
 	}
 
@@ -104,10 +155,12 @@ func runEnroll(args []string) {
 
 	// Enroll via the local socket. The SDK proto no longer carries
 	// a TLS-bypass field; agents always validate the server cert
-	// during enrollment.
+	// during enrollment. An optional CA fingerprint pin is verified
+	// server-side before the returned CA is trusted.
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: *server,
-		Token:     *token,
+		ServerUrl:        *server,
+		Token:            resolvedToken,
+		CaFingerprintPin: strings.ReplaceAll(strings.TrimSpace(caPin), ":", ""),
 	}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: enrollment failed: %v\n", err)
@@ -139,8 +192,9 @@ func trySocketEnroll(parsed *registrationURI) bool {
 	}
 
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: parsed.ServerURL,
-		Token:     parsed.Token,
+		ServerUrl:        parsed.ServerURL,
+		Token:            parsed.Token,
+		CaFingerprintPin: strings.ReplaceAll(strings.TrimSpace(parsed.Pin), ":", ""),
 	}))
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %v\n", err)
@@ -159,6 +213,7 @@ func trySocketEnroll(parsed *registrationURI) bool {
 type registrationURI struct {
 	ServerURL string
 	Token     string
+	Pin       string // optional CA fingerprint pin
 }
 
 // unixSocketHTTPClient returns an HTTP client that dials the given unix socket.

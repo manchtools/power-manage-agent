@@ -61,6 +61,46 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 	}, nil
 }
 
+// renewAt returns how long to wait, measured from now, before renewing a
+// certificate with the given validity window: 80% of its lifetime,
+// clamped to a 1-minute minimum so an already-expired or near-expired
+// cert renews almost immediately instead of busy-looping on a negative
+// wait.
+func renewAt(notBefore, notAfter, now time.Time) time.Duration {
+	lifetime := notAfter.Sub(notBefore)
+	renew := notBefore.Add(time.Duration(float64(lifetime) * 0.8))
+	if wait := renew.Sub(now); wait > 0 {
+		return wait
+	}
+	return time.Minute
+}
+
+// shouldEscalateRotation reports whether the rotation-failure log should
+// escalate to the louder "stalled" wording — once consecutive failures
+// reach the threshold.
+func shouldEscalateRotation(consecutiveFailures, threshold int) bool {
+	return consecutiveFailures >= threshold
+}
+
+// applyRenewal updates creds in place from a renewal result, refusing a
+// non-continuous CA (#4). If the server returned a CA that is neither
+// byte-identical to nor cross-signed by the enrolled CA, it is rejected
+// as a trust-anchor swap and creds is left UNCHANGED, so the existing
+// cert+CA remain valid on disk. Otherwise the new certificate (and the
+// CA, if one was returned) is adopted.
+func applyRenewal(creds *credentials.Credentials, result *sdk.RenewCertificateResult) error {
+	if len(result.CACert) > 0 {
+		if err := pmcrypto.VerifyCAContinuity(creds.CACert, result.CACert); err != nil {
+			return fmt.Errorf("refusing non-continuous CA on renewal: %w", err)
+		}
+	}
+	creds.Certificate = result.Certificate
+	if len(result.CACert) > 0 {
+		creds.CACert = result.CACert
+	}
+	return nil
+}
+
 // startCertRotation runs a background loop that renews the agent's mTLS
 // certificate before it expires. Renewal is attempted at 80% of the cert's
 // lifetime. On failure it retries every hour.
@@ -71,7 +111,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 // the count crosses a threshold the messages escalate to mention how
 // long the agent has been unable to rotate, which is what an operator
 // needs to triage "is the control server reachable?".
-func startCertRotation(ctx context.Context, credStore *credentials.Store, hostname string, logger *slog.Logger) {
+func startCertRotation(ctx context.Context, credStore *credentials.Store, hostname string, logger *slog.Logger, now func() time.Time) {
 	const (
 		retryInterval     = 1 * time.Hour
 		escalateThreshold = 3 // hours of consecutive failure before the log volume rises
@@ -80,7 +120,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 	logRetryFailure := func(stage string, err error) {
 		consecutiveFailures++
 		attrs := []any{"stage", stage, "error", err, "consecutive_failures", consecutiveFailures}
-		if consecutiveFailures >= escalateThreshold {
+		if shouldEscalateRotation(consecutiveFailures, escalateThreshold) {
 			// Escalated wording so a `journalctl -u power-manage-agent
 			// | grep "rotation stalled"` query surfaces the issue
 			// fast. The hours-stalled value is the operator-facing
@@ -112,17 +152,11 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			return
 		}
 
-		// Calculate renewal time at 80% of lifetime
-		lifetime := cert.NotAfter.Sub(cert.NotBefore)
-		renewAt := cert.NotBefore.Add(time.Duration(float64(lifetime) * 0.8))
-		waitDuration := time.Until(renewAt)
-		if waitDuration <= 0 {
-			waitDuration = 1 * time.Minute
-		}
+		// Renew at 80% of lifetime (clamped to >=1m if already past).
+		waitDuration := renewAt(cert.NotBefore, cert.NotAfter, now())
 
 		logger.Info("cert rotation: scheduled",
 			"not_after", cert.NotAfter,
-			"renew_at", renewAt,
 			"wait", waitDuration.String(),
 		)
 
@@ -176,10 +210,18 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 			continue
 		}
 
-		// Update credentials on disk with new certificate (and CA cert if rotated)
-		creds.Certificate = result.Certificate
-		if len(result.CACert) > 0 {
-			creds.CACert = result.CACert
+		// Adopt the new cert — and the CA only if it is continuous with
+		// the enrolled CA (#4). A non-continuous CA is refused (trust-
+		// anchor swap): keep the existing cert+CA on disk and treat it as
+		// a retryable failure rather than blindly broadening trust.
+		if err := applyRenewal(creds, result); err != nil {
+			logRetryFailure("ca_continuity", err)
+			select {
+			case <-ctx.Done():
+				return
+			case <-time.After(retryInterval):
+			}
+			continue
 		}
 		if err := credStore.Save(creds); err != nil {
 			logRetryFailure("save_credentials", err)
