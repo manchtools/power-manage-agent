@@ -584,6 +584,15 @@ When enabled, the scheduler checks if the system state already matches the desir
 
 **Use case**: Reduce unnecessary operations for idempotent actions that run frequently. Instead of reinstalling a package every 4 hours, only act when the package is missing or changed.
 
+### Scheduling resilience
+
+The offline scheduler and the SDK stream loop are hardened against corrupt local state, clock excursions, crashes, and a compromised/relay gateway:
+
+- **Maintenance window fails closed on decode error.** The active maintenance window is persisted to the agent's SQLite store so a restart inside a freeze keeps gating. If that persisted window exists but cannot be proto-decoded (a corrupt or tampered settings row), the scheduler does **not** boot unconstrained — it enters a deny-until-next-sync state that defers every due dispatch until the next successful window sync overwrites the bad row. A truly-absent window (a never-synced device) still boots unconstrained, the same default a fresh install gets.
+- **Forward clock jumps are clamped.** A future-dated `next_execute_at` cursor (left behind by a transient forward wall-clock excursion that was later corrected back) is clamped to at most `now + interval`, so a single clock jump can delay drift-prevention by at most one interval instead of suppressing it indefinitely.
+- **Crash-replay guard.** The due cursor is advanced one interval **before** an action executes, so a crash between execution and result recording does not silently re-run a non-idempotent action on the next boot. (Best-effort for non-idempotent actions; idempotent actions are unaffected, and the authoritative cursor is still written when the result is recorded.)
+- **One handler panic cannot crash the agent.** The SDK stream-dispatch loop wraps each inbound `ServerMessage` in a scoped `recover()` and isolates its goroutine fan-out, so a panic triggered by a malformed or hostile frame from a compromised gateway is logged and dropped as non-fatal rather than crash-looping the agent (a fleet DoS). Oversized inbound frames are refused (resource-exhausted) instead of being allocated, and PTY dimensions are validated before use. See the SDK README "Stream-loop robustness".
+
 ## Package Manager Detection
 
 The agent automatically detects the system's package manager:
