@@ -66,15 +66,17 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Reset handler connection state for new connection
 		h.ResetConnection()
 
-		// rc10: refuse http:// (h2c) for the network gateway path.
-		// The only h2c use in this binary is the local unix-socket
-		// enrollment client, never a remote gateway. A stored
-		// `http://` GatewayAddr means either a dev-leftover creds
-		// file or a tampered redirect — both are reasons to fail
-		// fast rather than silently skip mTLS on the live fleet.
-		if strings.HasPrefix(creds.GatewayAddr, "http://") {
-			logger.Error("refusing h2c gateway URL — agent requires https:// for gateway connections; re-enrol against an https:// gateway or delete the cached credentials",
-				"gateway", creds.GatewayAddr)
+		// rc10: refuse anything but https://host for the network gateway
+		// path. The only h2c use in this binary is the local unix-socket
+		// enrollment client, never a remote gateway. A non-https (or
+		// malformed) GatewayAddr means either a dev-leftover creds file or a
+		// tampered redirect — both are reasons to fail fast rather than
+		// silently skip mTLS on the live fleet. Shared predicate with
+		// cmd_selftest.go so the guard cannot drift (closes the HasPrefix
+		// case/opaque/hostless gaps).
+		if err := requireHTTPSGateway(creds.GatewayAddr); err != nil {
+			logger.Error("refusing gateway URL — re-enrol against an https:// gateway or delete the cached credentials",
+				"gateway", creds.GatewayAddr, "error", err)
 			os.Exit(1)
 		}
 		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
@@ -82,7 +84,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 			logger.Error("failed to configure mTLS", "error", err)
 			os.Exit(1)
 		}
-		client := sdk.NewClient(creds.GatewayAddr,
+		client := sdk.NewClient(strings.TrimSpace(creds.GatewayAddr),
 			mtlsOpt,
 			sdk.WithAuth(creds.DeviceID, ""),
 		)

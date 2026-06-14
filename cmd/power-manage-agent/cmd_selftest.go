@@ -4,7 +4,6 @@ package main
 import (
 	"context"
 	"flag"
-	"net/url"
 	"os"
 	"strings"
 	"time"
@@ -59,29 +58,14 @@ func runSelfTest(args []string) int {
 	}
 	logger.Info("self-test: credentials loaded", "device_id", creds.DeviceID)
 
-	// Step 2: Create mTLS client. rc10 refuses anything but https://
+	// Step 2: Create mTLS client. rc10 refuses anything but https://host
 	// here: the self-test is invoked by the packaged install flow on
 	// managed devices and must exercise the same security posture as
-	// normal agent operation.
-	//
-	// Parse the URL rather than checking a literal prefix so case
-	// variants (HTTP://, Https://), leading whitespace, and any
-	// non-https scheme (ftp://, h2c://, the empty scheme) all fail
-	// closed. A malformed URL is treated the same as a wrong-scheme
-	// URL — both block sdk.WithMTLSFromPEM from running.
+	// normal agent operation. Shared predicate with runtime.go so the
+	// guard cannot drift between dial sites.
 	gatewayAddr := strings.TrimSpace(creds.GatewayAddr)
-	parsed, parseErr := url.Parse(gatewayAddr)
-	// Require a proper https://host URL. The Opaque + Host checks
-	// catch the corner cases url.Parse leaves accepted: a bare
-	// "https:" parses with Scheme="https" but no Host, and an
-	// opaque "https:foo" parses with Opaque="foo" rather than as
-	// a network URL — both would slip past a Scheme-only check.
-	if parseErr != nil ||
-		strings.ToLower(parsed.Scheme) != "https" ||
-		parsed.Opaque != "" ||
-		parsed.Host == "" {
-		logger.Error("self-test: refusing non-https or hostless gateway URL — agent requires https://host for gateway connections",
-			"gateway", creds.GatewayAddr, "parse_error", parseErr)
+	if err := requireHTTPSGateway(creds.GatewayAddr); err != nil {
+		logger.Error("self-test: refusing gateway URL", "gateway", creds.GatewayAddr, "error", err)
 		return 1
 	}
 	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
