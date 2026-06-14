@@ -212,16 +212,85 @@ func TestExecuteAgentUpdate_HappyPathSwapsAndShutsDown(t *testing.T) {
 	}
 }
 
-// WS7 #1 defense-in-depth: an empty expected_sha256 in the (signed)
-// action is refused fail-closed before any download — the agent-update
-// path uses downloadToFile, which has no checksum chokepoint of its own.
-func TestExecuteAgentUpdate_RefusesEmptyExpectedSha256(t *testing.T) {
+// WS7 (revised): an action with NEITHER expected_sha256 NOR checksum_url
+// has no integrity source and is refused fail-closed (also enforced
+// server-side). The agent-update path uses downloadToFile, which has no
+// checksum chokepoint of its own.
+func TestExecuteAgentUpdate_RefusesNoIntegritySource(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params("")) // empty expected_sha256
+	// No expected_sha256 AND no checksum_url.
+	noIntegrity := &pb.AgentUpdateParams{
+		Amd64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent"},
+		Arm64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent"},
+	}
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), noIntegrity)
 	if err == nil {
-		t.Fatal("an empty expected_sha256 must be refused")
+		t.Fatal("an action with no integrity source must be refused")
+	}
+	if changed {
+		t.Error("changed must be false")
+	}
+	if got := h.currentBinary(t); string(got) != string(h.oldBytes) {
+		t.Error("live binary must be unchanged")
+	}
+}
+
+// WS7 (revised): the DEFAULT path — no pinned expected_sha256, integrity
+// verified against the operator's checksum_url (SHA256SUMS). This is what
+// lets binary_url/checksum_url track "latest" hands-off. A correct
+// checksum file + newer version → swap + shutdown.
+func TestExecuteAgentUpdate_ChecksumURLFallback(t *testing.T) {
+	staged := agentScript("v2026.06.05", 0)
+	// SHA256SUMS line for the binary served at /agent (filename "agent").
+	sums := []byte(sha256hex(staged) + "  agent\n")
+	h := newUpdateHarness(t, "v2026.06.01", staged, sums)
+
+	// No expected_sha256 → agent fetches + verifies via checksum_url.
+	p := &pb.AgentUpdateParams{
+		Amd64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
+		Arm64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
+	}
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), p)
+	if err != nil {
+		t.Fatalf("checksum_url fallback update failed: %v", err)
+	}
+	if !changed {
+		t.Error("changed must be true on a successful checksum_url-verified update")
+	}
+	if got := h.currentBinary(t); string(got) != string(staged) {
+		t.Error("binary must be swapped to the staged bytes")
+	}
+	bak, err := os.ReadFile(h.binaryPath + ".bak")
+	if err != nil {
+		t.Fatalf("read .bak: %v", err)
+	}
+	if string(bak) != string(h.oldBytes) {
+		t.Error(".bak must hold the previous binary")
+	}
+	if !h.shutdownCalled() {
+		t.Error("Shutdown must be invoked after a successful update")
+	}
+}
+
+// A checksum_url whose SHA256SUMS does NOT match the downloaded binary is
+// rejected (no swap).
+func TestExecuteAgentUpdate_ChecksumURLMismatchRejected(t *testing.T) {
+	staged := agentScript("v2026.06.05", 0)
+	tampered := append([]byte{}, staged...)
+	tampered[len(tampered)-2] ^= 0xff
+	// SHA256SUMS vouches for the GENUINE bytes; the server serves TAMPERED.
+	sums := []byte(sha256hex(staged) + "  agent\n")
+	h := newUpdateHarness(t, "v2026.06.01", tampered, sums)
+
+	p := &pb.AgentUpdateParams{
+		Amd64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
+		Arm64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
+	}
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), p)
+	if err == nil {
+		t.Fatal("a checksum_url mismatch must abort the update")
 	}
 	if changed {
 		t.Error("changed must be false")

@@ -1,6 +1,7 @@
 package executor
 
 import (
+	"bufio"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -108,20 +109,31 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("binary URL validation: %w", err)
 	}
 
-	// Step 4: The AUTHORITATIVE integrity gate is the CA-signed
-	// expected_sha256 (WS7 #1). It rides inside the signed action, so a
-	// compromised download origin — or a checksum file fetched from that
-	// same origin — cannot vouch for a tampered binary. We deliberately do
-	// NOT download or trust a same-origin checksum file; checksum_url is
-	// retained on the action only as operator-facing metadata.
+	// Step 4: determine the expected binary hash. Operator's choice (WS7):
+	//   - expected_sha256 set → AUTHORITATIVE, CA-signed pin. It rides
+	//     inside the signed action, so even a compromised download origin
+	//     cannot vouch for a tampered binary. Overrides checksum_url.
+	//   - otherwise → fetch the operator's checksum_url (SHA256SUMS) and
+	//     verify against it. This is the default that lets binary_url +
+	//     checksum_url track "latest" hands-off; authenticity is
+	//     origin-trust (the action is signed, so only an origin-manipulated
+	//     hash is a concern, which an operator can mitigate by hosting the
+	//     checksum file on a separate host).
+	// At least one must be present (also enforced server-side) so an update
+	// never runs with no integrity check.
 	expectedChecksum := strings.ToLower(arch.ExpectedSha256)
-	// Defense-in-depth: the server + proto require expected_sha256, but
-	// fail closed here too rather than downloading and reporting a
-	// confusing "expected , got <hash>" mismatch. (This path uses
-	// downloadToFile, not the downloadFile chokepoint, so the guard must
-	// live here.)
 	if expectedChecksum == "" {
-		return nil, false, fmt.Errorf("agent update rejected: expected_sha256 is empty in the signed action")
+		if arch.ChecksumUrl == "" {
+			return nil, false, fmt.Errorf("agent update rejected: action sets neither expected_sha256 nor checksum_url")
+		}
+		if err := validateHTTPS(arch.ChecksumUrl); err != nil {
+			return nil, false, fmt.Errorf("checksum URL validation: %w", err)
+		}
+		fileChecksum, err := downloadAndExtractChecksum(ctx, e.httpClient, arch.ChecksumUrl, extractFilename(arch.BinaryUrl))
+		if err != nil {
+			return nil, false, fmt.Errorf("download checksum: %w", err)
+		}
+		expectedChecksum = fileChecksum
 	}
 
 	// Step 5: Download binary to temp file in DataDir (agent-owned).
@@ -318,6 +330,58 @@ func parseAgentVersion(v string) ([3]int, error) {
 		out[i] = n
 	}
 	return out, nil
+}
+
+// extractFilename returns the filename from a URL, stripping query parameters.
+func extractFilename(rawURL string) string {
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return filepath.Base(rawURL)
+	}
+	return filepath.Base(u.Path)
+}
+
+// downloadAndExtractChecksum downloads a SHA256SUMS-style file and extracts
+// the checksum for the given filename (format: "<hex>  <filename>"). Used
+// as the default integrity source when the action does not pin
+// expected_sha256 (WS7: operator tracks "latest" via checksum_url).
+func downloadAndExtractChecksum(ctx context.Context, client *http.Client, checksumURL, filename string) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
+	if err != nil {
+		return "", fmt.Errorf("create request: %w", err)
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return "", fmt.Errorf("download: %w", err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
+	}
+
+	scanner := bufio.NewScanner(resp.Body)
+	for scanner.Scan() {
+		line := strings.TrimSpace(scanner.Text())
+		if line == "" {
+			continue
+		}
+		parts := strings.Fields(line)
+		if len(parts) != 2 {
+			continue
+		}
+		checksumHex := parts[0]
+		name := strings.TrimPrefix(strings.TrimPrefix(parts[1], "./"), "*")
+		if name == filename {
+			if len(checksumHex) != 64 {
+				return "", fmt.Errorf("invalid checksum length for %s: %d", filename, len(checksumHex))
+			}
+			return strings.ToLower(checksumHex), nil
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return "", fmt.Errorf("read checksum file: %w", err)
+	}
+	return "", fmt.Errorf("checksum for %q not found in checksum file", filename)
 }
 
 // getArchEntry returns the AgentUpdateArch for the current runtime architecture.
