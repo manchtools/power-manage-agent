@@ -599,14 +599,62 @@ func (s *Store) HasPriorExecution(actionID string) bool {
 	return err == nil && count > 1
 }
 
-// CleanupOldResults removes synced results older than the retention period.
-func (s *Store) CleanupOldResults(retention time.Duration) error {
+// unsyncedResultHardAge bounds how long an UNSYNCED result is kept even if it
+// never reaches the server (WS13 #6): past this it is evicted to stop unbounded
+// disk growth during a prolonged outage. Longer than the synced retention so a
+// transient outage doesn't drop results, but finite so a permanent one can't
+// fill the disk.
+const unsyncedResultHardAge = 30 * 24 * time.Hour
+
+// maxResultRows caps the total number of result rows regardless of sync state or
+// age (oldest evicted first) — a hard disk-bound backstop. A package var (not a
+// const) so tests can lower it to exercise the cap cheaply.
+var maxResultRows = 50_000
+
+// CleanupOldResults bounds the results table. It removes synced results older
+// than `retention` and — INDEPENDENTLY of sync state (WS13 #6) — evicts unsynced
+// results past unsyncedResultHardAge and caps the total row count to
+// maxResultRows (oldest first), so an agent that cannot reach the server cannot
+// exhaust local disk. Returns the number of UNSYNCED (i.e. undelivered) rows
+// dropped, so the caller can warn that results were lost before delivery.
+func (s *Store) CleanupOldResults(retention time.Duration) (unsyncedEvicted int, err error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
-	cutoff := s.now().Add(-retention)
-	_, err := s.db.Exec("DELETE FROM results WHERE synced = 1 AND executed_at < ?", cutoff)
-	return err
+	now := s.now()
+
+	// 1. Synced results past the retention period (the original behaviour).
+	if _, err := s.db.Exec("DELETE FROM results WHERE synced = 1 AND executed_at < ?", now.Add(-retention)); err != nil {
+		return 0, err
+	}
+
+	// 2. Unsynced results past the hard age ceiling — these were never
+	//    delivered, so count them for the caller's warning.
+	res, err := s.db.Exec("DELETE FROM results WHERE synced = 0 AND executed_at < ?", now.Add(-unsyncedResultHardAge))
+	if err != nil {
+		return 0, err
+	}
+	if n, aerr := res.RowsAffected(); aerr == nil {
+		unsyncedEvicted += int(n)
+	}
+
+	// 3. Hard row-count cap (oldest first), regardless of sync/age. Count the
+	//    unsynced rows about to be capped so the warning reflects undelivered
+	//    losses too. SQLite "LIMIT -1 OFFSET n" = "all rows after the newest n".
+	const overflow = `id IN (SELECT id FROM results ORDER BY executed_at DESC LIMIT -1 OFFSET ?)`
+	var capUnsynced int
+	if cerr := s.db.QueryRow("SELECT COUNT(*) FROM results WHERE synced = 0 AND "+overflow, maxResultRows).Scan(&capUnsynced); cerr != nil {
+		// Don't swallow it: a failed count means the warning would under-report
+		// dropped-before-delivery results. The cap DELETE below still runs.
+		slog.Warn("failed to count unsynced rows in the results overflow set; eviction warning may underreport losses", "error", cerr)
+	} else {
+		unsyncedEvicted += capUnsynced
+	}
+	if _, err := s.db.Exec("DELETE FROM results WHERE "+overflow, maxResultRows); err != nil {
+		return unsyncedEvicted, err
+	}
+
+	return unsyncedEvicted, nil
 }
 
 // SyncActions replaces all stored actions with the provided list from the server.
