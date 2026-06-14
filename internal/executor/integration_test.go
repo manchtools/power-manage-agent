@@ -2452,6 +2452,10 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test-1.0-1.noarch.rpm",
+			// Checksum is server-mandated and the agent fails closed
+			// without it before downloading (WS8); the value is
+			// irrelevant here — the download errors with the status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -2500,6 +2504,10 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_RPM, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test-1.0-1.noarch.rpm",
+			// Checksum is server-mandated and the agent fails closed
+			// without it before downloading (WS8); the value is
+			// irrelevant here — the download errors with the status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)

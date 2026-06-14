@@ -103,6 +103,12 @@ func validateRepositoryParams(params *pb.RepositoryParams) error {
 		if containsNewline(apt.GpgKeyUrl) {
 			return reject("apt.gpg_key_url")
 		}
+		// apt.gpg_key (the ASCII-armored key BLOB, distinct from
+		// gpg_key_url) is intentionally NOT newline-guarded: it is
+		// multi-line content written verbatim to a keyring file, never
+		// spliced into a config line or argv. The self-discovering
+		// coverage test (repository_validation_test.go) lists it as the
+		// sole multi-line-content exclusion.
 	}
 	if dnf := params.Dnf; dnf != nil {
 		if containsNewline(dnf.Baseurl) {
@@ -114,6 +120,12 @@ func validateRepositoryParams(params *pb.RepositoryParams) error {
 		if containsNewline(dnf.Gpgkey) {
 			return reject("dnf.gpgkey")
 		}
+		if dnf.Baseurl != "" && pkg.ValidateRepoBaseURL(dnf.Baseurl) != nil {
+			return badShape("dnf.baseurl")
+		}
+		if dnf.Gpgkey != "" && pkg.ValidateGpgKeyRef(dnf.Gpgkey) != nil {
+			return badShape("dnf.gpgkey")
+		}
 	}
 	if pac := params.Pacman; pac != nil {
 		if containsNewline(pac.Server) {
@@ -124,6 +136,9 @@ func validateRepositoryParams(params *pb.RepositoryParams) error {
 		}
 		if pac.SigLevel != "" && !validPacmanSigLevel.MatchString(pac.SigLevel) {
 			return badShape("pacman.sig_level")
+		}
+		if pac.Server != "" && pkg.ValidateRepoBaseURL(pac.Server) != nil {
+			return badShape("pacman.server")
 		}
 	}
 	if zyp := params.Zypper; zyp != nil {
@@ -142,7 +157,21 @@ func validateRepositoryParams(params *pb.RepositoryParams) error {
 		if zyp.Type != "" && !validZypperType.MatchString(zyp.Type) {
 			return badShape("zypper.type")
 		}
+		if zyp.Url != "" && pkg.ValidateRepoBaseURL(zyp.Url) != nil {
+			return badShape("zypper.url")
+		}
+		if zyp.Gpgkey != "" && pkg.ValidateGpgKeyRef(zyp.Gpgkey) != nil {
+			return badShape("zypper.gpgkey")
+		}
 	}
+	// NOTE — gpgcheck is an OPERATOR CHOICE, not a hard gate. We enforce
+	// the https transport on base URLs (above), but a dnf/zypper repo with
+	// gpgcheck=false is permitted: package-signature verification is the
+	// operator's call, mirroring the WS7 checksum_url "lenient but the
+	// transport is still verified" posture. Re-introducing a refusal here
+	// would break legitimate internal-mirror configurations; the accepted
+	// risk is documented in ADR 0012. See
+	// TestValidateRepositoryParams_AllowsOperatorChoiceGpgcheck.
 	return nil
 }
 
@@ -190,6 +219,13 @@ type Executor struct {
 	luksTimestampFailCount map[string]int
 
 	now func() time.Time // clock seam; defaults to time.Now, overridden in tests
+
+	// repairFS is a seam over repairFilesystem so tests can record
+	// whether a privileged remount/repair was attempted (proving that a
+	// malformed/rejected action never reaches the privileged side
+	// effects). nil in production → requireWritableFS calls the real
+	// e.repairFilesystem.
+	repairFS func(ctx context.Context) bool
 }
 
 // NewExecutor creates a new action executor.

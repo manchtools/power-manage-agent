@@ -10,12 +10,36 @@ import (
 	"strings"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/pkg"
 	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
+	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
 )
 
 func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("flatpak params required")
+	}
+
+	// Validate app-id and remote BEFORE the flatpak lookup or any
+	// dispatch (WS8 finding 7). Both reach `flatpak install` as operands,
+	// so a flag-shaped value (`--system`, `--from=…`) must be rejected up
+	// front. Validating before the lookup also means a malformed action
+	// is rejected on every host, not silently skipped on one without
+	// flatpak.
+	if params.AppId == "" {
+		return nil, false, fmt.Errorf("flatpak app_id is required")
+	}
+	if err := pkg.ValidatePackageName(params.AppId); err != nil {
+		return nil, false, fmt.Errorf("invalid flatpak app_id: %w", err)
+	}
+
+	// Default to flathub if no remote specified
+	remote := params.Remote
+	if remote == "" {
+		remote = "flathub"
+	}
+	if err := pkg.ValidateRemoteName(remote); err != nil {
+		return nil, false, fmt.Errorf("invalid flatpak remote: %w", err)
 	}
 
 	// Skip on systems without flatpak
@@ -26,20 +50,26 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		return nil, false, fmt.Errorf("flatpak lookup: %w", err)
 	}
 
-	if params.AppId == "" {
-		return nil, false, fmt.Errorf("flatpak app_id is required")
-	}
-
-	// Default to flathub if no remote specified
-	remote := params.Remote
-	if remote == "" {
-		remote = "flathub"
-	}
-
 	if params.SystemWide {
 		return e.executeFlatpakSystem(ctx, params, state, remote)
 	}
 	return e.executeFlatpakPerUser(ctx, params, state, remote)
+}
+
+// flatpakInstallArgs builds `flatpak install -y --noninteractive <scope>
+// -- <remote> <appId>` so the remote and app-id sit after the `--`
+// end-of-options separator and can never be reparsed as flatpak options
+// (`--from=…`, `--sideload-repo=…`, …).
+func flatpakInstallArgs(scopeFlag, remote, appId string) []string {
+	return sysexec.SeparatePositionals([]string{"install", "-y", "--noninteractive", scopeFlag}, remote, appId)
+}
+
+// flatpakUninstallArgs is the install counterpart: `flatpak uninstall -y
+// --noninteractive <scope> -- <appId>`. The app-id is already
+// grammar-validated at executeFlatpak's entry, but passing it after `--`
+// keeps the install/uninstall argv discipline symmetric.
+func flatpakUninstallArgs(scopeFlag, appId string) []string {
+	return sysexec.SeparatePositionals([]string{"uninstall", "-y", "--noninteractive", scopeFlag}, appId)
 }
 
 // executeFlatpakSystem implements the system-wide install/uninstall
@@ -84,7 +114,7 @@ func (e *Executor) executeFlatpakSystem(ctx context.Context, params *pb.FlatpakP
 			return out, false, err
 		}
 
-		output, err := runSudoCmd(ctx, "flatpak", "install", "-y", "--noninteractive", systemFlag, remote, params.AppId)
+		output, err := runSudoCmd(ctx, "flatpak", flatpakInstallArgs(systemFlag, remote, params.AppId)...)
 		if err != nil {
 			return output, false, fmt.Errorf("flatpak install failed: %w", err)
 		}
@@ -124,7 +154,7 @@ func (e *Executor) executeFlatpakSystem(ctx context.Context, params *pb.FlatpakP
 				"app_id", params.AppId, "error", err)
 		}
 
-		output, err := runSudoCmd(ctx, "flatpak", "uninstall", "-y", "--noninteractive", systemFlag, params.AppId)
+		output, err := runSudoCmd(ctx, "flatpak", flatpakUninstallArgs(systemFlag, params.AppId)...)
 		return output, true, err
 	}
 
@@ -203,7 +233,7 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 				continue
 			}
 
-			out, runErr := runAsUserCmd(ctx, s, nil, "flatpak", "install", "-y", "--noninteractive", "--user", remote, params.AppId)
+			out, runErr := runAsUserCmd(ctx, s, nil, "flatpak", flatpakInstallArgs("--user", remote, params.AppId)...)
 			if runErr != nil {
 				if firstFailure == nil {
 					firstFailure = fmt.Errorf("user %s: install failed: %w", s.Username, runErr)
@@ -264,7 +294,7 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 					"user", u.Username, "app_id", params.AppId, "error", err)
 			}
 
-			out, runErr := runAsUserCmd(ctx, u, nil, "flatpak", "uninstall", "-y", "--noninteractive", "--user", params.AppId)
+			out, runErr := runAsUserCmd(ctx, u, nil, "flatpak", flatpakUninstallArgs("--user", params.AppId)...)
 			perUserOut.WriteString("user=")
 			perUserOut.WriteString(u.Username)
 			perUserOut.WriteString(": ")
