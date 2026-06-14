@@ -1,6 +1,19 @@
 // Package credentials provides secure storage for agent credentials.
 // Credentials are encrypted at rest using AES-256-GCM with a key derived
-// from the machine ID using Argon2id.
+// from the machine ID (Argon2id) and a per-store random salt, written
+// 0600 in a 0700 owner-only directory.
+//
+// At-rest threat model (WS10): the agent runs as root, so the
+// credentials.enc + salt files are 0600 in a 0700 root-owned directory —
+// no unprivileged local user can read them. The machine-id KDF binds the
+// ciphertext to the host (it will not decrypt if copied to another
+// machine). It is NOT, however, protection against OFFLINE theft of the
+// disk/backup: the machine-id lives on the same disk, so an attacker with
+// raw disk access has both. **Full-disk encryption is the at-rest
+// protection for that threat** — a same-disk key file would add no real
+// defense, so it is intentionally not used (accepted residual). The
+// fail-closed guards below ensure the store cannot be FORGED by a
+// non-owner (a group/world-writable directory is refused).
 package credentials
 
 import (
@@ -76,11 +89,40 @@ func (s *Store) Exists() bool {
 	return err == nil
 }
 
+// requireOwnerOnlyDir fails closed if the credential-store directory is
+// group- or world-writable: a writable store dir lets a non-owner forge
+// the salt/ciphertext (and thus the agent's identity). World-readable is
+// tolerated — the secret files themselves are 0600 — but writable is
+// not. WS10 #1/#2 (the honest forgeable-store guard; the KDF itself is
+// machine-id + FDE per the package doc).
+func requireOwnerOnlyDir(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat store directory %s: %w", dir, err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("store path %s is not a directory", dir)
+	}
+	if info.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("store directory %s is group/world-writable (%#o); it must be owner-only-writable (0700)", dir, info.Mode().Perm())
+	}
+	return nil
+}
+
 // Save encrypts and saves credentials to disk.
 func (s *Store) Save(creds *Credentials) error {
 	// Ensure data directory exists with secure permissions
 	if err := os.MkdirAll(s.dataDir, 0700); err != nil {
 		return fmt.Errorf("create data directory: %w", err)
+	}
+	// Tighten an existing dir to 0700 (MkdirAll does not narrow an
+	// already-present directory), then fail closed if it is still
+	// group/world-writable (e.g. someone re-loosened it).
+	if err := os.Chmod(s.dataDir, 0700); err != nil {
+		return fmt.Errorf("secure data directory: %w", err)
+	}
+	if err := requireOwnerOnlyDir(s.dataDir); err != nil {
+		return err
 	}
 
 	// Generate or load salt
@@ -131,6 +173,12 @@ func (s *Store) Save(creds *Credentials) error {
 
 // Load decrypts and loads credentials from disk.
 func (s *Store) Load() (*Credentials, error) {
+	// Fail closed if the store directory is forgeable (group/world-
+	// writable) — a non-owner could have swapped the salt/ciphertext.
+	if err := requireOwnerOnlyDir(s.dataDir); err != nil {
+		return nil, err
+	}
+
 	// Load salt
 	saltPath := filepath.Join(s.dataDir, saltFile)
 	salt, err := os.ReadFile(saltPath)
@@ -242,8 +290,11 @@ func (s *Store) deriveKey(salt []byte) ([]byte, error) {
 	return key, nil
 }
 
-// getMachineID reads the machine ID from the system.
-func getMachineID() ([]byte, error) {
+// getMachineID reads the machine ID from the system. It is a package var
+// (not a plain func) so tests can inject a synthetic machine ID to prove
+// the cross-machine binding (credentials saved under one machine ID do
+// not decrypt under another).
+var getMachineID = func() ([]byte, error) {
 	// Try /etc/machine-id first (systemd)
 	id, err := os.ReadFile("/etc/machine-id")
 	if err == nil && len(id) > 0 {
