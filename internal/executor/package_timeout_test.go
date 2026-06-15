@@ -87,6 +87,31 @@ func TestExecutePackage_BindsManagerToActionContext(t *testing.T) {
 	}
 }
 
+// TestPkgManagerForCtx_CancelledCtx_FailsClosed pins that when the per-action
+// manager cannot be built and the action context is already cancelled/expired,
+// pkgManagerForCtx returns nil (fail closed) rather than falling back to the
+// construction-time Background-bound manager — which would silently bypass the
+// timeout/cancel guarantee. With a live ctx, a builder error still falls back.
+func TestPkgManagerForCtx_CancelledCtx_FailsClosed(t *testing.T) {
+	fallback := pkg.NewPackageManager(alreadyInstalledManager{})
+	e := &Executor{
+		pkgManager: fallback,
+		newPkgManager: func(context.Context) (*pkg.PackageManager, error) {
+			return nil, context.Canceled // simulate a creation failure
+		},
+	}
+
+	cancelledCtx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if mgr := e.pkgManagerForCtx(cancelledCtx); mgr != nil {
+		t.Error("a cancelled action ctx must fail closed (nil), not fall back to the Background-bound manager")
+	}
+
+	if mgr := e.pkgManagerForCtx(context.Background()); mgr != fallback {
+		t.Error("with a live ctx, a builder error should fall back to the construction-time manager")
+	}
+}
+
 // alreadyInstalledManager implements pkg.Manager reporting the package present,
 // so executePackage returns at the version/pin check without touching the
 // filesystem or shelling out. Only IsInstalled is reached.
