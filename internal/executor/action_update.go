@@ -15,43 +15,73 @@ import (
 	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
 )
 
-// hasUpdatesAvailable checks if there are pending package updates.
-// Uses exit codes and structured queries — language-agnostic.
-func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
-	if pkg.IsDnf() {
-		// dnf check-update: exit 100 = updates available, 0 = none (language-agnostic)
-		args := []string{"check-update"}
-		if securityOnly {
-			args = append(args, "--security")
-		}
-		_, exitCode, _ := queryCmdOutput("dnf", args...)
+// Seams so the security-only-upgrade and reboot-scheduling paths can be
+// exercised with fixtures instead of a live host. Production binds them to the
+// real implementations; tests stub them.
+var (
+	execLookPath = exec.LookPath
+	notifyAll    = sysnotify.NotifyAll
+)
+
+// interpretUpdateCheck maps a package manager's update-check result (its
+// stdout and exit code) onto "are updates available?". It is the pure,
+// language-agnostic decision extracted from hasUpdatesAvailable so it can be
+// exercised with fixtures rather than a live host — giving every manager
+// (notably zypper) a real assertion instead of a logged smoke value.
+//
+//   - dnf:    check-update exit 100 = updates, 0 = none
+//   - apt:    `-s upgrade` simulate; any "Inst " line = updates
+//   - pacman: -Qu exit 0 = updates, 1 = none
+//   - zypper: list-updates exit 100 = updates, 0 = none
+//   - unknown manager: assume updates (fail safe toward running the update)
+func interpretUpdateCheck(manager, stdout string, exitCode int) bool {
+	switch manager {
+	case "dnf":
 		return exitCode == 100
-	}
-	if pkg.IsApt() {
-		// apt/apt-get -s upgrade: simulate and count lines with "Inst " prefix (language-agnostic)
-		aptCmd := "apt-get"
-		if _, err := exec.LookPath("apt"); err == nil {
-			aptCmd = "apt"
-		}
-		out, _, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
-		for _, line := range strings.Split(out, "\n") {
+	case "apt":
+		for _, line := range strings.Split(stdout, "\n") {
 			if strings.HasPrefix(line, "Inst ") {
 				return true
 			}
 		}
 		return false
+	case "pacman":
+		return exitCode == 0
+	case "zypper":
+		return exitCode == 100
+	default:
+		return true
+	}
+}
+
+// hasUpdatesAvailable checks if there are pending package updates.
+// Uses exit codes and structured queries — language-agnostic.
+func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
+	if pkg.IsDnf() {
+		args := []string{"check-update"}
+		if securityOnly {
+			args = append(args, "--security")
+		}
+		out, exitCode, _ := queryCmdOutput("dnf", args...)
+		return interpretUpdateCheck("dnf", out, exitCode)
+	}
+	if pkg.IsApt() {
+		aptCmd := "apt-get"
+		if _, err := exec.LookPath("apt"); err == nil {
+			aptCmd = "apt"
+		}
+		out, exitCode, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
+		return interpretUpdateCheck("apt", out, exitCode)
 	}
 	if pkg.IsPacman() {
-		// pacman -Qu: exit 0 = updates available, 1 = none (language-agnostic)
-		_, exitCode, _ := queryCmdOutput("pacman", "-Qu")
-		return exitCode == 0
+		out, exitCode, _ := queryCmdOutput("pacman", "-Qu")
+		return interpretUpdateCheck("pacman", out, exitCode)
 	}
 	if pkg.IsZypper() {
-		// zypper: exit 100 = updates available, 0 = none
-		_, exitCode, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
-		return exitCode == 100
+		out, exitCode, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
+		return interpretUpdateCheck("zypper", out, exitCode)
 	}
-	return true // assume updates for unknown package managers
+	return interpretUpdateCheck("", "", 0) // unknown manager → assume updates
 }
 
 // installedPackageCount returns the number of installed packages (language-agnostic).
@@ -554,33 +584,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
 		if newRebootRequired && params != nil && params.RebootIfRequired {
-			// Issue the shutdown FIRST and only report success if
-			// it actually went out — the prior shape printed
-			// "Scheduling reboot..." regardless of whether
-			// shutdown(8) accepted the request, so an operator
-			// would see "scheduled" in the action result while
-			// the host stayed up. Failure to schedule a reboot
-			// the operator explicitly asked for is a real action
-			// failure, not a logged warning. The desktop
-			// notification is also gated on success so we don't
-			// tell users "your system will reboot" when it won't.
-			if out, err := runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot"); err != nil {
-				if out != nil {
-					allOutput.WriteString(out.Stdout)
-					allOutput.WriteString(out.Stderr)
-				}
-				allOutput.WriteString(fmt.Sprintf("FAILED to schedule reboot: %v\n", err))
-				// Always join the reboot failure into lastErr — the
-				// preceding comment claims this is a real action
-				// failure, but a first-error-wins guard would silently
-				// demote it whenever an earlier upgrade error already
-				// occupied lastErr. errors.Join keeps both visible to
-				// the caller.
-				lastErr = errors.Join(lastErr, fmt.Errorf("schedule reboot: %w", err))
-			} else {
-				sysnotify.NotifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
-				allOutput.WriteString("Scheduled reboot in 1 minute.\n")
-			}
+			// errors.Join keeps the reboot failure visible even when an
+			// earlier upgrade error already occupied lastErr — a
+			// first-error-wins guard would silently demote a reboot the
+			// operator explicitly asked for.
+			lastErr = errors.Join(lastErr, e.scheduleRebootAfterUpdate(ctx, &allOutput))
 		}
 	}
 
@@ -596,11 +604,32 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}, changed, lastErr
 }
 
+// scheduleRebootAfterUpdate issues the reboot the operator requested via
+// RebootIfRequired and notifies signed-in users ONLY if the shutdown actually
+// went out. A failure to schedule a reboot the operator explicitly asked for
+// is a real action failure (returned, not a logged warning); the desktop
+// notification is gated on success so users are never told "your system will
+// reboot" when it won't. Returns nil when the reboot was scheduled.
+func (e *Executor) scheduleRebootAfterUpdate(ctx context.Context, output *strings.Builder) error {
+	out, err := runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
+	if err != nil {
+		if out != nil {
+			output.WriteString(out.Stdout)
+			output.WriteString(out.Stderr)
+		}
+		output.WriteString(fmt.Sprintf("FAILED to schedule reboot: %v\n", err))
+		return fmt.Errorf("schedule reboot: %w", err)
+	}
+	notifyAll(ctx, "System Reboot", "A system update requires a reboot. This system will reboot in 1 minute.")
+	output.WriteString("Scheduled reboot in 1 minute.\n")
+	return nil
+}
+
 // executeAptUpgrade performs apt-specific upgrade.
 func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
 	if params != nil && params.SecurityOnly {
 		// Use unattended-upgrades for security-only updates if available.
-		if _, err := exec.LookPath("unattended-upgrade"); err == nil {
+		if _, err := execLookPath("unattended-upgrade"); err == nil {
 			cmdOutput, err := runSudoCmd(ctx, "unattended-upgrade", "-v")
 			if cmdOutput != nil {
 				output.WriteString(cmdOutput.Stdout)

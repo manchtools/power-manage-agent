@@ -28,6 +28,14 @@ func testCreds(cert string) *credentials.Credentials {
 // than the stale in-memory copy that would fail the handshake once
 // expired.
 func TestReloadCredsForReconnect_PicksUpRotatedCert(t *testing.T) {
+	// store.Save derives its at-rest key from the machine ID; on a host without
+	// /etc/machine-id (or /var/lib/dbus/machine-id) it cannot save. Skip cleanly
+	// rather than hard-fail via require.NoError below — matching the
+	// requireMachineID guard the internal/credentials tests use.
+	if !credentials.MachineIDAvailable() {
+		t.Skip("no machine-id on this host; credential save/load is unavailable")
+	}
+
 	dir := t.TempDir()
 	store := credentials.NewStore(dir)
 

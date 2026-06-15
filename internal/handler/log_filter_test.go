@@ -67,6 +67,23 @@ func TestSanitizeForLog(t *testing.T) {
 	}
 }
 
+// Pin the ACTUAL contract at the boundary, not the comment's overclaim:
+// sanitizeForLog redacts the AES-GCM enc:v1: ciphertext token and truncates;
+// it does NOT redact a PLAINTEXT secret printed without that prefix — such a
+// value is only length-bounded. Documenting this prevents a future reader from
+// trusting a protection the filter does not provide (plaintext-secret redaction
+// would be a separate security feature, not part of this filter).
+func TestSanitizeForLog_PlaintextSecretBoundary(t *testing.T) {
+	// A LUKS-passphrase-shaped plaintext, short enough to avoid truncation and
+	// carrying no enc:v1: prefix.
+	plaintext := "hunter2-luks-pass"
+	out := sanitizeForLog("recovered key: " + plaintext)
+	assert.Contains(t, out, plaintext,
+		"a plaintext secret with no enc:v1: prefix is length-bounded only — the filter does not redact it")
+	assert.NotContains(t, out, "[REDACTED-ENC]",
+		"there is no enc:v1: token here, so nothing is redacted")
+}
+
 func TestIsPathologicalGrepPattern(t *testing.T) {
 	cases := []struct {
 		name      string

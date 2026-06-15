@@ -310,6 +310,15 @@ var getMachineID = func() ([]byte, error) {
 	return nil, errors.New("machine ID not found")
 }
 
+// MachineIDAvailable reports whether a machine ID can be read on this host.
+// Credential save/load (and cert rotation, which round-trips through the
+// credential store) need it for the KDF binding, so cmd-level tests use this to
+// skip cleanly on machine-id-less hosts rather than hard-failing.
+func MachineIDAvailable() bool {
+	_, err := getMachineID()
+	return err == nil
+}
+
 // encrypt encrypts plaintext using AES-256-GCM.
 func encrypt(key, plaintext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)

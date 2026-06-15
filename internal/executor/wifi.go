@@ -28,8 +28,14 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 	if params == nil {
 		return nil, false, fmt.Errorf("wifi params required")
 	}
-	if actionID == "" {
-		return nil, false, fmt.Errorf("action ID required for wifi")
+	// The action ID is spliced into a filesystem path
+	// (network.CertBaseDir/<id> for EAP-TLS certificates) and the
+	// pm-wifi-<id> NetworkManager connection name. Validate it the same
+	// way the sudo/ssh/sshd executors do — empty was the only case
+	// checked before, leaving traversal/separator characters
+	// ("../../etc", "a/b") free to escape CertBaseDir.
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
 	}
 
 	conName := wifiConnectionName(actionID)

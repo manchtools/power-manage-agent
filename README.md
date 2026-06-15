@@ -711,6 +711,20 @@ power-manage-agent tty status
 
 Exit code 0 = enabled, 1 = disabled. Combined with `is_compliance=true` + `compliance_expected_output=enabled` (or `disabled`), admins can report on fleet-wide TTY state without a new action type.
 
+### Inbound-message & action-input validation (WS17a)
+
+The agent treats every server/gateway-supplied field that reaches a filesystem path, a shell, or a privileged call as untrusted and validates it before use. These device-side rejection guards are exercised by dedicated rejection-path tests:
+
+- **TTY `session_id` is validated as a ULID.** `TerminalStart.session_id` is spliced into the per-session `/tmp/<tty-user>.<session-id>` directory that is created and `chown`-ed as root, so it must parse as a ULID. Path-meaningful values (`../../etc`, `a/b`), embedded NULs, and the empty string are refused before any filesystem use; together with the validated `pm-tty-*` username this makes the joined path unable to escape `/tmp`.
+- **Locked/disabled TTY users are refused.** A `pm-tty-*` account that is shadow-locked cannot open a session.
+- **`FILE` actions refuse to overwrite a directory.** Writing a file to a path that already exists as a directory reports `FAILED` and leaves the directory untouched, rather than moving a temp file inside it (WS6).
+- **`WIFI` action IDs are filesystem-validated.** The action ID is run through the same `validateActionIDForFilesystem` guard the sudo/ssh/sshd executors use before it is spliced into the EAP-TLS cert directory or the `pm-wifi-<id>` connection name.
+- **`SHELL` env vars go through the SDK hijack allow-list.** Caller-supplied `LD_PRELOAD` / `PATH` / `LD_LIBRARY_PATH` and friends are refused before the interpreter is launched.
+- **The gateway URL must be `https://host`.** Cleartext / h2c / opaque / hostless gateway URLs are refused before the mTLS dial (WS15).
+- **osquery refuses credential-bearing tables.** The SDK's convenience table path denies `shadow` / `process_envs` / `crontab` / `shell_history` / `sudoers` (the signed `RawSql` escape hatch is unaffected) — see the SDK README.
+
+CI runs the agent unit/arch suite (`go test -race ./...`, no build tags) separately from the per-distro `-tags=integration` executor suite, so these pure-function and handler-level guards are covered without requiring root or a real device.
+
 ## Logging
 
 Logs are written to stdout/stderr and can be collected by systemd journal:

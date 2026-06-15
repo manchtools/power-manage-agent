@@ -264,12 +264,15 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, envelope []byte, si
 	}
 
 	// Log output for debugging — but truncate + redact (audit F-32).
-	// Shell scripts and configuration content may embed secrets
-	// (LUKS passphrases, API tokens, the AES-GCM `enc:v1:` prefix
-	// the server uses for secrets-at-rest). Truncating to a tail
-	// preview keeps debugging useful for short-output checks
-	// without dumping multi-KB payloads into journald + downstream
-	// log shippers (Loki, journald-to-syslog forwarders, etc.).
+	// The exact contract (see sanitizeForLog): the AES-GCM `enc:v1:`
+	// ciphertext token the server uses for secrets-at-rest is redacted,
+	// and the whole preview is length-bounded. A PLAINTEXT secret (a LUKS
+	// passphrase or API token printed without the enc:v1: prefix) is NOT
+	// redacted — only length-bounded — so this is a payload-size guard plus
+	// ciphertext redaction, not a plaintext-secret scrubber. Truncating to a
+	// tail preview keeps debugging useful for short-output checks without
+	// dumping multi-KB payloads into journald + downstream log shippers
+	// (Loki, journald-to-syslog forwarders, etc.).
 	if result.Output != nil {
 		if result.Output.Stdout != "" {
 			h.logger.Debug("action stdout", "action_id", actionID, "stdout", sanitizeForLog(result.Output.Stdout))

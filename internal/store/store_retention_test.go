@@ -41,6 +41,32 @@ func resultExists(t *testing.T, st *Store, id string) bool {
 	return n == 1
 }
 
+// The rejection case is the point: a result that is OLD (past the soft
+// retention) but still UNSYNCED and under the hard age ceiling must SURVIVE —
+// the soft retention only evicts DELIVERED (synced) results; undelivered ones
+// are kept until the 30-day hard ceiling so they are not silently lost.
+func TestCleanupOldResults_KeepsOldUnsyncedUnderHardAge(t *testing.T) {
+	st, err := New(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	base := time.Now()
+	clock := base
+	st.now = func() time.Time { return clock }
+
+	// 8 days old: past the 7-day soft retention, under the 30-day hard ceiling.
+	syncedOld := recordResultAt(t, st, &clock, base, "old-synced", 8*24*time.Hour, true)
+	unsyncedOld := recordResultAt(t, st, &clock, base, "old-unsynced", 8*24*time.Hour, false)
+
+	clock = base
+	_, err = st.CleanupOldResults(7 * 24 * time.Hour)
+	require.NoError(t, err)
+
+	assert.False(t, resultExists(t, st, syncedOld), "an old DELIVERED result is evicted at the soft retention")
+	assert.True(t, resultExists(t, st, unsyncedOld),
+		"an old UNDELIVERED result under the hard ceiling must survive the soft retention")
+}
+
 // TestCleanupOldResults_PrunesUnsyncedBeyondCeiling pins WS13 #6: the results
 // table is bounded INDEPENDENTLY of sync state. Ceilings are sourced from intent
 // (named constants), not from whatever the impl happens to do.
