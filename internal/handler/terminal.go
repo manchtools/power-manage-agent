@@ -22,6 +22,21 @@ import (
 // (the SDK Client's type-assert miss is a no-op for the agent).
 var _ sdk.TerminalHandler = (*Handler)(nil)
 
+// Seams over the sysuser helpers + the setup deadline, so the bounded-setup
+// behaviour (WS13 #2) is testable without a real pm-tty-* account: a test
+// substitutes a ctx-respecting blocker for Modify and a fixed user for Get, and
+// lowers the timeout to keep the test fast. Production uses the real helpers
+// (Modify shells out via sudo -n) and the 30s default.
+var (
+	sysuserModify = sysuser.Modify
+	sysuserGet    = sysuser.Get
+	// terminalSetupTimeout bounds the privileged setup steps (usermod, chown)
+	// that run on the dispatch loop before a session goes active, so a slow/hung
+	// step cannot wedge the receive loop. Bounds only SETUP, not the session
+	// lifetime (the PTY pump uses sessionCtx).
+	terminalSetupTimeout = 30 * time.Second
+)
+
 // Default agent-side limits per the issue spec
 // (manchtools/power-manage-sdk#16 — Security section).
 const (
@@ -279,7 +294,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	// the dedicated pm-tty-* account; failure here means the control
 	// server's TerminalAccess provisioning hasn't run on this device
 	// yet, or the user has been disabled.
-	info, err := sysuser.Get(req.TtyUser)
+	info, err := sysuserGet(req.TtyUser)
 	if err != nil {
 		h.failTerminalStart(ctx, sender, req.SessionId, fmt.Sprintf("tty user %q not provisioned: %v", req.TtyUser, err))
 		return nil
@@ -292,6 +307,12 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	// Build the session record up front so closeTerminal can find it
 	// during the slow start path and signal cancellation.
 	sessionCtx, cancel := context.WithCancel(context.Background())
+	// setupCtx bounds ONLY the privileged setup steps below (usermod, chown), so
+	// a slow/hung step cannot wedge the dispatch loop (WS13 #2). It derives from
+	// sessionCtx (a concurrent Stop still cancels setup) but adds a deadline; the
+	// session lifetime keeps sessionCtx. Released as soon as setup is done.
+	setupCtx, setupCancel := context.WithTimeout(sessionCtx, terminalSetupTimeout)
+	defer setupCancel()
 	ts := &terminalSession{
 		id:      req.SessionId,
 		ttyUser: req.TtyUser,
@@ -374,7 +395,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortStopped()
 		return nil
 	}
-	if _, err := sysuser.Modify(sessionCtx, req.TtyUser, "-s", terminalActivatedShell); err != nil {
+	if _, err := sysuserModify(setupCtx, req.TtyUser, "-s", terminalActivatedShell); err != nil {
 		abortFail(fmt.Sprintf("activate shell: %v", err))
 		return nil
 	}
@@ -407,7 +428,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortFail("temp home is not a regular directory")
 		return nil
 	}
-	if _, err := sysuser.ChownRecursive(sessionCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
+	if _, err := sysuser.ChownRecursive(setupCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
 		abortFail(fmt.Sprintf("chown temp home: %v", err))
 		return nil
 	}
