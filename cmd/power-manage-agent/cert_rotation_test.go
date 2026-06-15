@@ -1,42 +1,13 @@
 package main
 
 import (
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
 	"testing"
 	"time"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	sdk "github.com/manchtools/power-manage/sdk/go"
+	"github.com/manchtools/power-manage/sdk/go/cryptotest"
 )
-
-// genCAPEM creates a self-signed CA certificate (PEM).
-func genCAPEM(t *testing.T) []byte {
-	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	if err != nil {
-		t.Fatalf("key: %v", err)
-	}
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	if err != nil {
-		t.Fatalf("create cert: %v", err)
-	}
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-}
 
 // TestRenewAt_Computation pins the 80%-of-lifetime schedule and the
 // already-past clamp to a 1-minute minimum.
@@ -75,8 +46,11 @@ func TestShouldEscalateRotation(t *testing.T) {
 // that does not chain to the enrolled CA is refused and creds is left
 // untouched (old cert + CA stay on disk).
 func TestApplyRenewal_RefusesNonContinuousCA(t *testing.T) {
-	oldCA := genCAPEM(t)
-	unrelatedCA := genCAPEM(t)
+	// Distinct CNs make the "these are two different CAs" intent explicit
+	// (CAPEM also generates a fresh random key per call, so they differ
+	// regardless — the rejection path needs oldCA != unrelatedCA).
+	oldCA := cryptotest.CAPEM(t, "enrolled-ca")
+	unrelatedCA := cryptotest.CAPEM(t, "unrelated-ca")
 	creds := &credentials.Credentials{CACert: oldCA, Certificate: []byte("old-cert")}
 
 	err := applyRenewal(creds, &sdk.RenewCertificateResult{
@@ -94,7 +68,7 @@ func TestApplyRenewal_RefusesNonContinuousCA(t *testing.T) {
 // TestApplyRenewal_AcceptsIdenticalCA — the common case: the server
 // returns the same CA; the new cert is adopted.
 func TestApplyRenewal_AcceptsIdenticalCA(t *testing.T) {
-	oldCA := genCAPEM(t)
+	oldCA := cryptotest.CAPEM(t, "enrolled-ca")
 	creds := &credentials.Credentials{CACert: oldCA, Certificate: []byte("old-cert")}
 
 	if err := applyRenewal(creds, &sdk.RenewCertificateResult{
@@ -111,7 +85,7 @@ func TestApplyRenewal_AcceptsIdenticalCA(t *testing.T) {
 // TestApplyRenewal_NoCAReturned keeps the enrolled CA and still adopts
 // the new cert (renewal without rotation).
 func TestApplyRenewal_NoCAReturned(t *testing.T) {
-	oldCA := genCAPEM(t)
+	oldCA := cryptotest.CAPEM(t, "enrolled-ca")
 	creds := &credentials.Credentials{CACert: oldCA, Certificate: []byte("old-cert")}
 
 	if err := applyRenewal(creds, &sdk.RenewCertificateResult{Certificate: []byte("new-cert")}); err != nil {
