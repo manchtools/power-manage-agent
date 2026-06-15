@@ -14,6 +14,11 @@ import (
 	sysservice "github.com/manchtools/power-manage/sdk/go/sys/service"
 )
 
+// geteuidFn is a seam over os.Geteuid so the empty-default privilege branch
+// (root vs sudo) can be exercised deterministically in a normal non-root test
+// run instead of depending on the runner's real uid.
+var geteuidFn = os.Geteuid
+
 // randomBackoff returns a random duration between minInitialBackoff and maxInitialBackoff.
 func randomBackoff() time.Duration {
 	jitter := rand.Int64N(int64(maxInitialBackoff - minInitialBackoff))
@@ -101,7 +106,7 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) error {
 		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
 		privilegeTool = "sudo"
 	case "":
-		if os.Geteuid() == 0 {
+		if geteuidFn() == 0 {
 			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
 			privilegeTool = ""
 		} else {
