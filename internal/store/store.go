@@ -151,6 +151,16 @@ func New(dataDir string) (*Store, error) {
 	return &Store{db: db, now: time.Now}, nil
 }
 
+// SetClockForTest overrides the store's clock seam. Test-only: the scheduler's
+// due-action tests live in package scheduler and cannot reach the unexported
+// `now` field, so they advance the store's clock through this to make a stored
+// action become due (WS14 #5).
+func (s *Store) SetClockForTest(now func() time.Time) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.now = now
+}
+
 // Close closes the database connection.
 func (s *Store) Close() error {
 	return s.db.Close()
