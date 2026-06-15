@@ -387,10 +387,12 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		cleanup()
 	}
 
-	// Activate the shell. usermod via the SDK helper which already
-	// uses sudo -n. Note: sysuser.Modify ignores the context for
-	// cancellation today (it shells out via sudo), so we still gate
-	// on isStopping() between steps as a fallback.
+	// Activate the shell. usermod via the SDK helper which already uses
+	// sudo -n. sysuser.Modify honors the context (it shells out via
+	// exec.Privileged → Run, which cancels and SIGKILL-escalates the process
+	// group on ctx expiry), so a bounded ctx (e.g. the shutdown teardown's 30s
+	// deadline) does bite; we still gate on isStopping() between steps as a
+	// belt-and-suspenders fallback.
 	if ts.isStopping() {
 		abortStopped()
 		return nil

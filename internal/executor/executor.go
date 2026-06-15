@@ -268,6 +268,12 @@ func (e *Executor) pkgManagerForCtx(ctx context.Context) *pkg.PackageManager {
 	if e.newPkgManager != nil {
 		if m, err := e.newPkgManager(ctx); err == nil && m != nil {
 			return m
+		} else if ctx.Err() != nil {
+			// The action context is already cancelled/expired: don't fall back
+			// to the construction-time (Background-bound) manager, which would
+			// silently bypass the timeout/cancel guarantee. nil → the caller
+			// fails closed with "no package manager".
+			return nil
 		}
 	}
 	return e.pkgManager
