@@ -387,10 +387,12 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		cleanup()
 	}
 
-	// Activate the shell. usermod via the SDK helper which already
-	// uses sudo -n. Note: sysuser.Modify ignores the context for
-	// cancellation today (it shells out via sudo), so we still gate
-	// on isStopping() between steps as a fallback.
+	// Activate the shell. usermod via the SDK helper which already uses
+	// sudo -n. sysuser.Modify honors the context (it shells out via
+	// exec.Privileged → Run, which cancels and SIGKILL-escalates the process
+	// group on ctx expiry), so a bounded ctx (e.g. the shutdown teardown's 30s
+	// deadline) does bite; we still gate on isStopping() between steps as a
+	// belt-and-suspenders fallback.
 	if ts.isStopping() {
 		abortStopped()
 		return nil
@@ -739,6 +741,26 @@ func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
 			h.logger.Warn("failed to remove terminal temp home",
 				"session_id", sessionID, "path", tempHome, "error", err)
 		}
+	}
+}
+
+// CloseAllTerminals tears down every live terminal session — used on agent
+// shutdown so a session left open does not leave its pm-tty shell activated and
+// its temp home on disk (WS16 #5). It snapshots the session ids under h.mu,
+// then closes each via the idempotent closeTerminal (which cancels the session
+// ctx so the pump goroutine unblocks, reverts the shell when no other session
+// for that user remains, and removes the temp home). Safe to call with no
+// sessions.
+func (h *Handler) CloseAllTerminals(ctx context.Context) {
+	h.mu.Lock()
+	ids := make([]string, 0, len(h.terminals))
+	for id := range h.terminals {
+		ids = append(ids, id)
+	}
+	h.mu.Unlock()
+
+	for _, id := range ids {
+		h.closeTerminal(ctx, id, "agent shutdown")
 	}
 }
 

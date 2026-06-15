@@ -438,7 +438,11 @@ func (e *Executor) repairZypper(ctx context.Context) {
 // executeUpdate performs a system-wide package update.
 // It respects version pinning (apt-mark hold / dnf versionlock).
 func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (*pb.CommandOutput, bool, error) {
-	if e.pkgManager == nil {
+	// WS16 #3: bind the package manager to the action ctx so the per-action
+	// timeout reaches the index-update and generic-upgrade subprocesses. The
+	// apt/dnf-specific upgrade paths already build a ctx-bound backend.
+	mgr := e.pkgManagerForCtx(ctx)
+	if mgr == nil {
 		return nil, false, fmt.Errorf("no supported package manager found")
 	}
 
@@ -462,7 +466,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	rebootRequiredBefore := e.checkRebootRequired()
 
 	// Update package index
-	if updateResult, err := e.pkgManager.Update(); err != nil {
+	if updateResult, err := mgr.Update(); err != nil {
 		allOutput.WriteString("=== Package Index Update ===\n")
 		if updateResult != nil {
 			allOutput.WriteString(updateResult.Stdout)
@@ -492,7 +496,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		lastErr = e.executeDnfUpgrade(ctx, params, &allOutput)
 	} else {
 		// Fallback to generic upgrade via the builder
-		upgradeResult, err := e.pkgManager.Upgrade().Run()
+		upgradeResult, err := mgr.Upgrade().Run()
 		if err != nil {
 			allOutput.WriteString(fmt.Sprintf("Error: %v\n", err))
 			if upgradeResult != nil {

@@ -17,8 +17,13 @@ func TestExecuteDeb_SkipsWhenDpkgMissing(t *testing.T) {
 	}
 
 	e := NewExecutor(nil)
+	// A well-formed action (https + checksum): the executor-boundary
+	// requireVerifiedArtifact guard runs before the dpkg lookup, so a
+	// checksum-less action would be rejected rather than skipped on a non-deb
+	// host (WS16 #2). Use a valid action so this test exercises the skip path.
 	output, changed, err := e.executeDeb(context.Background(), &pb.AppInstallParams{
-		Url: "https://example.com/test.deb",
+		Url:            "https://example.com/test.deb",
+		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
 	if err != nil {
@@ -40,8 +45,11 @@ func TestExecuteRpm_SkipsWhenRpmMissing(t *testing.T) {
 	}
 
 	e := NewExecutor(nil)
+	// Well-formed action so requireVerifiedArtifact (which runs before the rpm
+	// lookup) passes and the test reaches the skip path on a non-rpm host.
 	output, changed, err := e.executeRpm(context.Background(), &pb.AppInstallParams{
-		Url: "https://example.com/test.rpm",
+		Url:            "https://example.com/test.rpm",
+		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
 	if err != nil {
@@ -86,9 +94,12 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 	}
 
 	e := NewExecutor(nil)
-	// Use an invalid URL so it fails after the tool check (proving it didn't skip)
+	// A well-formed action (https + valid checksum) so it passes the
+	// requireVerifiedArtifact guard and proceeds past the tool check; the
+	// unresolvable host then fails the download (proving it didn't skip).
 	output, _, err := e.executeDeb(context.Background(), &pb.AppInstallParams{
-		Url: "https://invalid.example.com/nonexistent.deb",
+		Url:            "https://invalid.example.com/nonexistent.deb",
+		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
 	// Should NOT contain "skipped" — it should proceed and fail on download/install
@@ -97,6 +108,11 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("expected error from download/install of invalid URL, got nil")
+	}
+	// And it must NOT be rejected at the artifact guard (that would mean it
+	// failed before the tool check, not after).
+	if err != nil && strings.Contains(err.Error(), "artifact rejected") {
+		t.Errorf("valid action wrongly rejected at the artifact guard: %v", err)
 	}
 }
 
@@ -108,8 +124,12 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 	}
 
 	e := NewExecutor(nil)
+	// A well-formed action (https + valid checksum) so it passes the
+	// requireVerifiedArtifact guard and proceeds past the rpm check; the
+	// unresolvable host then fails the download (proving it didn't skip).
 	output, _, err := e.executeRpm(context.Background(), &pb.AppInstallParams{
-		Url: "https://invalid.example.com/nonexistent.rpm",
+		Url:            "https://invalid.example.com/nonexistent.rpm",
+		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
@@ -117,6 +137,11 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 	}
 	if err == nil {
 		t.Error("expected error from download/install of invalid URL, got nil")
+	}
+	// And it must NOT be rejected at the artifact guard (that would mean it
+	// failed before the tool check, not after).
+	if err != nil && strings.Contains(err.Error(), "artifact rejected") {
+		t.Errorf("valid action wrongly rejected at the artifact guard: %v", err)
 	}
 }
 

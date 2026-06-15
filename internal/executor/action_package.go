@@ -13,7 +13,11 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	if params == nil {
 		return nil, false, fmt.Errorf("package params required")
 	}
-	if e.pkgManager == nil {
+	// WS16 #3: bind the package manager to the action ctx so the per-action
+	// timeout reaches the package-manager subprocesses (install/update/remove
+	// are the long-running operations).
+	mgr := e.pkgManagerForCtx(ctx)
+	if mgr == nil {
 		return nil, false, fmt.Errorf("no supported package manager found")
 	}
 	pkgName := e.getPackageNameForManager(params)
@@ -25,19 +29,19 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	}
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		return e.ensurePackagePresent(ctx, params, pkgName)
+		return e.ensurePackagePresent(ctx, mgr, params, pkgName)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		return e.ensurePackageAbsent(ctx, params, pkgName)
+		return e.ensurePackageAbsent(ctx, mgr, params, pkgName)
 	default:
 		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
 // ensurePackagePresent installs a package (with optional version and pin) if not already satisfied.
-func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+func (e *Executor) ensurePackagePresent(ctx context.Context, mgr *pkg.PackageManager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := mgr.IsInstalled(pkgName)
 	if isInstalled {
-		if out, changed, err := e.checkPackageVersionAndPin(ctx, params, pkgName); out != nil {
+		if out, changed, err := e.checkPackageVersionAndPin(ctx, mgr, params, pkgName); out != nil {
 			return out, changed, err
 		}
 	}
@@ -47,13 +51,13 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 	}
 	e.repairPackageManager(ctx)
 
-	if _, updateErr := e.pkgManager.Update(); updateErr != nil {
+	if _, updateErr := mgr.Update(); updateErr != nil {
 		e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
 	}
 
 	// Version and AllowDowngrade are independent — setting a version does NOT
 	// imply downgrade permission. Callers must explicitly set AllowDowngrade.
-	builder := e.pkgManager.Install(pkgName)
+	builder := mgr.Install(pkgName)
 	if params.Version != "" {
 		builder = builder.Version(params.Version)
 	}
@@ -63,7 +67,7 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 	result, err := builder.Run()
 
 	if err == nil && params.Pin {
-		if _, pinErr := e.pinPackage(pkgName); pinErr != nil {
+		if _, pinErr := e.pinPackage(mgr, pkgName); pinErr != nil {
 			// Pin is part of the requested state. The previous shape
 			// degraded to a stderr warning while the action result
 			// stayed success — operators saw "installed and pinned"
@@ -82,17 +86,17 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 // desired version and pin state. Returns (output, changed, error) when the check
 // is conclusive (output != nil). Returns (nil, false, nil) when the version
 // doesn't match and the package needs reinstallation.
-func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) checkPackageVersionAndPin(ctx context.Context, mgr *pkg.PackageManager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
 	versionStr := ""
 	if params.Version != "" {
-		installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
+		installedVersion, _ := mgr.GetInstalledVersion(pkgName)
 		if installedVersion != params.Version {
 			return nil, false, nil
 		}
 		versionStr = " version " + params.Version
 	}
 	if params.Pin {
-		changed, pinErr := e.ensurePackagePinned(ctx, pkgName)
+		changed, pinErr := e.ensurePackagePinned(ctx, mgr, pkgName)
 		if pinErr != nil {
 			return &pb.CommandOutput{
 				ExitCode: 1,
@@ -112,8 +116,8 @@ func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.Pac
 }
 
 // ensurePackageAbsent removes a package if installed.
-func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+func (e *Executor) ensurePackageAbsent(ctx context.Context, mgr *pkg.PackageManager, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := mgr.IsInstalled(pkgName)
 	if !isInstalled {
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -128,11 +132,11 @@ func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams,
 	// a pinned package's removal would surface as the package
 	// manager's "held" message instead of the underlying unpin
 	// failure. Log so the operator can correlate.
-	if _, err := e.ensurePackageUnpinned(pkgName); err != nil {
+	if _, err := e.ensurePackageUnpinned(mgr, pkgName); err != nil {
 		e.logger.Warn("ensurePackageAbsent: failed to unpin package before removal",
 			"package", pkgName, "error", err)
 	}
-	result, err := e.pkgManager.Remove(pkgName).Run()
+	result, err := mgr.Remove(pkgName).Run()
 	return packageResult(result, err)
 }
 
@@ -197,22 +201,22 @@ func (e *Executor) getPackageNameForManager(params *pb.PackageParams) string {
 // - Pacman: IgnorePkg in pacman.conf
 // - Zypper: zypper lock
 // - Flatpak: flatpak mask
-func (e *Executor) isPackagePinned(pkgName string) (bool, error) {
-	if e.pkgManager == nil {
+func (e *Executor) isPackagePinned(mgr *pkg.PackageManager, pkgName string) (bool, error) {
+	if mgr == nil {
 		return false, fmt.Errorf("no package manager available")
 	}
-	return e.pkgManager.IsPinned(pkgName)
+	return mgr.IsPinned(pkgName)
 }
 
 // pinPackage pins a package to prevent it from being upgraded.
 // Returns (changed, error) where changed is true if the package was newly pinned.
-func (e *Executor) pinPackage(pkgName string) (bool, error) {
-	if e.pkgManager == nil {
+func (e *Executor) pinPackage(mgr *pkg.PackageManager, pkgName string) (bool, error) {
+	if mgr == nil {
 		return false, fmt.Errorf("no package manager available")
 	}
 
 	// Check if already pinned
-	isPinned, err := e.pkgManager.IsPinned(pkgName)
+	isPinned, err := mgr.IsPinned(pkgName)
 	if err != nil {
 		return false, fmt.Errorf("check pin status: %w", err)
 	}
@@ -221,7 +225,7 @@ func (e *Executor) pinPackage(pkgName string) (bool, error) {
 	}
 
 	// Pin the package
-	_, err = e.pkgManager.Pin(pkgName).Run()
+	_, err = mgr.Pin(pkgName).Run()
 	if err != nil {
 		return false, fmt.Errorf("pin package: %w", err)
 	}
@@ -230,13 +234,13 @@ func (e *Executor) pinPackage(pkgName string) (bool, error) {
 
 // unpinPackage unpins a package to allow it to be upgraded.
 // Returns (changed, error) where changed is true if the package was unpinned.
-func (e *Executor) unpinPackage(pkgName string) (bool, error) {
-	if e.pkgManager == nil {
+func (e *Executor) unpinPackage(mgr *pkg.PackageManager, pkgName string) (bool, error) {
+	if mgr == nil {
 		return false, fmt.Errorf("no package manager available")
 	}
 
 	// Check if currently pinned
-	isPinned, err := e.pkgManager.IsPinned(pkgName)
+	isPinned, err := mgr.IsPinned(pkgName)
 	if err != nil {
 		return false, fmt.Errorf("check pin status: %w", err)
 	}
@@ -245,7 +249,7 @@ func (e *Executor) unpinPackage(pkgName string) (bool, error) {
 	}
 
 	// Unpin the package
-	_, err = e.pkgManager.Unpin(pkgName).Run()
+	_, err = mgr.Unpin(pkgName).Run()
 	if err != nil {
 		return false, fmt.Errorf("unpin package: %w", err)
 	}
@@ -254,9 +258,9 @@ func (e *Executor) unpinPackage(pkgName string) (bool, error) {
 
 // ensurePackagePinned ensures a package is pinned. Returns true if a change was made.
 // This is a convenience method that handles filesystem repair before pinning.
-func (e *Executor) ensurePackagePinned(ctx context.Context, pkgName string) (bool, error) {
+func (e *Executor) ensurePackagePinned(ctx context.Context, mgr *pkg.PackageManager, pkgName string) (bool, error) {
 	// Check if already pinned first (no filesystem write needed)
-	isPinned, _ := e.isPackagePinned(pkgName)
+	isPinned, _ := e.isPackagePinned(mgr, pkgName)
 	if isPinned {
 		return false, nil
 	}
@@ -266,10 +270,10 @@ func (e *Executor) ensurePackagePinned(ctx context.Context, pkgName string) (boo
 		return false, errReadOnlyFS
 	}
 
-	return e.pinPackage(pkgName)
+	return e.pinPackage(mgr, pkgName)
 }
 
 // ensurePackageUnpinned ensures a package is unpinned. Returns true if a change was made.
-func (e *Executor) ensurePackageUnpinned(pkgName string) (bool, error) {
-	return e.unpinPackage(pkgName)
+func (e *Executor) ensurePackageUnpinned(mgr *pkg.PackageManager, pkgName string) (bool, error) {
+	return e.unpinPackage(mgr, pkgName)
 }

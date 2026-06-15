@@ -2469,6 +2469,10 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DEB, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test.deb",
+			// Checksum is mandated and the executor fails closed without it
+			// before downloading (WS16 #2); the value is irrelevant here — the
+			// download errors with the HTTP status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -2521,6 +2525,10 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_DEB, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url: ts.URL + "/test.deb",
+			// Checksum is mandated and the executor fails closed without it
+			// before downloading (WS16 #2); the value is irrelevant here — the
+			// download errors with the HTTP status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)

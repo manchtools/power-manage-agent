@@ -246,6 +246,8 @@ Install, update, or remove system packages using the detected package manager (a
 - `PRESENT`: Install or update the package, optionally pin to version
 - `ABSENT`: Unpin and remove the package
 
+`PACKAGE` and `UPDATE` actions honor their per-action `timeout_seconds`; when none is set they fall back to a default 30-minute ceiling so a wedged package-manager operation (mirror outage, lock contention) cannot run unbounded. The package manager is bound to the action's deadline, so a timeout aborts the underlying `apt`/`dnf`/`zypper`/`pacman` subprocess.
+
 ### System Update (`UPDATE`)
 
 Perform system-wide package updates.

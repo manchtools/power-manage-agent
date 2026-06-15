@@ -732,13 +732,16 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 	// Identify and load removed actions (for undo), then delete them
 	for localID, la := range localActions {
 		if _, exists := serverActions[localID]; !exists {
-			// Load the full action for undo
+			// Load the full action for undo. WS16 #4: fail closed — a removed
+			// action whose stored JSON can't decode must NOT be deleted, or it
+			// vanishes without ever reverting its side effects (SSH/sudo/etc.)
+			// and the store and device drift apart. Keep the row so a later
+			// sync (after the corruption is resolved) can still revert it.
 			action := &pb.Action{}
 			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
-				slog.Warn("failed to unmarshal removed action for undo", "action_id", localID, "error", err)
-			} else {
-				result.RemovedActions = append(result.RemovedActions, action)
+				return nil, fmt.Errorf("removed action %s has undecodable stored JSON; refusing to delete without revert: %w", localID, err)
 			}
+			result.RemovedActions = append(result.RemovedActions, action)
 			if _, err := tx.Exec("DELETE FROM actions WHERE id = ?", localID); err != nil {
 				return nil, fmt.Errorf("delete action %s: %w", localID, err)
 			}
@@ -888,12 +891,13 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		// members that simply migrated to standalone (or vice versa)
 		// were already handled by the upsert below in past syncs.
 		if la.isGrouped == 0 {
+			// WS16 #4: fail closed on an undecodable removed standalone action
+			// rather than deleting it without ever reverting its side effects.
 			action := &pb.Action{}
 			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
-				slog.Warn("failed to unmarshal removed action for undo", "action_id", localID, "error", err)
-			} else {
-				result.RemovedActions = append(result.RemovedActions, action)
+				return nil, fmt.Errorf("removed standalone action %s has undecodable stored JSON; refusing to delete without revert: %w", localID, err)
 			}
+			result.RemovedActions = append(result.RemovedActions, action)
 		}
 		if _, err := tx.Exec("DELETE FROM actions WHERE id = ?", localID); err != nil {
 			return nil, fmt.Errorf("delete action %s: %w", localID, err)
@@ -1149,7 +1153,7 @@ func (s *Store) GetGroupByID(groupID string) (*StoredActionGroup, error) {
 		SELECT id, source_label, schedule_json, last_executed_at, next_execute_at
 		FROM action_groups WHERE id = ?
 	`, groupID).Scan(&g.ID, &g.SourceLabel, &schedJSON, &lastExec, &g.NextExecuteAt)
-	if err == sql.ErrNoRows {
+	if errors.Is(err, sql.ErrNoRows) {
 		return nil, nil
 	}
 	if err != nil {
