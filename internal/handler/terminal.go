@@ -742,6 +742,26 @@ func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
 	}
 }
 
+// CloseAllTerminals tears down every live terminal session — used on agent
+// shutdown so a session left open does not leave its pm-tty shell activated and
+// its temp home on disk (WS16 #5). It snapshots the session ids under h.mu,
+// then closes each via the idempotent closeTerminal (which cancels the session
+// ctx so the pump goroutine unblocks, reverts the shell when no other session
+// for that user remains, and removes the temp home). Safe to call with no
+// sessions.
+func (h *Handler) CloseAllTerminals(ctx context.Context) {
+	h.mu.Lock()
+	ids := make([]string, 0, len(h.terminals))
+	for id := range h.terminals {
+		ids = append(ids, id)
+	}
+	h.mu.Unlock()
+
+	for _, id := range ids {
+		h.closeTerminal(ctx, id, "agent shutdown")
+	}
+}
+
 // anySessionForUserExcept reports whether any active session in the
 // registry has the given tty user, ignoring the supplied session id.
 // Used by OnTerminalStart's cleanup path to decide whether reverting

@@ -13,7 +13,11 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	if params == nil {
 		return nil, false, fmt.Errorf("package params required")
 	}
-	if e.pkgManager == nil {
+	// WS16 #3: bind the package manager to the action ctx so the per-action
+	// timeout reaches the package-manager subprocesses (install/update/remove
+	// are the long-running operations).
+	mgr := e.pkgManagerForCtx(ctx)
+	if mgr == nil {
 		return nil, false, fmt.Errorf("no supported package manager found")
 	}
 	pkgName := e.getPackageNameForManager(params)
@@ -25,19 +29,19 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	}
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		return e.ensurePackagePresent(ctx, params, pkgName)
+		return e.ensurePackagePresent(ctx, mgr, params, pkgName)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		return e.ensurePackageAbsent(ctx, params, pkgName)
+		return e.ensurePackageAbsent(ctx, mgr, params, pkgName)
 	default:
 		return nil, false, fmt.Errorf("unknown desired state: %v", state)
 	}
 }
 
 // ensurePackagePresent installs a package (with optional version and pin) if not already satisfied.
-func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+func (e *Executor) ensurePackagePresent(ctx context.Context, mgr *pkg.PackageManager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := mgr.IsInstalled(pkgName)
 	if isInstalled {
-		if out, changed, err := e.checkPackageVersionAndPin(ctx, params, pkgName); out != nil {
+		if out, changed, err := e.checkPackageVersionAndPin(ctx, mgr, params, pkgName); out != nil {
 			return out, changed, err
 		}
 	}
@@ -47,13 +51,13 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 	}
 	e.repairPackageManager(ctx)
 
-	if _, updateErr := e.pkgManager.Update(); updateErr != nil {
+	if _, updateErr := mgr.Update(); updateErr != nil {
 		e.logger.Warn("package index update failed, continuing with install", "error", updateErr)
 	}
 
 	// Version and AllowDowngrade are independent — setting a version does NOT
 	// imply downgrade permission. Callers must explicitly set AllowDowngrade.
-	builder := e.pkgManager.Install(pkgName)
+	builder := mgr.Install(pkgName)
 	if params.Version != "" {
 		builder = builder.Version(params.Version)
 	}
@@ -82,10 +86,10 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, params *pb.PackageP
 // desired version and pin state. Returns (output, changed, error) when the check
 // is conclusive (output != nil). Returns (nil, false, nil) when the version
 // doesn't match and the package needs reinstallation.
-func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) checkPackageVersionAndPin(ctx context.Context, mgr *pkg.PackageManager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
 	versionStr := ""
 	if params.Version != "" {
-		installedVersion, _ := e.pkgManager.GetInstalledVersion(pkgName)
+		installedVersion, _ := mgr.GetInstalledVersion(pkgName)
 		if installedVersion != params.Version {
 			return nil, false, nil
 		}
@@ -112,8 +116,8 @@ func (e *Executor) checkPackageVersionAndPin(ctx context.Context, params *pb.Pac
 }
 
 // ensurePackageAbsent removes a package if installed.
-func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := e.pkgManager.IsInstalled(pkgName)
+func (e *Executor) ensurePackageAbsent(ctx context.Context, mgr *pkg.PackageManager, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
+	isInstalled, _ := mgr.IsInstalled(pkgName)
 	if !isInstalled {
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -132,7 +136,7 @@ func (e *Executor) ensurePackageAbsent(ctx context.Context, _ *pb.PackageParams,
 		e.logger.Warn("ensurePackageAbsent: failed to unpin package before removal",
 			"package", pkgName, "error", err)
 	}
-	result, err := e.pkgManager.Remove(pkgName).Run()
+	result, err := mgr.Remove(pkgName).Run()
 	return packageResult(result, err)
 }
 

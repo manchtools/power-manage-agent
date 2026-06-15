@@ -31,6 +31,17 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, false, fmt.Errorf("app params required")
 	}
 
+	// Fail closed before any privileged remount or network round-trip: the
+	// artifact URL must be https and carry a checksum. downloadFile enforces
+	// https but SKIPS checksum verification when the checksum is empty, so this
+	// executor-boundary guard (matching executeRpm) refuses an unverified .deb
+	// on every host rather than relying on the proto/server alone (WS16 #2).
+	// Runs before the dpkg lookup so a malformed action is rejected even on
+	// non-deb hosts.
+	if err := requireVerifiedArtifact(params.Url, params.ChecksumSha256); err != nil {
+		return nil, false, err
+	}
+
 	// Skip on non-deb systems
 	if _, err := exec.LookPath("dpkg"); err != nil {
 		if errors.Is(err, exec.ErrNotFound) {

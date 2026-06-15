@@ -184,6 +184,31 @@ const maxFileContentSize = 10 << 20
 // defaultScriptTimeout is applied when no timeout is specified for script actions.
 const defaultScriptTimeout int32 = 3600
 
+// defaultPackageTimeout bounds PACKAGE/UPDATE actions that carry no explicit
+// timeout. Without it these ran under an unbounded context, so a wedged
+// apt/dnf operation (mirror outage, lock contention) could pin the action
+// forever (WS16 #3). 30 minutes is generous for a slow mirror + large upgrade
+// set yet refuses to hang indefinitely.
+const defaultPackageTimeout int32 = 1800
+
+// defaultTimeoutForAction returns the timeout (seconds) to apply to an action
+// when the operator set one (requested > 0 wins) or a default ceiling for the
+// long-running action classes. 0 means "no timeout" (the previous behaviour
+// for non-script, non-package actions).
+func defaultTimeoutForAction(actionType pb.ActionType, requested int32) int32 {
+	if requested > 0 {
+		return requested
+	}
+	switch actionType {
+	case pb.ActionType_ACTION_TYPE_SHELL, pb.ActionType_ACTION_TYPE_SCRIPT_RUN:
+		return defaultScriptTimeout
+	case pb.ActionType_ACTION_TYPE_PACKAGE, pb.ActionType_ACTION_TYPE_UPDATE:
+		return defaultPackageTimeout
+	default:
+		return 0
+	}
+}
+
 // containsNewline returns true if s contains \n or \r.
 func containsNewline(s string) bool {
 	return strings.ContainsAny(s, "\n\r")
@@ -226,6 +251,26 @@ type Executor struct {
 	// effects). nil in production → requireWritableFS calls the real
 	// e.repairFilesystem.
 	repairFS func(ctx context.Context) bool
+
+	// newPkgManager builds a per-action package manager bound to the action's
+	// context, so a PACKAGE/UPDATE timeout actually propagates to the package-
+	// manager subprocesses (the construction-time e.pkgManager is bound to
+	// context.Background). A seam so a test can capture the threaded context.
+	// nil → executor falls back to the construction-time e.pkgManager.
+	newPkgManager func(ctx context.Context) (*pkg.PackageManager, error)
+}
+
+// pkgManagerForCtx returns a package manager bound to ctx for this action, so
+// the per-action timeout reaches the underlying package-manager subprocesses.
+// Falls back to the construction-time manager when re-detection is unavailable
+// (e.g. the seam is unset or detection fails), preserving the prior behaviour.
+func (e *Executor) pkgManagerForCtx(ctx context.Context) *pkg.PackageManager {
+	if e.newPkgManager != nil {
+		if m, err := e.newPkgManager(ctx); err == nil && m != nil {
+			return m
+		}
+	}
+	return e.pkgManager
 }
 
 // NewExecutor creates a new action executor.
@@ -265,6 +310,19 @@ func NewExecutor(verifier *verify.ActionVerifier) *Executor {
 		verifier:   verifier,
 		logger:     logger,
 		now:        time.Now,
+		newPkgManager: func(ctx context.Context) (*pkg.PackageManager, error) {
+			m, err := pkg.DetectWithContext(ctx)
+			if err != nil {
+				return nil, err
+			}
+			if m == nil {
+				// DetectWithContext returns ErrNoPackageManager (handled above)
+				// rather than (nil, nil) today; guard anyway so a future change
+				// can't wrap a nil Manager and nil-deref on first use.
+				return nil, nil
+			}
+			return pkg.NewPackageManager(m), nil
+		},
 	}
 }
 
@@ -375,11 +433,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 		Changed:  true, // Default to true; scheduler may override based on output comparison
 	}
 
-	// Apply timeout. Default to 1 hour for script actions to prevent infinite loops.
-	timeout := env.GetTimeoutSeconds()
-	if timeout <= 0 && (env.ActionType == pb.ActionType_ACTION_TYPE_SHELL || env.ActionType == pb.ActionType_ACTION_TYPE_SCRIPT_RUN) {
-		timeout = defaultScriptTimeout
-	}
+	// Apply a per-action timeout. Long-running classes (scripts, and — WS16 #3
+	// — package/update operations) get a default ceiling when none is set so
+	// they cannot run unbounded.
+	timeout := defaultTimeoutForAction(env.ActionType, env.GetTimeoutSeconds())
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)

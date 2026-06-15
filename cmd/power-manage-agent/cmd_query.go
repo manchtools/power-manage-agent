@@ -3,6 +3,7 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"sort"
@@ -12,6 +13,12 @@ import (
 	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
 )
+
+// isNotInstalled reports whether err signals that osquery is not installed,
+// matching the sentinel even when it is wrapped (WS16 #13).
+func isNotInstalled(err error) bool {
+	return errors.Is(err, osquery.ErrNotInstalled)
+}
 
 // runQuery executes a local osquery table query and prints results.
 // Usage: power-manage-agent query <table> [--json]
@@ -40,7 +47,7 @@ func runQuery(args []string) {
 	// Create registry (requires osquery to be installed)
 	registry, err := osquery.NewRegistry()
 	if err != nil {
-		if err == osquery.ErrNotInstalled {
+		if isNotInstalled(err) {
 			fmt.Fprintln(os.Stderr, "Error: osquery is not installed on this system")
 			fmt.Fprintln(os.Stderr, "")
 			fmt.Fprintln(os.Stderr, "Install osquery to use this feature:")
