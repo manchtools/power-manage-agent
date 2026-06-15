@@ -10,6 +10,8 @@ import (
 	"sync"
 	"time"
 
+	"github.com/oklog/ulid/v2"
+
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 	sdk "github.com/manchtools/power-manage/sdk/go"
 	"github.com/manchtools/power-manage/sdk/go/sys/terminal"
@@ -287,6 +289,21 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	if err := validateDims(req.Cols, req.Rows); err != nil {
 		logger.Warn("terminal start rejected: bad dimensions", "cols", req.Cols, "rows", req.Rows)
 		h.failTerminalStart(ctx, sender, req.SessionId, err.Error())
+		return nil
+	}
+
+	// The session id is spliced into a /tmp path (tempHome below) that is then
+	// created and chowned as root, so it must be a well-formed ULID — the proto
+	// declares session_id as validate:"required,ulid", and the agent enforces
+	// that on inbound stream messages rather than trusting a possibly-compromised
+	// gateway. ulid.Parse rejects path-meaningful values ("../../etc", "a/b",
+	// embedded NULs) and the empty string before any filesystem use; together
+	// with the validated pm-tty-* username this makes the joined path unable to
+	// escape /tmp. Placed after the TTY/dims gates so those keep their existing
+	// rejection precedence, but before the user lookup so an invalid id costs no
+	// syscall.
+	if _, err := ulid.Parse(req.SessionId); err != nil {
+		h.failTerminalStart(ctx, sender, req.SessionId, "invalid session id")
 		return nil
 	}
 
