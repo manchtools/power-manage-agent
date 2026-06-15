@@ -95,23 +95,31 @@ func TestDesiredAccountLocked(t *testing.T) {
 	}
 }
 
-// Pin the cross-function invariant directly: for every combination of
-// the three password-skip flags, "createUser left it passwordless" must
-// equal "desiredAccountLocked wants it locked". If they ever diverge,
-// updateUser will fight createUser and either churn forever or unlock a
-// passwordless account.
+// Pin the cross-function invariant by binding to the SHARED predicate, not a
+// hand-copy of it: for every combination of the three password-skip flags,
+// "desiredAccountLocked wants it locked" must equal "createUser did NOT set a
+// password". Both callers consult createUserSetsPassword, so this drives the
+// real function on both sides — a future edit to one cannot diverge from the
+// other without this test (and createUser's call site) catching it. The prior
+// version re-derived the rule inline in the test, which only proved
+// desiredAccountLocked matched a COPY of the rule, not createUser's actual code.
 func TestDesiredAccountLocked_MatchesCreateUserPasswordSkip(t *testing.T) {
 	for _, noPass := range []bool{false, true} {
 		for _, sysUser := range []bool{false, true} {
 			for _, disabled := range []bool{false, true} {
 				p := &pb.UserParams{NoPassword: noPass, SystemUser: sysUser, Disabled: disabled}
-				// createUser sets a password (and thus leaves the
-				// account unlockable) ONLY in the all-false case.
-				createUserSetsPassword := !noPass && !sysUser && !disabled
-				wantLocked := !createUserSetsPassword
-				assert.Equal(t, wantLocked, desiredAccountLocked(p),
+				assert.Equal(t, !createUserSetsPassword(p), desiredAccountLocked(p),
 					"no_password=%v system_user=%v disabled=%v", noPass, sysUser, disabled)
 			}
 		}
 	}
+
+	// Pin the password-skip contract itself so the binding above can't be
+	// satisfied by a vacuous "both wrong the same way". createUser sets a
+	// temporary password ONLY when none of the three opt-outs is requested.
+	assert.True(t, createUserSetsPassword(&pb.UserParams{}),
+		"a plain account (no opt-outs) must get a password")
+	assert.False(t, createUserSetsPassword(&pb.UserParams{NoPassword: true}), "no_password skips the password")
+	assert.False(t, createUserSetsPassword(&pb.UserParams{SystemUser: true}), "system_user skips the password")
+	assert.False(t, createUserSetsPassword(&pb.UserParams{Disabled: true}), "disabled skips the password")
 }

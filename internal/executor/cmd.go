@@ -32,8 +32,11 @@ func runCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...
 	return toOutput(r), err
 }
 
-// runSudoCmd wraps a command with sudo for privileged operations.
-func runSudoCmd(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
+// runSudoCmd wraps a command with sudo for privileged operations. It is a
+// package var (not a plain func) so update/reboot tests can stub the
+// privileged shell-out without a live host; production always uses the
+// sysexec.Privileged dispatch below.
+var runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
 	r, err := sysexec.Privileged(ctx, name, args...)
 	return toOutput(r), err
 }

@@ -237,7 +237,7 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	// are good to have for any account that might ever need a
 	// PAM-protected login path. See sdk proto comment on no_password.
 	var metadata map[string]string
-	if !params.NoPassword && !params.SystemUser && !params.Disabled {
+	if createUserSetsPassword(params) {
 		tempPassword, err := sysuser.GeneratePassword(16, false)
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
@@ -303,16 +303,26 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	return &pb.CommandOutput{ExitCode: 0, Stdout: output.String()}, metadata, nil
 }
 
+// createUserSetsPassword reports whether createUser will set a temporary
+// password for this account. createUser sets one only when none of
+// no_password / system_user / disabled is requested; in every other case the
+// account is left at the useradd '!' (locked, hash-less) default. This is the
+// single source of truth that createUser and desiredAccountLocked both consult
+// so the two can never drift — see desiredAccountLocked.
+func createUserSetsPassword(params *pb.UserParams) bool {
+	return !params.NoPassword && !params.SystemUser && !params.Disabled
+}
+
 // desiredAccountLocked reports whether the account described by params
 // must remain shadow-locked (no PAM login path). It is the single
-// source of truth shared between createUser and updateUser, and MUST
-// mirror createUser's password-skip condition: createUser sets a temp
-// password only when none of no_password / system_user / disabled is
-// set, leaving the account at the useradd '!' default otherwise. An
-// account with no password must never be unlocked — unlocking a
-// hash-less account yields a passwordless login path.
+// source of truth shared between createUser and updateUser, and is bound
+// to createUser's password-skip condition via createUserSetsPassword:
+// createUser sets a temp password only when none of no_password /
+// system_user / disabled is set, leaving the account at the useradd '!'
+// default otherwise. An account with no password must never be unlocked —
+// unlocking a hash-less account yields a passwordless login path.
 func desiredAccountLocked(params *pb.UserParams) bool {
-	return params.Disabled || params.NoPassword || params.SystemUser
+	return !createUserSetsPassword(params)
 }
 
 // updateUser modifies an existing user account.
