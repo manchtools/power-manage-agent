@@ -72,6 +72,12 @@ type Scheduler struct {
 	mu      sync.RWMutex
 	running bool
 	stopCh  chan struct{}
+	// done is closed when the Start loop returns. Stop() blocks on it so a
+	// caller can join the scheduler goroutine before closing the store (WS14 #9)
+	// — execution is synchronous in the loop, so once Start returns the last
+	// runDueActions (and its RecordExecution) has fully committed. Set in Start
+	// under mu; nil before the first Start.
+	done chan struct{}
 
 	// resultsCh is created once in New and never reassigned, so it
 	// is safe to read/write without the lock from any goroutine.
@@ -232,11 +238,18 @@ func (s *Scheduler) Start(ctx context.Context) {
 	}
 	s.running = true
 	s.stopCh = make(chan struct{})
+	s.done = make(chan struct{})
 	// Capture stopCh into a local under the lock. The select below
 	// reads this local, never the shared s.stopCh field — so Stop()
 	// mutating s.stopCh can't race the reader (audit F020 regression).
 	stopCh := s.stopCh
+	done := s.done
 	s.mu.Unlock()
+
+	// Closed when the loop returns so Stop() can join before the store closes
+	// (WS14 #9). Execution is synchronous in this loop, so a closed done means
+	// no runDueActions / RecordExecution is in flight.
+	defer close(done)
 
 	s.logger.Info("scheduler started")
 
@@ -270,15 +283,25 @@ func (s *Scheduler) Start(ctx context.Context) {
 // s.stopCh — Start reads a local copy, and a stale closed channel is
 // harmless because the next Start() reassigns it (audit F020; the
 // earlier nil-assignment raced Start's select reader).
+// Stop signals the scheduler loop to halt and BLOCKS until it has returned
+// (WS14 #9), so a caller can guarantee any in-flight execution's RecordExecution
+// has committed before closing the store. Safe to call when not running.
 func (s *Scheduler) Stop() {
 	s.mu.Lock()
-	defer s.mu.Unlock()
-
 	if !s.running {
+		s.mu.Unlock()
 		return
 	}
 	close(s.stopCh)
 	s.running = false
+	done := s.done
+	s.mu.Unlock()
+
+	// Join the loop OUTSIDE the lock: runDueActions doesn't take s.mu, but
+	// waiting under the lock would still deadlock a concurrent Start()/Stop().
+	if done != nil {
+		<-done
+	}
 }
 
 // Results returns a channel for receiving execution results.

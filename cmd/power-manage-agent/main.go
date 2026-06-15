@@ -308,6 +308,13 @@ func main() {
 
 	runAgent(ctx, credStore, creds, hostname, h, sched, syncTrigger, cfg.pendingSecurityAlert, luksDaemon, logger, time.Now)
 
+	// Join the scheduler goroutine BEFORE the deferred actionStore.Close()
+	// runs (WS14 #9). Stop() blocks until the Start loop returns; execution is
+	// synchronous in that loop, so any in-flight action's RecordExecution has
+	// committed to the store before we close it — no lost result / use-after-close
+	// on SIGTERM.
+	sched.Stop()
+
 	// Stop background goroutines started during runAgent. The
 	// terminal sweeper would otherwise outlive the agent process in
 	// any non-os.Exit shutdown path (audit F004).

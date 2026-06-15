@@ -64,6 +64,13 @@ type mockExecutor struct {
 	mu     sync.Mutex
 	calls  []*pb.SignedActionEnvelope
 	resets int
+	// script maps an action id to the result ExecuteEnvelope should return
+	// (default SUCCESS when absent), so a test can drive a FAILED execution /
+	// Changed=false / Error path. WS14 #3.
+	script map[string]*pb.ActionResult
+	// block, if non-nil for an action id, is received-from before ExecuteEnvelope
+	// returns — lets a test hold an execution in-flight (WS14 #9).
+	block map[string]chan struct{}
 }
 
 // VerifyEnvelope mirrors the real executor: verify the CA signature over the
@@ -81,13 +88,44 @@ func (m *mockExecutor) VerifyEnvelope(envelopeBytes, signature []byte) (*pb.Sign
 
 // ExecuteEnvelope records the verified envelope the scheduler asked to run.
 func (m *mockExecutor) ExecuteEnvelope(_ context.Context, env *pb.SignedActionEnvelope) *pb.ActionResult {
+	id := env.GetActionId().GetValue()
 	m.mu.Lock()
 	m.calls = append(m.calls, env)
+	scripted := m.script[id]
+	blockCh := m.block[id]
 	m.mu.Unlock()
+
+	if blockCh != nil {
+		<-blockCh // hold the execution in-flight until the test releases it
+	}
+	if scripted != nil {
+		return scripted
+	}
 	return &pb.ActionResult{
 		ActionId: env.GetActionId(),
 		Status:   pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
 	}
+}
+
+// setScript makes ExecuteEnvelope return result for the given action id.
+func (m *mockExecutor) setScript(id string, result *pb.ActionResult) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.script == nil {
+		m.script = map[string]*pb.ActionResult{}
+	}
+	m.script[id] = result
+}
+
+// setBlock makes ExecuteEnvelope for the given action id block on ch until the
+// test closes/sends to it (WS14 #9 in-flight hold).
+func (m *mockExecutor) setBlock(id string, ch chan struct{}) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.block == nil {
+		m.block = map[string]chan struct{}{}
+	}
+	m.block[id] = ch
 }
 
 // ResetUpdateCycle satisfies the ActionExecutor interface. The
