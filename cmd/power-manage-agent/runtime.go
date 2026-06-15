@@ -168,6 +168,12 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		<-syncDone
 		<-resultsDone
 
+		// Release the prior client's idle keep-alive connections before the next
+		// reconnect builds a fresh client (WS13 #8). Without this, each reconnect
+		// leaks a transport's idle-connection pool — a slow file-descriptor /
+		// socket leak over a long-lived agent's reconnect loop.
+		client.CloseIdleConnections()
+
 		// Drain any interval-update the child sent after the stream
 		// closed but before sessionCtx propagated. Non-blocking.
 		select {
