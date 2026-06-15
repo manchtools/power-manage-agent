@@ -210,6 +210,14 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
+	// A nil Id would panic at action.Id.Value below. The sibling sync paths
+	// (SyncActions, SyncStandaloneAndGrouped) already skip nil-Id actions
+	// rather than crash on a malformed envelope; SaveAction must be just as
+	// defensive and return an error instead of panicking.
+	if action.Id == nil {
+		return fmt.Errorf("save action: nil id")
+	}
+
 	actionJSON, err := canonicalProtoJSON(action)
 	if err != nil {
 		return fmt.Errorf("marshal action: %w", err)
@@ -764,9 +772,13 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
+		// Decide "changed" once, in Go, on the COMPACTED JSON so that
+		// insignificant protojson whitespace drift (e.g. after a self-update to
+		// a binary with a different marshal seed) is not mistaken for a change.
+		changed := exists && (local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON)
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON {
+		} else if changed {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -777,7 +789,14 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 		now := s.now().UTC()
 		nextExecute := s.calculateNextExecute(action, &now, false)
 
-		// Upsert: insert new or update existing (but preserve execution history)
+		// Upsert: insert new or update existing (but preserve execution history).
+		// next_execute_at is reset ONLY when the action actually changed — driven
+		// by the Go `changed` decision above, NOT by a raw byte compare of the
+		// stored vs incoming JSON. The byte compare disagreed with the compacted
+		// Go compare, so whitespace-only drift reset a standalone action's cadence
+		// even though it was reported unchanged (it never appeared in
+		// ChangedActionIDs). Passing the precomputed decision keeps the two in
+		// lockstep.
 		_, err = tx.Exec(`
 			INSERT INTO actions (id, action_json, assigned_at, next_execute_at, desired_state)
 			VALUES (?, ?, CURRENT_TIMESTAMP, ?, ?)
@@ -785,12 +804,10 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 				action_json = excluded.action_json,
 				desired_state = excluded.desired_state,
 				next_execute_at = CASE
-					WHEN excluded.desired_state != actions.desired_state
-						OR excluded.action_json != actions.action_json
-					THEN excluded.next_execute_at
+					WHEN ? THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, actionJSON, nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState, changed)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -918,10 +935,16 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
 
+		// Same lockstep decision as SyncActions: compare the COMPACTED JSON in
+		// Go (whitespace drift is not a change) and also treat a grouped→
+		// standalone transition as changed. The SQL CASE consumes this single
+		// decision instead of raw-byte-comparing the JSON, which would reset a
+		// standalone action's cadence on insignificant drift.
 		local, exists := localActions[actionID]
+		changed := exists && (local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON || local.isGrouped != 0)
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
-		} else if local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON || local.isGrouped != 0 {
+		} else if changed {
 			result.ChangedActionIDs = append(result.ChangedActionIDs, actionID)
 		}
 
@@ -935,13 +958,10 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 				desired_state = excluded.desired_state,
 				is_grouped = 0,
 				next_execute_at = CASE
-					WHEN excluded.desired_state != actions.desired_state
-						OR excluded.action_json != actions.action_json
-						OR actions.is_grouped != 0
-					THEN excluded.next_execute_at
+					WHEN ? THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, actionJSON, nextExecute, newDesiredState)
+		`, actionID, actionJSON, nextExecute, newDesiredState, changed)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}

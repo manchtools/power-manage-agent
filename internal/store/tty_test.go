@@ -4,6 +4,57 @@ import (
 	"testing"
 )
 
+// IsTTYEnabled's accept-list is exercised DIRECTLY via SetSetting (not via
+// SetTTYEnabled, which only ever writes the canonical "1"/"0") so the test
+// isn't circular: it pins the exact set of truthy spellings a manual sqlite
+// edit might use. The disable set is sourced from intent (wrong-but-plausible
+// values), not from the switch under test, so an under-specified accept-list
+// would be caught.
+func TestIsTTYEnabled_AcceptListExactBothDirections(t *testing.T) {
+	enable := []string{"1", "true", "TRUE", " enabled ", "yes", "On"}
+	disable := []string{"0", "", "garbage", "2", "disabled", "tru", "enabled!"}
+
+	for _, v := range enable {
+		t.Run("enable/"+v, func(t *testing.T) {
+			st, err := New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			if err := st.SetSetting(TTYSettingKey, v); err != nil {
+				t.Fatal(err)
+			}
+			enabled, err := st.IsTTYEnabled()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !enabled {
+				t.Errorf("IsTTYEnabled() with stored %q = false, want true", v)
+			}
+		})
+	}
+
+	for _, v := range disable {
+		t.Run("disable/"+v, func(t *testing.T) {
+			st, err := New(t.TempDir())
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer st.Close()
+			if err := st.SetSetting(TTYSettingKey, v); err != nil {
+				t.Fatal(err)
+			}
+			enabled, err := st.IsTTYEnabled()
+			if err != nil {
+				t.Fatal(err)
+			}
+			if enabled {
+				t.Errorf("IsTTYEnabled() with stored %q = true, want false", v)
+			}
+		})
+	}
+}
+
 func TestTTYDefault_Disabled(t *testing.T) {
 	st, err := New(t.TempDir())
 	if err != nil {
