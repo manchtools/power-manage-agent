@@ -1,0 +1,53 @@
+name: Unit Tests
+
+# Runs the agent's unit + arch test suite (`go test ./...`) on every PR and on
+# pushes to main. Closes the gap where agent CI ran only lint + the per-distro
+# executor INTEGRATION tests, so the unit/arch suite (internal/archtest,
+# internal/handler, internal/store, internal/scheduler, cmd/) was never gated —
+# which let a TestNoDynamicSQL arch-guard violation merge unnoticed (fixed in
+# #122). The suite needs no external infra (in-tree SQLite) and runs under -race.
+# sdk and server already gate their unit suites; this brings agent in line.
+
+on:
+  pull_request:
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/unit-test.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**.go'
+      - 'go.mod'
+      - 'go.sum'
+      - '.github/workflows/unit-test.yml'
+
+concurrency:
+  group: unit-test-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  unit-tests:
+    name: Unit Tests (race)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+        env:
+          # agent is not in the parent workspace's go.work; workspace mode would
+          # pick up the wrong module roots. Matches lint.yml.
+          GOWORK: 'off'
+
+      - name: go test
+        # Plain `go test ./...` runs only the unit/arch suite — the executor
+        # integration tests are behind the `integration` build tag and are
+        # covered by integration-test.yml's per-distro matrix. -race needs cgo,
+        # which ubuntu-latest provides (gcc preinstalled).
+        run: go test -race ./...
+        env:
+          GOWORK: 'off'
