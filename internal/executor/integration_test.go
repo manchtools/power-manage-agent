@@ -1539,11 +1539,14 @@ func TestIntegration_AppImage(t *testing.T) {
 	})
 
 	t.Run("InstallIdempotent", func(t *testing.T) {
-		// Test without checksum — file existence check should give changed=false
+		// Re-install with the SAME checksum — the file already exists with the
+		// correct hash, so the executor reports changed=false. (AppImage installs
+		// now fail closed without a checksum, parity with rpm/deb.)
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_APP_IMAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
-			Url:         ts.URL + "/" + fileName,
-			InstallPath: installDir,
+			Url:            ts.URL + "/" + fileName,
+			ChecksumSha256: checksumHex,
+			InstallPath:    installDir,
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
@@ -2437,6 +2440,10 @@ func TestIntegration_EdgeCase_DownloadHttp500(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url:         ts.URL + "/test.AppImage",
 			InstallPath: t.TempDir(),
+			// Checksum is mandated and the executor fails closed without it before
+			// downloading (parity with rpm/deb); the value is irrelevant here —
+			// the download errors with the HTTP status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -2493,6 +2500,10 @@ func TestIntegration_EdgeCase_DownloadHttp404(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url:         ts.URL + "/test.AppImage",
 			InstallPath: t.TempDir(),
+			// Checksum is mandated and the executor fails closed without it before
+			// downloading (parity with rpm/deb); the value is irrelevant here —
+			// the download errors with the HTTP status first.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -2582,6 +2593,10 @@ func TestIntegration_EdgeCase_DownloadTimeout(t *testing.T) {
 	action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 		Url:         ts.URL + "/test.AppImage",
 		InstallPath: installDir,
+		// Checksum is mandated and the executor fails closed without it before
+		// downloading (parity with rpm/deb); the value is irrelevant here — the
+		// slow download trips the action timeout first.
+		ChecksumSha256: strings.Repeat("a", 64),
 	}}
 	// Set a 1-second timeout on the action
 	action.TimeoutSeconds = 1
@@ -3022,6 +3037,9 @@ func TestIntegration_EdgeCase_DNSResolutionFailure(t *testing.T) {
 		action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 			Url:         "https://this-domain-does-not-exist-xyzzy.invalid/app.AppImage",
 			InstallPath: "/tmp/pm-edge-dns",
+			// Supply a checksum so the install passes the artifact-verification
+			// guard and actually reaches the DNS resolution this test exercises.
+			ChecksumSha256: strings.Repeat("a", 64),
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
@@ -3074,6 +3092,9 @@ func TestIntegration_EdgeCase_HTTPSCertError(t *testing.T) {
 	action.Params = &pb.Action_App{App: &pb.AppInstallParams{
 		Url:         ts.URL + "/test.AppImage",
 		InstallPath: "/tmp/pm-edge-tls",
+		// Supply a checksum so the install passes the artifact-verification guard
+		// and actually reaches the TLS handshake this test exercises.
+		ChecksumSha256: strings.Repeat("a", 64),
 	}}
 	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertFailed(t, result)
