@@ -141,6 +141,14 @@ func New(dataDir string) (*Store, error) {
 		db.Close()
 		return nil, fmt.Errorf("restrict data dir mode: %w", err)
 	}
+	// Re-stat to confirm the chmod actually tightened the mode: os.Chmod can
+	// silently no-op on some filesystems (9p, certain network/vfat mounts),
+	// which would leave the secrets dir group/world-accessible while Chmod
+	// reported success. Fail closed — "couldn't tighten → error", not "tried".
+	if err := verifyRestrictiveDirMode(dataDir); err != nil {
+		db.Close()
+		return nil, err
+	}
 	for _, p := range []string{dbPath, dbPath + "-wal", dbPath + "-shm"} {
 		if err := os.Chmod(p, 0o600); err != nil && !os.IsNotExist(err) {
 			db.Close()
@@ -149,6 +157,21 @@ func New(dataDir string) (*Store, error) {
 	}
 
 	return &Store{db: db, now: time.Now}, nil
+}
+
+// verifyRestrictiveDirMode fails closed unless dir has NO group/world permission
+// bits, i.e. the chmod to 0700 actually took effect. os.Chmod's success return
+// is not enough: on filesystems that don't honour Unix modes it silently no-ops,
+// which would leave the secrets data dir readable by other local users.
+func verifyRestrictiveDirMode(dir string) error {
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat data dir after chmod: %w", err)
+	}
+	if perm := info.Mode().Perm(); perm&0o077 != 0 {
+		return fmt.Errorf("data dir %s is %#o after tightening; refusing to store secrets in a group/world-accessible directory", dir, perm)
+	}
+	return nil
 }
 
 // SetClockForTest overrides the store's clock seam. Test-only: the scheduler's

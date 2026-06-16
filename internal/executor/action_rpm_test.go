@@ -67,11 +67,18 @@ func TestRequireVerifiedArtifact(t *testing.T) {
 	if err := requireVerifiedArtifact("https://x/x.rpm", validHex); err != nil {
 		t.Errorf("valid https+checksum rejected: %v", err)
 	}
+	// Uppercase / surrounding whitespace is a valid sha256 (operators paste it).
+	if err := requireVerifiedArtifact("https://x/x.rpm", "  "+strings.Repeat("A", 64)+"  "); err != nil {
+		t.Errorf("valid uppercase checksum rejected: %v", err)
+	}
 	bad := []struct{ url, sum string }{
 		{"http://x/x.rpm", validHex}, // non-https → MITM
 		{"ftp://x/x.rpm", validHex},
-		{"https://x/x.rpm", ""},    // empty checksum → unverified
-		{"https://x/x.rpm", "   "}, // whitespace-only checksum
+		{"https://x/x.rpm", ""},                      // empty checksum → unverified
+		{"https://x/x.rpm", "   "},                   // whitespace-only checksum
+		{"https://x/x.rpm", "abc123"},                // too short → malformed
+		{"https://x/x.rpm", strings.Repeat("a", 63)}, // wrong length → malformed
+		{"https://x/x.rpm", strings.Repeat("z", 64)}, // non-hex chars → malformed
 	}
 	for _, tc := range bad {
 		if err := requireVerifiedArtifact(tc.url, tc.sum); err == nil {

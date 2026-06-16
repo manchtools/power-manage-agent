@@ -170,8 +170,32 @@ func requireVerifiedArtifact(rawURL, checksum string) error {
 	if err := validateHTTPS(rawURL); err != nil {
 		return fmt.Errorf("artifact rejected: %w", err)
 	}
-	if strings.TrimSpace(checksum) == "" {
+	checksum = strings.TrimSpace(checksum)
+	if checksum == "" {
 		return fmt.Errorf("artifact rejected: checksum_sha256 is required (refusing to install an unverified binary)")
 	}
+	// Validate the FORM, not just presence: a sha256 is exactly 64 hex chars.
+	// A malformed checksum can never match the downloaded artifact, so reject it
+	// up front with a clear message rather than failing late at the post-download
+	// compare (WS16 #2 well-formedness).
+	if !isHex64(checksum) {
+		return fmt.Errorf("artifact rejected: checksum_sha256 must be 64 hexadecimal characters")
+	}
 	return nil
+}
+
+// isHex64 reports whether s is exactly 64 hexadecimal characters (a sha256
+// digest), case-insensitively — operators routinely paste uppercase digests.
+func isHex64(s string) bool {
+	if len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }
