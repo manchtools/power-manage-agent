@@ -10,6 +10,28 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
+// TestVerifyRestrictiveDirMode_FailsClosedOnWideDir pins WS14 #6's "couldn't
+// tighten → error" contract: the post-chmod re-stat must REJECT a data dir that
+// still carries group/world bits (the case where os.Chmod silently no-ops on a
+// mount that ignores modes), and accept a 0700 dir.
+func TestVerifyRestrictiveDirMode_FailsClosedOnWideDir(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("POSIX file modes are not meaningful on Windows")
+	}
+	dir := t.TempDir()
+
+	require.NoError(t, os.Chmod(dir, 0o777)) // simulate a chmod that did not tighten
+	require.Error(t, verifyRestrictiveDirMode(dir),
+		"a group/world-accessible data dir must be rejected, not accepted")
+
+	require.NoError(t, os.Chmod(dir, 0o750)) // group still has access
+	require.Error(t, verifyRestrictiveDirMode(dir),
+		"any group/world permission bit must be rejected")
+
+	require.NoError(t, os.Chmod(dir, 0o700))
+	require.NoError(t, verifyRestrictiveDirMode(dir), "a 0700 dir must be accepted")
+}
+
 // TestStoreNew_TightensDataDirAndDBFileModes pins WS14 #6: store.New re-asserts
 // 0700 on the data dir and 0600 on the DB + its WAL/SHM sidecars, even when the
 // dir pre-existed with a wider mode (distro package, prior umask) — the DB holds
