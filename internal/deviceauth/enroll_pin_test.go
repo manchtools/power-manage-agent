@@ -2,17 +2,9 @@ package deviceauth
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"log/slog"
-	"math/big"
 	"strings"
 	"testing"
-	"time"
 
 	"connectrpc.com/connect"
 	"github.com/stretchr/testify/assert"
@@ -22,6 +14,7 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
+	"github.com/manchtools/power-manage/sdk/go/cryptotest"
 )
 
 const fakeLeafPEM = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n"
@@ -29,20 +22,7 @@ const fakeLeafPEM = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE----
 // genTestCAPEM creates a self-signed CA certificate (PEM) for pin tests.
 func genTestCAPEM(t *testing.T) []byte {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
-		NotBefore:             time.Now().Add(-time.Hour),
-		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		KeyUsage:              x509.KeyUsageCertSign,
-		BasicConstraintsValid: true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	require.NoError(t, err)
-	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
+	return cryptotest.CAPEM(t, "test-ca")
 }
 
 func caReturningMock(caPEM []byte) *mockRegisterService {

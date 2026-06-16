@@ -6,6 +6,7 @@ import (
 	"encoding/pem"
 	"errors"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -64,6 +65,82 @@ func TestEnroll_RateLimitRejectsSixthInWindow(t *testing.T) {
 	assert.False(t, resp.Msg.Success)
 	assert.Contains(t, resp.Msg.Error, "rate limit")
 	assert.EqualValues(t, 5, atomic.LoadInt32(&registerCalls), "the 6th attempt must not reach the network")
+}
+
+// TestEnroll_RateLimitSlidingWindowEviction pins WS9 #6: the limiter is a
+// SLIDING window, not a permanent lockout — attempts older than the window are
+// evicted, so once the window passes enrollment is allowed again. (The
+// within-window rejection is covered by TestEnroll_RateLimitRejectsSixthInWindow;
+// this covers the eviction side, and also that FAILED attempts consume budget,
+// since all six here fail registration yet still trip the limit.)
+func TestEnroll_RateLimitSlidingWindowEviction(t *testing.T) {
+	var registerCalls int32
+	mock := &mockRegisterService{
+		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
+			atomic.AddInt32(&registerCalls, 1)
+			return nil, connect.NewError(connect.CodePermissionDenied, nil)
+		},
+	}
+	srv := startMockControlServer(t, mock)
+	credStore := credentials.NewStore(t.TempDir())
+	h := NewEnrollHandler("test-host", "dev", credStore, slog.Default(), nil)
+	h.registerOpts = trustServer(srv)
+	now := time.Now()
+	h.now = func() time.Time { return now }
+
+	// Exhaust the window: 5 reach (and fail) registration, the 6th is rate-limited.
+	for i := 0; i < 6; i++ {
+		_, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+		require.NoError(t, err)
+	}
+	require.EqualValues(t, 5, atomic.LoadInt32(&registerCalls), "only 5 attempts may reach the network within one window")
+
+	// Advance past the 1-minute window: the prior attempts are evicted, so a
+	// fresh attempt is allowed through to registration again.
+	now = now.Add(61 * time.Second)
+	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+	require.NoError(t, err)
+	assert.Contains(t, resp.Msg.Error, "registration failed", "after the window resets, enrollment is allowed through again")
+	assert.EqualValues(t, 6, atomic.LoadInt32(&registerCalls), "a fresh attempt after the window must reach registration")
+}
+
+// TestEnroll_ConcurrentSerializesToOneRegistration pins WS9 #12: enrollMu
+// serializes the enrollment body, so concurrent Enroll calls (all within the
+// rate-limit budget) cannot each pass the Exists() check and register duplicate
+// devices — the first registers and saves, and the rest short-circuit. Without
+// the lock this would race to N registrations / a corrupt Save.
+func TestEnroll_ConcurrentSerializesToOneRegistration(t *testing.T) {
+	var registerCalls int32
+	mock := &mockRegisterService{
+		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
+			atomic.AddInt32(&registerCalls, 1)
+			return connect.NewResponse(&pm.RegisterResponse{
+				DeviceId:    &pm.DeviceId{Value: "dev-123"},
+				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
+				Certificate: []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
+				GatewayUrl:  "https://gw.example.com:8443",
+			}), nil
+		},
+	}
+	srv := startMockControlServer(t, mock)
+	credStore := credentials.NewStore(t.TempDir())
+	h := NewEnrollHandler("test-host", "dev", credStore, slog.Default(), nil)
+	h.registerOpts = trustServer(srv)
+
+	const n = 5 // within the 5/min budget, so all reach the serialized body
+	var wg sync.WaitGroup
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			_, _ = h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+		}()
+	}
+	wg.Wait()
+
+	assert.EqualValues(t, 1, atomic.LoadInt32(&registerCalls),
+		"enrollMu must serialize concurrent enrollments so exactly one device registers; the rest short-circuit on Exists()")
+	assert.True(t, credStore.Exists(), "the single enrollment must have saved credentials")
 }
 
 // TestEnroll_RejectsMissingMTLSCerts pins fail-closed when the server
