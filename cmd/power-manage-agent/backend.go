@@ -40,7 +40,6 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 	if err := setPrivilegeBackend(cfg.PrivilegeBackend, logger); err != nil {
 		return err
 	}
-
 	// Service manager. Only systemd has a concrete implementation
 	// today; the other backends are scaffolded in the SDK so the
 	// proto enum + agent wiring stay stable, but WriteUnit / Enable /
@@ -97,25 +96,25 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) error {
 	var privilegeTool string
 	switch backend {
 	case "root":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+		sysexec.SetPrivilegeBackend(sysexec.Direct)
 		privilegeTool = ""
 	case "doas":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendDoas)
+		sysexec.SetPrivilegeBackend(sysexec.Doas)
 		privilegeTool = "doas"
 	case "sudo":
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		sysexec.SetPrivilegeBackend(sysexec.Sudo)
 		privilegeTool = "sudo"
 	case "":
 		if geteuidFn() == 0 {
-			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+			sysexec.SetPrivilegeBackend(sysexec.Direct)
 			privilegeTool = ""
 		} else {
-			sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+			sysexec.SetPrivilegeBackend(sysexec.Sudo)
 			privilegeTool = "sudo"
 		}
 	default:
 		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo", "value", backend)
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+		sysexec.SetPrivilegeBackend(sysexec.Sudo)
 		privilegeTool = "sudo"
 	}
 	if privilegeTool == "" {

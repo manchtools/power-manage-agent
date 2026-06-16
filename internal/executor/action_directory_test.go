@@ -21,7 +21,7 @@ import (
 func withRootBackend(t *testing.T) {
 	t.Helper()
 	prev := sysexec.CurrentPrivilegeBackend()
-	sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+	sysexec.SetPrivilegeBackend(sysexec.Direct)
 	t.Cleanup(func() { sysexec.SetPrivilegeBackend(prev) })
 }
 

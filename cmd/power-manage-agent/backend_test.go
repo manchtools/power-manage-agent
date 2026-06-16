@@ -31,7 +31,7 @@ import (
 func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 	// Restore the SDK's global state after each case so parallel
 	// test packages can't see stale backend selections.
-	defer sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+	defer sysexec.SetPrivilegeBackend(sysexec.Sudo)
 	defer sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
 	defer sysenc.SetBackend(sysenc.BackendLUKS)
 
@@ -56,25 +56,25 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 		{
 			name:    "empty defaults to sudo",
 			cfg:     &Config{},
-			want:    sysexec.PrivilegeBackendSudo,
+			want:    sysexec.Sudo,
 			wantErr: false,
 		},
 		{
 			name:    "explicit sudo",
 			cfg:     &Config{PrivilegeBackend: "sudo"},
-			want:    sysexec.PrivilegeBackendSudo,
+			want:    sysexec.Sudo,
 			wantErr: false,
 		},
 		{
 			name:    "explicit doas",
 			cfg:     &Config{PrivilegeBackend: "doas"},
-			want:    sysexec.PrivilegeBackendDoas,
+			want:    sysexec.Doas,
 			wantErr: false,
 		},
 		{
 			name:    "unknown value warns and falls back to sudo",
 			cfg:     &Config{PrivilegeBackend: "typo"},
-			want:    sysexec.PrivilegeBackendSudo,
+			want:    sysexec.Sudo,
 			wantErr: false,
 		},
 	}
@@ -103,7 +103,7 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 // as a cryptic "command not found" on the first privileged call,
 // long after the cause.
 func TestApplyBackendOverrides_MissingPrivilegeBinaryIsFatal(t *testing.T) {
-	defer sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+	defer sysexec.SetPrivilegeBackend(sysexec.Sudo)
 
 	// PATH that contains everything EXCEPT doas. systemctl is present
 	// so the service-backend check passes; we're isolating the
@@ -126,7 +126,7 @@ func TestApplyBackendOverrides_MissingPrivilegeBinaryIsFatal(t *testing.T) {
 // normal non-root CI run still proves the root default, instead of the silent
 // euid-coupled "want=sudo" the previous test baked in.
 func TestSetPrivilegeBackend_EmptyDefault_BranchesOnEuid(t *testing.T) {
-	defer sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+	defer sysexec.SetPrivilegeBackend(sysexec.Sudo)
 	origEuid := geteuidFn
 	t.Cleanup(func() { geteuidFn = origEuid })
 
@@ -139,7 +139,7 @@ func TestSetPrivilegeBackend_EmptyDefault_BranchesOnEuid(t *testing.T) {
 		if err := setPrivilegeBackend("", discardLogger()); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got := sysexec.CurrentPrivilegeBackend(); got != sysexec.PrivilegeBackendRoot {
+		if got := sysexec.CurrentPrivilegeBackend(); got != sysexec.Direct {
 			t.Errorf("empty default at euid 0 = %v, want Root", got)
 		}
 	})
@@ -149,7 +149,7 @@ func TestSetPrivilegeBackend_EmptyDefault_BranchesOnEuid(t *testing.T) {
 		if err := setPrivilegeBackend("", discardLogger()); err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
-		if got := sysexec.CurrentPrivilegeBackend(); got != sysexec.PrivilegeBackendSudo {
+		if got := sysexec.CurrentPrivilegeBackend(); got != sysexec.Sudo {
 			t.Errorf("empty default at euid 1000 = %v, want Sudo", got)
 		}
 	})
@@ -160,7 +160,7 @@ func TestSetPrivilegeBackend_EmptyDefault_BranchesOnEuid(t *testing.T) {
 // its binary present is selected (and warns); an unknown value falls back to
 // systemd WITHOUT erroring (fail-safe, not fail-open to the bogus name).
 func TestApplyBackendOverrides_ServiceBackend(t *testing.T) {
-	defer sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendSudo)
+	defer sysexec.SetPrivilegeBackend(sysexec.Sudo)
 	defer sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
 	defer sysenc.SetBackend(sysenc.BackendLUKS)
 

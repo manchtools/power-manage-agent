@@ -36,7 +36,7 @@ import (
 // root, breaking every `sudo -n cmd` invocation).
 func init() {
 	if os.Geteuid() == 0 {
-		sysexec.SetPrivilegeBackend(sysexec.PrivilegeBackendRoot)
+		sysexec.SetPrivilegeBackend(sysexec.Direct)
 	}
 }
 
