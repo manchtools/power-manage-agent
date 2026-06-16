@@ -2,13 +2,6 @@ package executor
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
-	"math/big"
 	"strings"
 	"testing"
 
@@ -16,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/cryptotest"
 	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
@@ -24,19 +18,8 @@ import (
 // by this signer verifies; anything else (or nothing) is refused.
 func testVerifierAndSigner(t *testing.T) (*Executor, *verify.ActionSigner) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	require.NoError(t, err)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	verifier, err := verify.NewActionVerifier(certPEM)
+	caPEM, key, _ := cryptotest.GenCA(t, "test-ca")
+	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
 	return NewExecutor(verifier), verify.NewActionSigner(key)
 }

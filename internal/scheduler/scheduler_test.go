@@ -31,6 +31,10 @@ var (
 	testVerifier *verify.ActionVerifier
 )
 
+// init builds the package-level signer/verifier. It cannot use the shared
+// sdk/go/cryptotest fixtures because those require a *testing.TB (for t.Helper /
+// t.Fatalf) and init() has none; the other agent test packages, whose CA setup
+// runs inside a test helper, consume cryptotest.GenCA instead.
 func init() {
 	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
 	if err != nil {

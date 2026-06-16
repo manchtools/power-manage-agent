@@ -2,14 +2,7 @@ package handler
 
 import (
 	"context"
-	"crypto/ecdsa"
-	"crypto/elliptic"
-	"crypto/rand"
-	"crypto/x509"
-	"crypto/x509/pkix"
-	"encoding/pem"
 	"log/slog"
-	"math/big"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
@@ -17,6 +10,7 @@ import (
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/sdk/go/cryptotest"
 	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
@@ -26,19 +20,8 @@ import (
 // by any OTHER key (or no signature) is rejected.
 func testCAAndSigner(t *testing.T) ([]byte, *verify.ActionSigner) {
 	t.Helper()
-	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
-	require.NoError(t, err)
-	tmpl := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test-ca"},
-		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
-		BasicConstraintsValid: true,
-		IsCA:                  true,
-	}
-	der, err := x509.CreateCertificate(rand.Reader, tmpl, tmpl, &key.PublicKey, key)
-	require.NoError(t, err)
-	certPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
-	return certPEM, verify.NewActionSigner(key)
+	caPEM, key, _ := cryptotest.GenCA(t, "test-ca")
+	return caPEM, verify.NewActionSigner(key)
 }
 
 // signEnvelope marshals env into its deterministic wire bytes and signs
