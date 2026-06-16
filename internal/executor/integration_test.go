@@ -1006,6 +1006,58 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 	})
 }
 
+// TestIntegration_User_ReapplyNoPasswordStaysLocked pins WS17a #16 (the #94
+// regression) on the RE-APPLY path: a no_password account is created locked, and
+// re-applying the SAME action must NOT silently unlock it (idempotent
+// reconciliation must leave the shadow entry locked and emit no lps rotation).
+// The unit tests cover the create-time lock decision; this drives the real
+// create-then-reapply path end to end.
+func TestIntegration_User_ReapplyNoPasswordStaysLocked(t *testing.T) {
+	e := newTestExecutor()
+	ctx := context.Background()
+	username := "pmtestreapplylock"
+	t.Cleanup(func() { cleanupTestUser(t, username) })
+
+	params := &pb.UserParams{
+		Username:   username,
+		Shell:      "/usr/sbin/nologin",
+		NoPassword: true,
+		Comment:    "no_password reapply regression (#94)",
+	}
+	assertLocked := func(stage string) {
+		t.Helper()
+		out, err := sudoRun("passwd", "-S", username).Output()
+		if err != nil {
+			t.Fatalf("%s: passwd -S %s failed: %v", stage, username, err)
+		}
+		fields := strings.Fields(string(out))
+		if len(fields) < 2 || (fields[1] != "L" && fields[1] != "LK") {
+			t.Fatalf("%s: account must remain LOCKED (passwd -S field 2 = L/LK), got %q", stage, string(out))
+		}
+	}
+	apply := func(stage string) *pb.ActionResult {
+		t.Helper()
+		a := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+		a.Params = &pb.Action_User{User: params}
+		res := e.ExecuteEnvelope(ctx, actionToEnvelope(a))
+		assertSuccess(t, res)
+		if res.Metadata != nil && res.Metadata["lps.rotations"] != "" {
+			t.Errorf("%s: a no_password account must not emit lps.rotations (no password set), got %q", stage, res.Metadata["lps.rotations"])
+		}
+		return res
+	}
+
+	// Create, then re-apply the byte-identical action.
+	apply("create")
+	if !userExists(username) {
+		t.Fatal("user not created")
+	}
+	assertLocked("after create")
+
+	apply("re-apply")
+	assertLocked("after re-apply") // the reconcile must not have unlocked it
+}
+
 // =============================================================================
 // Group Tests
 // =============================================================================
