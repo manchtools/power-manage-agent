@@ -67,6 +67,19 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	if filename == "." || filename == ".." || filename == "/" || filename == "" || strings.ContainsAny(filename, `/\`) {
 		return nil, false, fmt.Errorf("appimage URL %q does not yield a usable filename", params.Url)
 	}
+
+	// Defense-in-depth (parity with rpm/deb): refuse to INSTALL an unverified
+	// artifact — require https + a non-empty checksum — before any path
+	// resolution, privileged remount, or download. The control server validator
+	// already mandates a checksum for AppInstallParams, so this is belt-and-
+	// suspenders, not a behaviour change for legitimate dispatches. ABSENT
+	// (removal) needs no checksum, so the guard is PRESENT-only.
+	if state == pb.DesiredState_DESIRED_STATE_PRESENT {
+		if err := requireVerifiedArtifact(params.Url, params.ChecksumSha256); err != nil {
+			return nil, false, err
+		}
+	}
+
 	fullPath := filepath.Join(installPath, filename)
 
 	// Resolve symlinks to prevent traversal attacks
