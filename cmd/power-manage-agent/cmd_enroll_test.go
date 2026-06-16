@@ -83,3 +83,27 @@ func TestResolveEnrollToken(t *testing.T) {
 		})
 	}
 }
+
+// TestRegistrationURIRefusedByHandler pins WS7: the bare-binary / desktop
+// URI-handler path refuses registration URIs (server+token) — only luks
+// operation URIs are allowed — so a browser-triggered power-manage:// link can
+// never silently enroll the device. Enrollment stays explicit (the `enroll`
+// subcommand).
+func TestRegistrationURIRefusedByHandler(t *testing.T) {
+	cases := []struct {
+		uri    string
+		refuse bool
+	}{
+		{"power-manage://gateway.example.com:8080?token=abc123", true}, // registration → refused
+		{"power-manage://server?token=t&pin=DEADBEEF", true},
+		{"power-manage://luks/set-passphrase?token=xxx", false}, // luks op → allowed through to runLuksURI
+		{"power-manage://luks/rotate", false},
+		{"https://example.com/?token=x", false}, // not our scheme
+		{"", false},
+	}
+	for _, c := range cases {
+		if got := registrationURIRefusedByHandler(c.uri); got != c.refuse {
+			t.Errorf("registrationURIRefusedByHandler(%q) = %v, want %v", c.uri, got, c.refuse)
+		}
+	}
+}

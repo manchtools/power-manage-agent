@@ -175,39 +175,14 @@ func runEnroll(args []string) {
 	fmt.Printf("Enrolled successfully. Device ID: %s\n", resp.Msg.DeviceId)
 }
 
-// trySocketEnroll attempts to enroll via the agent's enrollment socket.
-// Returns true if enrollment succeeded (caller should exit).
-func trySocketEnroll(parsed *registrationURI) bool {
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	httpClient := unixSocketHTTPClient(deviceauth.EnrollSocketPath)
-	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
-
-	// Check if the enrollment socket is available
-	_, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))
-	if err != nil {
-		// Socket not available — fall back to direct registration
-		return false
-	}
-
-	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl:        parsed.ServerURL,
-		Token:            parsed.Token,
-		CaFingerprintPin: strings.ReplaceAll(strings.TrimSpace(parsed.Pin), ":", ""),
-	}))
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %v\n", err)
-		return false
-	}
-
-	if !resp.Msg.Success {
-		fmt.Fprintf(os.Stderr, "error: socket enrollment failed: %s\n", resp.Msg.Error)
-		return false
-	}
-
-	fmt.Printf("Enrolled successfully via agent socket. Device ID: %s\n", resp.Msg.DeviceId)
-	return true
+// registrationURIRefusedByHandler reports whether the bare-binary / desktop
+// URI-handler path must REFUSE uri. luks operation URIs (power-manage://luks/…)
+// are handled upstream; any OTHER power-manage:// URI is a registration URI
+// (server+token) and must not auto-enroll from a URI handler — a browser link
+// could otherwise silently enroll the device into an attacker-controlled
+// backend. Enrollment is only allowed via the explicit `enroll` subcommand. (WS7)
+func registrationURIRefusedByHandler(uri string) bool {
+	return strings.HasPrefix(uri, "power-manage://") && !strings.HasPrefix(uri, "power-manage://luks/")
 }
 
 type registrationURI struct {
