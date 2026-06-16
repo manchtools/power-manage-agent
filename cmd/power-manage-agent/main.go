@@ -356,18 +356,17 @@ func parseFlags() *Config {
 		runLuksURI(uri) // runLuksURI always exits
 	}
 
-	// Parse power-manage:// URI if provided (registration URIs)
-	// Format: power-manage://server:port?token=xxx
-	if uri != "" {
-		if parsed, err := parseRegistrationURI(uri); err == nil {
-			// Try socket enrollment first (no sudo needed)
-			if trySocketEnroll(parsed) {
-				os.Exit(0)
-			}
-			// Fallback to direct registration (sudo/service mode)
-			cfg.ServerURL = parsed.ServerURL
-			cfg.Token = parsed.Token
-		}
+	// Any remaining power-manage:// URI here is a REGISTRATION URI (server+token)
+	// arriving via the bare-binary / desktop URI-handler path (luks URIs already
+	// exited above). REFUSE it (WS7): a browser-triggered
+	// power-manage://<server>?token=... must not silently enroll this device into
+	// an attacker-controlled backend. Enrollment must be an explicit,
+	// operator-initiated action via the `enroll` subcommand, which accepts the
+	// same URI.
+	if registrationURIRefusedByHandler(uri) {
+		fmt.Fprintln(os.Stderr, "refusing to enroll from a URI handler: enrollment must be explicit. Run:")
+		fmt.Fprintf(os.Stderr, "  power-manage-agent enroll '%s'\n", uri)
+		os.Exit(1)
 	}
 
 	// Allow environment variables to override

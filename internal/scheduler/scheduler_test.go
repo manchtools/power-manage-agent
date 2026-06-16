@@ -341,6 +341,10 @@ func TestRemoveAction_MissingActionNoError(t *testing.T) {
 // ---------------------------------------------------------------------------
 
 func TestRemoveAction_AllPolicyTypes(t *testing.T) {
+	// All SIX revertible types per shouldRevertOnUnassign — USER and GROUP join
+	// the policy-style reverters (a user/group created by an assignment must not
+	// outlive it). This list must stay in lockstep with shouldRevertOnUnassign;
+	// the self-discovering partition test (scheduler_ws14_test.go) guards that.
 	policyTypes := []struct {
 		name       string
 		actionType pb.ActionType
@@ -349,6 +353,8 @@ func TestRemoveAction_AllPolicyTypes(t *testing.T) {
 		{"SSHD", pb.ActionType_ACTION_TYPE_SSHD},
 		{"Sudo", pb.ActionType_ACTION_TYPE_ADMIN_POLICY},
 		{"LPS", pb.ActionType_ACTION_TYPE_LPS},
+		{"User", pb.ActionType_ACTION_TYPE_USER},
+		{"Group", pb.ActionType_ACTION_TYPE_GROUP},
 	}
 
 	for _, tt := range policyTypes {
@@ -620,6 +626,54 @@ func TestRunDueActions_GroupRunOnAssign_OrdersMembers(t *testing.T) {
 		if calls[i].GetActionId().GetValue() != want {
 			t.Errorf("call %d: expected %q got %q", i, want, calls[i].GetActionId().GetValue())
 		}
+	}
+}
+
+// TestExecuteGroup_FailingMiddleMemberStillRunsLaterAndAdvancesGroup pins WS14
+// #3: a group member that FAILS must not abort the group — later members still
+// run in order — and the group cursor must still advance (MarkGroupExecuted), so
+// a failing member can't wedge the group into re-running every tick.
+func TestExecuteGroup_FailingMiddleMemberStillRunsLaterAndAdvancesGroup(t *testing.T) {
+	sched, mock := newTestScheduler(t)
+	ctx := context.Background()
+
+	a1 := makeTestAction("fm-a1", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	a2 := makeTestAction("fm-a2", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	a3 := makeTestAction("fm-a3", pb.ActionType_ACTION_TYPE_SHELL, pb.DesiredState_DESIRED_STATE_PRESENT)
+	group := &pb.ActionGroup{
+		SourceLabel: "action_set:fail-middle",
+		Schedule:    &pb.ActionSchedule{RunOnAssign: true, IntervalHours: 8},
+		Actions:     []*pb.Action{a1, a2, a3},
+	}
+	if err := sched.SyncActions(ctx, nil, []*pb.ActionGroup{group}, false); err != nil {
+		t.Fatal(err)
+	}
+
+	// The MIDDLE member fails. The group must not abort on it.
+	mock.setScript("fm-a2", &pb.ActionResult{
+		ActionId: &pb.ActionId{Value: "fm-a2"},
+		Status:   pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
+		Error:    "boom",
+	})
+
+	sched.runDueActions(ctx)
+
+	calls := mock.getCalls()
+	if len(calls) != 3 {
+		t.Fatalf("a failing middle member must not abort the group — expected all 3 members to run, got %d", len(calls))
+	}
+	for i, want := range []string{"fm-a1", "fm-a2", "fm-a3"} {
+		if calls[i].GetActionId().GetValue() != want {
+			t.Errorf("member %d: expected %q, got %q", i, want, calls[i].GetActionId().GetValue())
+		}
+	}
+
+	// The cursor must have advanced (MarkGroupExecuted ran despite the failure):
+	// a second immediate tick does NOT re-run the group.
+	mock.reset()
+	sched.runDueActions(ctx)
+	if got := len(mock.getCalls()); got != 0 {
+		t.Fatalf("the group's next_execute_at must advance past this tick despite the middle-member failure; got %d re-runs", got)
 	}
 }
 
