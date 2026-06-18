@@ -419,6 +419,20 @@ func isPathologicalGrepPattern(p string) string {
 			top := stack[len(stack)-1]
 			stack = stack[:len(stack)-1]
 			depth--
+			// Propagate the closed group's quantifier/alternation state up to its
+			// parent, so an outer quantifier still sees an unbounded quantifier or
+			// alternation nested one level deeper — `((a+))+`, `((a|ab))+`,
+			// `((.*a)){2}` would otherwise bypass the guard. (`((a)*)*` is caught
+			// without this because the `*` after the inner `)` re-attaches to the
+			// still-open outer group; these shapes have no such trailing quantifier.)
+			if len(stack) > 0 {
+				if top.hasInnerQuant {
+					stack[len(stack)-1].hasInnerQuant = true
+				}
+				if top.hasAlt {
+					stack[len(stack)-1].hasAlt = true
+				}
+			}
 			// Is the closing paren followed by an unbounded quantifier?
 			if i+1 < len(p) {
 				next := p[i+1]

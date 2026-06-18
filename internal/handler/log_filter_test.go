@@ -136,6 +136,15 @@ func TestIsPathologicalGrepPattern_IndependentReDoSCorpus(t *testing.T) {
 		`((a)*)*`,       // nested-star nesting
 		`a*b*c*d*e*f*`,  // 6 unbounded quantifiers, NO nesting — trips the counter alone
 		`(ab+)+`,        // nesting with <=5 total quantifiers — trips nesting alone
+		// Quantifier/alternation buried one level DEEPER than the outer
+		// quantifier — the flag must propagate from the inner group to its
+		// parent on close, or these bypass the guard. (`((a)*)*` above is
+		// already caught because the `*` after the inner `)` re-attaches to the
+		// still-open outer group; these are different — the inner quantifier
+		// lives INSIDE the inner group with no trailing quantifier of its own.)
+		`((a+))+`,    // nested unbounded quantifier, two groups deep
+		`((a|ab))+`,  // ambiguous alternation, two groups deep
+		`((.*a)){2}`, // bounded repetition of an unbounded group, two deep
 	}
 	for _, p := range corpus {
 		t.Run(p, func(t *testing.T) {
