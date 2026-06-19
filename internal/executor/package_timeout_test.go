@@ -6,8 +6,8 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
 )
 
 // WS16 #3: PACKAGE/UPDATE actions previously got no default timeout (only

@@ -12,9 +12,9 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // rpmImportArgs builds `rpm --import -- <ref>` so a flag-shaped GPG key
@@ -62,29 +62,29 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	// a read-only root just to bail out on the first line of the
 	// dispatcher. The skip path returns changed=false; remount
 	// only fires when we're about to actually mutate state.
-	switch {
-	case pkg.IsApt():
+	switch e.pkgBackend {
+	case pkg.Apt:
 		if params.Apt == nil || params.Apt.Disabled {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   "skipped: no APT repository configuration provided",
 			}, false, nil
 		}
-	case pkg.IsDnf():
+	case pkg.Dnf:
 		if params.Dnf == nil || params.Dnf.Disabled {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   "skipped: no DNF repository configuration provided",
 			}, false, nil
 		}
-	case pkg.IsPacman():
+	case pkg.Pacman:
 		if params.Pacman == nil || params.Pacman.Disabled {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   "skipped: no Pacman repository configuration provided",
 			}, false, nil
 		}
-	case pkg.IsZypper():
+	case pkg.Zypper:
 		if params.Zypper == nil || params.Zypper.Disabled {
 			return &pb.CommandOutput{
 				ExitCode: 0,
@@ -102,14 +102,14 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return out, false, err
 	}
 
-	switch {
-	case pkg.IsApt():
+	switch e.pkgBackend {
+	case pkg.Apt:
 		return e.executeAptRepository(ctx, params.Name, params.Apt, state)
-	case pkg.IsDnf():
+	case pkg.Dnf:
 		return e.executeDnfRepository(ctx, params.Name, params.Dnf, state)
-	case pkg.IsPacman():
+	case pkg.Pacman:
 		return e.executePacmanRepository(ctx, params.Name, params.Pacman, state)
-	case pkg.IsZypper():
+	case pkg.Zypper:
 		return e.executeZypperRepository(ctx, params.Name, params.Zypper, state)
 	default:
 		// Unreachable: the per-manager skip switch above already
@@ -357,10 +357,14 @@ func (e *Executor) executeAptRepository(ctx context.Context, name string, repo *
 
 		// Update package index only when something changed
 		if changed {
-			apt := pkg.NewAptWithContext(ctx)
-			updateOutput, updateErr := apt.Update()
-			if updateOutput != nil {
-				output.WriteString(updateOutput.Stdout)
+			apt, mErr := pkg.New(pkg.Apt, executorRunner)
+			var updateErr error
+			if mErr != nil {
+				updateErr = mErr
+			} else {
+				updateRes, uErr := apt.Update(ctx)
+				output.WriteString(updateRes.Stdout)
+				updateErr = uErr
 			}
 			if updateErr != nil {
 				// Mirror the dnf/pacman/zypper refresh-failure handling:

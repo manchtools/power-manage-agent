@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // withRootBackend forces the Root privilege backend (restored on cleanup)

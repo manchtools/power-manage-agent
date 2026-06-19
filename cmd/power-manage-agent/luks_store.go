@@ -4,8 +4,8 @@ package main
 import (
 	"context"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sdk "github.com/manchtools/power-manage-sdk"
 )
 
 // clientLuksKeyStore adapts sdk.Client to the executor.LuksKeyStore interface.

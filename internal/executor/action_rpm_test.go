@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // TestRpmQueryArgv_PassesNameAfterEndOfOptions pins the intent that the

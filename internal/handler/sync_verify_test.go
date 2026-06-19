@@ -9,9 +9,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/cryptotest"
-	"github.com/manchtools/power-manage/sdk/go/verify"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/cryptotest"
+	"github.com/manchtools/power-manage-sdk/verify"
 )
 
 // testCAAndSigner returns a self-signed CA cert (PEM) and a matching

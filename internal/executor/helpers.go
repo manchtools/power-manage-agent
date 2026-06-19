@@ -8,8 +8,8 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.

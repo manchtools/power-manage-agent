@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	"github.com/manchtools/power-manage/sdk/go/pkg"
+	"github.com/manchtools/power-manage-sdk/pkg"
 )
 
 // TestHasUpdatesAvailable_Dnf tests the dnf check-update path on Fedora systems.

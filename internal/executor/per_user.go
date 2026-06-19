@@ -9,15 +9,82 @@ import (
 	"context"
 	"os/exec"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/sys/desktop"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
+	"github.com/manchtools/power-manage-sdk/sys/network"
+	sysservice "github.com/manchtools/power-manage-sdk/sys/service"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // runuserPath mirrors desktop.runuserPath. Pinned here as well so a
 // future move of the runuser invocation off the helper layer (e.g.
 // streaming variant below) doesn't have to import the SDK constant.
 const runuserPath = "/usr/sbin/runuser"
+
+// desktopMgr is the process-wide desktop fan-out Manager (session enumeration +
+// run-as-user). It defaults to a Direct-runner Manager and is rebuilt by
+// NewExecutor with the configured backend so loginctl probes escalate when the
+// agent is not already root. A package var so a test can substitute a fake.
+var desktopMgr = mustDesktopManager(executorRunner)
+
+func mustDesktopManager(r sysexec.Runner) desktop.Manager {
+	m, err := desktop.New(r)
+	if err != nil {
+		panic("executor: desktop manager must construct: " + err.Error())
+	}
+	return m
+}
+
+// serviceMgr is the process-wide systemd service Manager; rebuilt by NewExecutor
+// with the configured backend. Package var so tests can substitute a fake.
+var serviceMgr = mustServiceManager(executorRunner)
+
+func mustServiceManager(r sysexec.Runner) sysservice.Manager {
+	m, err := sysservice.New(sysservice.Systemd, r)
+	if err != nil {
+		panic("executor: service manager must construct: " + err.Error())
+	}
+	return m
+}
+
+// networkMgr is the process-wide NetworkManager (nmcli) Manager; rebuilt by
+// NewExecutor with the configured backend. Package var so tests can substitute.
+var networkMgr = mustNetworkManager(executorRunner)
+
+func mustNetworkManager(r sysexec.Runner) network.Manager {
+	m, err := network.New(network.NetworkManager, r)
+	if err != nil {
+		panic("executor: network manager must construct: " + err.Error())
+	}
+	return m
+}
+
+// userMgr is the process-wide user/group (shadow-utils) Manager; rebuilt by
+// NewExecutor with the configured backend. Package var so tests can substitute.
+var userMgr = mustUserManager(executorRunner)
+
+func mustUserManager(r sysexec.Runner) sysuser.Manager {
+	m, err := sysuser.New(sysuser.ShadowUtils, r)
+	if err != nil {
+		panic("executor: user manager must construct: " + err.Error())
+	}
+	return m
+}
+
+// fsMgr is the process-wide filesystem Manager; rebuilt by NewExecutor with the
+// configured backend. Used for ownership operations (e.g. recursive chown of a
+// new home directory). Package var so tests can substitute.
+var fsMgr = mustFSManager(executorRunner)
+
+func mustFSManager(r sysexec.Runner) sysfs.Manager {
+	m, err := sysfs.New(r)
+	if err != nil {
+		panic("executor: fs manager must construct: " + err.Error())
+	}
+	return m
+}
 
 // runAsUserCmd runs `name args...` as the user owning the given
 // session and returns the result as a *pb.CommandOutput, matching
@@ -30,7 +97,7 @@ const runuserPath = "/usr/sbin/runuser"
 // last-write-wins semantics. Pass nil for extraEnv when the
 // desktop defaults suffice.
 func runAsUserCmd(ctx context.Context, s desktop.Session, extraEnv []string, name string, args ...string) (*pb.CommandOutput, error) {
-	cmd, err := desktop.RunAsCommand(ctx, s, extraEnv, name, args...)
+	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{ExtraEnv: extraEnv}, name, args...)
 	if err != nil {
 		return nil, err
 	}
@@ -69,7 +136,7 @@ func runCapturedCapped(cmd *exec.Cmd) (*pb.CommandOutput, error) {
 // callers (idempotency checks) treat any inability-to-determine as
 // "not installed, attempt the install."
 func runAsUserCheck(ctx context.Context, s desktop.Session, name string, args ...string) bool {
-	cmd, err := desktop.RunAsCommand(ctx, s, nil, name, args...)
+	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{}, name, args...)
 	if err != nil {
 		return false
 	}
@@ -104,8 +171,14 @@ func runAsUserStreaming(ctx context.Context, s desktop.Session, extraEnv []strin
 	// PATH is blocklisted from envVars, so it must be passed as the
 	// trusted child PATH — otherwise the user script inherits root's
 	// PATH and ~/.local/bin is ignored (see desktop.UserPath).
-	r, err := sysexec.RunStreamingChildPath(ctx, runuserPath, full, env, desktop.UserPath(s), dir, callback)
-	return toOutput(r), err
+	r, err := executorRunner.Stream(ctx, sysexec.Command{
+		Name:      runuserPath,
+		Args:      full,
+		Env:       env,
+		ChildPath: desktop.UserPath(s),
+		Dir:       dir,
+	}, callback)
+	return toOutput(&r), err
 }
 
 // errEmptyName / errEmptyUsername are sentinel errors so the

@@ -8,9 +8,9 @@ import (
 	"strings"
 	"testing"
 
-	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysservice "github.com/manchtools/power-manage/sdk/go/sys/service"
+	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysservice "github.com/manchtools/power-manage-sdk/sys/service"
 )
 
 // applyBackendOverrides is the single point where operator-supplied

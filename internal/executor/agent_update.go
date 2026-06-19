@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
@@ -210,15 +210,12 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	defer selfTestCancel()
 
 	e.logger.Info("running self-test on new binary", "path", tmpPath)
-	selfTestResult, selfTestErr := sysexec.Run(selfTestCtx, tmpPath, "self-test",
-		"--data-dir="+cfg.DataDir,
-		"--timeout=55s",
-	)
+	selfTestResult, selfTestErr := executorRunner.Run(selfTestCtx, sysexec.Command{
+		Name: tmpPath,
+		Args: []string{"self-test", "--data-dir=" + cfg.DataDir, "--timeout=55s"},
+	})
 	if selfTestErr != nil {
-		var combined string
-		if selfTestResult != nil {
-			combined = strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
-		}
+		combined := strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
 		e.logger.Error("self-test failed, keeping current binary",
 			"error", selfTestErr,
 			"output", combined)

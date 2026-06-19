@@ -3,8 +3,8 @@ package executor
 import (
 	"fmt"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/verify"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/verify"
 )
 
 // Stream-RPC signature verification (WS4). The four root stream-RPCs

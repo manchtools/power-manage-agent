@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // TestExecuteDeb_SkipsWhenDpkgMissing verifies that the DEB executor

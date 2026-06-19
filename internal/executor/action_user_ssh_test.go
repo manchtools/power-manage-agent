@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // setupSSHKeys must refuse an authorized_keys entry that carries an embedded

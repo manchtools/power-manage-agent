@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // executeWifi splices the action ID into a filesystem path

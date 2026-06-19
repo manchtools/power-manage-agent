@@ -10,9 +10,9 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	"github.com/manchtools/power-manage/sdk/go/verify"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/verify"
 )
 
 // ============================================================================

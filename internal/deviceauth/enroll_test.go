@@ -14,11 +14,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	sdk "github.com/manchtools/power-manage/sdk/go"
+	sdk "github.com/manchtools/power-manage-sdk"
 )
 
 // mockRegisterService implements the Register RPC of ControlServiceHandler.

@@ -10,8 +10,8 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/sys/osquery"
 )
 
 // isNotInstalled reports whether err signals that osquery is not installed,

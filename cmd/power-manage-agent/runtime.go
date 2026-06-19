@@ -12,8 +12,8 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/handler"
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sdk "github.com/manchtools/power-manage-sdk"
 )
 
 // runAgent connects to the gateway and processes messages.

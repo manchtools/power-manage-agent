@@ -8,8 +8,8 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/sys/desktop"
 )
 
 // TestExecuteFlatpak_PerUserPresentNoSessions guards the empty-set

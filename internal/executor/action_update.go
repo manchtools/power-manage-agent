@@ -10,9 +10,9 @@ import (
 	"os/exec"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
-	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysnotify "github.com/manchtools/power-manage-sdk/sys/notify"
 )
 
 // Seams so the security-only-upgrade and reboot-scheduling paths can be
@@ -20,7 +20,17 @@ import (
 // real implementations; tests stub them.
 var (
 	execLookPath = exec.LookPath
-	notifyAll    = sysnotify.NotifyAll
+	// notifyAll broadcasts a desktop/wall notification through a notify Manager
+	// built over the process-wide runner. Best-effort: a notification must never
+	// block an update/reboot action, so delivery errors are dropped. Kept as a
+	// package var (signature func(ctx, title, body)) so tests observe it.
+	notifyAll = func(ctx context.Context, title, body string) {
+		n, err := sysnotify.New(executorRunner)
+		if err != nil {
+			return
+		}
+		_ = n.NotifyAll(ctx, title, body)
+	}
 )
 
 // interpretUpdateCheck maps a package manager's update-check result (its
@@ -57,7 +67,7 @@ func interpretUpdateCheck(manager, stdout string, exitCode int) bool {
 // hasUpdatesAvailable checks if there are pending package updates.
 // Uses exit codes and structured queries — language-agnostic.
 func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
-	if pkg.IsDnf() {
+	if e.pkgBackend == pkg.Dnf {
 		args := []string{"check-update"}
 		if securityOnly {
 			args = append(args, "--security")
@@ -65,7 +75,7 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 		out, exitCode, _ := queryCmdOutput("dnf", args...)
 		return interpretUpdateCheck("dnf", out, exitCode)
 	}
-	if pkg.IsApt() {
+	if e.pkgBackend == pkg.Apt {
 		aptCmd := "apt-get"
 		if _, err := exec.LookPath("apt"); err == nil {
 			aptCmd = "apt"
@@ -73,11 +83,11 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 		out, exitCode, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
 		return interpretUpdateCheck("apt", out, exitCode)
 	}
-	if pkg.IsPacman() {
+	if e.pkgBackend == pkg.Pacman {
 		out, exitCode, _ := queryCmdOutput("pacman", "-Qu")
 		return interpretUpdateCheck("pacman", out, exitCode)
 	}
-	if pkg.IsZypper() {
+	if e.pkgBackend == pkg.Zypper {
 		out, exitCode, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
 		return interpretUpdateCheck("zypper", out, exitCode)
 	}
@@ -85,22 +95,22 @@ func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) b
 }
 
 // installedPackageCount returns the number of installed packages (language-agnostic).
-func installedPackageCount() int {
-	if pkg.IsDnf() || pkg.IsZypper() {
+func (e *Executor) installedPackageCount() int {
+	if e.pkgBackend == pkg.Dnf || e.pkgBackend == pkg.Zypper {
 		out, exitCode, _ := queryCmdOutput("rpm", "-qa", "--qf", "x\n")
 		if exitCode != 0 {
 			return -1
 		}
 		return strings.Count(out, "x\n")
 	}
-	if pkg.IsApt() {
+	if e.pkgBackend == pkg.Apt {
 		out, exitCode, _ := queryCmdOutput("dpkg-query", "-f", "x\n", "-W")
 		if exitCode != 0 {
 			return -1
 		}
 		return strings.Count(out, "x\n")
 	}
-	if pkg.IsPacman() {
+	if e.pkgBackend == pkg.Pacman {
 		out, exitCode, _ := queryCmdOutput("pacman", "-Qq")
 		if exitCode != 0 {
 			return -1
@@ -225,19 +235,23 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 	}
 
 	// Detect which package manager we're using and run appropriate repairs
-	if pkg.IsApt() {
+	if e.pkgBackend == pkg.Apt {
 		e.repairApt(ctx)
-	} else if pkg.IsDnf() {
+	} else if e.pkgBackend == pkg.Dnf {
 		e.repairDnf(ctx)
-	} else if pkg.IsPacman() {
+	} else if e.pkgBackend == pkg.Pacman {
 		e.repairPacman(ctx)
-	} else if pkg.IsZypper() {
+	} else if e.pkgBackend == pkg.Zypper {
 		e.repairZypper(ctx)
 	}
 
-	// Flatpak can coexist with any traditional package manager
-	if pkg.IsFlatpak() {
-		e.repairFlatpak(ctx)
+	// Flatpak can coexist with any traditional package manager, so check
+	// presence via Detect rather than the primary backend (e.pkgBackend).
+	for _, b := range pkg.Detect(ctx) {
+		if b == pkg.Flatpak {
+			e.repairFlatpak(ctx)
+			break
+		}
 	}
 }
 
@@ -365,17 +379,21 @@ func (e *Executor) repairApt(ctx context.Context) {
 		slog.Warn("repairApt: dpkg --configure -a failed", "error", err)
 	}
 
-	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
-	apt := pkg.NewAptWithContext(ctx)
+	// Use the SDK Apt Manager which sets DEBIAN_FRONTEND=noninteractive.
+	apt, err := pkg.New(pkg.Apt, executorRunner)
+	if err != nil {
+		slog.Warn("repairApt: build apt manager failed", "error", err)
+		return
+	}
 
 	// Update package lists to get latest dependency info
-	if _, err := apt.Update(); err != nil {
+	if _, err := apt.Update(ctx); err != nil {
 		slog.Warn("repairApt: apt update failed", "error", err)
 	}
 
-	// Fix broken dependencies and install missing ones
-	if _, err := apt.FixBroken(); err != nil {
-		slog.Warn("repairApt: apt fix-broken failed", "error", err)
+	// Fix broken dependencies and install missing ones (Repair = fix-broken + more)
+	if _, err := apt.Repair(ctx); err != nil {
+		slog.Warn("repairApt: apt repair failed", "error", err)
 	}
 }
 
@@ -496,15 +514,12 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	rebootRequiredBefore := e.checkRebootRequired()
 
 	// Update package index
-	if updateResult, err := mgr.Update(); err != nil {
-		allOutput.WriteString("=== Package Index Update ===\n")
-		if updateResult != nil {
-			allOutput.WriteString(updateResult.Stdout)
-			allOutput.WriteString(updateResult.Stderr)
-		}
+	allOutput.WriteString("=== Package Index Update ===\n")
+	if updateResult, err := mgr.Update(ctx); err != nil {
+		allOutput.WriteString(updateResult.Stdout)
+		allOutput.WriteString(updateResult.Stderr)
 		allOutput.WriteString(fmt.Sprintf("Warning: update failed: %v\n\n", err))
-	} else if updateResult != nil {
-		allOutput.WriteString("=== Package Index Update ===\n")
+	} else {
 		allOutput.WriteString(updateResult.Stdout)
 		if updateResult.Stderr != "" {
 			allOutput.WriteString(updateResult.Stderr)
@@ -520,23 +535,19 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	// Perform the upgrade
 	allOutput.WriteString("=== Package Upgrade ===\n")
 
-	if pkg.IsApt() {
+	if e.pkgBackend == pkg.Apt {
 		lastErr = e.executeAptUpgrade(ctx, params, &allOutput)
-	} else if pkg.IsDnf() {
+	} else if e.pkgBackend == pkg.Dnf {
 		lastErr = e.executeDnfUpgrade(ctx, params, &allOutput)
 	} else {
-		// Fallback to generic upgrade via the builder
-		upgradeResult, err := mgr.Upgrade().Run()
+		// Fallback to a full system upgrade (UpgradeAll — the no-arg Upgrade is
+		// now a deliberate no-op, so a whole-system upgrade is UpgradeAll).
+		upgradeResult, err := mgr.UpgradeAll(ctx)
+		allOutput.WriteString(upgradeResult.Stdout)
+		allOutput.WriteString(upgradeResult.Stderr)
 		if err != nil {
 			allOutput.WriteString(fmt.Sprintf("Error: %v\n", err))
-			if upgradeResult != nil {
-				allOutput.WriteString(upgradeResult.Stdout)
-				allOutput.WriteString(upgradeResult.Stderr)
-			}
 			lastErr = err
-		} else if upgradeResult != nil {
-			allOutput.WriteString(upgradeResult.Stdout)
-			allOutput.WriteString(upgradeResult.Stderr)
 		}
 	}
 
@@ -544,24 +555,26 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	autoremoved := false
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
-		countBefore := installedPackageCount()
+		countBefore := e.installedPackageCount()
 		// Capture autoremove errors so the action result reflects
 		// "we tried to autoremove and the call itself failed", not
 		// "everything succeeded but stale packages quietly remain".
 		// The previous shape only wrote stderr to the buffer and
 		// dropped the err on the floor.
 		var autoremoveErr error
-		if pkg.IsApt() {
-			apt := pkg.NewAptWithContext(ctx)
-			output, err := apt.Autoremove()
-			if output != nil {
+		if e.pkgBackend == pkg.Apt {
+			apt, mErr := pkg.New(pkg.Apt, executorRunner)
+			if mErr != nil {
+				autoremoveErr = mErr
+			} else {
+				output, err := apt.Autoremove(ctx)
 				allOutput.WriteString(output.Stdout)
 				if err != nil {
 					allOutput.WriteString(output.Stderr)
 				}
+				autoremoveErr = err
 			}
-			autoremoveErr = err
-		} else if pkg.IsDnf() {
+		} else if e.pkgBackend == pkg.Dnf {
 			output, err := dnfAutoremove(ctx)
 			if output != nil {
 				allOutput.WriteString(output.Stdout)
@@ -571,7 +584,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			}
 			autoremoveErr = err
 		}
-		countAfter := installedPackageCount()
+		countAfter := e.installedPackageCount()
 		autoremoved = countBefore > 0 && countAfter > 0 && countBefore != countAfter
 		if autoremoveErr != nil && lastErr == nil {
 			lastErr = fmt.Errorf("autoremove: %w", autoremoveErr)
@@ -649,28 +662,21 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 	}
 
 	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
-	apt := pkg.NewAptWithContext(ctx)
-
-	// Standard upgrade
-	cmdOutput, err := apt.Upgrade()
-	if cmdOutput != nil {
-		output.WriteString(cmdOutput.Stdout)
-		output.WriteString(cmdOutput.Stderr)
+	apt, mErr := pkg.New(pkg.Apt, executorRunner)
+	if mErr != nil {
+		return mErr
 	}
 
-	// Also run dist-upgrade for held-back packages (still respects holds).
-	// A dist-upgrade failure (e.g. a half-completed kernel transition)
-	// must not be swallowed — joining it into the returned error so the
-	// action reports FAILED instead of a clean SUCCESS with a broken
-	// upgrade underneath.
-	output.WriteString("\n=== Dist-Upgrade ===\n")
-	distOutput, distErr := apt.DistUpgrade()
-	if distOutput != nil {
-		output.WriteString(distOutput.Stdout)
-		output.WriteString(distOutput.Stderr)
-	}
-
-	return errors.Join(err, distErr)
+	// Full system upgrade. The SDK Manager's UpgradeAll is `apt dist-upgrade`
+	// (it adds/removes packages to satisfy held-back deps, still respecting
+	// holds) — the thorough path that supersedes the prior upgrade +
+	// dist-upgrade two-step. A failure (e.g. a half-completed kernel
+	// transition) is returned so the action reports FAILED rather than a clean
+	// SUCCESS over a broken upgrade.
+	res, err := apt.UpgradeAll(ctx)
+	output.WriteString(res.Stdout)
+	output.WriteString(res.Stderr)
+	return err
 }
 
 // executeDnfUpgrade performs dnf-specific upgrade.
@@ -693,7 +699,7 @@ func (e *Executor) checkRebootRequired() bool {
 	}
 
 	// RHEL/Fedora: check needs-restarting
-	if pkg.IsDnf() {
+	if e.pkgBackend == pkg.Dnf {
 		_, exitCode, _ := queryCmdOutput("needs-restarting", "-r")
 		// Exit code 1 means reboot required
 		if exitCode == 1 {

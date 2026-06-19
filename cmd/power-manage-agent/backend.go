@@ -9,9 +9,9 @@ import (
 	osexec "os/exec"
 	"time"
 
-	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysservice "github.com/manchtools/power-manage/sdk/go/sys/service"
+	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysservice "github.com/manchtools/power-manage-sdk/sys/service"
 )
 
 // geteuidFn is a seam over os.Geteuid so the empty-default privilege branch
@@ -92,43 +92,49 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
 // sudo (and without depending on per-distro quirks like openSUSE's
 // default sudoers excluding root). Returns an error if the selected
 // backend's binary isn't on PATH.
-func setPrivilegeBackend(backend string, logger *slog.Logger) error {
-	var privilegeTool string
+func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.PrivilegeBackend, error) {
+	var (
+		privilegeTool string
+		resolved      sysexec.PrivilegeBackend
+	)
 	switch backend {
 	case "root":
-		sysexec.SetPrivilegeBackend(sysexec.Direct)
+		resolved = sysexec.Direct
 		privilegeTool = ""
 	case "doas":
-		sysexec.SetPrivilegeBackend(sysexec.Doas)
+		resolved = sysexec.Doas
 		privilegeTool = "doas"
 	case "sudo":
-		sysexec.SetPrivilegeBackend(sysexec.Sudo)
+		resolved = sysexec.Sudo
 		privilegeTool = "sudo"
 	case "":
 		if geteuidFn() == 0 {
-			sysexec.SetPrivilegeBackend(sysexec.Direct)
+			resolved = sysexec.Direct
 			privilegeTool = ""
 		} else {
-			sysexec.SetPrivilegeBackend(sysexec.Sudo)
+			resolved = sysexec.Sudo
 			privilegeTool = "sudo"
 		}
 	default:
 		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo", "value", backend)
-		sysexec.SetPrivilegeBackend(sysexec.Sudo)
+		resolved = sysexec.Sudo
 		privilegeTool = "sudo"
 	}
+	// Install the legacy process-global backend for SDK call sites that have not
+	// yet been migrated to an injected Runner.
+	sysexec.SetPrivilegeBackend(resolved)
 	if privilegeTool == "" {
 		// Root backend has no external tool to look up — Privileged*
 		// dispatchers exec the resolved command directly.
 		logger.Info("privilege backend set", "backend", "root")
-		return nil
+		return resolved, nil
 	}
 	if _, err := osexec.LookPath(privilegeTool); err != nil {
-		return fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
+		return resolved, fmt.Errorf("privilege backend %q selected but %q is not on PATH: %w",
 			privilegeTool, privilegeTool, err)
 	}
 	logger.Info("privilege backend set", "backend", privilegeTool)
-	return nil
+	return resolved, nil
 }
 
 // setEncryptionBackend resolves and installs the SDK encryption backend.

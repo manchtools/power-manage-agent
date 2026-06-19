@@ -15,8 +15,8 @@ import (
 	"connectrpc.com/connect"
 
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
 )
 
 // parseRegistrationURI parses a power-manage:// URI.

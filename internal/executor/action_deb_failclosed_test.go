@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // WS16 #2: executeDeb relied solely on downloadFile, which SKIPS checksum

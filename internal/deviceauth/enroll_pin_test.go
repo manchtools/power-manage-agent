@@ -10,11 +10,11 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
-	"github.com/manchtools/power-manage/sdk/go/cryptotest"
+	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
+	"github.com/manchtools/power-manage-sdk/cryptotest"
 )
 
 const fakeLeafPEM = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n"

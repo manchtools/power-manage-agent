@@ -12,8 +12,8 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
 )
 
 // validDebPkgName matches the Debian package-name grammar
@@ -105,16 +105,16 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// having installed the requested package.
 		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
 		if err != nil {
-			fbOutput, fbErr := pkg.NewAptWithContext(ctx).FixBroken()
-			if fbOutput != nil {
+			if apt, mErr := pkg.New(pkg.Apt, executorRunner); mErr == nil {
+				fbRes, fbErr := apt.Repair(ctx)
 				if output == nil {
 					output = &pb.CommandOutput{}
 				}
-				output.Stdout += "\n=== apt --fix-broken install ===\n" + fbOutput.Stdout
-				output.Stderr += fbOutput.Stderr
-			}
-			if fbErr == nil && e.isDebInstalled(pkgName) {
-				err = nil
+				output.Stdout += "\n=== apt repair (fix-broken) ===\n" + fbRes.Stdout
+				output.Stderr += fbRes.Stderr
+				if fbErr == nil && e.isDebInstalled(pkgName) {
+					err = nil
+				}
 			}
 		}
 		return output, true, err

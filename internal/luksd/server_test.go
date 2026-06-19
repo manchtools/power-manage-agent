@@ -16,8 +16,8 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sdk "github.com/manchtools/power-manage-sdk"
 )
 
 const goodPassphrase = "correct-horse-battery-staple-42" // >= 16 chars

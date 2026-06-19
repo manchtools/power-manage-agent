@@ -12,7 +12,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // WS7 #2: downloadFile is the single chokepoint for deb/rpm/appimage

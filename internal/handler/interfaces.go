@@ -1,6 +1,6 @@
 package handler
 
-import sdk "github.com/manchtools/power-manage/sdk/go"
+import sdk "github.com/manchtools/power-manage-sdk"
 
 // Compile-time assertions that *Handler satisfies every optional SDK stream
 // handler interface it is meant to serve. The SDK dispatch loop selects these

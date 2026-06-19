@@ -12,10 +12,10 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	"github.com/manchtools/power-manage/sdk/go/sys/terminal"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sdk "github.com/manchtools/power-manage-sdk"
+	"github.com/manchtools/power-manage-sdk/sys/terminal"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // Compile-time assertion that *Handler satisfies sdk.TerminalHandler.

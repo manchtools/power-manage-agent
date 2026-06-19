@@ -11,8 +11,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	"github.com/manchtools/power-manage-sdk/sys/desktop"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // WS6 #15: runAsUserStreaming must reject a missing command name or an

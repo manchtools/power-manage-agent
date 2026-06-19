@@ -20,9 +20,9 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )

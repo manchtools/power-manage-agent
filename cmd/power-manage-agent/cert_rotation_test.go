@@ -5,8 +5,8 @@ import (
 	"time"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	"github.com/manchtools/power-manage/sdk/go/cryptotest"
+	sdk "github.com/manchtools/power-manage-sdk"
+	"github.com/manchtools/power-manage-sdk/cryptotest"
 )
 
 // TestRenewAt_Computation pins the 80%-of-lifetime schedule and the

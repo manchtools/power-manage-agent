@@ -7,8 +7,8 @@ import (
 	"os"
 	"strconv"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // getFileOwnership retrieves the current owner:group of a file using stat.

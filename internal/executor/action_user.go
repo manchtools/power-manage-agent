@@ -13,9 +13,9 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // executeUser manages user accounts (create, update, disable, remove).
@@ -130,45 +130,14 @@ func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams
 
 // createUser creates a new user account.
 func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, map[string]string, error) {
-	args := []string{}
-
-	// UID
-	if params.Uid > 0 {
-		args = append(args, "-u", fmt.Sprintf("%d", params.Uid))
-	}
-
-	// GID or primary group
-	if params.Gid > 0 {
-		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
-	} else if params.PrimaryGroup != "" {
-		// Ensure group exists
-		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
-			e.logger.Warn("failed to ensure primary group exists", "group", params.PrimaryGroup, "error", err)
-		}
-		args = append(args, "-g", params.PrimaryGroup)
-	}
-
-	// Home directory
-	if params.HomeDir != "" {
-		args = append(args, "-d", params.HomeDir)
-	}
-
 	// Shell (default to /bin/bash for normal users, /usr/sbin/nologin for disabled/system)
 	shell := params.Shell
 	if shell == "" {
-		if params.Disabled {
-			shell = "/usr/sbin/nologin"
-		} else if params.SystemUser {
+		if params.Disabled || params.SystemUser {
 			shell = "/usr/sbin/nologin"
 		} else {
 			shell = "/bin/bash"
 		}
-	}
-	args = append(args, "-s", shell)
-
-	// System user
-	if params.SystemUser {
-		args = append(args, "-r") // Create system account
 	}
 
 	// Respect the explicit create_home value from the proto. A prior
@@ -180,52 +149,32 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	// silently override. The control server's system-managed pm-tty
 	// action and the web UI's "Create home" checkbox both rely on
 	// explicit-false being honoured.
-	createHome := params.CreateHome
-
-	// Determine home directory path to check if it exists
-	homeDir := params.HomeDir
-	if homeDir == "" {
-		homeDir = "/home/" + params.Username
+	opts := sysuser.CreateOptions{
+		Shell:      shell,
+		HomeDir:    params.HomeDir,
+		Comment:    params.Comment,
+		System:     params.SystemUser,
+		CreateHome: params.CreateHome, // the SDK handles the "home already exists" -M/chown dance
 	}
-
-	// Check if home directory already exists - useradd -m fails if it does
-	homeExists := false
-	if _, err := os.Stat(homeDir); err == nil {
-		homeExists = true
+	if params.Uid > 0 {
+		opts.UID = int(params.Uid)
 	}
-
-	if createHome && !homeExists {
-		args = append(args, "-m")
-	} else {
-		args = append(args, "-M")
-	}
-
-	// Comment/GECOS
-	if params.Comment != "" {
-		args = append(args, "-c", params.Comment)
-	}
-
-	// Create the user via SDK
-	result, err := sysuser.Create(ctx, params.Username, args...)
-	if err != nil {
-		if result != nil {
-			output.WriteString(result.Stderr)
+	// GID or primary group
+	if params.Gid > 0 {
+		opts.PrimaryGroup = fmt.Sprintf("%d", params.Gid)
+	} else if params.PrimaryGroup != "" {
+		if err := userMgr.GroupEnsure(ctx, params.PrimaryGroup); err != nil {
+			e.logger.Warn("failed to ensure primary group exists", "group", params.PrimaryGroup, "error", err)
 		}
+		opts.PrimaryGroup = params.PrimaryGroup
+	}
+
+	// Create the user via the SDK user Manager.
+	if err := userMgr.Create(ctx, params.Username, opts); err != nil {
+		output.WriteString(err.Error())
 		return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, nil, fmt.Errorf("failed to create user: %w", err)
 	}
 	output.WriteString(fmt.Sprintf("created user: %s\n", params.Username))
-
-	// If home directory already existed, fix ownership
-	if homeExists && createHome {
-		if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to fix home directory ownership: %v\n", chownErr))
-			if chownResult != nil {
-				output.WriteString(chownResult.Stderr)
-			}
-		} else {
-			output.WriteString(fmt.Sprintf("fixed ownership of existing home directory: %s\n", homeDir))
-		}
-	}
 
 	// Generate and set temporary password for non-system users.
 	//
@@ -238,27 +187,25 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 	// PAM-protected login path. See sdk proto comment on no_password.
 	var metadata map[string]string
 	if createUserSetsPassword(params) {
-		tempPassword, err := sysuser.GeneratePassword(16, false)
+		tempPassword, err := sysuser.GeneratePassword(16, sysuser.ComplexityAlphanumeric)
 		if err != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to generate temporary password: %v\n", err))
 		} else {
 			// Set password
-			if chpasswdResult, chpasswdErr := sysuser.SetPassword(ctx, params.Username, tempPassword); chpasswdErr != nil {
+			if chpasswdErr := userMgr.SetPassword(ctx, params.Username, tempPassword); chpasswdErr != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to set temporary password: %v\n", chpasswdErr))
-				if chpasswdResult != nil {
-					output.WriteString(chpasswdResult.Stderr)
-				}
 			} else {
 				// Force password change on first login
-				if _, chageErr := sysuser.ExpirePassword(ctx, params.Username); chageErr != nil {
+				if chageErr := userMgr.ExpirePassword(ctx, params.Username); chageErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to expire password: %v\n", chageErr))
 				}
 				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
 
-				// Report password via lps.rotations metadata so it's stored in the LPS table
+				// Report password via lps.rotations metadata so it's stored in the
+				// LPS table for operator retrieval — the sanctioned plaintext sink.
 				rotations := []lpsRotationEntry{{
 					Username:  params.Username,
-					Password:  tempPassword,
+					Password:  tempPassword.Reveal(),
 					RotatedAt: e.now().UTC().Format(time.RFC3339),
 					Reason:    "user_created",
 				}}
@@ -285,11 +232,8 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 
 	// Handle disabled state (lock the account)
 	if params.Disabled {
-		if lockResult, lockErr := sysuser.Lock(ctx, params.Username); lockErr != nil {
+		if lockErr := userMgr.Lock(ctx, params.Username); lockErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
-			if lockResult != nil {
-				output.WriteString(lockResult.Stderr)
-			}
 		} else {
 			output.WriteString("account locked (disabled)\n")
 		}
@@ -328,13 +272,14 @@ func desiredAccountLocked(params *pb.UserParams) bool {
 // updateUser modifies an existing user account.
 func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, bool, error) {
 	// Get current user state
-	currentInfo, err := sysuser.Get(params.Username)
+	currentInfo, err := userMgr.Get(ctx, params.Username)
 	if err != nil {
 		return nil, false, fmt.Errorf("failed to get current user info: %w", err)
 	}
 
 	changed := false
-	args := []string{}
+	var modOpts sysuser.ModifyOptions
+	needModify := false
 
 	// Determine desired shell
 	desiredShell := params.Shell
@@ -347,42 +292,46 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 
 	// Shell - only change if explicitly set and different
 	if desiredShell != "" && currentInfo.Shell != desiredShell {
-		args = append(args, "-s", desiredShell)
+		modOpts.Shell = desiredShell
+		needModify = true
 		output.WriteString(fmt.Sprintf("shell: %s -> %s\n", currentInfo.Shell, desiredShell))
 	}
 
 	// Home directory - only if explicitly set and different
 	if params.HomeDir != "" && currentInfo.HomeDir != params.HomeDir {
-		args = append(args, "-d", params.HomeDir)
+		modOpts.HomeDir = params.HomeDir
+		needModify = true
 		output.WriteString(fmt.Sprintf("home: %s -> %s\n", currentInfo.HomeDir, params.HomeDir))
 	}
 
 	// Comment - only if explicitly set and different
 	if params.Comment != "" && currentInfo.Comment != params.Comment {
-		args = append(args, "-c", params.Comment)
+		modOpts.Comment = params.Comment
+		needModify = true
 		output.WriteString(fmt.Sprintf("comment: %s -> %s\n", currentInfo.Comment, params.Comment))
 	}
 
-	// Primary group - only if explicitly set and different
+	// Primary group - only if explicitly set and different. usermod -g (which the
+	// SDK ModifyOptions.PrimaryGroup drives) accepts either a numeric GID or a
+	// group name, so both forms map onto the same field.
 	if params.Gid > 0 && currentInfo.GID != int(params.Gid) {
-		args = append(args, "-g", fmt.Sprintf("%d", params.Gid))
+		modOpts.PrimaryGroup = fmt.Sprintf("%d", params.Gid)
+		needModify = true
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
 		// Check if primary group needs to change (would need to resolve group name to GID)
-		if _, err := sysuser.GroupEnsureExists(ctx, params.PrimaryGroup); err != nil {
+		if err := userMgr.GroupEnsure(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists for usermod", "group", params.PrimaryGroup, "error", err)
 		}
 		// For simplicity, always set if specified by name (could be optimized)
-		args = append(args, "-g", params.PrimaryGroup)
+		modOpts.PrimaryGroup = params.PrimaryGroup
+		needModify = true
 	}
 
 	// Apply usermod if we have changes
-	if len(args) > 0 {
-		result, err := sysuser.Modify(ctx, params.Username, args...)
-		if err != nil {
-			if result != nil {
-				output.WriteString(result.Stderr)
-			}
+	if needModify {
+		if err := userMgr.Modify(ctx, params.Username, modOpts); err != nil {
+			output.WriteString(err.Error())
 			return &pb.CommandOutput{ExitCode: 1, Stderr: output.String()}, false, fmt.Errorf("failed to update user: %w", err)
 		}
 		changed = true
@@ -406,11 +355,8 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
 			} else {
 				runSudoCmd(ctx, "cp", "-a", "--", "/etc/skel/.", homeDir)
-				if chownResult, chownErr := sysuser.ChownRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
+				if chownErr := fsMgr.SetOwnershipRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
 					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
-					if chownResult != nil {
-						output.WriteString(chownResult.Stderr)
-					}
 				}
 				runSudoCmd(ctx, "chmod", "0700", "--", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
@@ -433,21 +379,15 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	desiredLocked := desiredAccountLocked(params)
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
-			if lockResult, err := sysuser.Lock(ctx, params.Username); err != nil {
+			if err := userMgr.Lock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
-				if lockResult != nil {
-					output.WriteString(lockResult.Stderr)
-				}
 			} else {
 				output.WriteString("account locked (disabled)\n")
 				changed = true
 			}
 		} else {
-			if unlockResult, err := sysuser.Unlock(ctx, params.Username); err != nil {
+			if err := userMgr.Unlock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to unlock user: %v\n", err))
-				if unlockResult != nil {
-					output.WriteString(unlockResult.Stderr)
-				}
 			} else {
 				output.WriteString("account unlocked\n")
 				changed = true
@@ -504,18 +444,15 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	removeAccountsServiceFile(ctx, username)
 
 	// Remove user and their home directory
-	result, err := sysuser.Delete(ctx, username, true)
+	err := userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
 	if err != nil {
 		// If home directory doesn't exist, userdel -r may still succeed
 		// but report an error. Check if user is actually removed.
-		if !sysuser.Exists(username) {
+		if exists, _ := userMgr.Exists(ctx, username); !exists {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("removed user: %s (home directory may not have existed)\n", username),
 			}, true, nil
-		}
-		if result != nil {
-			return &pb.CommandOutput{ExitCode: 1, Stderr: result.Stderr}, false, fmt.Errorf("failed to remove user: %w", err)
 		}
 		return nil, false, fmt.Errorf("failed to remove user: %w", err)
 	}
@@ -673,7 +610,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	// and the rename-side of the symlink race. The agent runs as root
 	// (post root-mode rewire), so it can write to the user's home
 	// directly without a sudo'd helper.
-	if err := sysfs.SafeReplaceFile(authKeysFile, []byte(desiredContent), 0o600, true); err != nil {
+	if err := fsMgr.WriteFile(ctx, authKeysFile, []byte(desiredContent), sysfs.WriteOptions{Mode: 0o600}); err != nil {
 		return false, fmt.Errorf("failed to write authorized_keys: %w", err)
 	}
 

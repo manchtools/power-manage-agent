@@ -7,8 +7,8 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysenc "github.com/manchtools/power-manage/sdk/go/sys/encryption"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )

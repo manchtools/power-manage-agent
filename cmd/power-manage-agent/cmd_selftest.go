@@ -9,8 +9,8 @@ import (
 	"time"
 
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	"github.com/manchtools/power-manage/sdk/go/logging"
+	sdk "github.com/manchtools/power-manage-sdk"
+	"github.com/manchtools/power-manage-sdk/logging"
 )
 
 // runSelfTest runs a minimal connectivity probe to validate that this binary

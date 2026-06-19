@@ -19,8 +19,8 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/sdk/go/logging"
-	"github.com/manchtools/power-manage/sdk/go/verify"
+	"github.com/manchtools/power-manage-sdk/logging"
+	"github.com/manchtools/power-manage-sdk/verify"
 )
 
 // version is set at build time via -ldflags.

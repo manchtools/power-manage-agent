@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // executeGroup manages Linux groups and their members.

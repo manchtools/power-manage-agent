@@ -9,10 +9,10 @@ import (
 	"os/exec"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	"github.com/manchtools/power-manage-sdk/sys/desktop"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -178,7 +178,7 @@ func (e *Executor) executeFlatpakSystem(ctx context.Context, params *pb.FlatpakP
 func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.FlatpakParams, state pb.DesiredState, remote string) (*pb.CommandOutput, bool, error) {
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		sessions, err := desktop.ActiveSessions(ctx)
+		sessions, err := desktopMgr.ActiveSessions(ctx)
 		if err != nil {
 			return nil, false, fmt.Errorf("enumerate active desktop sessions: %w", err)
 		}
@@ -266,7 +266,7 @@ func (e *Executor) executeFlatpakPerUser(ctx context.Context, params *pb.Flatpak
 		return &pb.CommandOutput{Stdout: perUserOut.String()}, anyChanged, firstFailure
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		users, err := desktop.UsersWithFlatpakInstall(params.AppId)
+		users, err := desktopMgr.UsersWithFlatpakInstall(ctx, params.AppId)
 		if err != nil {
 			return nil, false, fmt.Errorf("enumerate per-user flatpak installs: %w", err)
 		}
