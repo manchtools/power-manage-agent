@@ -102,12 +102,16 @@ func removeDirectory(ctx context.Context, path string) error {
 	return fsMgr.RemoveDir(ctx, path)
 }
 
-// userExists checks if a user exists on the system.
-func userExists(username string) bool {
-	return checkCmdSuccess("id", username)
+// userExists checks if a user exists on the system, via the SDK user Manager
+// (which runs the `id` lookup) rather than shelling it here.
+func userExists(ctx context.Context, username string) bool {
+	exists, _ := userMgr.Exists(ctx, username)
+	return exists
 }
 
-// groupExists checks if a group exists on the system.
-func groupExists(groupName string) bool {
-	return checkCmdSuccess("getent", "group", groupName)
+// groupExists checks if a group exists on the system, via the SDK user Manager
+// (which runs the `getent group` lookup) rather than shelling it here.
+func groupExists(ctx context.Context, groupName string) bool {
+	exists, _ := userMgr.GroupExists(ctx, groupName)
+	return exists
 }

@@ -86,7 +86,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 	for _, username := range params.Usernames {
 		// Verify user exists
-		if !userExists(username) {
+		if !userExists(ctx, username) {
 			output.WriteString(fmt.Sprintf("LPS: user %q does not exist, skipping\n", username))
 			e.logger.Warn("LPS user does not exist, skipping", "username", username)
 			continue
@@ -287,14 +287,12 @@ func shouldRotateLps(ctx context.Context, state *store.LpsUserState, params *pb.
 // pkill failed", so the discarded errors get logged with stage tags
 // instead of being silently swallowed.
 func killUserSessions(ctx context.Context, username string) {
-	// Graceful: terminate systemd-logind sessions
-	if _, err := runSudoCmd(ctx, "loginctl", "terminate-user", username); err != nil {
-		slog.Warn("killUserSessions: loginctl terminate-user failed (may be benign — no active sessions)",
-			"username", username, "error", err)
-	}
-	// Forceful: kill all remaining processes owned by the user
-	if _, err := runSudoCmd(ctx, "pkill", "-KILL", "-u", username); err != nil {
-		slog.Warn("killUserSessions: pkill failed (may be benign — no remaining processes)",
+	// Delegate to the SDK user Manager, which terminates systemd-logind sessions
+	// (loginctl terminate-user) and falls back to pkill -KILL -u, treating
+	// "no sessions / no processes" as success — only a genuine failure returns
+	// an error. Log it so operators can distinguish it from the benign case.
+	if err := userMgr.KillSessions(ctx, username); err != nil {
+		slog.Warn("killUserSessions: SDK KillSessions failed (may be benign — no active sessions/processes)",
 			"username", username, "error", err)
 	}
 	// Brief wait for processes to fully exit

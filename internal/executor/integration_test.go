@@ -323,7 +323,7 @@ Description: Test package for integration tests
 // ensureTestUser creates a test user if it doesn't exist.
 func ensureTestUser(t *testing.T, username string) {
 	t.Helper()
-	if userExists(username) {
+	if userExists(context.Background(), username) {
 		return
 	}
 	cmd := sudoRun("useradd", "--no-create-home", "--shell", "/bin/bash", username)
@@ -816,7 +816,7 @@ func TestIntegration_User(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if !userExists(username) {
+		if !userExists(context.Background(), username) {
 			t.Error("user not created")
 		}
 		// Verify password metadata returned
@@ -860,7 +860,7 @@ func TestIntegration_User(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if userExists(username) {
+		if userExists(context.Background(), username) {
 			t.Error("user still exists")
 		}
 	})
@@ -875,7 +875,7 @@ func TestIntegration_User(t *testing.T) {
 
 	t.Run("ProtectPowerManage", func(t *testing.T) {
 		// Ensure power-manage user exists
-		if !userExists("power-manage") {
+		if !userExists(context.Background(), "power-manage") {
 			sudoRun("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "power-manage").Run()
 			t.Cleanup(func() { sudoRun("userdel", "power-manage").Run() })
 		}
@@ -883,7 +883,7 @@ func TestIntegration_User(t *testing.T) {
 		action.Params = &pb.Action_User{User: &pb.UserParams{Username: "power-manage"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
-		if !userExists("power-manage") {
+		if !userExists(context.Background(), "power-manage") {
 			t.Error("power-manage user was deleted despite protection")
 		}
 	})
@@ -922,7 +922,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
-		if !userExists(username) {
+		if !userExists(context.Background(), username) {
 			t.Fatal("user not created")
 		}
 
@@ -947,7 +947,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
-		if !userExists(username) {
+		if !userExists(context.Background(), username) {
 			t.Fatal("user not created")
 		}
 
@@ -991,7 +991,7 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
-		if !userExists(username) {
+		if !userExists(context.Background(), username) {
 			t.Fatal("user not created")
 		}
 
@@ -1083,7 +1083,7 @@ func TestIntegration_User_ReapplyNoPasswordStaysLocked(t *testing.T) {
 
 	// Create, then re-apply the byte-identical action.
 	apply("create")
-	if !userExists(username) {
+	if !userExists(context.Background(), username) {
 		t.Fatal("user not created")
 	}
 	assertLocked("after create")
@@ -1113,7 +1113,7 @@ func TestIntegration_Group(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if !groupExists(groupName) {
+		if !groupExists(context.Background(), groupName) {
 			t.Error("group not created")
 		}
 	})
@@ -1157,7 +1157,7 @@ func TestIntegration_Group(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if !groupExists(groupName) {
+		if !groupExists(context.Background(), groupName) {
 			t.Error("group should still exist")
 		}
 		if userInGroup(ctx, "pmgrpuser1", groupName) {
@@ -1174,13 +1174,13 @@ func TestIntegration_Group(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if groupExists(groupName) {
+		if groupExists(context.Background(), groupName) {
 			t.Error("group still exists")
 		}
 	})
 
 	t.Run("ProtectPowerManage", func(t *testing.T) {
-		if !groupExists("power-manage") {
+		if !groupExists(context.Background(), "power-manage") {
 			sudoRun("groupadd", "power-manage").Run()
 			t.Cleanup(func() { sudoRun("groupdel", "power-manage").Run() })
 		}
@@ -1188,7 +1188,7 @@ func TestIntegration_Group(t *testing.T) {
 		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: "power-manage"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertFailed(t, result)
-		if !groupExists("power-manage") {
+		if !groupExists(context.Background(), "power-manage") {
 			t.Error("power-manage group was deleted despite protection")
 		}
 	})
@@ -1267,7 +1267,7 @@ func TestIntegration_Sudo(t *testing.T) {
 		if sudoFileExists(filePath) {
 			t.Error("sudoers file still exists")
 		}
-		if groupExists(sanitizeSudoGroupName(actionID)) {
+		if groupExists(context.Background(), sanitizeSudoGroupName(actionID)) {
 			t.Error("sudo group still exists")
 		}
 	})
@@ -1308,7 +1308,7 @@ func TestIntegration_SSH(t *testing.T) {
 		if !sudoFileExists(configPath) {
 			t.Error("SSH config not created")
 		}
-		if !groupExists(sshGroupName(actionID)) {
+		if !groupExists(context.Background(), sshGroupName(actionID)) {
 			t.Error("SSH group not created")
 		}
 	})
@@ -3276,7 +3276,7 @@ func TestIntegration_EdgeCase_UserDeleteWhileLoggedIn(t *testing.T) {
 	assertSuccess(t, result)
 	assertChanged(t, result, true)
 
-	if userExists(username) {
+	if userExists(context.Background(), username) {
 		t.Error("user still exists despite having active processes")
 	}
 }

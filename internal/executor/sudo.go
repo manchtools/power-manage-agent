@@ -80,7 +80,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 	}
 
 	// Ensure group exists
-	if !groupExists(groupName) {
+	if !groupExists(ctx, groupName) {
 		if err := userMgr.GroupCreate(ctx, groupName, sysuser.GroupCreateOptions{}); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}

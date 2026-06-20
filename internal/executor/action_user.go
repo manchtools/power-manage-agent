@@ -115,7 +115,7 @@ func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
 
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
-	exists := userExists(params.Username)
+	exists := userExists(ctx, params.Username)
 
 	if exists {
 		// Update existing user
@@ -434,7 +434,7 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 		}, false, fmt.Errorf("cannot remove protected user: power-manage")
 	}
 
-	if !userExists(username) {
+	if !userExists(ctx, username) {
 		// User doesn't exist, no change needed
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -642,15 +642,15 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 // reloadSshd reloads the sshd service, falling back to the "ssh" service name
 // for Debian/Ubuntu. Writes the result to output.
 func reloadSshd(ctx context.Context, output *strings.Builder) {
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	// Reload via the SDK service Manager, falling back to the Debian/Ubuntu
+	// "ssh" unit name when "sshd" is not the unit on this host.
+	err := serviceMgr.Reload(ctx, "sshd")
+	if err != nil {
+		err = serviceMgr.Reload(ctx, "ssh")
 	}
-	if reloadErr != nil {
+	if err != nil {
 		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
+		output.WriteString(strings.TrimSpace(err.Error()) + "\n")
 	} else {
 		output.WriteString("reloaded sshd\n")
 	}

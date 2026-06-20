@@ -38,7 +38,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	changed := false
 
 	// Check idempotency: group exists and members match
-	if groupExists(params.Name) && sudoGroupMembersMatch(ctx, params.Name, params.Members) {
+	if groupExists(ctx, params.Name) && sudoGroupMembersMatch(ctx, params.Name, params.Members) {
 		output.WriteString(fmt.Sprintf("group %s already up to date\n", params.Name))
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -51,7 +51,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	}
 
 	// Create group if it doesn't exist
-	if !groupExists(params.Name) {
+	if !groupExists(ctx, params.Name) {
 		opts := sysuser.GroupCreateOptions{System: params.SystemGroup}
 		if params.Gid > 0 {
 			opts.GID = int(params.Gid)
@@ -88,7 +88,7 @@ func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.Comma
 		}, false, fmt.Errorf("cannot remove protected group: power-manage")
 	}
 
-	if !groupExists(groupName) {
+	if !groupExists(ctx, groupName) {
 		output.WriteString(fmt.Sprintf("group %s does not exist, nothing to remove\n", groupName))
 		return &pb.CommandOutput{
 			ExitCode: 0,
