@@ -13,23 +13,20 @@ import (
 )
 
 // TestRpmQueryArgv_PassesNameAfterEndOfOptions pins the intent that the
-// package NAME reaches `rpm -q` / `rpm -e` as an operand, never an
-// option — even when a crafted .rpm makes the name flag-shaped.
+// package NAME reaches `rpm -q` as an operand, never an option — even when a
+// crafted .rpm makes the name flag-shaped. (Erase/install now go through the SDK
+// pkg.Manager Remove/InstallLocal; only the read-only query still shells rpm.)
 func TestRpmQueryArgv_PassesNameAfterEndOfOptions(t *testing.T) {
 	if got, want := rpmQueryArgs("bash"), []string{"-q", "--", "bash"}; !slices.Equal(got, want) {
 		t.Errorf("rpmQueryArgs(bash) = %v, want %v", got, want)
-	}
-	if got, want := rpmEraseArgs("bash"), []string{"-e", "--", "bash"}; !slices.Equal(got, want) {
-		t.Errorf("rpmEraseArgs(bash) = %v, want %v", got, want)
 	}
 	// present-but-WRONG: a flag-shaped "name" must be the final operand,
 	// preceded by the "--" separator (so it can never be reparsed as an
 	// option even though it equals a flag).
 	for _, name := range []string{"-e", "--eval=%{lua:os.execute('id')}"} {
-		for _, args := range [][]string{rpmQueryArgs(name), rpmEraseArgs(name)} {
-			if n := len(args); n < 2 || args[n-1] != name || args[n-2] != "--" {
-				t.Errorf("name %q must be the final operand preceded by --; args=%v", name, args)
-			}
+		args := rpmQueryArgs(name)
+		if n := len(args); n < 2 || args[n-1] != name || args[n-2] != "--" {
+			t.Errorf("name %q must be the final operand preceded by --; args=%v", name, args)
 		}
 	}
 }
