@@ -9,7 +9,6 @@ import (
 	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.
@@ -164,7 +163,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 				changed = true
 			}
 		}
-		if _, err := sysuser.GroupDelete(ctx, groupName); err != nil {
+		if err := userMgr.GroupDelete(ctx, groupName); err != nil {
 			return changed, fmt.Errorf("delete group %s: %w", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))

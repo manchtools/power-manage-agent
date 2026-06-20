@@ -16,49 +16,63 @@ func getFileOwnership(path string) (owner, group string) {
 	return sysfs.GetOwnership(path)
 }
 
-// writeFileWithSudo writes content to a file using sudo tee.
+// writeFileWithSudo writes content to a file through the fs Manager (fd-anchored
+// on the Direct/root backend; escalated tee otherwise).
 func writeFileWithSudo(ctx context.Context, path, content string) (*pb.CommandOutput, error) {
-	err := sysfs.WriteFile(ctx, path, content)
-	if err != nil {
+	if err := fsMgr.WriteFile(ctx, path, []byte(content), sysfs.WriteOptions{}); err != nil {
 		return &pb.CommandOutput{ExitCode: 1, Stderr: err.Error()}, err
 	}
 	return &pb.CommandOutput{ExitCode: 0}, nil
 }
 
-// atomicWriteFile writes content to a file atomically with the specified permissions.
+// atomicWriteFile writes content to a file atomically with the specified
+// permissions. The fs Manager's WriteFile is atomic on every backend.
 func atomicWriteFile(ctx context.Context, path, content, mode, owner, group string) error {
-	return sysfs.WriteFileAtomic(ctx, path, content, mode, owner, group)
+	opts := sysfs.WriteOptions{Owner: owner, Group: group}
+	if mode != "" {
+		v, err := strconv.ParseUint(mode, 8, 32)
+		if err != nil {
+			return fmt.Errorf("invalid file mode %q: %w", mode, err)
+		}
+		opts.Mode = os.FileMode(v)
+	}
+	return fsMgr.WriteFile(ctx, path, []byte(content), opts)
 }
 
-// readFileWithSudo reads a file's contents using sudo cat.
+// readFileWithSudo reads a file's contents through the fs Manager.
 func readFileWithSudo(ctx context.Context, path string) (string, error) {
-	return sysfs.ReadFile(ctx, path)
+	b, err := fsMgr.ReadFile(ctx, path)
+	if err != nil {
+		return "", err
+	}
+	return string(b), nil
 }
 
-// fileExistsWithSudo checks whether a path exists using sudo test -e.
+// fileExistsWithSudo checks whether a path exists. A probe error is treated as
+// "absent" to preserve the boolean contract of the previous helper.
 func fileExistsWithSudo(ctx context.Context, path string) bool {
-	return sysfs.FileExists(ctx, path)
+	ok, _ := fsMgr.Exists(ctx, path)
+	return ok
 }
 
 // removeFileStrict removes a file and returns any error.
 func removeFileStrict(ctx context.Context, path string) error {
-	return sysfs.RemoveStrict(ctx, path)
+	return fsMgr.Remove(ctx, path)
 }
 
-// createDirectory creates a directory using sudo mkdir.
+// createDirectory creates a directory through the fs Manager.
 func createDirectory(ctx context.Context, path string, recursive bool) error {
-	return sysfs.Mkdir(ctx, path, recursive)
+	return fsMgr.Mkdir(ctx, path, sysfs.MkdirOptions{Recursive: recursive})
 }
 
 // createDirectoryWithPermissions creates a directory and applies its mode
 // and ownership through the fd-based, no-follow helper (WS6 #5). The old
-// path-based chmod/chown (sysfs.MkdirWithPermissions) re-resolved the path
-// and would dereference a final-component symlink swapped in after mkdir,
-// redirecting a root chmod/chown onto the target. Here the perms are
-// applied via an O_NOFOLLOW|O_DIRECTORY fd, so a swapped-in symlink aborts
-// the operation (ELOOP) instead.
+// path-based chmod/chown re-resolved the path and would dereference a final-
+// component symlink swapped in after mkdir, redirecting a root chmod/chown onto
+// the target. Here the perms are applied via an O_NOFOLLOW|O_DIRECTORY fd, so a
+// swapped-in symlink aborts the operation (ELOOP) instead.
 func createDirectoryWithPermissions(ctx context.Context, path, mode, owner, group string, recursive bool) error {
-	if err := sysfs.Mkdir(ctx, path, recursive); err != nil {
+	if err := fsMgr.Mkdir(ctx, path, sysfs.MkdirOptions{Recursive: recursive}); err != nil {
 		return fmt.Errorf("create directory: %w", err)
 	}
 	if mode == "" && owner == "" && group == "" {
@@ -85,7 +99,7 @@ func createDirectoryWithPermissions(ctx context.Context, path, mode, owner, grou
 
 // removeDirectory removes a directory and its contents.
 func removeDirectory(ctx context.Context, path string) error {
-	return sysfs.RemoveDir(ctx, path)
+	return fsMgr.RemoveDir(ctx, path)
 }
 
 // userExists checks if a user exists on the system.

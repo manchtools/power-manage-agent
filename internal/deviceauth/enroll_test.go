@@ -17,8 +17,8 @@ import (
 	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
 
-	"github.com/manchtools/power-manage/agent/internal/credentials"
 	sdk "github.com/manchtools/power-manage-sdk"
+	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
 
 // mockRegisterService implements the Register RPC of ControlServiceHandler.

@@ -4,9 +4,9 @@ import (
 	"testing"
 	"time"
 
-	"github.com/manchtools/power-manage/agent/internal/credentials"
 	sdk "github.com/manchtools/power-manage-sdk"
 	"github.com/manchtools/power-manage-sdk/cryptotest"
+	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
 
 // TestRenewAt_Computation pins the 80%-of-lifetime schedule and the

@@ -12,7 +12,6 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
-	sysnotify "github.com/manchtools/power-manage-sdk/sys/notify"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
@@ -76,7 +75,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		e.logger.Warn("LPS policy has no complexity set, defaulting to alphanumeric",
 			"action_id", actionID)
 	}
-	complex := params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX
+	complexity := sysuser.ComplexityAlphanumeric
+	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
+		complexity = sysuser.ComplexityComplex
+	}
 
 	var rotations []lpsRotationEntry
 	var rotatedUsers []string
@@ -116,7 +118,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 				"requested", requested, "effective", length,
 				"min", sysuser.MinPasswordLength, "max", sysuser.MaxPasswordLength)
 		}
-		password, err := sysuser.GeneratePassword(length, complex)
+		password, err := sysuser.GeneratePassword(length, complexity)
 		if err != nil {
 			anyError = fmt.Errorf("generate password for %s: %w", username, err)
 			output.WriteString(fmt.Sprintf("LPS: %s — failed to generate password: %v\n", username, err))
@@ -124,9 +126,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Set the password
-		if result, err := sysuser.SetPassword(ctx, username, password); err != nil {
+		if err := userMgr.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
-			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v%s\n", username, err, stderrSuffix(result)))
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
 			continue
 		}
 
@@ -135,8 +137,11 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		now := e.now().UTC()
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
-		// Update per-user state in SQLite
-		hash := sha256.Sum256([]byte(password))
+		// Update per-user state in SQLite. password is an exec.Secret; Reveal()
+		// is the sanctioned plaintext access for the drift hash + the operator-
+		// facing rotation record below.
+		plaintext := password.Reveal()
+		hash := sha256.Sum256([]byte(plaintext))
 		hashStr := hex.EncodeToString(hash[:])
 		if err := st.SetLpsUserState(actionID, username, now, hashStr); err != nil {
 			e.logger.Warn("failed to save LPS user state", "action_id", actionID, "username", username, "error", err)
@@ -144,7 +149,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 		rotations = append(rotations, lpsRotationEntry{
 			Username:  username,
-			Password:  password,
+			Password:  plaintext,
 			RotatedAt: now.Format(time.RFC3339),
 			Reason:    reason,
 		})
@@ -152,7 +157,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 	// Notify affected users and terminate sessions after a grace period
 	if len(rotatedUsers) > 0 {
-		sysnotify.NotifyUsers(ctx, rotatedUsers, "Session Termination",
+		notifyUsers(ctx, rotatedUsers, "Session Termination",
 			"Your password has been changed by Power Manage. All sessions will be terminated in 60 seconds. Please save your work.")
 		output.WriteString(fmt.Sprintf("LPS: notified %d user(s), waiting 60 seconds before session termination\n", len(rotatedUsers)))
 
@@ -301,7 +306,7 @@ func killUserSessions(ctx context.Context, username string) {
 func getLastAuthTime(username string) (time.Time, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	r, err := sysexec.RunWithCLocale(ctx, "last", "-1", "-F", username)
+	r, err := executorRunner.Run(ctx, sysexec.Command{Name: "last", Args: []string{"-1", "-F", username}})
 	if err != nil {
 		return time.Time{}, fmt.Errorf("last command: %w", err)
 	}

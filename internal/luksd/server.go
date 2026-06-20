@@ -11,10 +11,10 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manchtools/power-manage/agent/internal/store"
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sdk "github.com/manchtools/power-manage-sdk"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 // Session is the agent's authenticated gateway connection, supplying the

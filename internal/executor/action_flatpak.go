@@ -11,7 +11,6 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
-	"github.com/manchtools/power-manage-sdk/sys/desktop"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 

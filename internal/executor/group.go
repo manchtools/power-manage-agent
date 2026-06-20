@@ -52,15 +52,11 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 
 	// Create group if it doesn't exist
 	if !groupExists(params.Name) {
-		var extraArgs []string
+		opts := sysuser.GroupCreateOptions{System: params.SystemGroup}
 		if params.Gid > 0 {
-			extraArgs = append(extraArgs, "-g", fmt.Sprintf("%d", params.Gid))
+			opts.GID = int(params.Gid)
 		}
-		if params.SystemGroup {
-			extraArgs = append(extraArgs, "-r")
-		}
-
-		if _, err := sysuser.GroupCreate(ctx, params.Name, extraArgs...); err != nil {
+		if err := userMgr.GroupCreate(ctx, params.Name, opts); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", params.Name, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", params.Name))

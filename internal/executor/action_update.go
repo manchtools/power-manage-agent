@@ -31,6 +31,16 @@ var (
 		}
 		_ = n.NotifyAll(ctx, title, body)
 	}
+	// notifyUsers is notifyAll's targeted sibling: it notifies a specific set of
+	// users (LPS rotation). Same best-effort, errors-dropped contract; a package
+	// var so tests observe it.
+	notifyUsers = func(ctx context.Context, users []string, title, body string) {
+		n, err := sysnotify.New(executorRunner)
+		if err != nil {
+			return
+		}
+		_ = n.NotifyUsers(ctx, users, title, body)
+	}
 )
 
 // interpretUpdateCheck maps a package manager's update-check result (its
@@ -542,7 +552,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	} else {
 		// Fallback to a full system upgrade (UpgradeAll — the no-arg Upgrade is
 		// now a deliberate no-op, so a whole-system upgrade is UpgradeAll).
-		upgradeResult, err := mgr.UpgradeAll(ctx)
+		upgradeResult, err := mgr.UpgradeAll(ctx, pkg.UpgradeOptions{})
 		allOutput.WriteString(upgradeResult.Stdout)
 		allOutput.WriteString(upgradeResult.Stderr)
 		if err != nil {
@@ -673,7 +683,7 @@ func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParam
 	// dist-upgrade two-step. A failure (e.g. a half-completed kernel
 	// transition) is returned so the action reports FAILED rather than a clean
 	// SUCCESS over a broken upgrade.
-	res, err := apt.UpgradeAll(ctx)
+	res, err := apt.UpgradeAll(ctx, pkg.UpgradeOptions{})
 	output.WriteString(res.Stdout)
 	output.WriteString(res.Stderr)
 	return err

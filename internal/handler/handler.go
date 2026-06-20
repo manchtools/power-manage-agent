@@ -13,14 +13,14 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/manchtools/power-manage/agent/internal/executor"
-	"github.com/manchtools/power-manage/agent/internal/scheduler"
-	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/sys/inventory"
 	"github.com/manchtools/power-manage-sdk/sys/osquery"
 	"github.com/manchtools/power-manage-sdk/validate"
+	"github.com/manchtools/power-manage/agent/internal/executor"
+	"github.com/manchtools/power-manage/agent/internal/scheduler"
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 // streamValidator validates incoming stream-RPC messages at the agent boundary

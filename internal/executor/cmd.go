@@ -44,10 +44,27 @@ func toOutput(r *sysexec.Result) *pb.CommandOutput {
 	}
 }
 
+// asCmdError preserves the pre-rework contract that a non-zero exit is an error.
+// The reworked Runner reports a non-zero exit in Result.ExitCode (not as err),
+// but every caller of the non-streaming command helpers treats `err != nil` as
+// "the command failed" (e.g. `if err != nil { return ..., err }`). Without this
+// mapping a failed sudo command would look like success. (Streaming callers, by
+// contrast, want the exit code in the output to report a script's status, so
+// runCmdStreaming/runAsUserStreaming deliberately do NOT use this.)
+func asCmdError(name string, r sysexec.Result, err error) error {
+	if err != nil {
+		return err
+	}
+	if r.ExitCode != 0 {
+		return &sysexec.CommandError{Name: name, ExitCode: r.ExitCode, Stderr: r.Stderr}
+	}
+	return nil
+}
+
 // runCmdWithStdin executes an unprivileged command with stdin input.
 func runCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (*pb.CommandOutput, error) {
 	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Stdin: stdin})
-	return toOutput(&r), err
+	return toOutput(&r), asCmdError(name, r, err)
 }
 
 // runSudoCmd runs a command through the privilege backend. It is a package var
@@ -55,13 +72,13 @@ func runCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...
 // without a live host; production dispatches through the configured runner.
 var runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
 	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Escalate: true})
-	return toOutput(&r), err
+	return toOutput(&r), asCmdError(name, r, err)
 }
 
 // runSudoCmdWithStdin runs a privileged command with stdin input.
 func runSudoCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (*pb.CommandOutput, error) {
 	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Stdin: stdin, Escalate: true})
-	return toOutput(&r), err
+	return toOutput(&r), asCmdError(name, r, err)
 }
 
 // runCmdStreaming executes a command with real-time output streaming.

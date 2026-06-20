@@ -20,11 +20,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	"github.com/manchtools/power-manage/agent/internal/store"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/verify"
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 // validRepoName restricts repository names to safe characters only.
@@ -287,6 +287,7 @@ func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Execut
 		networkMgr = mustNetworkManager(runner)
 		userMgr = mustUserManager(runner)
 		fsMgr = mustFSManager(runner)
+		encMgr = mustEncManager(runner)
 	}
 	switch {
 	case runner == nil:

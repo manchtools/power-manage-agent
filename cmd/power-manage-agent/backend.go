@@ -9,9 +9,7 @@ import (
 	osexec "os/exec"
 	"time"
 
-	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
-	sysservice "github.com/manchtools/power-manage-sdk/sys/service"
 )
 
 // geteuidFn is a seam over os.Geteuid so the empty-default privilege branch
@@ -36,53 +34,28 @@ func randomBackoff() time.Duration {
 // PATH (e.g. POWER_MANAGE_PRIVILEGE_BACKEND=doas on a host with no
 // doas installed). Fail-fast at startup is cheaper than debugging a
 // "permission denied" on the first privileged call hours later.
-func applyBackendOverrides(cfg *Config, logger *slog.Logger) error {
-	if err := setPrivilegeBackend(cfg.PrivilegeBackend, logger); err != nil {
-		return err
+func applyBackendOverrides(cfg *Config, logger *slog.Logger) (sysexec.PrivilegeBackend, error) {
+	resolved, err := setPrivilegeBackend(cfg.PrivilegeBackend, logger)
+	if err != nil {
+		return resolved, err
 	}
-	// Service manager. Only systemd has a concrete implementation
-	// today; the other backends are scaffolded in the SDK so the
-	// proto enum + agent wiring stay stable, but WriteUnit / Enable /
-	// Start return sysservice.unsupported(...) until implementations
-	// land. Warn loudly so operators who select a scaffold backend
-	// don't think the agent silently succeeded — the first action
-	// will fail, but the warning explains why before that happens.
-	var serviceTool string
-	scaffoldOnly := false
-	switch cfg.ServiceBackend {
-	case "openrc":
-		sysservice.SetServiceBackend(sysservice.ServiceBackendOpenRC)
-		serviceTool = "rc-service"
-		scaffoldOnly = true
-	case "runit":
-		sysservice.SetServiceBackend(sysservice.ServiceBackendRunit)
-		serviceTool = "sv"
-		scaffoldOnly = true
-	case "s6":
-		sysservice.SetServiceBackend(sysservice.ServiceBackendS6)
-		serviceTool = "s6-svc"
-		scaffoldOnly = true
-	case "systemd", "":
-		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
-		serviceTool = "systemctl"
-	default:
-		logger.Warn("unknown POWER_MANAGE_SERVICE_BACKEND, staying on systemd",
-			"value", cfg.ServiceBackend)
-		sysservice.SetServiceBackend(sysservice.ServiceBackendSystemd)
-		serviceTool = "systemctl"
+	// Service manager. The reworked SDK implements only systemd
+	// (service.New(service.Systemd, runner)); the OpenRC/Runit/S6 scaffolds and
+	// the global SetServiceBackend selector were removed. Warn loudly if a
+	// non-systemd backend was requested — the first SERVICE action will fail, but
+	// the warning explains why before that happens — and require systemctl since
+	// the Manager always drives systemd.
+	if sb := normalizedServiceBackend(cfg.ServiceBackend); sb != "systemd" {
+		logger.Warn("only the systemd service backend is implemented; SERVICE actions will fail on this host",
+			"requested", sb)
 	}
-	if scaffoldOnly {
-		logger.Warn("service backend has no SDK implementation yet; SERVICE actions will fail until support lands",
-			"backend", cfg.ServiceBackend)
+	if _, err := osexec.LookPath("systemctl"); err != nil {
+		return resolved, fmt.Errorf("systemd service backend requires systemctl on PATH: %w", err)
 	}
-	if _, err := osexec.LookPath(serviceTool); err != nil {
-		return fmt.Errorf("service backend %q selected but %q is not on PATH: %w",
-			normalizedServiceBackend(cfg.ServiceBackend), serviceTool, err)
-	}
-	logger.Info("service backend set", "backend", normalizedServiceBackend(cfg.ServiceBackend))
+	logger.Info("service backend set", "backend", "systemd")
 
 	setEncryptionBackend(cfg.EncryptionBackend, logger)
-	return nil
+	return resolved, nil
 }
 
 // setPrivilegeBackend resolves and installs the SDK privilege backend.
@@ -120,9 +93,9 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.Privilege
 		resolved = sysexec.Sudo
 		privilegeTool = "sudo"
 	}
-	// Install the legacy process-global backend for SDK call sites that have not
-	// yet been migrated to an injected Runner.
-	sysexec.SetPrivilegeBackend(resolved)
+	// The resolved backend is returned to the caller, which builds the one
+	// process-wide exec.Runner from it (sysexec.NewRunner) and injects that into
+	// every capability Manager — there is no global privilege state anymore.
 	if privilegeTool == "" {
 		// Root backend has no external tool to look up — Privileged*
 		// dispatchers exec the resolved command directly.
@@ -137,24 +110,17 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.Privilege
 	return resolved, nil
 }
 
-// setEncryptionBackend resolves and installs the SDK encryption backend.
-// Only LUKS is implemented today. GELI/CGD live on BSD where we don't
-// probe for a specific CLI binary.
+// setEncryptionBackend validates the configured encryption backend. The reworked
+// SDK implements only LUKS (encryption.New(encryption.LUKS, runner)) and the
+// global backend selector was removed, so this only warns on a non-luks request
+// and checks that cryptsetup is on PATH.
 func setEncryptionBackend(backend string, logger *slog.Logger) {
-	var encName string
+	encName := backend
 	switch backend {
-	case "geli":
-		sysenc.SetBackend(sysenc.BackendGELI)
-		encName = "geli"
-	case "cgd":
-		sysenc.SetBackend(sysenc.BackendCGD)
-		encName = "cgd"
 	case "luks", "":
-		sysenc.SetBackend(sysenc.BackendLUKS)
 		encName = "luks"
 	default:
-		logger.Warn("unknown POWER_MANAGE_ENCRYPTION_BACKEND, staying on luks", "value", backend)
-		sysenc.SetBackend(sysenc.BackendLUKS)
+		logger.Warn("only the luks encryption backend is implemented; ENCRYPTION actions will fail on this host", "requested", backend)
 		encName = "luks"
 	}
 	if encName == "luks" {

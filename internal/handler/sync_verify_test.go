@@ -8,10 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	"github.com/manchtools/power-manage/agent/internal/executor"
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/cryptotest"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/verify"
+	"github.com/manchtools/power-manage/agent/internal/executor"
 )
 
 // testCAAndSigner returns a self-signed CA cert (PEM) and a matching
@@ -45,7 +45,7 @@ func newVerifierHandler(t *testing.T, caPEM []byte) (*Handler, chan struct{}) {
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
 	syncTrigger := make(chan struct{}, 1)
-	h := NewHandler(slog.Default(), executor.NewExecutor(verifier), nil, nil, syncTrigger)
+	h := NewHandler(slog.Default(), executor.NewExecutor(verifier, nil), nil, nil, syncTrigger)
 	return h, syncTrigger
 }
 
@@ -163,7 +163,7 @@ func TestOnAction_ParamsTamperRefused(t *testing.T) {
 func TestOnAction_NoVerifierIsFailClosed(t *testing.T) {
 	_, signer := testCAAndSigner(t)
 	syncTrigger := make(chan struct{}, 1)
-	h := NewHandler(slog.Default(), executor.NewExecutor(nil), nil, nil, syncTrigger)
+	h := NewHandler(slog.Default(), executor.NewExecutor(nil, nil), nil, nil, syncTrigger)
 
 	env := &pb.SignedActionEnvelope{
 		ActionId:   &pb.ActionId{Value: "01HSYNCNOVERIFIER"},

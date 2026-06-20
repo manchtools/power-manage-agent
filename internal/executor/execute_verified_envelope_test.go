@@ -8,8 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/cryptotest"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/verify"
 )
 
@@ -21,7 +21,7 @@ func testVerifierAndSigner(t *testing.T) (*Executor, *verify.ActionSigner) {
 	caPEM, key, _ := cryptotest.GenCA(t, "test-ca")
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
-	return NewExecutor(verifier), verify.NewActionSigner(key)
+	return NewExecutor(verifier, nil), verify.NewActionSigner(key)
 }
 
 func signEnv(t *testing.T, signer *verify.ActionSigner, env *pb.SignedActionEnvelope) (envelope []byte, signature []byte) {
@@ -134,7 +134,7 @@ func TestExecutor_VerifyEnvelopeFailClosed(t *testing.T) {
 	})
 
 	t.Run("nil verifier fails closed", func(t *testing.T) {
-		noVerifier := NewExecutor(nil)
+		noVerifier := NewExecutor(nil, nil)
 		_, err := noVerifier.VerifyEnvelope(envBytes, sig)
 		assert.Error(t, err, "an executor with no verifier must refuse, not pass")
 	})

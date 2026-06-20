@@ -11,6 +11,7 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/sys/desktop"
+	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 	"github.com/manchtools/power-manage-sdk/sys/network"
@@ -82,6 +83,18 @@ func mustFSManager(r sysexec.Runner) sysfs.Manager {
 	m, err := sysfs.New(r)
 	if err != nil {
 		panic("executor: fs manager must construct: " + err.Error())
+	}
+	return m
+}
+
+// encMgr is the process-wide LUKS encryption Manager; rebuilt by NewExecutor
+// with the configured backend. Package var so tests can substitute a fake.
+var encMgr = mustEncManager(executorRunner)
+
+func mustEncManager(r sysexec.Runner) sysenc.Manager {
+	m, err := sysenc.New(sysenc.LUKS, r)
+	if err != nil {
+		panic("executor: encryption manager must construct: " + err.Error())
 	}
 	return m
 }

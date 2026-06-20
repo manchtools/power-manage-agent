@@ -53,7 +53,7 @@ func TestExecuteAptUpgrade_SecurityOnly_FailsClosedWhenUnattendedAbsent(t *testi
 	origSudo := runSudoCmd
 	t.Cleanup(func() { execLookPath = origLook; runSudoCmd = origSudo })
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 
 	t.Run("absent unattended-upgrade fails closed, no broad upgrade", func(t *testing.T) {
 		execLookPath = func(name string) (string, error) {
@@ -106,7 +106,7 @@ func TestScheduleRebootAfterUpdate(t *testing.T) {
 	origNotify := notifyAll
 	t.Cleanup(func() { runSudoCmd = origSudo; notifyAll = origNotify })
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 
 	t.Run("shutdown failure returns an error and suppresses notify", func(t *testing.T) {
 		runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {

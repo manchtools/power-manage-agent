@@ -45,7 +45,7 @@ func init() {
 // =============================================================================
 
 func newTestExecutor() *Executor {
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	// Downloads are https-only (WS7 #2). The test file servers
 	// (startFileServer) are TLS with self-signed certs, so trust any cert
 	// here — this is integration-test-only code.

@@ -7,15 +7,29 @@ import (
 	"testing"
 
 	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
+
+// updateTestExecutor builds an Executor over a real Direct runner so the
+// package-manager Manager is detected and built (NewExecutor with a nil runner
+// builds no Manager). The detected backend is exposed via e.pkgBackend, which the
+// per-manager integration tests below use as their skip guard — replacing the
+// removed package-global pkg.IsApt/IsDnf/... detectors.
+func updateTestExecutor(t *testing.T) *Executor {
+	t.Helper()
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		t.Fatalf("build direct runner: %v", err)
+	}
+	return NewExecutor(nil, r)
+}
 
 // TestHasUpdatesAvailable_Dnf tests the dnf check-update path on Fedora systems.
 func TestHasUpdatesAvailable_Dnf(t *testing.T) {
-	if !pkg.IsDnf() {
+	e := updateTestExecutor(t)
+	if e.pkgBackend != pkg.Dnf {
 		t.Skip("not a dnf-based system")
 	}
-
-	e := NewExecutor(nil)
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (dnf) = %v", result)
 
@@ -34,11 +48,10 @@ func TestHasUpdatesAvailable_Dnf(t *testing.T) {
 
 // TestHasUpdatesAvailable_Apt tests the apt-get -s upgrade path on Debian systems.
 func TestHasUpdatesAvailable_Apt(t *testing.T) {
-	if !pkg.IsApt() {
+	e := updateTestExecutor(t)
+	if e.pkgBackend != pkg.Apt {
 		t.Skip("not an apt-based system")
 	}
-
-	e := NewExecutor(nil)
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (apt) = %v", result)
 
@@ -60,11 +73,10 @@ func TestHasUpdatesAvailable_Apt(t *testing.T) {
 
 // TestHasUpdatesAvailable_Pacman tests the pacman -Qu path on Arch systems.
 func TestHasUpdatesAvailable_Pacman(t *testing.T) {
-	if !pkg.IsPacman() {
+	e := updateTestExecutor(t)
+	if e.pkgBackend != pkg.Pacman {
 		t.Skip("not a pacman-based system")
 	}
-
-	e := NewExecutor(nil)
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (pacman) = %v", result)
 
@@ -78,18 +90,18 @@ func TestHasUpdatesAvailable_Pacman(t *testing.T) {
 
 // TestHasUpdatesAvailable_Zypper tests the zypper list-updates path on openSUSE systems.
 func TestHasUpdatesAvailable_Zypper(t *testing.T) {
-	if !pkg.IsZypper() {
+	e := updateTestExecutor(t)
+	if e.pkgBackend != pkg.Zypper {
 		t.Skip("not a zypper-based system")
 	}
-
-	e := NewExecutor(nil)
 	result := e.hasUpdatesAvailable(context.Background(), false)
 	t.Logf("hasUpdatesAvailable (zypper) = %v", result)
 }
 
 // TestInstalledPackageCount verifies the package count function works on the current system.
 func TestInstalledPackageCount(t *testing.T) {
-	count := installedPackageCount()
+	e := updateTestExecutor(t)
+	count := e.installedPackageCount()
 	if count <= 0 {
 		t.Skipf("installedPackageCount() = %d (no supported package manager or error)", count)
 	}
@@ -98,11 +110,12 @@ func TestInstalledPackageCount(t *testing.T) {
 
 // TestInstalledPackageCount_Stable verifies that two consecutive calls return the same count.
 func TestInstalledPackageCount_Stable(t *testing.T) {
-	a := installedPackageCount()
+	e := updateTestExecutor(t)
+	a := e.installedPackageCount()
 	if a <= 0 {
 		t.Skip("no supported package manager")
 	}
-	b := installedPackageCount()
+	b := e.installedPackageCount()
 	if a != b {
 		t.Errorf("package count not stable: %d vs %d", a, b)
 	}

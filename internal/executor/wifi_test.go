@@ -20,7 +20,7 @@ import (
 // check, before conName/certDir are computed, so no connection is created and
 // no cert directory is written.
 func TestExecuteWifi_RejectsUnsafeActionID(t *testing.T) {
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	ctx := context.Background()
 	// Non-nil params so the nil-params guard isn't what trips; the action-ID
 	// gate must reject before params are ever read.

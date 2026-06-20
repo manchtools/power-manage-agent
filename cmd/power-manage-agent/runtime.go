@@ -8,12 +8,12 @@ import (
 	"strings"
 	"time"
 
+	sdk "github.com/manchtools/power-manage-sdk"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/handler"
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage-sdk"
 )
 
 // runAgent connects to the gateway and processes messages.

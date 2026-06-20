@@ -17,7 +17,7 @@ var protoJSONAllowlist = map[string]string{}
 
 // protoPkgPathSuffix identifies the generated protobuf package regardless of
 // the import alias a file chooses (conventionally "pm").
-const protoPkgPathSuffix = "/sdk/gen/go/pm/v1"
+const protoPkgPathSuffix = "-sdk/gen/go/pm/v1"
 
 // TestNoStdlibJSONOfProtoMessage forbids passing a generated protobuf type to
 // the standard library encoding/json (Marshal / MarshalIndent / Unmarshal, and

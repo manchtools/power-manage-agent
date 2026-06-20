@@ -20,9 +20,18 @@ import (
 // against test-user-owned temp dirs instead of escalating via sudo.
 func withRootBackend(t *testing.T) {
 	t.Helper()
-	prev := sysexec.CurrentPrivilegeBackend()
-	sysexec.SetPrivilegeBackend(sysexec.Direct)
-	t.Cleanup(func() { sysexec.SetPrivilegeBackend(prev) })
+	// The fs helpers dispatch through the fsMgr seam now (no process-global
+	// backend). Point it (and the shared runner) at a Direct runner so the
+	// fd-based, direct-syscall path runs against test-user-owned temp dirs, and
+	// restore the prior seams on cleanup.
+	prevRunner, prevFS := executorRunner, fsMgr
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		t.Fatalf("build direct runner: %v", err)
+	}
+	executorRunner = r
+	fsMgr = mustFSManager(r)
+	t.Cleanup(func() { executorRunner = prevRunner; fsMgr = prevFS })
 }
 
 func newDirExecutor() *Executor {

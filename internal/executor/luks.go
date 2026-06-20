@@ -9,9 +9,15 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
+
+// luksSecret wraps a key string the agent holds (a PSK or a key-store value) as
+// an exec.Secret for the encryption Manager, which keeps it off argv (cryptsetup
+// reads it via --key-file). NewMultilineSecret accepts arbitrary key material.
+func luksSecret(s string) sysexec.Secret { return sysexec.NewMultilineSecret(s) }
 
 // LuksKeyStore is the interface for LUKS key operations via the agent stream.
 type LuksKeyStore interface {
@@ -170,7 +176,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 	if localState != nil && localState.OwnershipTaken && localState.DevicePath != "" {
 		// Subsequent run — use stored device path
 		devicePath = localState.DevicePath
-		isLuks, err := sysenc.IsLuks(ctx, devicePath)
+		isLuks, err := encMgr.IsEncrypted(ctx, devicePath)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("failed to check LUKS status: %w", err)
 		}
@@ -180,10 +186,10 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 		output.WriteString(fmt.Sprintf("LUKS: managing volume %s\n", devicePath))
 	} else {
 		// First run — detect volume by PSK
-		vol, err := sysenc.DetectVolumeByKey(ctx, params.PresharedKey)
+		vol, err := encMgr.DetectVolumeByKey(ctx, luksSecret(params.PresharedKey))
 		if err != nil {
 			// Fall back to heuristic detection (PSK may have been removed by a partial prior run)
-			vol, err = sysenc.DetectVolume(ctx)
+			vol, err = encMgr.DetectVolume(ctx)
 			if err != nil {
 				return nil, false, nil, fmt.Errorf("no LUKS-encrypted volumes detected on this device")
 			}
@@ -283,7 +289,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	if getKeyErr == nil && existingKey != "" {
 		e.logger.Info("LUKS: server has stored key, testing against volume",
 			"action_id", actionID, "key_len", len(existingKey))
-		ok, testErr := sysenc.TestPassphrase(ctx, devicePath, existingKey)
+		ok, testErr := encMgr.VerifyPassphrase(ctx, devicePath, luksSecret(existingKey))
 		e.logger.Info("LUKS: test-passphrase result", "ok", ok, "error", testErr)
 		if testErr == nil && ok {
 			e.logger.Info("LUKS: recovered ownership from server-stored key", "action_id", actionID)
@@ -303,24 +309,27 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 		minWords = 5
 	}
 
-	// Generate managed passphrase
-	passphrase, err := sysenc.GeneratePassphrase(minWords)
+	// Generate managed passphrase. The agent's key-store layer handles keys as
+	// strings (they must be serialized to the server), so Reveal once here and
+	// re-wrap as a Secret at each encryption-Manager boundary below.
+	passSecret, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return fmt.Errorf("generate passphrase: %w", err)
 	}
+	passphrase := passSecret.Reveal()
 
 	// Add managed passphrase using PSK (both keys now valid)
 	e.logger.Info("LUKS: adding managed key using PSK",
 		"psk_len", len(params.PresharedKey),
 		"new_key_len", len(passphrase))
-	if err := sysenc.AddKey(ctx, devicePath, params.PresharedKey, passphrase); err != nil {
+	if err := encMgr.AddKey(ctx, devicePath, luksSecret(params.PresharedKey), luksSecret(passphrase), sysenc.AddKeyOptions{}); err != nil {
 		return fmt.Errorf("add managed key: %w", err)
 	}
 
 	// Store on server — must succeed before removing PSK
 	if err := ks.StoreKey(ctx, actionID, devicePath, passphrase, pb.RotationReason_ROTATION_REASON_INITIAL); err != nil {
 		// Rollback: remove the managed key we just added
-		if rmErr := sysenc.RemoveKey(ctx, devicePath, passphrase); rmErr != nil {
+		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(passphrase)); rmErr != nil {
 			e.logger.Error("LUKS: rollback failed — managed key remains in slot",
 				"action_id", actionID, "error", rmErr)
 		}
@@ -335,7 +344,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	}
 
 	// Verified — now safe to remove PSK
-	if err := sysenc.RemoveKey(ctx, devicePath, params.PresharedKey); err != nil {
+	if err := encMgr.RemoveKey(ctx, devicePath, luksSecret(params.PresharedKey)); err != nil {
 		e.logger.Warn("failed to remove PSK after ownership (both keys work)", "error", err)
 	}
 
@@ -387,21 +396,23 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		minWords = 5
 	}
 
-	// Generate new passphrase
-	newPassphrase, err := sysenc.GeneratePassphrase(minWords)
+	// Generate new passphrase (Reveal once for the string-based key store; re-wrap
+	// as a Secret at each encryption-Manager boundary below).
+	newPassSecret, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return false, fmt.Errorf("generate passphrase: %w", err)
 	}
+	newPassphrase := newPassSecret.Reveal()
 
 	// Add new key using old key (both valid)
-	if err := sysenc.AddKey(ctx, devicePath, currentKey, newPassphrase); err != nil {
+	if err := encMgr.AddKey(ctx, devicePath, luksSecret(currentKey), luksSecret(newPassphrase), sysenc.AddKeyOptions{}); err != nil {
 		return false, fmt.Errorf("add new key: %w", err)
 	}
 
 	// Store on server — must succeed before removing old key
 	if err := ks.StoreKey(ctx, actionID, devicePath, newPassphrase, pb.RotationReason_ROTATION_REASON_SCHEDULED); err != nil {
 		// Rollback: remove the new key we just added
-		if rmErr := sysenc.RemoveKey(ctx, devicePath, newPassphrase); rmErr != nil {
+		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(newPassphrase)); rmErr != nil {
 			e.logger.Error("LUKS: rotation rollback failed — new key remains in slot",
 				"action_id", actionID, "error", rmErr)
 		}
@@ -415,7 +426,7 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	}
 
 	// Verified — now safe to remove old key
-	if err := sysenc.RemoveKey(ctx, devicePath, currentKey); err != nil {
+	if err := encMgr.RemoveKey(ctx, devicePath, luksSecret(currentKey)); err != nil {
 		e.logger.Warn("failed to remove old key after rotation (both keys work)", "error", err)
 	}
 
@@ -490,7 +501,11 @@ func (e *Executor) enrollTpm(ctx context.Context, actionID, devicePath string) e
 		return fmt.Errorf("agent store not configured")
 	}
 
-	hasTPM, err := sysenc.HasTPM2(ctx)
+	tpm, ok := encMgr.TPM()
+	if !ok {
+		return fmt.Errorf("TPM2 not supported by the encryption backend")
+	}
+	hasTPM, err := tpm.Available(ctx)
 	if err != nil {
 		return fmt.Errorf("check TPM2: %w", err)
 	}
@@ -503,7 +518,7 @@ func (e *Executor) enrollTpm(ctx context.Context, actionID, devicePath string) e
 		return fmt.Errorf("get managed key: %w", err)
 	}
 
-	if err := sysenc.EnrollTPM(ctx, devicePath, managedKey); err != nil {
+	if err := tpm.Enroll(ctx, devicePath, luksSecret(managedKey)); err != nil {
 		return err
 	}
 
@@ -528,11 +543,15 @@ func (e *Executor) revokeDeviceKeyInternal(ctx context.Context, localState *stor
 
 	switch localState.DeviceKeyType {
 	case "tpm":
-		if err := sysenc.WipeTPM(ctx, localState.DevicePath, managedKey); err != nil {
+		tpm, ok := encMgr.TPM()
+		if !ok {
+			return fmt.Errorf("TPM2 not supported by the encryption backend")
+		}
+		if err := tpm.Wipe(ctx, localState.DevicePath, luksSecret(managedKey)); err != nil {
 			return err
 		}
 	case "user_passphrase":
-		if err := sysenc.KillSlot(ctx, localState.DevicePath, 7, managedKey); err != nil {
+		if err := encMgr.KillSlot(ctx, localState.DevicePath, 7, luksSecret(managedKey)); err != nil {
 			return err
 		}
 	case "none":
@@ -684,7 +703,7 @@ func (e *Executor) verifyKeyRoundTrip(ctx context.Context, actionID, devicePath,
 		}
 
 		// Defense-in-depth: verify the key actually unlocks the volume.
-		ok, testErr := sysenc.TestPassphrase(ctx, devicePath, storedKey)
+		ok, testErr := encMgr.VerifyPassphrase(ctx, devicePath, luksSecret(storedKey))
 		if testErr != nil || !ok {
 			return fmt.Errorf("server-stored key does not unlock volume (test_ok=%v, err=%v)", ok, testErr)
 		}

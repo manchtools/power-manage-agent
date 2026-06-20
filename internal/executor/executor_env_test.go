@@ -20,7 +20,7 @@ import (
 // exec, the failure would surface as an interpreter error rather than the
 // allow-list message — and this test would catch it.
 func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	ctx := context.Background()
 
 	const bogusInterp = "/nonexistent/pm-ws17a-interp"

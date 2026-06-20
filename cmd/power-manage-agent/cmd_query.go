@@ -2,6 +2,7 @@
 package main
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,8 +12,20 @@ import (
 	"text/tabwriter"
 
 	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/sys/osquery"
 )
+
+// newOsqueryRegistry builds an osquery Querier over a Direct runner — this CLI
+// subcommand runs ad-hoc as the invoking admin, so no privilege escalation is
+// needed. New fails closed with ErrNotInstalled when osqueryi is absent.
+func newOsqueryRegistry() (osquery.Querier, error) {
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		return nil, err
+	}
+	return osquery.New(r)
+}
 
 // isNotInstalled reports whether err signals that osquery is not installed,
 // matching the sentinel even when it is wrapped (WS16 #13).
@@ -45,7 +58,7 @@ func runQuery(args []string) {
 	}
 
 	// Create registry (requires osquery to be installed)
-	registry, err := osquery.NewRegistry()
+	registry, err := newOsqueryRegistry()
 	if err != nil {
 		if isNotInstalled(err) {
 			fmt.Fprintln(os.Stderr, "Error: osquery is not installed on this system")
@@ -61,7 +74,7 @@ func runQuery(args []string) {
 		os.Exit(1)
 	}
 
-	result, err := registry.Query(&pm.OSQuery{
+	result, err := registry.Query(context.Background(), &pm.OSQuery{
 		QueryId: "cli-query",
 		Table:   tableName,
 	})
@@ -102,25 +115,25 @@ func printQueryUsage() {
 }
 
 func printAvailableTables() {
-	// Check if osquery is installed
-	if !osquery.IsInstalled() {
-		fmt.Fprintln(os.Stderr, "Error: osquery is not installed on this system")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "Install osquery to use this feature:")
-		fmt.Fprintln(os.Stderr, "  Fedora/RHEL: sudo dnf install osquery")
-		fmt.Fprintln(os.Stderr, "  Debian/Ubuntu: sudo apt install osquery")
-		fmt.Fprintln(os.Stderr, "")
-		fmt.Fprintln(os.Stderr, "See: https://osquery.io/downloads/official")
-		os.Exit(1)
-	}
-
-	registry, err := osquery.NewRegistry()
+	// newOsqueryRegistry fails closed with ErrNotInstalled when osqueryi is
+	// absent, so the installed check and the registry build are one step.
+	registry, err := newOsqueryRegistry()
 	if err != nil {
-		fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		if isNotInstalled(err) {
+			fmt.Fprintln(os.Stderr, "Error: osquery is not installed on this system")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "Install osquery to use this feature:")
+			fmt.Fprintln(os.Stderr, "  Fedora/RHEL: sudo dnf install osquery")
+			fmt.Fprintln(os.Stderr, "  Debian/Ubuntu: sudo apt install osquery")
+			fmt.Fprintln(os.Stderr, "")
+			fmt.Fprintln(os.Stderr, "See: https://osquery.io/downloads/official")
+		} else {
+			fmt.Fprintf(os.Stderr, "Error: %v\n", err)
+		}
 		os.Exit(1)
 	}
 
-	tables, err := registry.ListTables()
+	tables, err := registry.ListTables(context.Background())
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error listing tables: %v\n", err)
 		os.Exit(1)

@@ -160,9 +160,13 @@ func TestOnTerminalResize_ColsRowsBounds(t *testing.T) {
 
 	h, _ := newTestHandlerWithTTY(t, true)
 
-	// Start a real PTY as the current user (terminal.Start skips the
-	// setresuid when the target uid matches, so no sudo is needed).
-	sess, err := terminal.Start(terminal.SessionConfig{User: cur.Username})
+	// Start a real PTY as the current user (Open skips the setresuid when the
+	// target uid matches, so no sudo is needed).
+	tm, err := terminal.New()
+	if err != nil {
+		t.Skipf("cannot build terminal manager: %v", err)
+	}
+	sess, err := tm.Open(context.Background(), terminal.SessionConfig{User: cur.Username})
 	if err != nil {
 		t.Skipf("cannot start a local PTY session: %v", err)
 	}

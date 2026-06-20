@@ -39,7 +39,7 @@ func TestSetupSSHKeys_RejectsEmbeddedNewline(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			e := NewExecutor(nil)
+			e := NewExecutor(nil, nil)
 			home := t.TempDir()
 			params := &pb.UserParams{
 				Username:          "alice",

@@ -12,9 +12,9 @@ import (
 
 	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 
-	"github.com/manchtools/power-manage/agent/internal/credentials"
 	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	"github.com/manchtools/power-manage-sdk/cryptotest"
+	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
 
 const fakeLeafPEM = "-----BEGIN CERTIFICATE-----\nleaf\n-----END CERTIFICATE-----\n"
