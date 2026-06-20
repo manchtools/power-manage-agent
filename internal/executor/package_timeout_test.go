@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"log/slog"
 	"testing"
 	"time"
@@ -9,6 +10,30 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 )
+
+// probeErrPkgManager fails the IsInstalled state probe, standing in for a
+// cancelled context or a backend lookup failure.
+type probeErrPkgManager struct{ pkg.Manager }
+
+func (probeErrPkgManager) IsInstalled(context.Context, string) (bool, error) {
+	return false, errors.New("backend probe failed")
+}
+
+// TestExecutePackage_FailsClosedOnProbeError pins that a failed package-state
+// probe fails the action CLOSED for both PRESENT and ABSENT, rather than
+// silently proceeding to a privileged install/remove against an unknown state
+// (CR finding: discarded IsInstalled errors at action_package.go:43/117).
+func TestExecutePackage_FailsClosedOnProbeError(t *testing.T) {
+	e := &Executor{logger: slog.Default(), now: time.Now, pkgBackend: pkg.Apt, pkgManager: probeErrPkgManager{}}
+	for _, state := range []pb.DesiredState{
+		pb.DesiredState_DESIRED_STATE_PRESENT,
+		pb.DesiredState_DESIRED_STATE_ABSENT,
+	} {
+		if _, _, err := e.executePackage(context.Background(), &pb.PackageParams{Name: "anything"}, state); err == nil {
+			t.Errorf("state %v: a probe error must fail closed, not proceed to a privileged mutation", state)
+		}
+	}
+}
 
 // WS16 #3: PACKAGE/UPDATE actions previously got no default timeout (only
 // SHELL/SCRIPT_RUN did) and ran their package-manager operations under

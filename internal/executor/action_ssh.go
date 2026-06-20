@@ -156,7 +156,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Check idempotency: file content + group membership
 	fileMatches := e.configMatchesDesired(ctx, configPath, content)
-	membersMatch := sudoGroupMembersMatch(groupName, users)
+	membersMatch := sudoGroupMembersMatch(ctx, groupName, users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
 		return &pb.CommandOutput{

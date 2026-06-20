@@ -30,7 +30,7 @@ of gap simultaneously.
 Each stage IS a known system state. The Dockerfile IS the specification. The
 image hash IS the proof that the state hasn't changed.
 
-```
+```text
 sdk/test/Dockerfile.debian
   ├── base                      — clean Debian with full tool surface
   ├── state-locked-apt          — stale /var/lib/dpkg/lock

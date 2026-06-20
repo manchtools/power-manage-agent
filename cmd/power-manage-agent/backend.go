@@ -72,6 +72,14 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.Privilege
 	)
 	switch backend {
 	case "root":
+		// Refuse the no-escalation root backend unless the process is actually
+		// root. Otherwise an explicit POWER_MANAGE_PRIVILEGE_BACKEND=root on a
+		// non-root agent would build a usable Direct runner, bypassing the
+		// fail-closed path and running privileged commands unescalated (e.g. a
+		// desktop reboot via logind/polkit). Fail fast at startup instead.
+		if euid := geteuidFn(); euid != 0 {
+			return sysexec.Direct, fmt.Errorf("privilege backend %q selected but process euid is %d; run as root, or use the sudo/doas backend", backend, euid)
+		}
 		resolved = sysexec.Direct
 		privilegeTool = ""
 	case "doas":

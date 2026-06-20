@@ -66,7 +66,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 
 	// Check idempotency: file content + group membership
 	fileMatches := e.configMatchesDesired(ctx, sudoersPath, content)
-	membersMatch := sudoGroupMembersMatch(groupName, params.Users)
+	membersMatch := sudoGroupMembersMatch(ctx, groupName, params.Users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("sudo policy already up to date: %s\n", sudoersPath))
 		return &pb.CommandOutput{
@@ -362,20 +362,21 @@ func removeUserFromGroup(ctx context.Context, username, groupName string) error 
 }
 
 // getGroupMembers returns the members of a group (empty on lookup failure,
-// matching the previous non-ctx helper's contract).
-func getGroupMembers(groupName string) []string {
-	members, _ := userMgr.GroupMembers(context.Background(), groupName)
+// matching the previous helper's contract). It honors the action context so a
+// hung backend lookup is bounded by the action's cancellation/timeout.
+func getGroupMembers(ctx context.Context, groupName string) []string {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
 	return members
 }
 
 // userInGroup checks if a user is a member of the specified group.
-func userInGroup(username, groupName string) bool {
-	members, _ := userMgr.GroupMembers(context.Background(), groupName)
+func userInGroup(ctx context.Context, username, groupName string) bool {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
 	return slices.Contains(members, username)
 }
 
 // sudoGroupMembersMatch checks if the current group members match the desired list.
-func sudoGroupMembersMatch(groupName string, desiredUsers []string) bool {
-	members, _ := userMgr.GroupMembers(context.Background(), groupName)
+func sudoGroupMembersMatch(ctx context.Context, groupName string, desiredUsers []string) bool {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
 	return sysuser.MembersMatch(members, desiredUsers)
 }

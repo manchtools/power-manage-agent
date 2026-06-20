@@ -103,10 +103,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// .deb performs no per-file signature check (deb carries none), so
 		// it still honours the agent's checksum-not-gpg artifact model
 		// already enforced above by requireVerifiedArtifact.
-		if e.pkgManager == nil {
-			return nil, false, fmt.Errorf("no package manager available to install %s", pkgName)
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to install %s (context expired or none detected)", pkgName)
 		}
-		return packageResult(e.pkgManager.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{}))
+		return packageResult(mgr.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{}))
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Resolve the package name to remove. Prefer the AUTHORITATIVE
@@ -135,10 +136,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// direct `dpkg -r`, so the package manager runs the maintainer
 		// (prerm) scripts with a proper PATH — the same reason the install
 		// path delegates to apt.
-		if e.pkgManager == nil {
-			return nil, false, fmt.Errorf("no package manager available to remove %s", pkgName)
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to remove %s (context expired or none detected)", pkgName)
 		}
-		return packageResult(e.pkgManager.Remove(ctx, pkg.RemoveOptions{}, pkgName))
+		return packageResult(mgr.Remove(ctx, pkg.RemoveOptions{}, pkgName))
 	}
 
 	return nil, false, fmt.Errorf("unknown desired state: %v", state)

@@ -1137,10 +1137,10 @@ func TestIntegration_Group(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if !userInGroup("pmgrpuser1", groupName) {
+		if !userInGroup(ctx, "pmgrpuser1", groupName) {
 			t.Error("pmgrpuser1 not in group")
 		}
-		if !userInGroup("pmgrpuser2", groupName) {
+		if !userInGroup(ctx, "pmgrpuser2", groupName) {
 			t.Error("pmgrpuser2 not in group")
 		}
 	})
@@ -1160,10 +1160,10 @@ func TestIntegration_Group(t *testing.T) {
 		if !groupExists(groupName) {
 			t.Error("group should still exist")
 		}
-		if userInGroup("pmgrpuser1", groupName) {
+		if userInGroup(ctx, "pmgrpuser1", groupName) {
 			t.Error("pmgrpuser1 should have been removed from group")
 		}
-		if userInGroup("pmgrpuser2", groupName) {
+		if userInGroup(ctx, "pmgrpuser2", groupName) {
 			t.Error("pmgrpuser2 should have been removed from group")
 		}
 	})

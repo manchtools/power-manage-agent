@@ -38,7 +38,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	changed := false
 
 	// Check idempotency: group exists and members match
-	if groupExists(params.Name) && sudoGroupMembersMatch(params.Name, params.Members) {
+	if groupExists(params.Name) && sudoGroupMembersMatch(ctx, params.Name, params.Members) {
 		output.WriteString(fmt.Sprintf("group %s already up to date\n", params.Name))
 		return &pb.CommandOutput{
 			ExitCode: 0,

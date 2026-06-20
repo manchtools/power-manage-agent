@@ -40,7 +40,13 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 
 // ensurePackagePresent installs a package (with optional version and pin) if not already satisfied.
 func (e *Executor) ensurePackagePresent(ctx context.Context, mgr pkg.Manager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := mgr.IsInstalled(ctx, pkgName)
+	// Fail closed if the state probe itself failed (cancelled context, backend
+	// lookup error): proceeding would run a privileged install against an
+	// unknown current state and misreport the result.
+	isInstalled, err := mgr.IsInstalled(ctx, pkgName)
+	if err != nil {
+		return nil, false, fmt.Errorf("probe package state for %s: %w", pkgName, err)
+	}
 	if isInstalled {
 		if out, changed, err := e.checkPackageVersionAndPin(ctx, mgr, params, pkgName); out != nil {
 			return out, changed, err
@@ -86,7 +92,14 @@ func (e *Executor) ensurePackagePresent(ctx context.Context, mgr pkg.Manager, pa
 func (e *Executor) checkPackageVersionAndPin(ctx context.Context, mgr pkg.Manager, params *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
 	versionStr := ""
 	if params.Version != "" {
-		installedVersion, _ := mgr.InstalledVersion(ctx, pkgName)
+		installedVersion, err := mgr.InstalledVersion(ctx, pkgName)
+		if err != nil {
+			// Fail closed (non-nil output so the caller surfaces it, per this
+			// function's contract) rather than treating an unreadable version as
+			// a mismatch and silently reinstalling.
+			return &pb.CommandOutput{ExitCode: 1, Stderr: fmt.Sprintf("read installed version for %s: %v", pkgName, err)},
+				false, fmt.Errorf("read installed version for %s: %w", pkgName, err)
+		}
 		if installedVersion != params.Version {
 			return nil, false, nil
 		}
@@ -114,7 +127,12 @@ func (e *Executor) checkPackageVersionAndPin(ctx context.Context, mgr pkg.Manage
 
 // ensurePackageAbsent removes a package if installed.
 func (e *Executor) ensurePackageAbsent(ctx context.Context, mgr pkg.Manager, _ *pb.PackageParams, pkgName string) (*pb.CommandOutput, bool, error) {
-	isInstalled, _ := mgr.IsInstalled(ctx, pkgName)
+	// Fail closed if the state probe failed — proceeding would run a privileged
+	// remove against an unknown current state.
+	isInstalled, err := mgr.IsInstalled(ctx, pkgName)
+	if err != nil {
+		return nil, false, fmt.Errorf("probe package state for %s: %w", pkgName, err)
+	}
 	if !isInstalled {
 		return &pb.CommandOutput{
 			ExitCode: 0,

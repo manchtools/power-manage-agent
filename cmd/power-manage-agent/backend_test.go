@@ -121,6 +121,33 @@ func TestSetPrivilegeBackend_EmptyDefault_BranchesOnEuid(t *testing.T) {
 	})
 }
 
+// An EXPLICIT root backend must be refused on a non-root process. Otherwise it
+// would build a usable Direct runner under a non-root agent, bypassing the
+// fail-closed path and running privileged commands unescalated (e.g. a
+// logind/polkit reboot). At euid 0 it is accepted (no escalation tool).
+func TestSetPrivilegeBackend_RootBackend_RequiresRootEuid(t *testing.T) {
+	origEuid := geteuidFn
+	t.Cleanup(func() { geteuidFn = origEuid })
+
+	t.Run("euid 1000 refuses the explicit root backend", func(t *testing.T) {
+		geteuidFn = func() int { return 1000 }
+		if _, err := setPrivilegeBackend("root", discardLogger()); err == nil {
+			t.Fatal("root backend on a non-root process must error, not build a Direct runner")
+		}
+	})
+
+	t.Run("euid 0 accepts the explicit root backend", func(t *testing.T) {
+		geteuidFn = func() int { return 0 }
+		got, err := setPrivilegeBackend("root", discardLogger())
+		if err != nil {
+			t.Fatalf("unexpected error: %v", err)
+		}
+		if got != sysexec.Direct {
+			t.Errorf("root backend at euid 0 = %v, want Direct", got)
+		}
+	})
+}
+
 // The reworked SDK implements only the systemd service backend (the OpenRC/
 // Runit/S6 scaffolds and the global SetServiceBackend selector were removed).
 // The contract is now: systemctl must be on PATH (fatal otherwise); a non-systemd

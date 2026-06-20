@@ -73,10 +73,13 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
 	}
 
-	mgr, err := repo.New(e.pkgBackend, executorRunner)
+	// Build the repository Manager over the executor's per-instance runner (the
+	// same field the reboot path uses), not the process-global executorRunner —
+	// so a nil-runner executor fails closed here instead of silently borrowing
+	// global state. A nil runner (or, defensively, an unsupported backend the
+	// skip switch already filtered) yields the configuration error below.
+	mgr, err := repo.New(e.pkgBackend, e.runner)
 	if err != nil {
-		// The skip switch above already rejected unsupported managers; a failure
-		// here means a nil runner, which is a configuration error.
 		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
 	}
 
@@ -181,9 +184,17 @@ func (e *Executor) downloadAptKey(ctx context.Context, keyURL string) ([]byte, e
 	if resp.StatusCode != http.StatusOK {
 		return nil, fmt.Errorf("GPG key download failed: HTTP %d", resp.StatusCode)
 	}
-	raw, err := io.ReadAll(io.LimitReader(resp.Body, 10<<20)) // 10 MiB limit
+	// Read one byte past the cap so an oversized key is REJECTED rather than
+	// silently truncated: io.ReadAll(io.LimitReader(r, n)) returns only the
+	// first n bytes with no error, which would hand a corrupt (truncated) key to
+	// gpg --dearmor and surface as a confusing dearmor failure later.
+	const maxGPGKeySize = 10 << 20 // 10 MiB
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxGPGKeySize+1))
 	if err != nil {
 		return nil, fmt.Errorf("failed to read GPG key response: %w", err)
+	}
+	if len(raw) > maxGPGKeySize {
+		return nil, fmt.Errorf("GPG key exceeds the %d-byte limit", maxGPGKeySize)
 	}
 	return raw, nil
 }

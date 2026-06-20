@@ -319,13 +319,18 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		needModify = true
 		output.WriteString(fmt.Sprintf("gid: %d -> %d\n", currentInfo.GID, params.Gid))
 	} else if params.PrimaryGroup != "" {
-		// Check if primary group needs to change (would need to resolve group name to GID)
 		if err := userMgr.GroupEnsure(ctx, params.PrimaryGroup); err != nil {
 			e.logger.Warn("failed to ensure primary group exists for usermod", "group", params.PrimaryGroup, "error", err)
 		}
-		// For simplicity, always set if specified by name (could be optimized)
-		modOpts.PrimaryGroup = params.PrimaryGroup
-		needModify = true
+		// Only modify when the requested primary group differs from the user's
+		// current GID, so a re-applied action stays idempotent (changed=false)
+		// instead of running usermod every cycle. If the group can't be resolved
+		// to a GID, fall back to applying and let usermod reconcile.
+		if grp, err := user.LookupGroup(params.PrimaryGroup); err != nil || grp.Gid != strconv.Itoa(currentInfo.GID) {
+			modOpts.PrimaryGroup = params.PrimaryGroup
+			needModify = true
+			output.WriteString(fmt.Sprintf("primary group -> %s\n", params.PrimaryGroup))
+		}
 	}
 
 	// Apply usermod if we have changes
@@ -446,9 +451,12 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	// Remove user and their home directory
 	err := userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
 	if err != nil {
-		// If home directory doesn't exist, userdel -r may still succeed
-		// but report an error. Check if user is actually removed.
-		if exists, _ := userMgr.Exists(ctx, username); !exists {
+		// userdel -r can report an error when only the home directory was missing
+		// yet the account was removed. Confirm via Exists — but if THAT probe
+		// also fails we cannot claim success (the zero value would read
+		// exists=false and mask an unknown state), so surface the original error.
+		exists, existsErr := userMgr.Exists(ctx, username)
+		if existsErr == nil && !exists {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("removed user: %s (home directory may not have existed)\n", username),
