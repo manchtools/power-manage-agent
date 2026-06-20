@@ -7,19 +7,18 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
-	"os/exec"
 	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysnotify "github.com/manchtools/power-manage-sdk/sys/notify"
+	sysreboot "github.com/manchtools/power-manage-sdk/sys/reboot"
 )
 
-// Seams so the security-only-upgrade and reboot-scheduling paths can be
-// exercised with fixtures instead of a live host. Production binds them to the
-// real implementations; tests stub them.
+// Notification seams so the update/LPS paths can be exercised with fixtures
+// instead of a live host. Production binds them to the real notify Manager;
+// tests stub them.
 var (
-	execLookPath = exec.LookPath
 	// notifyAll broadcasts a desktop/wall notification through a notify Manager
 	// built over the process-wide runner. Best-effort: a notification must never
 	// block an update/reboot action, so delivery errors are dropped. Kept as a
@@ -42,112 +41,6 @@ var (
 		_ = n.NotifyUsers(ctx, users, title, body)
 	}
 )
-
-// interpretUpdateCheck maps a package manager's update-check result (its
-// stdout and exit code) onto "are updates available?". It is the pure,
-// language-agnostic decision extracted from hasUpdatesAvailable so it can be
-// exercised with fixtures rather than a live host — giving every manager
-// (notably zypper) a real assertion instead of a logged smoke value.
-//
-//   - dnf:    check-update exit 100 = updates, 0 = none
-//   - apt:    `-s upgrade` simulate; any "Inst " line = updates
-//   - pacman: -Qu exit 0 = updates, 1 = none
-//   - zypper: list-updates exit 100 = updates, 0 = none
-//   - unknown manager: assume updates (fail safe toward running the update)
-func interpretUpdateCheck(manager, stdout string, exitCode int) bool {
-	switch manager {
-	case "dnf":
-		return exitCode == 100
-	case "apt":
-		for _, line := range strings.Split(stdout, "\n") {
-			if strings.HasPrefix(line, "Inst ") {
-				return true
-			}
-		}
-		return false
-	case "pacman":
-		return exitCode == 0
-	case "zypper":
-		return exitCode == 100
-	default:
-		return true
-	}
-}
-
-// hasUpdatesAvailable checks if there are pending package updates.
-// Uses exit codes and structured queries — language-agnostic.
-func (e *Executor) hasUpdatesAvailable(ctx context.Context, securityOnly bool) bool {
-	if e.pkgBackend == pkg.Dnf {
-		args := []string{"check-update"}
-		if securityOnly {
-			args = append(args, "--security")
-		}
-		out, exitCode, _ := queryCmdOutput("dnf", args...)
-		return interpretUpdateCheck("dnf", out, exitCode)
-	}
-	if e.pkgBackend == pkg.Apt {
-		aptCmd := "apt-get"
-		if _, err := exec.LookPath("apt"); err == nil {
-			aptCmd = "apt"
-		}
-		out, exitCode, _ := queryCmdOutput(aptCmd, "-s", "upgrade")
-		return interpretUpdateCheck("apt", out, exitCode)
-	}
-	if e.pkgBackend == pkg.Pacman {
-		out, exitCode, _ := queryCmdOutput("pacman", "-Qu")
-		return interpretUpdateCheck("pacman", out, exitCode)
-	}
-	if e.pkgBackend == pkg.Zypper {
-		out, exitCode, _ := queryCmdOutput("zypper", "--non-interactive", "list-updates")
-		return interpretUpdateCheck("zypper", out, exitCode)
-	}
-	return interpretUpdateCheck("", "", 0) // unknown manager → assume updates
-}
-
-// installedPackageCount returns the number of installed packages (language-agnostic).
-func (e *Executor) installedPackageCount() int {
-	if e.pkgBackend == pkg.Dnf || e.pkgBackend == pkg.Zypper {
-		out, exitCode, _ := queryCmdOutput("rpm", "-qa", "--qf", "x\n")
-		if exitCode != 0 {
-			return -1
-		}
-		return strings.Count(out, "x\n")
-	}
-	if e.pkgBackend == pkg.Apt {
-		out, exitCode, _ := queryCmdOutput("dpkg-query", "-f", "x\n", "-W")
-		if exitCode != 0 {
-			return -1
-		}
-		return strings.Count(out, "x\n")
-	}
-	if e.pkgBackend == pkg.Pacman {
-		out, exitCode, _ := queryCmdOutput("pacman", "-Qq")
-		if exitCode != 0 {
-			return -1
-		}
-		count := 0
-		for _, line := range strings.Split(out, "\n") {
-			if strings.TrimSpace(line) != "" {
-				count++
-			}
-		}
-		return count
-	}
-	return -1
-}
-
-// dnfUpgrade runs dnf upgrade. If securityOnly is true, only security updates are applied.
-func dnfUpgrade(ctx context.Context, securityOnly bool) (*pb.CommandOutput, error) {
-	if securityOnly {
-		return runSudoCmd(ctx, "dnf", "-y", "upgrade", "--security")
-	}
-	return runSudoCmd(ctx, "dnf", "-y", "upgrade")
-}
-
-// dnfAutoremove runs dnf autoremove -y to remove unused packages.
-func dnfAutoremove(ctx context.Context) (*pb.CommandOutput, error) {
-	return runSudoCmd(ctx, "dnf", "-y", "autoremove")
-}
 
 // repairFilesystem attempts to fix read-only filesystem issues.
 // This can happen when the kernel remounts the filesystem as read-only due to errors.
@@ -518,11 +411,15 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 
 	securityOnly := params != nil && params.SecurityOnly
 
-	// Check if updates are available before running the upgrade.
-	updatesAvailable := e.hasUpdatesAvailable(ctx, securityOnly)
+	// Check if updates are available before running the upgrade (SDK HasUpdates).
+	// A probe error fails SAFE toward running the upgrade (prior behavior).
+	updatesAvailable, hasUpdErr := mgr.HasUpdates(ctx, securityOnly)
+	if hasUpdErr != nil {
+		updatesAvailable = true
+	}
 
 	// Record pre-update reboot state to detect new reboot requirements.
-	rebootRequiredBefore := e.checkRebootRequired()
+	rebootRequiredBefore := e.rebootRequired(ctx)
 
 	// Update package index
 	allOutput.WriteString("=== Package Index Update ===\n")
@@ -538,64 +435,43 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 		allOutput.WriteString("\n")
 	}
 
-	// Re-check after index update (new updates may now be visible)
+	// Re-check after index update (new updates may now be visible).
 	if !updatesAvailable {
-		updatesAvailable = e.hasUpdatesAvailable(ctx, securityOnly)
+		if u, err := mgr.HasUpdates(ctx, securityOnly); err == nil {
+			updatesAvailable = u
+		}
 	}
 
 	// Perform the upgrade
 	allOutput.WriteString("=== Package Upgrade ===\n")
 
-	if e.pkgBackend == pkg.Apt {
-		lastErr = e.executeAptUpgrade(ctx, params, &allOutput)
-	} else if e.pkgBackend == pkg.Dnf {
-		lastErr = e.executeDnfUpgrade(ctx, params, &allOutput)
-	} else {
-		// Fallback to a full system upgrade (UpgradeAll — the no-arg Upgrade is
-		// now a deliberate no-op, so a whole-system upgrade is UpgradeAll).
-		upgradeResult, err := mgr.UpgradeAll(ctx, pkg.UpgradeOptions{})
-		allOutput.WriteString(upgradeResult.Stdout)
-		allOutput.WriteString(upgradeResult.Stderr)
-		if err != nil {
-			allOutput.WriteString(fmt.Sprintf("Error: %v\n", err))
-			lastErr = err
-		}
+	// Full system upgrade via the SDK Manager. SecurityOnly is honored per
+	// backend by the SDK: apt routes to unattended-upgrade (failing closed if it
+	// is absent), dnf adds --security, zypper its security patch path; pacman and
+	// flatpak return ErrSecurityOnlyUnsupported (so a security-only request fails
+	// closed instead of silently widening to a full upgrade).
+	upgradeResult, upgradeErr := mgr.UpgradeAll(ctx, pkg.UpgradeOptions{SecurityOnly: securityOnly})
+	allOutput.WriteString(upgradeResult.Stdout)
+	allOutput.WriteString(upgradeResult.Stderr)
+	if upgradeErr != nil {
+		allOutput.WriteString(fmt.Sprintf("Error: %v\n", upgradeErr))
+		lastErr = upgradeErr
 	}
 
-	// Autoremove if requested — use package count comparison (language-agnostic)
+	// Autoremove if requested. Delegate to the SDK Manager (a no-op on backends
+	// with no native equivalent) and detect change via the SDK installed-count
+	// comparison. Surface a call failure so the result reflects "we tried to
+	// autoremove and it failed", not a clean success over stale packages.
 	autoremoved := false
 	if params != nil && params.Autoremove {
 		allOutput.WriteString("\n=== Autoremove Unused Packages ===\n")
-		countBefore := e.installedPackageCount()
-		// Capture autoremove errors so the action result reflects
-		// "we tried to autoremove and the call itself failed", not
-		// "everything succeeded but stale packages quietly remain".
-		// The previous shape only wrote stderr to the buffer and
-		// dropped the err on the floor.
-		var autoremoveErr error
-		if e.pkgBackend == pkg.Apt {
-			apt, mErr := pkg.New(pkg.Apt, executorRunner)
-			if mErr != nil {
-				autoremoveErr = mErr
-			} else {
-				output, err := apt.Autoremove(ctx)
-				allOutput.WriteString(output.Stdout)
-				if err != nil {
-					allOutput.WriteString(output.Stderr)
-				}
-				autoremoveErr = err
-			}
-		} else if e.pkgBackend == pkg.Dnf {
-			output, err := dnfAutoremove(ctx)
-			if output != nil {
-				allOutput.WriteString(output.Stdout)
-				if err != nil {
-					allOutput.WriteString(output.Stderr)
-				}
-			}
-			autoremoveErr = err
+		countBefore, _ := mgr.InstalledCount(ctx)
+		arOut, autoremoveErr := mgr.Autoremove(ctx)
+		allOutput.WriteString(arOut.Stdout)
+		if autoremoveErr != nil {
+			allOutput.WriteString(arOut.Stderr)
 		}
-		countAfter := e.installedPackageCount()
+		countAfter, _ := mgr.InstalledCount(ctx)
 		autoremoved = countBefore > 0 && countAfter > 0 && countBefore != countAfter
 		if autoremoveErr != nil && lastErr == nil {
 			lastErr = fmt.Errorf("autoremove: %w", autoremoveErr)
@@ -603,7 +479,7 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	}
 
 	// Check if this run created a new reboot requirement.
-	rebootRequiredAfter := e.checkRebootRequired()
+	rebootRequiredAfter := e.rebootRequired(ctx)
 	newRebootRequired := rebootRequiredAfter && !rebootRequiredBefore
 	if rebootRequiredAfter {
 		allOutput.WriteString("\n*** REBOOT REQUIRED ***\n")
@@ -635,12 +511,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 // notification is gated on success so users are never told "your system will
 // reboot" when it won't. Returns nil when the reboot was scheduled.
 func (e *Executor) scheduleRebootAfterUpdate(ctx context.Context, output *strings.Builder) error {
-	out, err := runSudoCmd(ctx, "shutdown", "-r", "+1", "System update requires reboot")
+	rb, err := sysreboot.New(e.runner)
+	if err == nil {
+		err = rb.Schedule(ctx, sysreboot.ScheduleOptions{Delay: "+1", Message: "System update requires reboot"})
+	}
 	if err != nil {
-		if out != nil {
-			output.WriteString(out.Stdout)
-			output.WriteString(out.Stderr)
-		}
 		output.WriteString(fmt.Sprintf("FAILED to schedule reboot: %v\n", err))
 		return fmt.Errorf("schedule reboot: %w", err)
 	}
@@ -649,74 +524,15 @@ func (e *Executor) scheduleRebootAfterUpdate(ctx context.Context, output *string
 	return nil
 }
 
-// executeAptUpgrade performs apt-specific upgrade.
-func (e *Executor) executeAptUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
-	if params != nil && params.SecurityOnly {
-		// Use unattended-upgrades for security-only updates if available.
-		if _, err := execLookPath("unattended-upgrade"); err == nil {
-			cmdOutput, err := runSudoCmd(ctx, "unattended-upgrade", "-v")
-			if cmdOutput != nil {
-				output.WriteString(cmdOutput.Stdout)
-				output.WriteString(cmdOutput.Stderr)
-			}
-			return err
-		}
-		// No security-only path on this host. Fail closed instead
-		// of silently falling through to a full apt.Upgrade() —
-		// the caller asked for security-only because their
-		// compliance posture forbids the broader upgrade, and
-		// quietly delivering it anyway is a real compliance
-		// violation. Operators can install unattended-upgrades or
-		// switch the action to allow full upgrades.
-		output.WriteString("ERROR: security-only updates requested but no security-only path is available on this host (install unattended-upgrades, or set SecurityOnly=false to allow full upgrades).\n")
-		return fmt.Errorf("security-only apt updates requested but unattended-upgrade is not installed")
+// rebootRequired reports whether the system needs a reboot, via the SDK reboot
+// Manager (the reboot-required marker on Debian/Ubuntu, needs-restarting on
+// Fedora/RHEL). A nil runner or a probe error reports false — best-effort,
+// matching the prior behavior.
+func (e *Executor) rebootRequired(ctx context.Context) bool {
+	rb, err := sysreboot.New(e.runner)
+	if err != nil {
+		return false
 	}
-
-	// Use the SDK Apt abstraction which sets DEBIAN_FRONTEND=noninteractive.
-	apt, mErr := pkg.New(pkg.Apt, executorRunner)
-	if mErr != nil {
-		return mErr
-	}
-
-	// Full system upgrade. The SDK Manager's UpgradeAll is `apt dist-upgrade`
-	// (it adds/removes packages to satisfy held-back deps, still respecting
-	// holds) — the thorough path that supersedes the prior upgrade +
-	// dist-upgrade two-step. A failure (e.g. a half-completed kernel
-	// transition) is returned so the action reports FAILED rather than a clean
-	// SUCCESS over a broken upgrade.
-	res, err := apt.UpgradeAll(ctx, pkg.UpgradeOptions{})
-	output.WriteString(res.Stdout)
-	output.WriteString(res.Stderr)
-	return err
-}
-
-// executeDnfUpgrade performs dnf-specific upgrade.
-func (e *Executor) executeDnfUpgrade(ctx context.Context, params *pb.UpdateParams, output *strings.Builder) error {
-	securityOnly := params != nil && params.SecurityOnly
-	cmdOutput, err := dnfUpgrade(ctx, securityOnly)
-	if cmdOutput != nil {
-		output.WriteString(cmdOutput.Stdout)
-		output.WriteString(cmdOutput.Stderr)
-	}
-
-	return err
-}
-
-// checkRebootRequired checks if the system requires a reboot after updates.
-func (e *Executor) checkRebootRequired() bool {
-	// Debian/Ubuntu: check for reboot-required file
-	if _, err := os.Stat("/var/run/reboot-required"); err == nil {
-		return true
-	}
-
-	// RHEL/Fedora: check needs-restarting
-	if e.pkgBackend == pkg.Dnf {
-		_, exitCode, _ := queryCmdOutput("needs-restarting", "-r")
-		// Exit code 1 means reboot required
-		if exitCode == 1 {
-			return true
-		}
-	}
-
-	return false
+	required, _ := rb.IsRequired(ctx)
+	return required
 }

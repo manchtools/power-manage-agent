@@ -3,115 +3,29 @@ package executor
 import (
 	"context"
 	"errors"
-	"fmt"
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/sys/exec/exectest"
 )
 
-// interpretUpdateCheck is the pure exit-code/stdout → "updates available?"
-// mapping extracted from hasUpdatesAvailable. Driving it with fixtures gives
-// every manager — including zypper, which previously only had a logged smoke
-// value — a real assertion in both directions. The "wrong" rows (e.g. dnf exit
-// 0, apt with no Inst line) are the rejection cases that matter.
-func TestInterpretUpdateCheck(t *testing.T) {
-	cases := []struct {
-		manager  string
-		stdout   string
-		exitCode int
-		want     bool
-	}{
-		{"dnf", "", 100, true},
-		{"dnf", "", 0, false},
-		{"apt", "Inst libfoo [1.0] (1.1 stable)\n", 0, true},
-		{"apt", "Reading package lists...\nBuilding dependency tree...\n", 0, false},
-		{"pacman", "", 0, true},
-		{"pacman", "", 1, false},
-		{"zypper", "", 100, true},
-		{"zypper", "", 0, false},
-		{"", "", 0, true},        // unknown manager → assume updates (fail safe)
-		{"weirdpm", "", 0, true}, // unknown manager → assume updates (fail safe)
-	}
-	for _, tc := range cases {
-		t.Run(fmt.Sprintf("%s/exit=%d", tc.manager, tc.exitCode), func(t *testing.T) {
-			got := interpretUpdateCheck(tc.manager, tc.stdout, tc.exitCode)
-			if got != tc.want {
-				t.Errorf("interpretUpdateCheck(%q, %q, %d) = %v, want %v",
-					tc.manager, tc.stdout, tc.exitCode, got, tc.want)
-			}
-		})
-	}
-}
-
-// executeAptUpgrade must fail CLOSED when a security-only update is requested
-// but no security-only path exists on the host: the operator asked for
-// security-only because their compliance posture forbids the broader upgrade,
-// so silently delivering a full apt.Upgrade() is a compliance violation.
-func TestExecuteAptUpgrade_SecurityOnly_FailsClosedWhenUnattendedAbsent(t *testing.T) {
-	origLook := execLookPath
-	origSudo := runSudoCmd
-	t.Cleanup(func() { execLookPath = origLook; runSudoCmd = origSudo })
-
-	e := NewExecutor(nil, nil)
-
-	t.Run("absent unattended-upgrade fails closed, no broad upgrade", func(t *testing.T) {
-		execLookPath = func(name string) (string, error) {
-			return "", fmt.Errorf("exec: %q: executable file not found in $PATH", name)
-		}
-		var out strings.Builder
-		err := e.executeAptUpgrade(context.Background(), &pb.UpdateParams{SecurityOnly: true}, &out)
-		if err == nil {
-			t.Fatal("security-only upgrade must fail closed when unattended-upgrade is absent")
-		}
-		if !strings.Contains(err.Error(), "unattended-upgrade") {
-			t.Errorf("error = %q, want it to name the missing unattended-upgrade", err)
-		}
-		if !strings.Contains(out.String(), "ERROR: security-only") {
-			t.Errorf("output = %q, want the security-only ERROR line", out.String())
-		}
-		// The broad upgrade path writes a "Dist-Upgrade" banner — it must NOT
-		// have been reached (the function returns at the fail-closed branch).
-		if strings.Contains(out.String(), "Dist-Upgrade") {
-			t.Error("broad upgrade path was taken; security-only must not fall through to a full upgrade")
-		}
-	})
-
-	t.Run("present unattended-upgrade runs the security path", func(t *testing.T) {
-		execLookPath = func(name string) (string, error) { return "/usr/bin/unattended-upgrade", nil }
-		ran := ""
-		runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-			ran = name
-			return &pb.CommandOutput{Stdout: "0 upgraded, 0 newly installed"}, nil
-		}
-		var out strings.Builder
-		err := e.executeAptUpgrade(context.Background(), &pb.UpdateParams{SecurityOnly: true}, &out)
-		if err != nil {
-			t.Fatalf("present security path returned error: %v", err)
-		}
-		if ran != "unattended-upgrade" {
-			t.Errorf("expected the security path to run unattended-upgrade, ran %q", ran)
-		}
-		if strings.Contains(out.String(), "Dist-Upgrade") {
-			t.Error("security path must not run the broad dist-upgrade")
-		}
-	})
-}
-
-// scheduleRebootAfterUpdate must treat a failed `shutdown` as a real action
-// error (the operator asked for the reboot), and must NOT notify users that
-// their system will reboot when it won't. On success it notifies exactly once.
+// scheduleRebootAfterUpdate schedules the reboot through the SDK reboot Manager
+// (over the executor's runner). It must treat a failed schedule as a real action
+// error (the operator asked for the reboot) and must NOT notify users that their
+// system will reboot when it won't; on success it notifies exactly once.
+//
+// The interpret-update-check and apt security-only fail-closed logic that used
+// to live here moved into the SDK (pkg.HasUpdates and apt securityUpgrade) and
+// is tested there — the agent now delegates rather than reimplementing them.
 func TestScheduleRebootAfterUpdate(t *testing.T) {
-	origSudo := runSudoCmd
 	origNotify := notifyAll
-	t.Cleanup(func() { runSudoCmd = origSudo; notifyAll = origNotify })
+	t.Cleanup(func() { notifyAll = origNotify })
 
-	e := NewExecutor(nil, nil)
-
-	t.Run("shutdown failure returns an error and suppresses notify", func(t *testing.T) {
-		runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-			return &pb.CommandOutput{Stderr: "Failed to set wall message"}, fmt.Errorf("exit status 1")
-		}
+	t.Run("schedule failure returns an error and suppresses notify", func(t *testing.T) {
+		fake := exectest.New(sysexec.Sudo)
+		fake.Push(sysexec.Result{ExitCode: 1, Stderr: "Failed to set wall message"}, nil)
+		e := &Executor{runner: fake}
 		notified := 0
 		notifyAll = func(ctx context.Context, title, body string) { notified++ }
 
@@ -132,9 +46,8 @@ func TestScheduleRebootAfterUpdate(t *testing.T) {
 	})
 
 	t.Run("success notifies exactly once", func(t *testing.T) {
-		runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-			return &pb.CommandOutput{Stdout: "Shutdown scheduled"}, nil
-		}
+		fake := exectest.New(sysexec.Sudo) // empty queue → clean success
+		e := &Executor{runner: fake}
 		notified := 0
 		notifyAll = func(ctx context.Context, title, body string) { notified++ }
 
@@ -151,9 +64,9 @@ func TestScheduleRebootAfterUpdate(t *testing.T) {
 	})
 
 	t.Run("reboot failure joins with a prior error rather than demoting it", func(t *testing.T) {
-		runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
-			return nil, fmt.Errorf("exit status 1")
-		}
+		fake := exectest.New(sysexec.Sudo)
+		fake.Push(sysexec.Result{}, errors.New("escalation unavailable"))
+		e := &Executor{runner: fake}
 		notifyAll = func(ctx context.Context, title, body string) {}
 
 		var out strings.Builder
