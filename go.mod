@@ -4,6 +4,7 @@ go 1.25.11
 
 require (
 	connectrpc.com/connect v1.18.1
+	github.com/manchtools/power-manage-sdk v0.4.1-0.20260619162112-689b5be0badc
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -41,7 +42,6 @@ require (
 	github.com/go-playground/validator/v10 v10.30.1 // indirect
 	github.com/google/uuid v1.6.0 // indirect
 	github.com/leodido/go-urn v1.4.0 // indirect
-	github.com/manchtools/power-manage-sdk v0.4.1-0.20260619054456-9f9e35b04d92 // indirect
 	github.com/mattn/go-isatty v0.0.20 // indirect
 	github.com/mfridman/interpolate v0.0.2 // indirect
 	github.com/ncruces/go-strftime v1.0.0 // indirect
