@@ -88,10 +88,10 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 	}
 
 	// Check and update enable/disable status
-	isEnabled := e.isUnitEnabled(params.UnitName)
+	isEnabled := e.isUnitEnabled(ctx, params.UnitName)
 	if params.Enable && !isEnabled {
 		// Check if unit is masked - provide helpful error
-		if e.isUnitMasked(params.UnitName) {
+		if e.isUnitMasked(ctx, params.UnitName) {
 			return nil, changed, fmt.Errorf("enable: unit %s is masked (run 'systemctl unmask %s' first)", params.UnitName, params.UnitName)
 		}
 		if err := serviceMgr.Enable(ctx, params.UnitName); err != nil {
@@ -116,7 +116,7 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 	}
 
 	// Handle running state
-	isActive := e.isUnitActive(params.UnitName)
+	isActive := e.isUnitActive(ctx, params.UnitName)
 	switch params.DesiredState {
 	case pb.ServiceUnitState_SERVICE_UNIT_STATE_STARTED:
 		if !isActive {
@@ -161,8 +161,8 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 // enabled" to keep the previous behaviour, but logged at debug so
 // operators have the context when troubleshooting why a unit wasn't
 // marked enabled.
-func (e *Executor) isUnitEnabled(unitName string) bool {
-	enabled, err := serviceMgr.IsEnabled(context.Background(), unitName)
+func (e *Executor) isUnitEnabled(ctx context.Context, unitName string) bool {
+	enabled, err := serviceMgr.IsEnabled(ctx, unitName)
 	if err != nil {
 		e.logger.Debug("sysservice.IsEnabled failed; treating as not enabled",
 			"unit", unitName, "error", err)
@@ -174,8 +174,8 @@ func (e *Executor) isUnitEnabled(unitName string) bool {
 // at warn — the masked/unmasked distinction drives whether we reject
 // an Enable attempt with a "run systemctl unmask" hint, so a false
 // negative here is a confusing user-visible failure worth surfacing.
-func (e *Executor) isUnitMasked(unitName string) bool {
-	masked, err := serviceMgr.IsMasked(context.Background(), unitName)
+func (e *Executor) isUnitMasked(ctx context.Context, unitName string) bool {
+	masked, err := serviceMgr.IsMasked(ctx, unitName)
 	if err != nil {
 		e.logger.Warn("sysservice.IsMasked failed; treating as not masked",
 			"unit", unitName, "error", err)
@@ -184,8 +184,8 @@ func (e *Executor) isUnitMasked(unitName string) bool {
 }
 
 // isUnitActive checks if a service unit is currently active (running).
-func (e *Executor) isUnitActive(unitName string) bool {
-	active, err := serviceMgr.IsActive(context.Background(), unitName)
+func (e *Executor) isUnitActive(ctx context.Context, unitName string) bool {
+	active, err := serviceMgr.IsActive(ctx, unitName)
 	if err != nil {
 		e.logger.Debug("sysservice.IsActive failed; treating as not active",
 			"unit", unitName, "error", err)

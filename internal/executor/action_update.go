@@ -245,13 +245,14 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 	}
 
 	// Detect which package manager we're using and run appropriate repairs
-	if e.pkgBackend == pkg.Apt {
+	switch e.pkgBackend {
+	case pkg.Apt:
 		e.repairApt(ctx)
-	} else if e.pkgBackend == pkg.Dnf {
+	case pkg.Dnf:
 		e.repairDnf(ctx)
-	} else if e.pkgBackend == pkg.Pacman {
+	case pkg.Pacman:
 		e.repairPacman(ctx)
-	} else if e.pkgBackend == pkg.Zypper {
+	case pkg.Zypper:
 		e.repairZypper(ctx)
 	}
 
