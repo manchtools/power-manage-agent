@@ -9,8 +9,8 @@ import (
 	"path/filepath"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {

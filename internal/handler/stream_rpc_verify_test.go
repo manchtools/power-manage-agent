@@ -9,10 +9,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
 // ============================================================================
@@ -34,12 +34,12 @@ type fakeOsquery struct {
 	tableCalls []string
 }
 
-func (f *fakeOsquery) Query(q *pb.OSQuery) (*pb.OSQueryResult, error) {
+func (f *fakeOsquery) Query(_ context.Context, q *pb.OSQuery) (*pb.OSQueryResult, error) {
 	f.queryCalls++
 	return &pb.OSQueryResult{QueryId: q.GetQueryId(), Success: true}, nil
 }
 
-func (f *fakeOsquery) QueryTable(name string) ([]*pb.OSQueryRow, error) {
+func (f *fakeOsquery) QueryTable(_ context.Context, name string) ([]*pb.OSQueryRow, error) {
 	f.tableCalls = append(f.tableCalls, name)
 	return []*pb.OSQueryRow{{Data: map[string]string{"k": "v"}}}, nil
 }
@@ -50,17 +50,17 @@ func verifierHandler(t *testing.T, caPEM []byte, oq osqueryRunner) *Handler {
 	t.Helper()
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
-	h := NewHandler(slog.Default(), executor.NewExecutor(verifier), nil, nil, make(chan struct{}, 1))
+	h := NewHandler(slog.Default(), executor.NewExecutor(verifier, nil), nil, nil, make(chan struct{}, 1))
 	if oq != nil {
 		h.setOsqueryForTest(oq)
 	}
 	return h
 }
 
-// noVerifierHandler builds a handler with NO verifier (executor.NewExecutor(nil)).
+// noVerifierHandler builds a handler with NO verifier (executor.NewExecutor(nil, nil)).
 func noVerifierHandler(t *testing.T, oq osqueryRunner) *Handler {
 	t.Helper()
-	h := NewHandler(slog.Default(), executor.NewExecutor(nil), nil, nil, make(chan struct{}, 1))
+	h := NewHandler(slog.Default(), executor.NewExecutor(nil, nil), nil, nil, make(chan struct{}, 1))
 	if oq != nil {
 		h.setOsqueryForTest(oq)
 	}

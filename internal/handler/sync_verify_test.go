@@ -8,10 +8,10 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	"github.com/manchtools/power-manage-sdk/cryptotest"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/executor"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/cryptotest"
-	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
 // testCAAndSigner returns a self-signed CA cert (PEM) and a matching
@@ -45,7 +45,7 @@ func newVerifierHandler(t *testing.T, caPEM []byte) (*Handler, chan struct{}) {
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
 	syncTrigger := make(chan struct{}, 1)
-	h := NewHandler(slog.Default(), executor.NewExecutor(verifier), nil, nil, syncTrigger)
+	h := NewHandler(slog.Default(), executor.NewExecutor(verifier, nil), nil, nil, syncTrigger)
 	return h, syncTrigger
 }
 
@@ -110,9 +110,15 @@ func TestOnAction_ValidSyncTriggersExactlyOnce(t *testing.T) {
 // lives in the SIGNED envelope: a validly signed REBOOT envelope delivered
 // on OnAction must NOT be treated as a SYNC, even though it travels the same
 // dispatch path. A compromised relay cannot lift a non-SYNC signature onto a
-// SYNC because the type is inside the signed bytes. (REBOOT is an instant
-// action that does not reach the executor's typed switch here; the load-
-// bearing assertion is that NO resync is enqueued.)
+// SYNC because the type is inside the signed bytes.
+//
+// REBOOT DOES reach the executor's dispatch (executeReboot) — an earlier
+// version of this comment wrongly claimed it did not, and because the executor
+// is built with NewExecutor(verifier, nil) the unseamed reboot path once shelled
+// out a real `shutdown -r +5` and rebooted a developer's machine. executeReboot
+// now fails closed when no privilege runner is configured (see
+// TestExecuteReboot_FailsClosedWithoutRunner), so this dispatch is inert. The
+// load-bearing assertion remains that NO resync is enqueued for a non-SYNC type.
 func TestOnAction_NonSyncEnvelopeNeverTriggersSync(t *testing.T) {
 	caPEM, signer := testCAAndSigner(t)
 	h, syncTrigger := newVerifierHandler(t, caPEM)
@@ -163,7 +169,7 @@ func TestOnAction_ParamsTamperRefused(t *testing.T) {
 func TestOnAction_NoVerifierIsFailClosed(t *testing.T) {
 	_, signer := testCAAndSigner(t)
 	syncTrigger := make(chan struct{}, 1)
-	h := NewHandler(slog.Default(), executor.NewExecutor(nil), nil, nil, syncTrigger)
+	h := NewHandler(slog.Default(), executor.NewExecutor(nil, nil), nil, nil, syncTrigger)
 
 	env := &pb.SignedActionEnvelope{
 		ActionId:   &pb.ActionId{Value: "01HSYNCNOVERIFIER"},

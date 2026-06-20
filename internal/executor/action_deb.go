@@ -12,8 +12,8 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
 )
 
 // validDebPkgName matches the Debian package-name grammar
@@ -93,31 +93,21 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 			}, false, nil
 		}
 
-		// Install with dpkg (requires sudo). On failure, retry via
-		// `apt --fix-broken install` which can complete a half-done
-		// dpkg invocation. If the retry succeeds, clear the
-		// original dpkg error — the action recovered. The previous
-		// shape ran FixBroken but propagated the original error
-		// regardless, so callers saw "install failed" even when the
-		// recovery path resolved it. Verify the final state by
-		// re-checking installation rather than trusting either
-		// command's exit alone, since FixBroken can succeed without
-		// having installed the requested package.
-		output, err := runSudoCmd(ctx, "dpkg", "-i", tmpFile.Name())
-		if err != nil {
-			fbOutput, fbErr := pkg.NewAptWithContext(ctx).FixBroken()
-			if fbOutput != nil {
-				if output == nil {
-					output = &pb.CommandOutput{}
-				}
-				output.Stdout += "\n=== apt --fix-broken install ===\n" + fbOutput.Stdout
-				output.Stderr += fbOutput.Stderr
-			}
-			if fbErr == nil && e.isDebInstalled(pkgName) {
-				err = nil
-			}
+		// Install through the SDK package manager's local-file install
+		// (apt install <path>), which resolves dependencies from the
+		// configured repositories AND lets apt set PATH for the dpkg it
+		// drives. A direct `dpkg -i` runs under the SDK Runner's
+		// PATH-stripped child env and dpkg hard-refuses ("PATH is not
+		// set"); it also wouldn't resolve dependencies (the old shape had
+		// to retry via `apt --fix-broken install`). apt install of a local
+		// .deb performs no per-file signature check (deb carries none), so
+		// it still honours the agent's checksum-not-gpg artifact model
+		// already enforced above by requireVerifiedArtifact.
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to install %s (context expired or none detected)", pkgName)
 		}
-		return output, true, err
+		return packageResult(mgr.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{}))
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Resolve the package name to remove. Prefer the AUTHORITATIVE
@@ -142,8 +132,15 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		if out, err := e.requireWritableFS(ctx); err != nil {
 			return out, false, err
 		}
-		output, err := runSudoCmd(ctx, "dpkg", "-r", pkgName)
-		return output, true, err
+		// Remove through the SDK manager (apt remove <name>) rather than a
+		// direct `dpkg -r`, so the package manager runs the maintainer
+		// (prerm) scripts with a proper PATH — the same reason the install
+		// path delegates to apt.
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to remove %s (context expired or none detected)", pkgName)
+		}
+		return packageResult(mgr.Remove(ctx, pkg.RemoveOptions{}, pkgName))
 	}
 
 	return nil, false, fmt.Errorf("unknown desired state: %v", state)

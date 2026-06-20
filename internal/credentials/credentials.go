@@ -18,6 +18,7 @@ package credentials
 
 import (
 	"bytes"
+	"context"
 	"crypto/aes"
 	"crypto/cipher"
 	"crypto/rand"
@@ -30,7 +31,8 @@ import (
 
 	"golang.org/x/crypto/argon2"
 
-	sdkfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sdkfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 const (
@@ -73,14 +75,39 @@ type Credentials struct {
 // Store manages encrypted credential storage.
 type Store struct {
 	dataDir string
+	fs      sdkfs.Manager
+	fsErr   error // deferred fs-manager construction error, surfaced fail-closed on write
 }
 
-// NewStore creates a new credential store.
+// NewStore creates a new credential store. Writes go through the SDK fs Manager
+// over a Direct runner: the agent runs as root and owns its data directory, so
+// no privilege escalation is needed; WriteFile is atomic (temp + rename).
 func NewStore(dataDir string) *Store {
 	if dataDir == "" {
 		dataDir = DefaultDataDir
 	}
-	return &Store{dataDir: dataDir}
+	s := &Store{dataDir: dataDir}
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		s.fsErr = fmt.Errorf("credentials: build direct runner: %w", err)
+		return s
+	}
+	m, err := sdkfs.New(r)
+	if err != nil {
+		s.fsErr = fmt.Errorf("credentials: build fs manager: %w", err)
+		return s
+	}
+	s.fs = m
+	return s
+}
+
+// writeFile atomically writes data at 0600 through the Direct fs Manager,
+// surfacing any deferred construction error fail-closed.
+func (s *Store) writeFile(path string, data []byte) error {
+	if s.fsErr != nil {
+		return s.fsErr
+	}
+	return s.fs.WriteFile(context.Background(), path, data, sdkfs.WriteOptions{Mode: 0600})
 }
 
 // Exists checks if credentials exist.
@@ -164,7 +191,7 @@ func (s *Store) Save(creds *Credentials) error {
 	// before the directory entry is swapped, and the parent-dir
 	// fsync afterwards flushes the directory entry itself.
 	credPath := filepath.Join(s.dataDir, credentialsFile)
-	if err := sdkfs.AtomicWriteFile(credPath, ciphertext, 0600); err != nil {
+	if err := s.writeFile(credPath, ciphertext); err != nil {
 		return fmt.Errorf("write credentials: %w", err)
 	}
 
@@ -271,7 +298,7 @@ func (s *Store) loadOrCreateSalt() ([]byte, error) {
 	// Save salt atomically — the salt is paired with the encrypted
 	// credentials and a corrupt salt is just as fatal as a corrupt
 	// credentials.enc.
-	if err := sdkfs.AtomicWriteFile(saltPath, salt, 0600); err != nil {
+	if err := s.writeFile(saltPath, salt); err != nil {
 		return nil, fmt.Errorf("write salt: %w", err)
 	}
 

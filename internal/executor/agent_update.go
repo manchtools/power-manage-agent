@@ -17,9 +17,9 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysfs "github.com/manchtools/power-manage/sdk/go/sys/fs"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
@@ -210,15 +210,18 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	defer selfTestCancel()
 
 	e.logger.Info("running self-test on new binary", "path", tmpPath)
-	selfTestResult, selfTestErr := sysexec.Run(selfTestCtx, tmpPath, "self-test",
-		"--data-dir="+cfg.DataDir,
-		"--timeout=55s",
-	)
-	if selfTestErr != nil {
-		var combined string
-		if selfTestResult != nil {
-			combined = strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
+	selfTestResult, selfTestErr := executorRunner.Run(selfTestCtx, sysexec.Command{
+		Name: tmpPath,
+		Args: []string{"self-test", "--data-dir=" + cfg.DataDir, "--timeout=55s"},
+	})
+	// The reworked Runner reports a non-zero exit in Result.ExitCode, not as
+	// selfTestErr (which is set only when the process could not run). A self-test
+	// binary that exits non-zero IS a failure, so check both.
+	if selfTestErr != nil || selfTestResult.ExitCode != 0 {
+		if selfTestErr == nil {
+			selfTestErr = fmt.Errorf("self-test exited with code %d", selfTestResult.ExitCode)
 		}
+		combined := strings.TrimSpace(selfTestResult.Stdout + "\n" + selfTestResult.Stderr)
 		e.logger.Error("self-test failed, keeping current binary",
 			"error", selfTestErr,
 			"output", combined)
@@ -269,7 +272,10 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	if err != nil {
 		return nil, false, fmt.Errorf("read staged binary %s: %w", tmpPath, err)
 	}
-	if err := sysfs.SafeBackupAndReplace(cfg.BinaryPath, bakPath, newBinary, 0o755, true); err != nil {
+	// fs.Manager.WriteFile with Backup set copies the live binary → .bak
+	// (clobbering an existing .bak) and writes the new binary atomically over the
+	// live path — the same crash-safe backup-then-replace SafeBackupAndReplace did.
+	if err := fsMgr.WriteFile(ctx, cfg.BinaryPath, newBinary, sysfs.WriteOptions{Mode: 0o755, Backup: bakPath}); err != nil {
 		return nil, false, fmt.Errorf("swap binary at %s: %w", cfg.BinaryPath, err)
 	}
 
@@ -450,7 +456,7 @@ func downloadToFile(ctx context.Context, client *http.Client, downloadURL string
 func getBinaryVersion(binaryPath string) (string, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
-	result, err := sysexec.Run(ctx, binaryPath, "version")
+	result, err := executorRunner.Run(ctx, sysexec.Command{Name: binaryPath, Args: []string{"version"}})
 	if err != nil {
 		return "", fmt.Errorf("run %s version: %w", binaryPath, err)
 	}

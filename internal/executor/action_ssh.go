@@ -8,8 +8,8 @@ import (
 	"fmt"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // shortGroupName builds a Linux-group-safe name from a prefix and an
@@ -156,7 +156,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Check idempotency: file content + group membership
 	fileMatches := e.configMatchesDesired(ctx, configPath, content)
-	membersMatch := sudoGroupMembersMatch(groupName, users)
+	membersMatch := sudoGroupMembersMatch(ctx, groupName, users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("SSH config already up to date: %s\n", configPath))
 		return &pb.CommandOutput{
@@ -171,7 +171,7 @@ func (e *Executor) setupSshAccess(ctx context.Context, params *pb.SshParams, use
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if _, err := sysuser.GroupCreate(ctx, groupName); err != nil {
+		if err := userMgr.GroupCreate(ctx, groupName, sysuser.GroupCreateOptions{}); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))

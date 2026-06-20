@@ -20,32 +20,41 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
-
-// init mirrors the agent's runtime privilege-backend selection so the
-// integration suite exercises the same dispatcher branch as production.
-// When the test process is already root (the post-rewire default —
-// containers no longer set up a power-manage user), use the no-escalation
-// root backend so privileged calls don't depend on per-distro sudoers
-// quirks (notably openSUSE Tumbleweed's default /etc/sudoers excludes
-// root, breaking every `sudo -n cmd` invocation).
-func init() {
-	if os.Geteuid() == 0 {
-		sysexec.SetPrivilegeBackend(sysexec.Direct)
-	}
-}
 
 // =============================================================================
 // Test Helpers
 // =============================================================================
 
+// testRunner builds the privilege runner for the integration suite, mirroring
+// the agent's runtime backend selection so the tests exercise the same
+// dispatcher branch as production. When the test process is already root (the
+// post-rewire container default — containers no longer set up a power-manage
+// user) it uses the no-escalation Direct backend so privileged calls don't
+// depend on per-distro sudoers quirks (notably openSUSE Tumbleweed's default
+// /etc/sudoers excludes root, breaking every `sudo -n cmd`); otherwise it
+// escalates via sudo.
+func testRunner() sysexec.Runner {
+	backend := sysexec.Sudo
+	if os.Geteuid() == 0 {
+		backend = sysexec.Direct
+	}
+	r, err := sysexec.NewRunner(backend)
+	if err != nil {
+		panic("failed to build integration test runner: " + err.Error())
+	}
+	return r
+}
+
 func newTestExecutor() *Executor {
-	e := NewExecutor(nil)
+	// Pass a real runner so NewExecutor adopts it process-wide AND runs
+	// pkg.Detect — the repository/package actions dispatch on e.pkgBackend,
+	// which is only set when a runner is supplied.
+	e := NewExecutor(nil, testRunner())
 	// Downloads are https-only (WS7 #2). The test file servers
 	// (startFileServer) are TLS with self-signed certs, so trust any cert
 	// here — this is integration-test-only code.
@@ -373,6 +382,31 @@ func sudoWriteFile(path string, content []byte) error {
 // directories not readable by the current user (e.g. /etc/sudoers.d on Fedora).
 func sudoFileExists(path string) bool {
 	return sudoRun("sh", "-c", fmt.Sprintf("test -e %s", path)).Run() == nil
+}
+
+// removePacmanSection removes a [name] section from pacman.conf content. A
+// section extends from [name] to the next [section] line (exclusive) or end of
+// file. The production logic now lives in the SDK repo Manager; this copy
+// restores pacman.conf in the pacman repository test's cleanup.
+func removePacmanSection(content, name string) string {
+	sectionHeader := "[" + name + "]"
+	lines := strings.Split(content, "\n")
+	var result []string
+	inSection := false
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == sectionHeader {
+			inSection = true
+			continue
+		}
+		if inSection && strings.HasPrefix(trimmed, "[") {
+			inSection = false
+		}
+		if !inSection {
+			result = append(result, line)
+		}
+	}
+	return strings.Join(result, "\n")
 }
 
 // =============================================================================
@@ -811,7 +845,7 @@ func TestIntegration_User(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		info, err := sysuser.Get(username)
+		info, err := userMgr.Get(ctx, username)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -1103,10 +1137,10 @@ func TestIntegration_Group(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if !userInGroup("pmgrpuser1", groupName) {
+		if !userInGroup(ctx, "pmgrpuser1", groupName) {
 			t.Error("pmgrpuser1 not in group")
 		}
-		if !userInGroup("pmgrpuser2", groupName) {
+		if !userInGroup(ctx, "pmgrpuser2", groupName) {
 			t.Error("pmgrpuser2 not in group")
 		}
 	})
@@ -1126,10 +1160,10 @@ func TestIntegration_Group(t *testing.T) {
 		if !groupExists(groupName) {
 			t.Error("group should still exist")
 		}
-		if userInGroup("pmgrpuser1", groupName) {
+		if userInGroup(ctx, "pmgrpuser1", groupName) {
 			t.Error("pmgrpuser1 should have been removed from group")
 		}
-		if userInGroup("pmgrpuser2", groupName) {
+		if userInGroup(ctx, "pmgrpuser2", groupName) {
 			t.Error("pmgrpuser2 should have been removed from group")
 		}
 	})

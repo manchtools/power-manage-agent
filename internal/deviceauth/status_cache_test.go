@@ -13,8 +13,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
 // countingStore counts Load() calls so the test can prove the costly

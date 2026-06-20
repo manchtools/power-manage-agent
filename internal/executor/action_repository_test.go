@@ -3,26 +3,12 @@ package executor
 import (
 	"context"
 	"log/slog"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
-
-// TestRpmImportGpgArgv_AfterEndOfOptions pins that a dnf/zypper GPG key
-// import builds `rpm --import -- <ref>` so a flag-shaped ref can never be
-// reparsed as an option to `rpm --import`.
-func TestRpmImportGpgArgv_AfterEndOfOptions(t *testing.T) {
-	if got, want := rpmImportArgs("https://m/key.asc"), []string{"--import", "--", "https://m/key.asc"}; !slices.Equal(got, want) {
-		t.Errorf("rpmImportArgs = %v, want %v", got, want)
-	}
-	a := rpmImportArgs("--import=/etc/shadow")
-	if n := len(a); n < 2 || a[n-1] != "--import=/etc/shadow" || a[n-2] != "--" {
-		t.Errorf("flag-shaped ref must be the final operand preceded by --; args=%v", a)
-	}
-}
 
 // TestExecuteRepository_RejectsBeforePrivilegedRemount pins finding 5:
 // a malformed repository action (bad name, oversized name, non-https
@@ -47,5 +33,20 @@ func TestExecuteRepository_RejectsBeforePrivilegedRemount(t *testing.T) {
 	}
 	if remountCalls != 0 {
 		t.Errorf("privileged remount ran %d times for rejected actions; want 0", remountCalls)
+	}
+}
+
+// TestDownloadAptKey_RejectsNonHTTPS pins WS7 #2 at the agent boundary: the apt
+// signing-key download — the one repository responsibility the SDK Manager
+// cannot own, because it takes raw key bytes, not a URL — refuses any non-https
+// scheme before performing network I/O. The SDK validator never sees
+// gpg_key_url, so this guard lives only here; a regression would let an action
+// pull a signing key over an unauthenticated transport.
+func TestDownloadAptKey_RejectsNonHTTPS(t *testing.T) {
+	e := &Executor{}
+	for _, u := range []string{"http://m/key.asc", "ftp://m/key", "file:///etc/x", "//m/key", "HTTPS://m/k"} {
+		if _, err := e.downloadAptKey(context.Background(), u); err == nil {
+			t.Errorf("non-https GPG key URL accepted: %q", u)
+		}
 	}
 }

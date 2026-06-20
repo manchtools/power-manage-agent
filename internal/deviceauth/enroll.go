@@ -10,12 +10,12 @@ import (
 
 	"connectrpc.com/connect"
 
-	pm "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
 
+	sdk "github.com/manchtools/power-manage-sdk"
+	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 )
 
 // credentialStore is the slice of *credentials.Store the enrollment

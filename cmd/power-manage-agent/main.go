@@ -12,6 +12,9 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/manchtools/power-manage-sdk/logging"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 	"github.com/manchtools/power-manage/agent/internal/executor"
@@ -19,8 +22,6 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	"github.com/manchtools/power-manage/sdk/go/logging"
-	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
 // version is set at build time via -ldflags.
@@ -106,8 +107,16 @@ func main() {
 	// Linux-systemd-sudo deployment continues working with no
 	// configuration; operators on OpenBSD-style doas or OpenRC-flavoured
 	// systems flip the backend once via env var.
-	if err := applyBackendOverrides(cfg, logger); err != nil {
+	resolvedBackend, err := applyBackendOverrides(cfg, logger)
+	if err != nil {
 		logger.Error("backend validation failed", "error", err)
+		os.Exit(1)
+	}
+	// Build the one process-wide exec.Runner from the resolved privilege backend
+	// and inject it into every capability Manager (no global privilege state).
+	runner, err := sysexec.NewRunner(resolvedBackend)
+	if err != nil {
+		logger.Error("failed to build privilege runner", "error", err)
 		os.Exit(1)
 	}
 
@@ -243,7 +252,7 @@ func main() {
 	}
 
 	// Initialize the scheduler for autonomous action execution
-	exec := executor.NewExecutor(actionVerifier)
+	exec := executor.NewExecutor(actionVerifier, runner)
 	exec.SetStore(actionStore)
 	sched := scheduler.New(actionStore, exec, logger)
 	exec.SetActionStore(sched)

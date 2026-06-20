@@ -8,8 +8,8 @@ import (
 	"testing"
 	"time"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
 // fakeSender records every TerminalOutput / TerminalStateChange so

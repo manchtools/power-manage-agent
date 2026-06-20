@@ -13,14 +13,14 @@ import (
 	"google.golang.org/protobuf/types/known/durationpb"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/sys/inventory"
+	"github.com/manchtools/power-manage-sdk/sys/osquery"
+	"github.com/manchtools/power-manage-sdk/validate"
 	"github.com/manchtools/power-manage/agent/internal/executor"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	"github.com/manchtools/power-manage/sdk/go/sys/inventory"
-	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
-	"github.com/manchtools/power-manage/sdk/go/validate"
 )
 
 // streamValidator validates incoming stream-RPC messages at the agent boundary
@@ -29,19 +29,38 @@ import (
 // before any signature/root work.
 var streamValidator = validate.NewValidator()
 
+// handlerRunner is the unprivileged runner OnLogQuery shells out through (the
+// agent runs as root; journalctl reads run directly, matching the prior
+// unprivileged sysexec.Run behaviour).
+var handlerRunner = func() sysexec.Runner {
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		panic("handler: Direct runner must construct: " + err.Error())
+	}
+	return r
+}()
+
 // runCommand is the seam through which OnLogQuery shells out to journalctl.
-// It defaults to sysexec.Run and is overridable from tests so the WS4 charter
-// can record the args journalctl would receive — and assert it is NOT invoked
-// when a log query's signature is missing or invalid.
-var runCommand = sysexec.Run
+// It defaults to a runner-backed dispatch and is overridable from tests so the
+// WS4 charter can record the args journalctl would receive — and assert it is
+// NOT invoked when a log query's signature is missing or invalid. A non-zero
+// exit is mapped to an error so callers keep treating a failed journalctl run as
+// a failure (the Runner itself reports non-zero exit in Result.ExitCode).
+var runCommand = func(ctx context.Context, name string, args ...string) (*sysexec.Result, error) {
+	r, err := handlerRunner.Run(ctx, sysexec.Command{Name: name, Args: args})
+	if err == nil && r.ExitCode != 0 {
+		err = &sysexec.CommandError{Name: name, ExitCode: r.ExitCode, Stderr: r.Stderr}
+	}
+	return &r, err
+}
 
 // osqueryRunner is the minimal osquery surface the handler uses. Declared as an
-// interface (vs the concrete *osquery.Registry) so tests can inject a fake that
+// interface (vs the concrete osquery client) so tests can inject a fake that
 // records calls — letting the WS4 charter assert "osquery was NOT invoked" when
-// a stream-RPC signature is missing/invalid. *osquery.Registry satisfies it.
+// a stream-RPC signature is missing/invalid. The SDK's osquery.Querier satisfies it.
 type osqueryRunner interface {
-	Query(query *pb.OSQuery) (*pb.OSQueryResult, error)
-	QueryTable(tableName string) ([]*pb.OSQueryRow, error)
+	Query(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error)
+	QueryTable(ctx context.Context, tableName string) ([]*pb.OSQueryRow, error)
 }
 
 // Handler implements the SDK StreamHandler interface.
@@ -96,7 +115,7 @@ func (h *Handler) getOsquery() osqueryRunner {
 		return h.osquery
 	}
 
-	registry, err := osquery.NewRegistry()
+	registry, err := osquery.New(handlerRunner)
 	if err != nil {
 		return nil
 	}
@@ -583,7 +602,7 @@ func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryRe
 		}, nil
 	}
 
-	result, err := oq.Query(query)
+	result, err := oq.Query(ctx, query)
 	if err != nil {
 		h.logger.Error("query execution error", "query_id", query.QueryId, "error", err)
 		return &pb.OSQueryResult{
@@ -614,14 +633,14 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 	}
 
 	// Get uptime
-	if result, _ := oq.Query(&pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(context.Background(), &pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
 		if sec, err := strconv.ParseInt(result.Rows[0].Data["total_seconds"], 10, 64); err == nil {
 			hb.Uptime = durationpb.New(time.Duration(sec) * time.Second)
 		}
 	}
 
 	// Get memory usage
-	if result, _ := oq.Query(&pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(context.Background(), &pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
 		data := result.Rows[0].Data
 		total, totalErr := strconv.ParseInt(data["memory_total"], 10, 64)
 		free, freeErr := strconv.ParseInt(data["memory_free"], 10, 64)
@@ -834,8 +853,14 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.InventoryTable {
 	tables := make(map[string]*pb.InventoryTable)
 
-	// system_info + kernel_info (single GetSystemInfo call)
-	if sysInfo, err := inventory.GetSystemInfo(ctx); err == nil {
+	inv, err := inventory.New(handlerRunner)
+	if err != nil {
+		h.logger.Debug("baseline inventory unavailable", "error", err)
+		return tables
+	}
+
+	// system_info + kernel_info (single System call)
+	if sysInfo, err := inv.System(ctx); err == nil {
 		tables["system_info"] = &pb.InventoryTable{
 			TableName: "system_info",
 			Rows: []*pb.OSQueryRow{{Data: map[string]string{
@@ -858,7 +883,7 @@ func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.I
 	}
 
 	// os_version
-	if osInfo, err := inventory.GetOSInfo(); err == nil {
+	if osInfo, err := inv.OS(); err == nil {
 		tables["os_version"] = &pb.InventoryTable{
 			TableName: "os_version",
 			Rows: []*pb.OSQueryRow{{Data: map[string]string{
@@ -873,7 +898,7 @@ func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.I
 	}
 
 	// block_devices
-	if disks, err := inventory.GetDisks(ctx); err == nil {
+	if disks, err := inv.Disks(ctx); err == nil {
 		var rows []*pb.OSQueryRow
 		for _, d := range disks {
 			rows = append(rows, &pb.OSQueryRow{Data: map[string]string{
@@ -894,7 +919,7 @@ func (h *Handler) collectBaselineInventory(ctx context.Context) map[string]*pb.I
 	}
 
 	// interface_details + interface_addresses
-	if ifaces, err := inventory.GetNetworkInterfaces(ctx); err == nil {
+	if ifaces, err := inv.NetworkInterfaces(ctx); err == nil {
 		var detailRows, addrRows []*pb.OSQueryRow
 		for _, iface := range ifaces {
 			detailRows = append(detailRows, &pb.OSQueryRow{Data: map[string]string{
@@ -964,7 +989,7 @@ func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*p
 	packageTables := inventoryPackageTables
 
 	for _, tableName := range coreTables {
-		rows, err := oq.QueryTable(tableName)
+		rows, err := oq.QueryTable(context.Background(), tableName)
 		if err != nil {
 			h.logger.Debug("osquery table unavailable", "table", tableName, "error", err)
 			continue
@@ -979,7 +1004,7 @@ func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*p
 	}
 
 	for _, tableName := range packageTables {
-		rows, err := oq.QueryTable(tableName)
+		rows, err := oq.QueryTable(context.Background(), tableName)
 		if err != nil {
 			continue
 		}

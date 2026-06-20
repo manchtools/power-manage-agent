@@ -8,8 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // TestExecuteFlatpak_PerUserPresentNoSessions guards the empty-set
@@ -29,7 +28,7 @@ func TestExecuteFlatpak_PerUserPresentNoSessions(t *testing.T) {
 	if _, err := exec.LookPath("flatpak"); err != nil {
 		t.Skip("flatpak is not available on this system; the per-user empty-set branch fires after the lookup")
 	}
-	sessions, err := desktop.ActiveSessions(context.Background())
+	sessions, err := desktopMgr.ActiveSessions(context.Background())
 	if err != nil {
 		t.Skipf("loginctl probe failed (%v) — skipping rather than asserting against an unknown session state", err)
 	}
@@ -38,7 +37,7 @@ func TestExecuteFlatpak_PerUserPresentNoSessions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	e.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	out, changed, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
@@ -75,7 +74,7 @@ func TestExecuteFlatpak_PerUserPresentDispatchesToLoop(t *testing.T) {
 	if _, err := exec.LookPath("flatpak"); err != nil {
 		t.Skip("flatpak is not available on this system")
 	}
-	sessions, err := desktop.ActiveSessions(context.Background())
+	sessions, err := desktopMgr.ActiveSessions(context.Background())
 	if err != nil {
 		t.Skipf("loginctl probe failed (%v) — skipping rather than asserting against an unknown session state", err)
 	}
@@ -83,7 +82,7 @@ func TestExecuteFlatpak_PerUserPresentDispatchesToLoop(t *testing.T) {
 		t.Skip("no active desktop sessions — TestExecuteFlatpak_PerUserPresentNoSessions covers the empty-set path here")
 	}
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	out, _, _ := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId:      "org.nonexistent.surely_does_not_exist_pmtest",
 		SystemWide: false,
@@ -107,7 +106,7 @@ func TestExecuteFlatpak_PerUserAbsentNoUsers(t *testing.T) {
 		t.Skip("flatpak is not available on this system")
 	}
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	out, changed, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId:      "org.nonexistent.surely_does_not_exist_pmtest",
 		SystemWide: false,
@@ -134,7 +133,7 @@ func TestExecuteFlatpak_SystemWideRoutesUnchanged(t *testing.T) {
 		t.Skip("flatpak is not available on this system")
 	}
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	out, _, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId:      "org.nonexistent.surely_does_not_exist_pmtest",
 		SystemWide: true,

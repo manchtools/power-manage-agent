@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // setupSSHKeys must refuse an authorized_keys entry that carries an embedded
@@ -39,7 +39,7 @@ func TestSetupSSHKeys_RejectsEmbeddedNewline(t *testing.T) {
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			e := NewExecutor(nil)
+			e := NewExecutor(nil, nil)
 			home := t.TempDir()
 			params := &pb.UserParams{
 				Username:          "alice",

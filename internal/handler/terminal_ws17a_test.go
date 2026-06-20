@@ -9,9 +9,8 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 func ws17aULID() string { return ulid.Make().String() }
@@ -102,9 +101,9 @@ func TestTerminal_Start_RejectsNonUlidSessionId(t *testing.T) {
 		origGet := sysuserGet
 		origModify := sysuserModify
 		t.Cleanup(func() { sysuserGet = origGet; sysuserModify = origModify })
-		sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: false}, nil }
-		sysuserModify = func(context.Context, string, ...string) (*sysexec.Result, error) {
-			return nil, fmt.Errorf("usermod unavailable in test")
+		sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: false}, nil }
+		sysuserModify = func(context.Context, string, sysuser.ModifyOptions) error {
+			return fmt.Errorf("usermod unavailable in test")
 		}
 		h, sender := newTestHandler(t)
 		err := h.OnTerminalStart(context.Background(), &pb.TerminalStart{
@@ -125,7 +124,7 @@ func TestTerminal_Start_RejectsNonUlidSessionId(t *testing.T) {
 func TestTerminal_Start_RejectsAtSessionLimit(t *testing.T) {
 	origGet := sysuserGet
 	t.Cleanup(func() { sysuserGet = origGet })
-	sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: false}, nil }
+	sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: false}, nil }
 
 	h, sender := newTestHandler(t)
 	h.terminalLimit = 2
@@ -153,7 +152,7 @@ func TestTerminal_Start_RejectsAtSessionLimit(t *testing.T) {
 func TestTerminal_Start_RejectsDuplicateSession(t *testing.T) {
 	origGet := sysuserGet
 	t.Cleanup(func() { sysuserGet = origGet })
-	sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: false}, nil }
+	sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: false}, nil }
 
 	h, sender := newTestHandler(t)
 	dup := ws17aULID()
@@ -186,7 +185,7 @@ func TestTerminal_Start_RejectsLockedTtyUser(t *testing.T) {
 	t.Cleanup(func() { sysuserGet = origGet; sysuserModify = origModify })
 
 	t.Run("locked user is rejected, nothing reserved", func(t *testing.T) {
-		sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: true}, nil }
+		sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: true}, nil }
 		h, sender := newTestHandler(t)
 		err := h.OnTerminalStart(context.Background(), &pb.TerminalStart{
 			SessionId: ws17aULID(), TtyUser: "pm-tty-test", Cols: 80, Rows: 24,
@@ -207,9 +206,9 @@ func TestTerminal_Start_RejectsLockedTtyUser(t *testing.T) {
 	})
 
 	t.Run("unlocked user passes the locked gate (fails later at shell activation)", func(t *testing.T) {
-		sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: false}, nil }
-		sysuserModify = func(context.Context, string, ...string) (*sysexec.Result, error) {
-			return nil, fmt.Errorf("usermod boom")
+		sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: false}, nil }
+		sysuserModify = func(context.Context, string, sysuser.ModifyOptions) error {
+			return fmt.Errorf("usermod boom")
 		}
 		h, sender := newTestHandler(t)
 		err := h.OnTerminalStart(context.Background(), &pb.TerminalStart{

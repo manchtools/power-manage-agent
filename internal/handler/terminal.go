@@ -12,10 +12,11 @@ import (
 
 	"github.com/oklog/ulid/v2"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	"github.com/manchtools/power-manage/sdk/go/sys/terminal"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	sdk "github.com/manchtools/power-manage-sdk"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
+	"github.com/manchtools/power-manage-sdk/sys/terminal"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // Compile-time assertion that *Handler satisfies sdk.TerminalHandler.
@@ -30,14 +31,37 @@ var _ sdk.TerminalHandler = (*Handler)(nil)
 // lowers the timeout to keep the test fast. Production uses the real helpers
 // (Modify shells out via sudo -n) and the 30s default.
 var (
-	sysuserModify = sysuser.Modify
-	sysuserGet    = sysuser.Get
+	// termUserMgr/termFSMgr drive the privileged tty-account setup (usermod shell,
+	// recursive chown of the temp home), built over the handler's Direct runner —
+	// the agent runs as root — mirroring the osquery/inventory Managers. The
+	// sysuserModify/sysuserGet method-value seams stay so tests can substitute a
+	// ctx-respecting blocker / a fixed user without a real pm-tty-* account.
+	termUserMgr   = mustTermUserManager()
+	termFSMgr     = mustTermFSManager()
+	sysuserModify = termUserMgr.Modify
+	sysuserGet    = termUserMgr.Get
 	// terminalSetupTimeout bounds the privileged setup steps (usermod, chown)
 	// that run on the dispatch loop before a session goes active, so a slow/hung
 	// step cannot wedge the receive loop. Bounds only SETUP, not the session
 	// lifetime (the PTY pump uses sessionCtx).
 	terminalSetupTimeout = 30 * time.Second
 )
+
+func mustTermUserManager() sysuser.Manager {
+	m, err := sysuser.New(sysuser.ShadowUtils, handlerRunner)
+	if err != nil {
+		panic("handler: user manager must construct: " + err.Error())
+	}
+	return m
+}
+
+func mustTermFSManager() sysfs.Manager {
+	m, err := sysfs.New(handlerRunner)
+	if err != nil {
+		panic("handler: fs manager must construct: " + err.Error())
+	}
+	return m
+}
 
 // Default agent-side limits per the issue spec
 // (manchtools/power-manage-sdk#16 — Security section).
@@ -311,7 +335,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	// the dedicated pm-tty-* account; failure here means the control
 	// server's TerminalAccess provisioning hasn't run on this device
 	// yet, or the user has been disabled.
-	info, err := sysuserGet(req.TtyUser)
+	info, err := sysuserGet(ctx, req.TtyUser)
 	if err != nil {
 		h.failTerminalStart(ctx, sender, req.SessionId, fmt.Sprintf("tty user %q not provisioned: %v", req.TtyUser, err))
 		return nil
@@ -414,7 +438,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortStopped()
 		return nil
 	}
-	if _, err := sysuserModify(setupCtx, req.TtyUser, "-s", terminalActivatedShell); err != nil {
+	if err := sysuserModify(setupCtx, req.TtyUser, sysuser.ModifyOptions{Shell: terminalActivatedShell}); err != nil {
 		abortFail(fmt.Sprintf("activate shell: %v", err))
 		return nil
 	}
@@ -447,7 +471,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		abortFail("temp home is not a regular directory")
 		return nil
 	}
-	if _, err := sysuser.ChownRecursive(setupCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
+	if err := termFSMgr.SetOwnershipRecursive(setupCtx, tempHome, req.TtyUser, req.TtyUser); err != nil {
 		abortFail(fmt.Sprintf("chown temp home: %v", err))
 		return nil
 	}
@@ -468,7 +492,12 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		Env:     []string{"HOME=" + tempHome, "USER=" + req.TtyUser, "LOGNAME=" + req.TtyUser},
 	}
 
-	sess, err := terminal.Start(cfg)
+	tm, err := terminal.New()
+	if err != nil {
+		abortFail(fmt.Sprintf("build terminal manager: %v", err))
+		return nil
+	}
+	sess, err := tm.Open(setupCtx, cfg)
 	if err != nil {
 		abortFail(fmt.Sprintf("allocate pty: %v", err))
 		return nil
@@ -803,7 +832,7 @@ func (h *Handler) anySessionForUserExcept(ttyUser, exceptSessionID string) bool 
 // Best-effort: a failure here is logged but does not block the rest
 // of the cleanup.
 func (h *Handler) deactivateShell(ctx context.Context, ttyUser string) {
-	if _, err := sysuser.Modify(ctx, ttyUser, "-s", terminalDeactivatedShell); err != nil {
+	if err := termUserMgr.Modify(ctx, ttyUser, sysuser.ModifyOptions{Shell: terminalDeactivatedShell}); err != nil {
 		h.logger.Warn("failed to revert tty user shell",
 			"tty_user", ttyUser, "error", err)
 	}

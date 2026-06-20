@@ -9,9 +9,9 @@ import (
 	"log/slog"
 	"time"
 
+	sdk "github.com/manchtools/power-manage-sdk"
+	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	sdk "github.com/manchtools/power-manage/sdk/go"
-	pmcrypto "github.com/manchtools/power-manage/sdk/go/crypto"
 )
 
 // register performs initial registration with the control server.

@@ -8,8 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.
@@ -65,7 +64,7 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
 			continue
 		}
-		if !userInGroup(username, groupName) {
+		if !userInGroup(ctx, username, groupName) {
 			if err := addUserToGroup(ctx, username, groupName); err != nil {
 				msg := fmt.Sprintf("failed to add user %s to group %s: %v", username, groupName, err)
 				output.WriteString(fmt.Sprintf("warning: %s\n", msg))
@@ -78,7 +77,7 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 	}
 
 	// Remove members not in desired list
-	currentMembers := getGroupMembers(groupName)
+	currentMembers := getGroupMembers(ctx, groupName)
 	desiredSet := make(map[string]bool, len(desiredUsers))
 	for _, u := range desiredUsers {
 		desiredSet[u] = true
@@ -155,7 +154,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 				return false, fmt.Errorf("writable fs: %w", err)
 			}
 		}
-		members := getGroupMembers(groupName)
+		members := getGroupMembers(ctx, groupName)
 		for _, member := range members {
 			if err := removeUserFromGroup(ctx, member, groupName); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to remove user %s from group %s: %v\n", member, groupName, err))
@@ -164,7 +163,7 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 				changed = true
 			}
 		}
-		if _, err := sysuser.GroupDelete(ctx, groupName); err != nil {
+		if err := userMgr.GroupDelete(ctx, groupName); err != nil {
 			return changed, fmt.Errorf("delete group %s: %w", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("deleted group: %s\n", groupName))

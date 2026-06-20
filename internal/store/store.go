@@ -24,8 +24,8 @@ import (
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store/migrations"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
 // cronParser is constructed once at package init instead of per-call

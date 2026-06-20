@@ -20,12 +20,11 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	"github.com/manchtools/power-manage/sdk/go/verify"
 )
 
 // validRepoName restricts repository names to safe characters only.
@@ -216,8 +215,16 @@ func containsNewline(s string) bool {
 
 // Executor handles the execution of actions.
 type Executor struct {
-	httpClient   *http.Client
-	pkgManager   *pkg.PackageManager
+	httpClient *http.Client
+	pkgManager pkg.Manager // nil when no supported package manager is present
+	pkgBackend pkg.Backend // the detected backend driving pkgManager (zero when nil)
+	// runner is the privilege runner this executor was constructed with, or nil
+	// when NewExecutor was called without one (the unit-test convention,
+	// NewExecutor(_, nil)). The destructive reboot path uses it DIRECTLY and
+	// fails closed when it is nil — never the process-global Direct default — so
+	// a test that dispatches a REBOOT through a no-runner executor can never
+	// issue a real `shutdown` on the host (it once rebooted a workstation).
+	runner       sysexec.Runner
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
 	mu           sync.RWMutex // protects luksKeyStore, store, actionStore
@@ -251,84 +258,76 @@ type Executor struct {
 	// effects). nil in production → requireWritableFS calls the real
 	// e.repairFilesystem.
 	repairFS func(ctx context.Context) bool
-
-	// newPkgManager builds a per-action package manager bound to the action's
-	// context, so a PACKAGE/UPDATE timeout actually propagates to the package-
-	// manager subprocesses (the construction-time e.pkgManager is bound to
-	// context.Background). A seam so a test can capture the threaded context.
-	// nil → executor falls back to the construction-time e.pkgManager.
-	newPkgManager func(ctx context.Context) (*pkg.PackageManager, error)
 }
 
-// pkgManagerForCtx returns a package manager bound to ctx for this action, so
-// the per-action timeout reaches the underlying package-manager subprocesses.
-// Falls back to the construction-time manager when re-detection is unavailable
-// (e.g. the seam is unset or detection fails), preserving the prior behaviour.
-func (e *Executor) pkgManagerForCtx(ctx context.Context) *pkg.PackageManager {
-	if e.newPkgManager != nil {
-		if m, err := e.newPkgManager(ctx); err == nil && m != nil {
-			return m
-		} else if ctx.Err() != nil {
-			// The action context is already cancelled/expired: don't fall back
-			// to the construction-time (Background-bound) manager, which would
-			// silently bypass the timeout/cancel guarantee. nil → the caller
-			// fails closed with "no package manager".
-			return nil
-		}
+// pkgManagerForCtx returns the package manager for this action. The reworked SDK
+// Manager takes a context on every call, so the per-action timeout reaches the
+// package-manager subprocesses directly — there is no longer a per-action
+// manager to rebuild. It returns nil (fail closed) once the action context is
+// already cancelled, so a wedged or expired action never starts a privileged
+// package operation.
+func (e *Executor) pkgManagerForCtx(ctx context.Context) pkg.Manager {
+	if ctx.Err() != nil {
+		return nil
 	}
 	return e.pkgManager
 }
 
-// NewExecutor creates a new action executor.
-// If verifier is non-nil, action signatures will be checked before execution.
-func NewExecutor(verifier *verify.ActionVerifier) *Executor {
-	pm, pmErr := pkg.New()
+// NewExecutor creates a new action executor. If verifier is non-nil, action
+// signatures are checked before execution. runner is the privilege-backend
+// runner the package manager dispatches through; a nil runner leaves the package
+// manager unset (package actions fail) — used by unit tests that inject their
+// own pkg.Manager into e.pkgManager.
+func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Executor {
 	logger := slog.Default()
+	var (
+		mgr     pkg.Manager
+		backend pkg.Backend
+	)
+	// Adopt the configured runner process-wide so the cmd.go helpers (notably
+	// the escalating runSudoCmd) and the desktop fan-out dispatch through it. A
+	// nil runner (unit tests) leaves the Direct defaults in place.
+	if runner != nil {
+		executorRunner = runner
+		desktopMgr = mustDesktopManager(runner)
+		serviceMgr = mustServiceManager(runner)
+		networkMgr = mustNetworkManager(runner)
+		userMgr = mustUserManager(runner)
+		fsMgr = mustFSManager(runner)
+		encMgr = mustEncManager(runner)
+	}
 	switch {
-	case pmErr != nil || pm == nil:
-		// Operators with no supported package manager need to know
-		// every package action will fail — silently no-op'ing on
-		// boot makes the diagnosis hard later. Audit F031.
-		logger.Warn("no supported package manager detected; package actions will fail", "error", pmErr)
+	case runner == nil:
+		logger.Warn("no privilege runner provided; package actions will fail")
 	default:
-		// Detection is via SDK helpers (IsApt/IsDnf/etc.) so the
-		// startup line names whichever shells out at runtime.
-		var name string
-		switch {
-		case pkg.IsApt():
-			name = "apt"
-		case pkg.IsDnf():
-			name = "dnf"
-		case pkg.IsPacman():
-			name = "pacman"
-		case pkg.IsZypper():
-			name = "zypper"
-		default:
-			name = "unknown"
+		// Detect lists installed backends in priority order (native managers
+		// before flatpak); pick the first. An empty list means no supported
+		// package manager — operators need to know every package action will
+		// fail rather than silently no-op on boot (Audit F031).
+		if backends := pkg.Detect(context.Background()); len(backends) == 0 {
+			logger.Warn("no supported package manager detected; package actions will fail")
+		} else {
+			backend = backends[0]
+			m, err := pkg.New(backend, runner)
+			if err != nil {
+				logger.Warn("failed to build package manager; package actions will fail",
+					"backend", backend.String(), "error", err)
+			} else {
+				mgr = m
+				logger.Info("package manager detected", "manager", backend.String())
+			}
 		}
-		logger.Info("package manager detected", "manager", name)
 	}
 	return &Executor{
 		httpClient: &http.Client{
 			Timeout: 5 * time.Minute,
 		},
-		pkgManager: pm,
+		pkgManager: mgr,
+		pkgBackend: backend,
+		runner:     runner,
 		verifier:   verifier,
 		logger:     logger,
 		now:        time.Now,
-		newPkgManager: func(ctx context.Context) (*pkg.PackageManager, error) {
-			m, err := pkg.DetectWithContext(ctx)
-			if err != nil {
-				return nil, err
-			}
-			if m == nil {
-				// DetectWithContext returns ErrNoPackageManager (handled above)
-				// rather than (nil, nil) today; guard anyway so a future change
-				// can't wrap a nil Manager and nil-deref on first use.
-				return nil, nil
-			}
-			return pkg.NewPackageManager(m), nil
-		},
 	}
 }
 
@@ -626,16 +625,17 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 	// even worse — `envVars` stayed nil, so the child silently
 	// inherited the *full* ambient environment.
 	//
-	// PATH is intentionally NOT in this baseline: as of SDK F-31
-	// hardening (sdk #75), sys/exec.RunStreaming refuses any caller-
-	// supplied PATH (hijack-prone) and instead injects its own
-	// sanitized PATH derived from the agent's own environment when
-	// envVars is non-empty. Passing PATH here would be rejected with
-	// ErrBlockedEnvVar. LANG/HOME/USER keep `~`-expansion and
-	// locale-aware tools sane; anything else goes through
+	// Neither PATH nor the locale family is set here. The reworked SDK
+	// Runner injects its own sanitized PATH (derived from the agent's
+	// environment, since envVars is non-empty) and FORCES the deterministic
+	// locale (LC_ALL=C/LANG=C/NO_COLOR=1) on every command — and REJECTS any
+	// attempt to set LANG/LC_*/LANGUAGE/NO_COLOR via Command.Env. This used
+	// to set `LANG=<host LANG>`, which made EVERY shell action fail with
+	// ErrReservedEnvVar once the agent moved onto the reworked Runner. PATH
+	// is likewise blocklisted and supplied by the Runner. HOME/USER keep
+	// `~`-expansion and user-context tools sane; anything else goes through
 	// `params.Environment` and the IsAllowedEnvVar gate.
 	envVars := []string{
-		"LANG=" + os.Getenv("LANG"),
 		"HOME=" + os.Getenv("HOME"),
 		"USER=" + os.Getenv("USER"),
 	}
@@ -648,8 +648,14 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 
 	args := []string{"-c", script}
 	if params.RunAsRoot {
-		r, err := sysexec.PrivilegedStreaming(ctx, interpreter, args, envVars, params.WorkingDirectory, callback)
-		return toOutput(r), err
+		r, err := executorRunner.Stream(ctx, sysexec.Command{
+			Name:     interpreter,
+			Args:     args,
+			Env:      envVars,
+			Dir:      params.WorkingDirectory,
+			Escalate: true,
+		}, callback)
+		return toOutput(&r), err
 	}
 	// RunAsRoot=false → per-user fan-out.
 	return e.runShellScriptPerUser(ctx, params, interpreter, args, envVars, callback)
@@ -666,7 +672,7 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 // otherwise the first non-zero exit so the action result can still
 // drive the changed/failed bookkeeping in executeShellStreaming.
 func (e *Executor) runShellScriptPerUser(ctx context.Context, params *pb.ShellParams, interpreter string, args []string, envVars []string, callback OutputCallback) (*pb.CommandOutput, error) {
-	sessions, err := desktop.ActiveSessions(ctx)
+	sessions, err := desktopMgr.ActiveSessions(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("enumerate active desktop sessions: %w", err)
 	}

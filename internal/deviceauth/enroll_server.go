@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manchtools/power-manage/sdk/gen/go/pm/v1/pmv1connect"
+	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
 )
 
 const (

@@ -10,10 +10,9 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysnotify "github.com/manchtools/power-manage/sdk/go/sys/notify"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
@@ -76,7 +75,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		e.logger.Warn("LPS policy has no complexity set, defaulting to alphanumeric",
 			"action_id", actionID)
 	}
-	complex := params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX
+	complexity := sysuser.ComplexityAlphanumeric
+	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX {
+		complexity = sysuser.ComplexityComplex
+	}
 
 	var rotations []lpsRotationEntry
 	var rotatedUsers []string
@@ -94,7 +96,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		storedState := userStates[username]
 
 		// Determine if rotation is needed
-		rotate, reason := shouldRotateLps(storedState, params, username, e.now().UTC())
+		rotate, reason := shouldRotateLps(ctx, storedState, params, username, e.now().UTC())
 		if !rotate {
 			output.WriteString(fmt.Sprintf("LPS: %s — password up to date\n", username))
 			continue
@@ -116,7 +118,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 				"requested", requested, "effective", length,
 				"min", sysuser.MinPasswordLength, "max", sysuser.MaxPasswordLength)
 		}
-		password, err := sysuser.GeneratePassword(length, complex)
+		password, err := sysuser.GeneratePassword(length, complexity)
 		if err != nil {
 			anyError = fmt.Errorf("generate password for %s: %w", username, err)
 			output.WriteString(fmt.Sprintf("LPS: %s — failed to generate password: %v\n", username, err))
@@ -124,9 +126,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		// Set the password
-		if result, err := sysuser.SetPassword(ctx, username, password); err != nil {
+		if err := userMgr.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
-			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v%s\n", username, err, stderrSuffix(result)))
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to set password: %v\n", username, err))
 			continue
 		}
 
@@ -135,16 +137,25 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		now := e.now().UTC()
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
-		// Update per-user state in SQLite
-		hash := sha256.Sum256([]byte(password))
+		// Update per-user state in SQLite. password is an exec.Secret; Reveal()
+		// is the sanctioned plaintext access for the drift hash + the operator-
+		// facing rotation record below.
+		plaintext := password.Reveal()
+		hash := sha256.Sum256([]byte(plaintext))
 		hashStr := hex.EncodeToString(hash[:])
 		if err := st.SetLpsUserState(actionID, username, now, hashStr); err != nil {
-			e.logger.Warn("failed to save LPS user state", "action_id", actionID, "username", username, "error", err)
+			// The password WAS rotated (a durable side effect), but if the
+			// rotation state fails to persist, last_rotated_at/password_hash stay
+			// stale and the NEXT cycle re-rotates. Surface it as an action error
+			// instead of reporting a clean success that hides the re-rotation.
+			e.logger.Error("failed to persist LPS rotation state; next cycle will re-rotate",
+				"action_id", actionID, "username", username, "error", err)
+			anyError = fmt.Errorf("rotated password for %s but failed to persist rotation state (will re-rotate next cycle): %w", username, err)
 		}
 
 		rotations = append(rotations, lpsRotationEntry{
 			Username:  username,
-			Password:  password,
+			Password:  plaintext,
 			RotatedAt: now.Format(time.RFC3339),
 			Reason:    reason,
 		})
@@ -152,7 +163,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 	// Notify affected users and terminate sessions after a grace period
 	if len(rotatedUsers) > 0 {
-		sysnotify.NotifyUsers(ctx, rotatedUsers, "Session Termination",
+		notifyUsers(ctx, rotatedUsers, "Session Termination",
 			"Your password has been changed by Power Manage. All sessions will be terminated in 60 seconds. Please save your work.")
 		output.WriteString(fmt.Sprintf("LPS: notified %d user(s), waiting 60 seconds before session termination\n", len(rotatedUsers)))
 
@@ -239,7 +250,7 @@ func (e *Executor) removeLpsManagement(_ context.Context, actionID string) (*pb.
 // shouldRotateLps determines if a password rotation is needed for a user and returns the reason.
 // now is the caller's clock reading (UTC); injecting it keeps rotation decisions
 // deterministically testable with a fixed clock.
-func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username string, now time.Time) (bool, string) {
+func shouldRotateLps(ctx context.Context, state *store.LpsUserState, params *pb.LpsParams, username string, now time.Time) (bool, string) {
 
 	// No state = first run
 	if state == nil {
@@ -254,7 +265,7 @@ func shouldRotateLps(state *store.LpsUserState, params *pb.LpsParams, username s
 
 	// Auth-based rotation: check if user authenticated since last rotation
 	if params.GracePeriodHours > 0 {
-		lastAuth, err := getLastAuthTime(username)
+		lastAuth, err := getLastAuthTime(ctx, username)
 		if err == nil && !lastAuth.IsZero() && lastAuth.After(state.LastRotatedAt) {
 			graceDuration := time.Duration(params.GracePeriodHours) * time.Hour
 			if now.Sub(lastAuth) >= graceDuration {
@@ -298,10 +309,13 @@ func killUserSessions(ctx context.Context, username string) {
 // "could not parse date", causing the rotation logic to fall back to the
 // caller's default and rotate every tick. RunWithCLocale is the SDK helper
 // that strips environment to a minimal {LC_ALL=C, LANG=C, PATH=...} set.
-func getLastAuthTime(username string) (time.Time, error) {
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+func getLastAuthTime(ctx context.Context, username string) (time.Time, error) {
+	// Derive the probe timeout from the ACTION context so a cancelled/expired
+	// action aborts the `last` lookup instead of detaching it onto a fresh
+	// background context.
+	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	r, err := sysexec.RunWithCLocale(ctx, "last", "-1", "-F", username)
+	r, err := executorRunner.Run(ctx, sysexec.Command{Name: "last", Args: []string{"-1", "-F", username}})
 	if err != nil {
 		return time.Time{}, fmt.Errorf("last command: %w", err)
 	}

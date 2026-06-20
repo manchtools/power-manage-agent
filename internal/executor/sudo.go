@@ -3,10 +3,11 @@ package executor
 import (
 	"context"
 	"fmt"
+	"slices"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 // sanitizeSudoGroupName creates a valid Linux group name from the action ID.
@@ -65,7 +66,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 
 	// Check idempotency: file content + group membership
 	fileMatches := e.configMatchesDesired(ctx, sudoersPath, content)
-	membersMatch := sudoGroupMembersMatch(groupName, params.Users)
+	membersMatch := sudoGroupMembersMatch(ctx, groupName, params.Users)
 	if fileMatches && membersMatch {
 		output.WriteString(fmt.Sprintf("sudo policy already up to date: %s\n", sudoersPath))
 		return &pb.CommandOutput{
@@ -80,7 +81,7 @@ func (e *Executor) setupSudoPolicy(ctx context.Context, params *pb.AdminPolicyPa
 
 	// Ensure group exists
 	if !groupExists(groupName) {
-		if _, err := sysuser.GroupCreate(ctx, groupName); err != nil {
+		if err := userMgr.GroupCreate(ctx, groupName, sysuser.GroupCreateOptions{}); err != nil {
 			return nil, false, fmt.Errorf("create group %s: %v", groupName, err)
 		}
 		output.WriteString(fmt.Sprintf("created group: %s\n", groupName))
@@ -352,27 +353,30 @@ func generateCustomSudoConfig(groupName, customConfig string) string {
 
 // addUserToGroup adds a user to a supplementary group.
 func addUserToGroup(ctx context.Context, username, groupName string) error {
-	_, err := sysuser.GroupAddUser(ctx, username, groupName)
-	return err
+	return userMgr.AddToGroup(ctx, username, groupName)
 }
 
 // removeUserFromGroup removes a user from a supplementary group.
 func removeUserFromGroup(ctx context.Context, username, groupName string) error {
-	_, err := sysuser.GroupRemoveUser(ctx, username, groupName)
-	return err
+	return userMgr.RemoveFromGroup(ctx, username, groupName)
 }
 
-// getGroupMembers returns the members of a group.
-func getGroupMembers(groupName string) []string {
-	return sysuser.GroupMembers(groupName)
+// getGroupMembers returns the members of a group (empty on lookup failure,
+// matching the previous helper's contract). It honors the action context so a
+// hung backend lookup is bounded by the action's cancellation/timeout.
+func getGroupMembers(ctx context.Context, groupName string) []string {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
+	return members
 }
 
 // userInGroup checks if a user is a member of the specified group.
-func userInGroup(username, groupName string) bool {
-	return sysuser.GroupHasUser(username, groupName)
+func userInGroup(ctx context.Context, username, groupName string) bool {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
+	return slices.Contains(members, username)
 }
 
 // sudoGroupMembersMatch checks if the current group members match the desired list.
-func sudoGroupMembersMatch(groupName string, desiredUsers []string) bool {
-	return sysuser.GroupMembersMatch(groupName, desiredUsers)
+func sudoGroupMembersMatch(ctx context.Context, groupName string, desiredUsers []string) bool {
+	members, _ := userMgr.GroupMembers(ctx, groupName)
+	return sysuser.MembersMatch(members, desiredUsers)
 }

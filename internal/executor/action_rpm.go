@@ -9,9 +9,9 @@ import (
 	"os/exec"
 	"strings"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/pkg"
-	sysexec "github.com/manchtools/power-manage/sdk/go/sys/exec"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -79,11 +79,18 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 			}, false, nil
 		}
 
-		// Install with rpm (requires sudo). The path is a temp file we
-		// created, but pass it after `--` for consistency with the rest
-		// of the rpm argv discipline.
-		output, err := runSudoCmd(ctx, "rpm", "-i", "--", tmpFile.Name())
-		return output, true, err
+		// Install through the SDK package manager's local-file install
+		// (dnf/zypper install <path>), which resolves dependencies and lets the
+		// manager set PATH for the rpm it drives. AllowUnsigned mirrors the prior
+		// `rpm -i` posture: the agent's artifact trust is the verified HTTPS +
+		// SHA256 checksum (requireVerifiedArtifact above), NOT a per-file GPG
+		// signature — operator-provided rpms typically carry none — so dnf/zypper
+		// must not reject the file as unsigned.
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to install %s (context expired or none detected)", pkgName)
+		}
+		return packageResult(mgr.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{AllowUnsigned: true}))
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// For ABSENT the URL is the only handle we have; we must
@@ -119,8 +126,14 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 			}, false, nil
 		}
 
-		output, err := runSudoCmd(ctx, "rpm", rpmEraseArgs(pkgName)...)
-		return output, true, err
+		// Remove through the SDK manager (dnf/zypper remove <name>) rather than a
+		// direct `rpm -e`, so the package manager runs the scriptlets with a
+		// proper PATH — symmetric with the install path and the deb executor.
+		mgr := e.pkgManagerForCtx(ctx)
+		if mgr == nil {
+			return nil, false, fmt.Errorf("no usable package manager to remove %s (context expired or none detected)", pkgName)
+		}
+		return packageResult(mgr.Remove(ctx, pkg.RemoveOptions{}, pkgName))
 	}
 
 	return nil, false, fmt.Errorf("unknown desired state: %v", state)
@@ -153,12 +166,11 @@ func rpmPackageName(queryFn rpmQueryFunc, path string) (string, error) {
 	return name, nil
 }
 
-// rpmQueryArgs / rpmEraseArgs build rpm argv with the package NAME passed
-// after a `--` end-of-options separator, so a name that slipped past
-// validation (or a future caller that skips it) can still never be
-// reparsed as an rpm option.
+// rpmQueryArgs builds `rpm -q -- <name>` so the package NAME is passed after a
+// `--` end-of-options separator and can never be reparsed as an rpm option, even
+// if a crafted .rpm made it flag-shaped. (Install/erase now go through the SDK
+// pkg.Manager InstallLocal/Remove, not a direct rpm invocation.)
 func rpmQueryArgs(name string) []string { return sysexec.SeparatePositionals([]string{"-q"}, name) }
-func rpmEraseArgs(name string) []string { return sysexec.SeparatePositionals([]string{"-e"}, name) }
 
 // requireVerifiedArtifact fails closed unless rawURL is https and a
 // non-empty checksum is present. A download-and-install artifact whose

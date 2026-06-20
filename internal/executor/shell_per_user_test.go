@@ -8,8 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/desktop"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
 // TestRunShellScript_RunAsRootFalseNoSessions pins the empty-set
@@ -19,7 +18,7 @@ import (
 // behavior. Without this guard an admin who turned off RunAsRoot
 // would still see effectively-root behavior with no diagnostic.
 func TestRunShellScript_RunAsRootFalseNoSessions(t *testing.T) {
-	sessions, err := desktop.ActiveSessions(context.Background())
+	sessions, err := desktopMgr.ActiveSessions(context.Background())
 	if err != nil {
 		t.Skipf("loginctl probe failed (%v) — skipping rather than asserting against an unknown session state", err)
 	}
@@ -28,7 +27,7 @@ func TestRunShellScript_RunAsRootFalseNoSessions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	e.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	out, err := e.runShellScript(context.Background(), &pb.ShellParams{
@@ -63,7 +62,7 @@ func TestRunShellScript_RunAsRootFalseDispatchesToLoop(t *testing.T) {
 		// developer sees a skip rather than a meaningless failure.
 		t.Skip("runuser requires root to switch users; run this test under privileged CI")
 	}
-	sessions, err := desktop.ActiveSessions(context.Background())
+	sessions, err := desktopMgr.ActiveSessions(context.Background())
 	if err != nil {
 		t.Skipf("loginctl probe failed (%v)", err)
 	}
@@ -71,7 +70,7 @@ func TestRunShellScript_RunAsRootFalseDispatchesToLoop(t *testing.T) {
 		t.Skip("no active desktop sessions — TestRunShellScript_RunAsRootFalseNoSessions covers the empty-set path here")
 	}
 
-	e := NewExecutor(nil)
+	e := NewExecutor(nil, nil)
 	out, err := e.runShellScript(context.Background(), &pb.ShellParams{
 		// `id -un` prints the username; if the per-user fan-out
 		// works, the merged stdout will contain the desktop user's

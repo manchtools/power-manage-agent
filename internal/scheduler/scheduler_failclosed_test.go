@@ -7,8 +7,8 @@ import (
 
 	"google.golang.org/protobuf/proto"
 
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/store"
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
 )
 
 // WS15 #1 — fail-CLOSED on a corrupt persisted maintenance window.

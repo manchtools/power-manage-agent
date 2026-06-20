@@ -5,7 +5,7 @@ import (
 	"fmt"
 	"testing"
 
-	"github.com/manchtools/power-manage/sdk/go/sys/osquery"
+	"github.com/manchtools/power-manage-sdk/sys/osquery"
 )
 
 // WS16 #13: the install-guidance branch must fire even when the

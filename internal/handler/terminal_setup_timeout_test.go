@@ -8,9 +8,8 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/exec"
-	sysuser "github.com/manchtools/power-manage/sdk/go/sys/user"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
 const setupTestULID = "01ARZ3NDEKTSV4RRFFQ69G5FAV"
@@ -28,14 +27,14 @@ func TestOnTerminalStart_BoundedSetupContext(t *testing.T) {
 	})
 
 	// A valid, unlocked user so we reach the setup steps.
-	sysuserGet = func(string) (*sysuser.Info, error) { return &sysuser.Info{Locked: false}, nil }
+	sysuserGet = func(context.Context, string) (sysuser.Info, error) { return sysuser.Info{Locked: false}, nil }
 	// Modify hangs, respecting ctx — it returns only when the bounded setup ctx
 	// fires. This is the "hung sudo" the bound defends against.
 	modifyEntered := make(chan struct{})
-	sysuserModify = func(ctx context.Context, _ string, _ ...string) (*exec.Result, error) {
+	sysuserModify = func(ctx context.Context, _ string, _ sysuser.ModifyOptions) error {
 		close(modifyEntered)
 		<-ctx.Done()
-		return nil, ctx.Err()
+		return ctx.Err()
 	}
 	terminalSetupTimeout = 100 * time.Millisecond // fast test
 

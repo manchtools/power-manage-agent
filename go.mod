@@ -4,7 +4,7 @@ go 1.25.11
 
 require (
 	connectrpc.com/connect v1.18.1
-	github.com/manchtools/power-manage/sdk v0.2.1
+	github.com/manchtools/power-manage-sdk v0.4.1-0.20260620175815-30c4b75ec46a
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -30,7 +30,6 @@ require (
 // it. There is no automatic floating tag — that's intentional, because
 // SDK proto/Go API drifts between commits should be reviewable in the
 // same PR as the agent change that consumes them.
-replace github.com/manchtools/power-manage/sdk => github.com/manchtools/power-manage-sdk v0.4.1-0.20260616163503-979ab22c4a6b
 
 require (
 	github.com/creack/pty v1.1.24 // indirect

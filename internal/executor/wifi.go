@@ -5,8 +5,9 @@ import (
 	"fmt"
 	"path/filepath"
 
-	pb "github.com/manchtools/power-manage/sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage/sdk/go/sys/network"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/sys/network"
 )
 
 // wifiConnectionName returns the managed connection name for an action.
@@ -50,13 +51,13 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 		// Pattern matches the DNF/Zypper repository ABSENT branches
 		// in action_repository.go which also short-circuit when the
 		// resource is already gone.
-		existed, existsErr := network.ConnectionExists(ctx, conName)
+		existed, existsErr := networkMgr.ConnectionExists(ctx, conName)
 		if existsErr != nil {
 			e.logger.Warn("wifi ABSENT: ConnectionExists failed; conservatively reporting changed=true",
 				"connection", conName, "error", existsErr)
 			existed = true
 		}
-		if err := network.Delete(ctx, conName, certDir); err != nil {
+		if err := networkMgr.Delete(ctx, conName, network.DeleteOptions{CertDir: certDir}); err != nil {
 			return nil, false, fmt.Errorf("delete connection: %w", err)
 		}
 		stdout := fmt.Sprintf("connection %s already absent\n", conName)
@@ -69,14 +70,14 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 		}, existed, nil
 	}
 
-	profile := network.WiFiProfile{
+	profile := network.Profile{
 		Name:        conName,
 		SSID:        params.Ssid,
 		AuthType:    wifiAuthFromProto(params.AuthType),
-		PSK:         params.Psk,
+		PSK:         sysexec.NewMultilineSecret(params.Psk),
 		CACert:      params.CaCert,
 		ClientCert:  params.ClientCert,
-		ClientKey:   params.ClientKey,
+		ClientKey:   sysexec.NewMultilineSecret(params.ClientKey),
 		Identity:    params.Identity,
 		AutoConnect: params.AutoConnect,
 		Hidden:      params.Hidden,
@@ -84,7 +85,7 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 		CertDir:     certDir,
 	}
 
-	changed, err := network.CreateOrUpdate(ctx, profile)
+	changed, err := networkMgr.Apply(ctx, profile)
 	if err != nil {
 		return nil, false, err
 	}
@@ -97,12 +98,12 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 }
 
 // wifiAuthFromProto maps the proto auth type enum to the SDK enum.
-func wifiAuthFromProto(t pb.WifiAuthType) network.WiFiAuthType {
+func wifiAuthFromProto(t pb.WifiAuthType) network.AuthType {
 	switch t {
 	case pb.WifiAuthType_WIFI_AUTH_TYPE_PSK:
-		return network.WiFiAuthPSK
+		return network.AuthPSK
 	case pb.WifiAuthType_WIFI_AUTH_TYPE_EAP_TLS:
-		return network.WiFiAuthEAPTLS
+		return network.AuthEAPTLS
 	}
 	return 0
 }
