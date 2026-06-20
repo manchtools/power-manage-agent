@@ -110,9 +110,15 @@ func TestOnAction_ValidSyncTriggersExactlyOnce(t *testing.T) {
 // lives in the SIGNED envelope: a validly signed REBOOT envelope delivered
 // on OnAction must NOT be treated as a SYNC, even though it travels the same
 // dispatch path. A compromised relay cannot lift a non-SYNC signature onto a
-// SYNC because the type is inside the signed bytes. (REBOOT is an instant
-// action that does not reach the executor's typed switch here; the load-
-// bearing assertion is that NO resync is enqueued.)
+// SYNC because the type is inside the signed bytes.
+//
+// REBOOT DOES reach the executor's dispatch (executeReboot) — an earlier
+// version of this comment wrongly claimed it did not, and because the executor
+// is built with NewExecutor(verifier, nil) the unseamed reboot path once shelled
+// out a real `shutdown -r +5` and rebooted a developer's machine. executeReboot
+// now fails closed when no privilege runner is configured (see
+// TestExecuteReboot_FailsClosedWithoutRunner), so this dispatch is inert. The
+// load-bearing assertion remains that NO resync is enqueued for a non-SYNC type.
 func TestOnAction_NonSyncEnvelopeNeverTriggersSync(t *testing.T) {
 	caPEM, signer := testCAAndSigner(t)
 	h, syncTrigger := newVerifierHandler(t, caPEM)

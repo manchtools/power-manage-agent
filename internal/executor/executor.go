@@ -215,9 +215,16 @@ func containsNewline(s string) bool {
 
 // Executor handles the execution of actions.
 type Executor struct {
-	httpClient   *http.Client
-	pkgManager   pkg.Manager // nil when no supported package manager is present
-	pkgBackend   pkg.Backend // the detected backend driving pkgManager (zero when nil)
+	httpClient *http.Client
+	pkgManager pkg.Manager // nil when no supported package manager is present
+	pkgBackend pkg.Backend // the detected backend driving pkgManager (zero when nil)
+	// runner is the privilege runner this executor was constructed with, or nil
+	// when NewExecutor was called without one (the unit-test convention,
+	// NewExecutor(_, nil)). The destructive reboot path uses it DIRECTLY and
+	// fails closed when it is nil — never the process-global Direct default — so
+	// a test that dispatches a REBOOT through a no-runner executor can never
+	// issue a real `shutdown` on the host (it once rebooted a workstation).
+	runner       sysexec.Runner
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
 	mu           sync.RWMutex // protects luksKeyStore, store, actionStore
@@ -317,6 +324,7 @@ func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Execut
 		},
 		pkgManager: mgr,
 		pkgBackend: backend,
+		runner:     runner,
 		verifier:   verifier,
 		logger:     logger,
 		now:        time.Now,
