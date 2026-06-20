@@ -115,7 +115,10 @@ func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
 
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
-	exists := userExists(ctx, params.Username)
+	exists, err := userExists(ctx, params.Username)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("check user %s: %w", params.Username, err)
+	}
 
 	if exists {
 		// Update existing user
@@ -434,7 +437,11 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 		}, false, fmt.Errorf("cannot remove protected user: power-manage")
 	}
 
-	if !userExists(ctx, username) {
+	uExists, err := userExists(ctx, username)
+	if err != nil {
+		return nil, false, fmt.Errorf("check user %s: %w", username, err)
+	}
+	if !uExists {
 		// User doesn't exist, no change needed
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -449,7 +456,7 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	removeAccountsServiceFile(ctx, username)
 
 	// Remove user and their home directory
-	err := userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
+	err = userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
 	if err != nil {
 		// userdel -r can report an error when only the home directory was missing
 		// yet the account was removed. Confirm via Exists — but if THAT probe

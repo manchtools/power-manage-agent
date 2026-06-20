@@ -85,8 +85,15 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	var anyError error
 
 	for _, username := range params.Usernames {
-		// Verify user exists
-		if !userExists(ctx, username) {
+		// Verify user exists (fail closed on a check error — record it and move
+		// on, matching this loop's other per-user error handling).
+		uExists, err := userExists(ctx, username)
+		if err != nil {
+			anyError = fmt.Errorf("check user %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to verify user: %v\n", username, err))
+			continue
+		}
+		if !uExists {
 			output.WriteString(fmt.Sprintf("LPS: user %q does not exist, skipping\n", username))
 			e.logger.Warn("LPS user does not exist, skipping", "username", username)
 			continue

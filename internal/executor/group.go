@@ -37,8 +37,14 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	var output strings.Builder
 	changed := false
 
+	// Resolve existence once (fail closed if the lookup itself errors).
+	exists, err := groupExists(ctx, params.Name)
+	if err != nil {
+		return nil, false, fmt.Errorf("check group %s: %w", params.Name, err)
+	}
+
 	// Check idempotency: group exists and members match
-	if groupExists(ctx, params.Name) && sudoGroupMembersMatch(ctx, params.Name, params.Members) {
+	if exists && sudoGroupMembersMatch(ctx, params.Name, params.Members) {
 		output.WriteString(fmt.Sprintf("group %s already up to date\n", params.Name))
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -51,7 +57,7 @@ func (e *Executor) setupGroup(ctx context.Context, params *pb.GroupParams) (*pb.
 	}
 
 	// Create group if it doesn't exist
-	if !groupExists(ctx, params.Name) {
+	if !exists {
 		opts := sysuser.GroupCreateOptions{System: params.SystemGroup}
 		if params.Gid > 0 {
 			opts.GID = int(params.Gid)
@@ -88,7 +94,11 @@ func (e *Executor) removeGroup(ctx context.Context, groupName string) (*pb.Comma
 		}, false, fmt.Errorf("cannot remove protected group: power-manage")
 	}
 
-	if !groupExists(ctx, groupName) {
+	exists, err := groupExists(ctx, groupName)
+	if err != nil {
+		return nil, false, fmt.Errorf("check group %s: %w", groupName, err)
+	}
+	if !exists {
 		output.WriteString(fmt.Sprintf("group %s does not exist, nothing to remove\n", groupName))
 		return &pb.CommandOutput{
 			ExitCode: 0,

@@ -102,16 +102,17 @@ func removeDirectory(ctx context.Context, path string) error {
 	return fsMgr.RemoveDir(ctx, path)
 }
 
-// userExists checks if a user exists on the system, via the SDK user Manager
-// (which runs the `id` lookup) rather than shelling it here.
-func userExists(ctx context.Context, username string) bool {
-	exists, _ := userMgr.Exists(ctx, username)
-	return exists
+// userExists reports whether a user exists on the system, via the SDK user
+// Manager (the `id` lookup). The lookup error is propagated, not coerced to
+// "not found", so a caller can fail closed on "couldn't check" rather than
+// blindly creating or skipping.
+func userExists(ctx context.Context, username string) (bool, error) {
+	return userMgr.Exists(ctx, username)
 }
 
-// groupExists checks if a group exists on the system, via the SDK user Manager
-// (which runs the `getent group` lookup) rather than shelling it here.
-func groupExists(ctx context.Context, groupName string) bool {
-	exists, _ := userMgr.GroupExists(ctx, groupName)
-	return exists
+// groupExists reports whether a group exists on the system, via the SDK user
+// Manager (the `getent group` lookup). The lookup error is propagated, not
+// coerced to "not found".
+func groupExists(ctx context.Context, groupName string) (bool, error) {
+	return userMgr.GroupExists(ctx, groupName)
 }
