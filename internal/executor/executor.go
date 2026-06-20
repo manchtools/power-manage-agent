@@ -625,16 +625,17 @@ func (e *Executor) runShellScript(ctx context.Context, params *pb.ShellParams, s
 	// even worse — `envVars` stayed nil, so the child silently
 	// inherited the *full* ambient environment.
 	//
-	// PATH is intentionally NOT in this baseline: as of SDK F-31
-	// hardening (sdk #75), sys/exec.RunStreaming refuses any caller-
-	// supplied PATH (hijack-prone) and instead injects its own
-	// sanitized PATH derived from the agent's own environment when
-	// envVars is non-empty. Passing PATH here would be rejected with
-	// ErrBlockedEnvVar. LANG/HOME/USER keep `~`-expansion and
-	// locale-aware tools sane; anything else goes through
+	// Neither PATH nor the locale family is set here. The reworked SDK
+	// Runner injects its own sanitized PATH (derived from the agent's
+	// environment, since envVars is non-empty) and FORCES the deterministic
+	// locale (LC_ALL=C/LANG=C/NO_COLOR=1) on every command — and REJECTS any
+	// attempt to set LANG/LC_*/LANGUAGE/NO_COLOR via Command.Env. This used
+	// to set `LANG=<host LANG>`, which made EVERY shell action fail with
+	// ErrReservedEnvVar once the agent moved onto the reworked Runner. PATH
+	// is likewise blocklisted and supplied by the Runner. HOME/USER keep
+	// `~`-expansion and user-context tools sane; anything else goes through
 	// `params.Environment` and the IsAllowedEnvVar gate.
 	envVars := []string{
-		"LANG=" + os.Getenv("LANG"),
 		"HOME=" + os.Getenv("HOME"),
 		"USER=" + os.Getenv("USER"),
 	}
