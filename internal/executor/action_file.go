@@ -241,32 +241,6 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 	return true
 }
 
-// protectedPaths contains directories that should never be deleted as a whole.
-var protectedPaths = []string{
-	"/",
-	"/bin",
-	"/boot",
-	"/dev",
-	"/etc",
-	"/home",
-	"/lib",
-	"/lib32",
-	"/lib64",
-	"/libx32",
-	"/media",
-	"/mnt",
-	"/opt",
-	"/proc",
-	"/root",
-	"/run",
-	"/sbin",
-	"/srv",
-	"/sys",
-	"/tmp",
-	"/usr",
-	"/var",
-}
-
 // criticalFiles lists individual files whose removal would render the
 // system unbootable, lock the operator out, or destroy account/auth
 // state. Their parent directories (e.g. /etc) are not blanket-protected
@@ -293,10 +267,12 @@ var criticalFiles = []string{
 func isProtectedPath(path string) bool {
 	cleanPath := filepath.Clean(path)
 
-	for _, protected := range protectedPaths {
-		if cleanPath == protected {
-			return true
-		}
+	// Whole-directory protection for system dirs is the SDK's
+	// sysfs.IsProtectedPath (a superset of the agent's former list — it also
+	// covers /snap). The agent keeps two rules the SDK does not: a critical-FILE
+	// denylist, and "any immediate child of / is protected".
+	if sysfs.IsProtectedPath(cleanPath) {
+		return true
 	}
 
 	if isCriticalFile(cleanPath) {

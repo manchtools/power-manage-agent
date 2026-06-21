@@ -45,14 +45,15 @@ func TestIsCriticalFile_DenylistExhaustive(t *testing.T) {
 	assert.True(t, isCriticalFile("/etc/resolv.conf"))
 }
 
-// WS6 #8: protected-path predicate covers the listed system directories,
-// every immediate child of / (e.g. /lost+found), and the critical files,
-// but NOT managed config two levels down.
+// WS6 #8: protected-path predicate covers the system directories (now via the
+// SDK's sysfs.IsProtectedPath), every immediate child of / (e.g. /lost+found),
+// and the critical files, but NOT managed config two levels down.
 func TestIsProtectedPath_DirsAndTopLevelChildren(t *testing.T) {
-	require.NotEmpty(t, protectedPaths)
-
-	for _, p := range protectedPaths {
-		assert.Truef(t, isProtectedPath(p), "listed protected path %q must be recognised", p)
+	// Whole-directory protection is delegated to sysfs.IsProtectedPath; spot-check
+	// a representative set, including /snap, which the SDK list adds over the
+	// agent's former hard-coded list.
+	for _, p := range []string{"/", "/etc", "/usr", "/var", "/home", "/root", "/boot", "/opt", "/tmp", "/snap"} {
+		assert.Truef(t, isProtectedPath(p), "system directory %q must be protected", p)
 	}
 
 	assert.True(t, isProtectedPath("/lost+found"), "immediate children of / are protected")
