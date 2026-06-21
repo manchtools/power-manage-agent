@@ -111,7 +111,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 					}, false, nil
 				}
 			}
-		} else if _, err := os.Stat(resolvedPath); err == nil {
+		} else if ok, _ := fsMgr.Exists(ctx, resolvedPath); ok {
 			// No checksum specified, file exists
 			return &pb.CommandOutput{
 				ExitCode: 0,
@@ -124,19 +124,38 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 			return out, false, err
 		}
 
-		// Create directory
-		if err := os.MkdirAll(filepath.Dir(resolvedPath), 0755); err != nil {
-			return nil, false, fmt.Errorf("create directory: %w", err)
+		// Download + checksum-verify into an unprivileged temp (the HTTP fetch
+		// and verification are the agent's concern; an os.TempDir temp is always
+		// agent-writable), then stream the verified file into the privileged
+		// install path via the fs Manager's WriteReader. WriteReader mktemps in
+		// the destination dir and renames into place — so the placement is atomic
+		// (a failed copy never clobbers an existing AppImage), streamed (no
+		// buffering a hundred-MB payload), mode-set, and escalated when the agent
+		// is not root. This replaces the os.MkdirAll + os.CreateTemp-in-dest +
+		// os.Rename + os.Chmod dance, which only worked when the agent already
+		// had write access to the install dir.
+		tmpFile, err := os.CreateTemp("", "*.appimage")
+		if err != nil {
+			return nil, false, fmt.Errorf("create temp file: %w", err)
 		}
+		defer os.Remove(tmpFile.Name())
+		_ = tmpFile.Close()
 
-		// Download file
-		if err := e.downloadFile(ctx, params.Url, resolvedPath, params.ChecksumSha256); err != nil {
+		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
-		// Make executable
-		if err := os.Chmod(resolvedPath, 0755); err != nil {
-			return nil, false, fmt.Errorf("chmod: %w", err)
+		if err := createDirectory(ctx, filepath.Dir(resolvedPath), true); err != nil {
+			return nil, false, fmt.Errorf("create directory: %w", err)
+		}
+
+		src, err := os.Open(tmpFile.Name())
+		if err != nil {
+			return nil, false, fmt.Errorf("open downloaded file: %w", err)
+		}
+		defer src.Close()
+		if err := fsMgr.WriteReader(ctx, resolvedPath, src, sysfs.WriteOptions{Mode: 0o755}); err != nil {
+			return nil, false, fmt.Errorf("install appimage: %w", err)
 		}
 
 		return &pb.CommandOutput{
@@ -145,8 +164,10 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// Check if file already doesn't exist
-		if _, err := os.Stat(resolvedPath); os.IsNotExist(err) {
+		// Check if file already doesn't exist. Only short-circuit on a definite
+		// "absent" (no probe error); a probe error falls through to the remove,
+		// which surfaces the real failure rather than falsely reporting absence.
+		if ok, existErr := fsMgr.Exists(ctx, resolvedPath); existErr == nil && !ok {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("appimage %s already not present", filename),
@@ -158,7 +179,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 			return out, false, err
 		}
 
-		if err := os.Remove(resolvedPath); err != nil {
+		if err := removeFileStrict(ctx, resolvedPath); err != nil {
 			return nil, false, fmt.Errorf("remove: %w", err)
 		}
 		return &pb.CommandOutput{
