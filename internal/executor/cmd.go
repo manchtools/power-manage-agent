@@ -87,12 +87,6 @@ func runCmdStreaming(ctx context.Context, name string, args []string, envVars []
 	return toOutput(&r), err
 }
 
-// queryCmdOutput runs an unprivileged command and returns stdout, exit code, and any error.
-func queryCmdOutput(name string, args ...string) (stdout string, exitCode int, err error) {
-	r, err := executorRunner.Run(context.Background(), sysexec.Command{Name: name, Args: args})
-	return r.Stdout, r.ExitCode, err
-}
-
 // checkCmdSuccess runs an unprivileged command and returns true if it succeeds (exit 0).
 func checkCmdSuccess(name string, args ...string) bool {
 	r, err := executorRunner.Run(context.Background(), sysexec.Command{Name: name, Args: args})

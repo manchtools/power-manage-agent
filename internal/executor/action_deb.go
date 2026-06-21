@@ -54,6 +54,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, false, fmt.Errorf("dpkg lookup: %w", err)
 	}
 
+	mgr := e.pkgManagerForCtx(ctx)
+	if mgr == nil {
+		return nil, false, fmt.Errorf("no usable package manager for .deb (context expired or none detected)")
+	}
+
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		// Repair filesystem if mounted read-only
@@ -79,14 +84,19 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
-		// Ask dpkg-deb for the canonical package NAME from the
-		// downloaded file — authoritative across naming conventions.
-		pkgName, err := debPackageName(tmpFile.Name())
+		// Ask the SDK for the canonical package NAME from the downloaded
+		// file (LocalPackageInfo -> dpkg-deb), authoritative across naming
+		// conventions and validated against the package-name grammar inside
+		// the SDK.
+		info, err := mgr.LocalPackageInfo(ctx, tmpFile.Name())
 		if err != nil {
 			return nil, false, err
 		}
+		pkgName := info.Name
 
-		if e.isDebInstalled(pkgName) {
+		if installed, err := mgr.IsInstalled(ctx, pkgName); err != nil {
+			return nil, false, fmt.Errorf("check %s installed: %w", pkgName, err)
+		} else if installed {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("deb package %s is already installed", pkgName),
@@ -96,17 +106,10 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// Install through the SDK package manager's local-file install
 		// (apt install <path>), which resolves dependencies from the
 		// configured repositories AND lets apt set PATH for the dpkg it
-		// drives. A direct `dpkg -i` runs under the SDK Runner's
-		// PATH-stripped child env and dpkg hard-refuses ("PATH is not
-		// set"); it also wouldn't resolve dependencies (the old shape had
-		// to retry via `apt --fix-broken install`). apt install of a local
-		// .deb performs no per-file signature check (deb carries none), so
-		// it still honours the agent's checksum-not-gpg artifact model
-		// already enforced above by requireVerifiedArtifact.
-		mgr := e.pkgManagerForCtx(ctx)
-		if mgr == nil {
-			return nil, false, fmt.Errorf("no usable package manager to install %s (context expired or none detected)", pkgName)
-		}
+		// drives. apt install of a local .deb performs no per-file signature
+		// check (deb carries none), so it still honours the agent's
+		// checksum-not-gpg artifact model enforced above by
+		// requireVerifiedArtifact.
 		return packageResult(mgr.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{}))
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
@@ -119,11 +122,13 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// fails (artifact deleted upstream after install), so ABSENT
 		// still reports "already absent" instead of degrading to a
 		// download error.
-		pkgName, err := e.debAbsentPackageName(ctx, params)
+		pkgName, err := e.debAbsentPackageName(ctx, mgr, params)
 		if err != nil {
 			return nil, false, err
 		}
-		if !e.isDebInstalled(pkgName) {
+		if installed, err := mgr.IsInstalled(ctx, pkgName); err != nil {
+			return nil, false, fmt.Errorf("check %s installed: %w", pkgName, err)
+		} else if !installed {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("deb package %s is already not installed", pkgName),
@@ -136,10 +141,6 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		// direct `dpkg -r`, so the package manager runs the maintainer
 		// (prerm) scripts with a proper PATH — the same reason the install
 		// path delegates to apt.
-		mgr := e.pkgManagerForCtx(ctx)
-		if mgr == nil {
-			return nil, false, fmt.Errorf("no usable package manager to remove %s (context expired or none detected)", pkgName)
-		}
 		return packageResult(mgr.Remove(ctx, pkg.RemoveOptions{}, pkgName))
 	}
 
@@ -153,7 +154,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 // download fails — the common "artifact deleted upstream after the
 // install" case — it falls back to the URL-filename heuristic so the
 // action can still report "already absent" rather than erroring.
-func (e *Executor) debAbsentPackageName(ctx context.Context, params *pb.AppInstallParams) (string, error) {
+func (e *Executor) debAbsentPackageName(ctx context.Context, mgr pkg.Manager, params *pb.AppInstallParams) (string, error) {
 	tmpFile, err := os.CreateTemp("", "*.deb")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
@@ -167,37 +168,16 @@ func (e *Executor) debAbsentPackageName(ctx context.Context, params *pb.AppInsta
 		// parse failure here is a real corruption/format error, NOT a
 		// stale URL — surface it rather than guessing from the URL
 		// filename, which could target (and remove) the wrong package.
-		name, nameErr := debPackageName(tmpFile.Name())
+		info, nameErr := mgr.LocalPackageInfo(ctx, tmpFile.Name())
 		if nameErr != nil {
-			return "", fmt.Errorf("download succeeded but dpkg-deb could not read the package name: %w", nameErr)
+			return "", fmt.Errorf("download succeeded but could not read the package name: %w", nameErr)
 		}
-		return name, nil
+		return info.Name, nil
 	}
 	// Download failed (dead URL — artifact deleted upstream after the
 	// install) — best effort from the URL filename so a stale-URL ABSENT
 	// still converges to "already absent".
 	return debPackageNameFromURL(params.Url)
-}
-
-// debPackageName returns the canonical Package field of the given .deb
-// file. Uses dpkg-deb so the answer matches what dpkg -i / dpkg -r will
-// see, instead of guessing from the URL filename. The returned name is
-// validated against the Debian package-name grammar so a maliciously
-// crafted .deb cannot inject a value that confuses downstream sudo'd
-// dpkg invocations.
-func debPackageName(debPath string) (string, error) {
-	out, _, err := queryCmdOutput("dpkg-deb", "-f", debPath, "Package")
-	if err != nil {
-		return "", fmt.Errorf("dpkg-deb -f Package: %w", err)
-	}
-	name := strings.TrimSpace(out)
-	if name == "" {
-		return "", fmt.Errorf("dpkg-deb -f Package returned empty for %s", debPath)
-	}
-	if !validDebPkgName.MatchString(name) {
-		return "", fmt.Errorf("invalid debian package name %q in %s", name, debPath)
-	}
-	return name, nil
 }
 
 // debPackageNameFromURL parses the canonical Debian package NAME out
@@ -231,9 +211,4 @@ func debPackageNameFromURL(rawURL string) (string, error) {
 		return "", fmt.Errorf("invalid debian package name %q derived from %s", name, rawURL)
 	}
 	return name, nil
-}
-
-// isDebInstalled checks if a deb package is installed.
-func (e *Executor) isDebInstalled(pkgName string) bool {
-	return checkCmdSuccess("dpkg", "-s", pkgName)
 }
