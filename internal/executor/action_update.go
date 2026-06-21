@@ -48,80 +48,44 @@ var (
 // like /usr may be mounted separately and go read-only independently.
 // Returns true if all filesystems are writable, false if any repair failed.
 func (e *Executor) repairFilesystem(ctx context.Context) bool {
-	mounts, err := os.ReadFile("/proc/mounts")
+	mounts, err := fsMgr.ListMounts(ctx)
 	if err != nil {
-		e.logger.Warn("could not read /proc/mounts", "error", err)
+		e.logger.Warn("could not list mounts", "error", err)
 		return true // Assume writable, let operations fail naturally
 	}
 
 	allOk := true
-	for _, line := range strings.Split(string(mounts), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) < 4 {
+	for _, mnt := range mounts {
+		// Only real block-device filesystems: skip virtual mounts (proc, sysfs,
+		// cgroup, tmpfs, …) which are legitimately read-only and must never be
+		// remounted rw.
+		if !strings.HasPrefix(mnt.Source, "/dev/") {
 			continue
 		}
-		device := fields[0]
-		mountPoint := fields[1]
-		options := fields[3]
-
-		// Only check real block device filesystems (skip virtual: proc, sys, cgroup, etc.)
-		if !strings.HasPrefix(device, "/dev/") {
-			continue
-		}
-
-		isReadOnly := false
-		for _, opt := range strings.Split(options, ",") {
-			if opt == "ro" {
-				isReadOnly = true
-				break
-			}
-		}
-		if !isReadOnly {
+		if !mnt.ReadOnly {
 			continue
 		}
 
 		e.logger.Warn("filesystem is mounted read-only, attempting remount",
-			"mount", mountPoint, "device", device,
+			"mount", mnt.Target, "device", mnt.Source,
 		)
 
-		output, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", mountPoint)
-		if err != nil {
+		if err := fsMgr.RemountRW(ctx, mnt.Target); err != nil {
 			e.logger.Error("failed to remount filesystem as read-write",
-				"mount", mountPoint, "device", device,
-				"error", err, "output", output,
+				"mount", mnt.Target, "device", mnt.Source, "error", err,
 			)
 			e.logger.Error("filesystem may have errors - system likely needs reboot and fsck",
-				"mount", mountPoint,
+				"mount", mnt.Target,
 			)
 			allOk = false
 		} else {
 			e.logger.Info("successfully remounted filesystem as read-write",
-				"mount", mountPoint, "device", device,
+				"mount", mnt.Target, "device", mnt.Source,
 			)
 		}
 	}
 
 	return allOk
-}
-
-// isRootReadOnly checks whether the root filesystem is mounted read-only
-// by parsing /proc/mounts.
-func isRootReadOnly() bool {
-	data, err := os.ReadFile("/proc/mounts")
-	if err != nil {
-		return false
-	}
-	for _, line := range strings.Split(string(data), "\n") {
-		fields := strings.Fields(line)
-		if len(fields) >= 4 && fields[1] == "/" {
-			for _, opt := range strings.Split(fields[3], ",") {
-				if opt == "ro" {
-					return true
-				}
-			}
-		}
-	}
-	return false
 }
 
 // repairPackageManager attempts to fix common broken package manager states.
@@ -130,9 +94,12 @@ func isRootReadOnly() bool {
 func (e *Executor) repairPackageManager(ctx context.Context) {
 	// If root filesystem is read-only (e.g. disk error caused kernel to remount ro),
 	// all package operations will fail. Attempt to remount it read-write first.
-	if isRootReadOnly() {
+	// A probe error is treated as "not read-only" (skip the remount) — the same
+	// fail-safe as the previous /proc/mounts parse, letting the package op surface
+	// the real failure rather than remounting speculatively.
+	if ro, err := fsMgr.IsReadOnly(ctx, "/"); err == nil && ro {
 		slog.Warn("root filesystem is mounted read-only, attempting remount as read-write")
-		if _, err := runSudoCmd(ctx, "mount", "-o", "remount,rw", "/"); err != nil {
+		if err := fsMgr.RemountRW(ctx, "/"); err != nil {
 			slog.Error("failed to remount root filesystem as read-write", "error", err)
 		}
 	}
