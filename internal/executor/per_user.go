@@ -99,24 +99,6 @@ func mustEncManager(r sysexec.Runner) sysenc.Manager {
 	return m
 }
 
-// runAsUserCmd runs `name args...` as the user owning the given
-// session and returns the result as a *pb.CommandOutput, matching
-// runSudoCmd's signature so per-user call sites don't need a
-// different result-handling path.
-//
-// Caller-supplied extraEnv is merged on top of the desktop default
-// env (HOME / USER / LOGNAME / XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS);
-// duplicate keys win on the extraEnv side, matching Go's exec.Cmd
-// last-write-wins semantics. Pass nil for extraEnv when the
-// desktop defaults suffice.
-func runAsUserCmd(ctx context.Context, s desktop.Session, extraEnv []string, name string, args ...string) (*pb.CommandOutput, error) {
-	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{ExtraEnv: extraEnv}, name, args...)
-	if err != nil {
-		return nil, err
-	}
-	return runCapturedCapped(cmd)
-}
-
 // runCapturedCapped runs cmd, capturing stdout/stderr through the SDK's
 // MaxOutputBytes-bounded buffer so a child emitting unbounded output
 // cannot exhaust the root agent's memory (WS6 #14). Truncated streams
@@ -136,24 +118,6 @@ func runCapturedCapped(cmd *exec.Cmd) (*pb.CommandOutput, error) {
 		out.ExitCode = int32(cmd.ProcessState.ExitCode())
 	}
 	return out, runErr
-}
-
-// runAsUserCheck runs `name args...` as the given session's user
-// and reports whether the command exited 0. Mirrors checkCmdSuccess
-// for the per-user execution path — used for "is X installed for
-// this user" idempotency probes where stdout/stderr would be
-// discarded anyway.
-//
-// A failure to construct the command (zero-value session, etc.) is
-// reported as "false" rather than a separate error path because the
-// callers (idempotency checks) treat any inability-to-determine as
-// "not installed, attempt the install."
-func runAsUserCheck(ctx context.Context, s desktop.Session, name string, args ...string) bool {
-	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{}, name, args...)
-	if err != nil {
-		return false
-	}
-	return cmd.Run() == nil
 }
 
 // runAsUserStreaming runs `name args...` as the given session's user
