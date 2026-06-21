@@ -4,7 +4,7 @@ go 1.25.11
 
 require (
 	connectrpc.com/connect v1.18.1
-	github.com/manchtools/power-manage-sdk v0.4.1-0.20260620175815-30c4b75ec46a
+	github.com/manchtools/power-manage-sdk v0.4.1-0.20260621094911-3fd93c0c49db
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1

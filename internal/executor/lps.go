@@ -11,7 +11,6 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
@@ -272,7 +271,7 @@ func shouldRotateLps(ctx context.Context, state *store.LpsUserState, params *pb.
 
 	// Auth-based rotation: check if user authenticated since last rotation
 	if params.GracePeriodHours > 0 {
-		lastAuth, err := getLastAuthTime(ctx, username)
+		lastAuth, err := userMgr.LastLogin(ctx, username)
 		if err == nil && !lastAuth.IsZero() && lastAuth.After(state.LastRotatedAt) {
 			graceDuration := time.Duration(params.GracePeriodHours) * time.Hour
 			if now.Sub(lastAuth) >= graceDuration {
@@ -304,70 +303,4 @@ func killUserSessions(ctx context.Context, username string) {
 	}
 	// Brief wait for processes to fully exit
 	time.Sleep(500 * time.Millisecond)
-}
-
-// getLastAuthTime returns the most recent login time for a user by parsing `last -1 -F <username>`.
-//
-// Audit F025: forces LC_ALL=C and LANG=C so the weekday strings ("Mon",
-// "Tue", ...) and time format below are deterministic. Under a non-English
-// LANG the weekdays are translated and the parser silently fails with
-// "could not parse date", causing the rotation logic to fall back to the
-// caller's default and rotate every tick. RunWithCLocale is the SDK helper
-// that strips environment to a minimal {LC_ALL=C, LANG=C, PATH=...} set.
-func getLastAuthTime(ctx context.Context, username string) (time.Time, error) {
-	// Derive the probe timeout from the ACTION context so a cancelled/expired
-	// action aborts the `last` lookup instead of detaching it onto a fresh
-	// background context.
-	ctx, cancel := context.WithTimeout(ctx, 30*time.Second)
-	defer cancel()
-	r, err := executorRunner.Run(ctx, sysexec.Command{Name: "last", Args: []string{"-1", "-F", username}})
-	if err != nil {
-		return time.Time{}, fmt.Errorf("last command: %w", err)
-	}
-	output := r.Stdout
-
-	lines := strings.Split(strings.TrimSpace(output), "\n")
-	if len(lines) == 0 {
-		return time.Time{}, fmt.Errorf("no output from last command")
-	}
-
-	// Parse the first line of `last -1 -F` output
-	// Format: "username pts/0    192.168.1.1  Mon Feb 10 14:30:00 2025   still logged in"
-	// Or:     "username pts/0    192.168.1.1  Mon Feb 10 14:30:00 2025 - Mon Feb 10 15:00:00 2025  (00:30)"
-	firstLine := lines[0]
-	if strings.Contains(firstLine, "wtmp begins") || strings.Contains(firstLine, "btmp begins") || firstLine == "" {
-		return time.Time{}, fmt.Errorf("no login records for user %s", username)
-	}
-
-	// The timestamp starts after the 3rd field (username, terminal, source)
-	// Find the weekday name which starts the timestamp
-	weekdays := []string{"Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"}
-	for _, wd := range weekdays {
-		idx := strings.Index(firstLine, wd+" ")
-		if idx >= 0 {
-			// Extract the date portion (e.g., "Mon Feb 10 14:30:00 2025")
-			dateStr := firstLine[idx:]
-			// Trim after the year (look for " - " or "   still" or "   gone")
-			for _, sep := range []string{" - ", "   still", "   gone", "  ("} {
-				if sepIdx := strings.Index(dateStr, sep); sepIdx > 0 {
-					dateStr = dateStr[:sepIdx]
-				}
-			}
-			dateStr = strings.TrimSpace(dateStr)
-
-			// Parse with various formats
-			formats := []string{
-				"Mon Jan 2 15:04:05 2006",
-				"Mon Jan  2 15:04:05 2006",
-			}
-			for _, fmt := range formats {
-				if t, err := time.Parse(fmt, dateStr); err == nil {
-					return t, nil
-				}
-			}
-			return time.Time{}, fmt.Errorf("could not parse date: %q", dateStr)
-		}
-	}
-
-	return time.Time{}, fmt.Errorf("could not find timestamp in last output: %q", firstLine)
 }
