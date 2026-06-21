@@ -358,15 +358,16 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 		if homeDir == "" {
 			homeDir = "/home/" + params.Username
 		}
-		if _, err := os.Stat(homeDir); os.IsNotExist(err) {
-			if _, mkErr := runSudoCmd(ctx, "mkdir", "-p", "--", homeDir); mkErr != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
+		if ok, _ := fsMgr.Exists(ctx, homeDir); !ok {
+			// Home is missing (a prior run failed, or the account was created
+			// with -M). Delegate the create+seed+own+mode repair to the SDK's
+			// idempotent EnsureHome (mkdir + /etc/skel seed + recursive ownership
+			// + 0700) instead of orchestrating mkdir / cp -a / chown / chmod by
+			// hand. EnsureHome resolves the home from the user's passwd entry,
+			// which Modify above has already set to the desired path.
+			if hErr := userMgr.EnsureHome(ctx, params.Username, sysuser.EnsureHomeOptions{Group: homeGroupFor(params), Mode: 0o700}); hErr != nil {
+				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", hErr))
 			} else {
-				runSudoCmd(ctx, "cp", "-a", "--", "/etc/skel/.", homeDir)
-				if chownErr := fsMgr.SetOwnershipRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
-					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
-				}
-				runSudoCmd(ctx, "chmod", "0700", "--", homeDir)
 				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
 				changed = true
 			}
