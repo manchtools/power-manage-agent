@@ -104,14 +104,20 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 		}
 	}
 
-	// Detect which package manager we're using and run appropriate repairs
+	// apt/dnf/pacman repair is fully covered by the SDK pkg.Manager.Repair
+	// (stale-lock removal, dpkg --configure / dnf history-redo / pacman-key init,
+	// fix-broken, refresh) — delegate to it. zypper is the exception: the SDK's
+	// zypper Repair does refresh + a fuser-based stale-lock, but the agent also
+	// needs clean --all + verify + rpm-db rebuild and a PID-based zypp.pid probe,
+	// which are not yet in the SDK (filed: SDK gap E2) — keep repairZypper until
+	// E2 lands.
 	switch e.pkgBackend {
-	case pkg.Apt:
-		e.repairApt(ctx)
-	case pkg.Dnf:
-		e.repairDnf(ctx)
-	case pkg.Pacman:
-		e.repairPacman(ctx)
+	case pkg.Apt, pkg.Dnf, pkg.Pacman:
+		if mgr := e.pkgManagerForCtx(ctx); mgr != nil {
+			if _, err := mgr.Repair(ctx); err != nil {
+				slog.Warn("package manager repair failed", "backend", e.pkgBackend, "error", err)
+			}
+		}
 	case pkg.Zypper:
 		e.repairZypper(ctx)
 	}
@@ -126,57 +132,23 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 	}
 }
 
-// removeStaleLockFile removes a package-manager lock file ONLY if
-// no live process currently holds it open. Unconditionally
-// `rm -f`-ing a lock while a real apt/dpkg/pacman/zypper process is
-// mid-flight corrupts the database — the running process keeps its
-// open file descriptor (POSIX semantics) but a NEW process can now
-// grab the lock and start a concurrent transaction.
-//
-// Liveness check uses `fuser <path>`: exit 0 means at least one
-// process has the file open (skip removal), exit 1 means no holder
-// (safe to remove), other exits / fuser-not-installed are treated
-// as "be safe, skip" so we never delete a lock we couldn't prove
-// stale.
-func (e *Executor) removeStaleLockFile(ctx context.Context, path string) {
-	if _, err := os.Stat(path); err != nil {
-		// Already absent — nothing to do.
-		return
-	}
-	// `fuser -s` runs silently and uses exit codes only:
-	//   exit 0 → file is held by a live process (skip removal),
-	//   exit 1 → no holder (safe to unlink),
-	//   any other exit (incl. fuser-missing) → can't prove stale,
-	//                                          be safe and skip.
-	fuserOut, fuserErr := runSudoCmd(ctx, "fuser", "-s", path)
-	if fuserErr == nil {
-		slog.Warn("repair: lock file held by live process; refusing to unlink",
-			"path", path)
-		return
-	}
-	if fuserOut == nil || fuserOut.ExitCode != 1 {
-		slog.Warn("repair: cannot probe lock file holder; skipping unlink",
-			"path", path, "error", fuserErr)
-		return
-	}
-	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
-		slog.Warn("repair: failed to remove confirmed-stale lock file",
-			"path", path, "error", err)
-	}
-}
-
 // removeStaleZyppPidFile removes a zypper PID file ONLY if the
 // recorded PID does not belong to a running process. zypp.pid
 // records zypper's PID; the daemonized process closes the fd
-// after writing, so fuser would report no holder even when zypper
-// is mid-flight — using removeStaleLockFile here would mis-classify
-// a running zypper as stale and yank the lock from under it.
+// after writing, so a fuser-based lock check would report no holder
+// even when zypper is mid-flight and mis-classify a running zypper
+// as stale, yanking the lock from under it.
 //
 // Liveness check uses `kill -0 <pid>`: exit 0 means the process
 // exists (skip removal), nonzero means no such process (safe to
 // remove). A malformed file (no parseable PID) is treated as
 // stale and removed. We never delete a PID file we couldn't prove
 // stale via a successful kill -0 negative.
+//
+// This (and repairZypper) stay agent-side until the SDK's zypper Repair gains
+// clean --all / verify / rpm-db rebuild and a PID-based zypp.pid probe — see the
+// SDK-GAPS-REPORT "E2" extension; apt/dnf/pacman repair already delegate to
+// pkg.Manager.Repair.
 func (e *Executor) removeStaleZyppPidFile(ctx context.Context, path string) {
 	if _, err := os.Stat(path); err != nil {
 		return
@@ -220,102 +192,6 @@ func (e *Executor) removeStaleZyppPidFile(ctx context.Context, path string) {
 	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
 		slog.Warn("repair: failed to remove confirmed-stale zypp PID file",
 			"path", path, "error", err)
-	}
-}
-
-// repairApt fixes common apt/dpkg issues:
-// - Stale lock files from interrupted operations
-// - Interrupted dpkg operations (dpkg --configure -a)
-// - Broken dependencies (apt -f install)
-// - Stale package lists
-func (e *Executor) repairApt(ctx context.Context) {
-	// Remove stale lock files that may be left from interrupted operations.
-	// Each removal is gated on a fuser-based liveness probe so we never
-	// yank a lock from a live apt/dpkg process.
-	for _, lf := range []string{
-		"/var/lib/dpkg/lock-frontend",
-		"/var/lib/dpkg/lock",
-		"/var/lib/apt/lists/lock",
-		"/var/cache/apt/archives/lock",
-	} {
-		e.removeStaleLockFile(ctx, lf)
-	}
-
-	// Fix any interrupted dpkg operations.
-	// Uses env to set DEBIAN_FRONTEND=noninteractive so kernel/grub postinst
-	// scripts don't hang waiting for debconf input. The --force-confdef and
-	// --force-confold options prevent dpkg from prompting about config files.
-	if _, err := runSudoCmd(ctx, "env", "DEBIAN_FRONTEND=noninteractive",
-		"dpkg", "--configure", "-a", "--force-confdef", "--force-confold"); err != nil {
-		slog.Warn("repairApt: dpkg --configure -a failed", "error", err)
-	}
-
-	// Use the SDK Apt Manager which sets DEBIAN_FRONTEND=noninteractive.
-	apt, err := pkg.New(pkg.Apt, executorRunner)
-	if err != nil {
-		slog.Warn("repairApt: build apt manager failed", "error", err)
-		return
-	}
-
-	// Update package lists to get latest dependency info
-	if _, err := apt.Update(ctx); err != nil {
-		slog.Warn("repairApt: apt update failed", "error", err)
-	}
-
-	// Fix broken dependencies and install missing ones (Repair = fix-broken + more)
-	if _, err := apt.Repair(ctx); err != nil {
-		slog.Warn("repairApt: apt repair failed", "error", err)
-	}
-}
-
-// repairDnf fixes common dnf/rpm issues:
-// - Incomplete transactions (dnf-automatic, interrupted updates)
-// - Corrupted rpm database
-// - Duplicate packages
-func (e *Executor) repairDnf(ctx context.Context) {
-	// Complete any interrupted transactions
-	// This is similar to "dnf-automatic" leaving things half-done
-	if _, err := runSudoCmd(ctx, "dnf", "-y", "history", "redo", "last"); err != nil {
-		slog.Warn("repairDnf: history redo failed", "error", err)
-	}
-
-	// Clean up any duplicate packages
-	if _, err := runSudoCmd(ctx, "dnf", "-y", "remove", "--duplicates"); err != nil {
-		slog.Warn("repairDnf: remove duplicates failed", "error", err)
-	}
-
-	// Rebuild rpm database if corrupted
-	// First try to verify, if that fails, rebuild
-	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
-			slog.Warn("repairDnf: rpm --rebuilddb failed", "error", err)
-		}
-	}
-}
-
-// repairPacman fixes common pacman issues:
-// - Stale lock files from interrupted operations
-// - Corrupted package database
-// - Keyring issues
-func (e *Executor) repairPacman(ctx context.Context) {
-	// Remove stale lock file if held by no live process — handles
-	// "unable to lock database" errors from interrupted operations
-	// without yanking the lock from a real concurrent transaction.
-	e.removeStaleLockFile(ctx, "/var/lib/pacman/db.lck")
-
-	// Refresh package database to fix potential corruption
-	// Using -Syy to force refresh even if recently updated
-	if _, err := runSudoCmd(ctx, "pacman", "-Syy", "--noconfirm"); err != nil {
-		slog.Warn("repairPacman: database refresh failed", "error", err)
-	}
-
-	// Reinitialize keyring if there are signature issues
-	// This fixes "signature is unknown trust" errors
-	if _, err := runSudoCmd(ctx, "pacman-key", "--init"); err != nil {
-		slog.Warn("repairPacman: pacman-key init failed", "error", err)
-	}
-	if _, err := runSudoCmd(ctx, "pacman-key", "--populate", "archlinux"); err != nil {
-		slog.Warn("repairPacman: pacman-key populate failed", "error", err)
 	}
 }
 
