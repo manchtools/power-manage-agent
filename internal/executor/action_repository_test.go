@@ -44,7 +44,13 @@ func TestExecuteRepository_RejectsBeforePrivilegedRemount(t *testing.T) {
 // pull a signing key over an unauthenticated transport.
 func TestDownloadAptKey_RejectsNonHTTPS(t *testing.T) {
 	e := &Executor{}
-	for _, u := range []string{"http://m/key.asc", "ftp://m/key", "file:///etc/x", "//m/key", "HTTPS://m/k"} {
+	// Genuinely non-https URLs must be rejected before any network round-trip.
+	// "HTTPS://m/k" (uppercase) is intentionally NOT here: a URL scheme is
+	// case-insensitive (RFC 3986), so it is valid https — the old strict
+	// HasPrefix("https://") falsely rejected it; sdk.ValidateHTTPSURL (the single
+	// https-trust boundary, used here now) correctly accepts it. "https:m/k" IS
+	// rejected: it is an opaque URL with no host.
+	for _, u := range []string{"http://m/key.asc", "ftp://m/key", "file:///etc/x", "//m/key", "https:m/k"} {
 		if _, err := e.downloadAptKey(context.Background(), u); err == nil {
 			t.Errorf("non-https GPG key URL accepted: %q", u)
 		}

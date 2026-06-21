@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 )
@@ -148,7 +149,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 // plane mandates both (proto + server validation); this is the
 // agent-side defense in depth at the executor boundary.
 func requireVerifiedArtifact(rawURL, checksum string) error {
-	if err := validateHTTPS(rawURL); err != nil {
+	if err := sdk.ValidateHTTPSURL(rawURL); err != nil {
 		return fmt.Errorf("artifact rejected: %w", err)
 	}
 	checksum = strings.TrimSpace(checksum)

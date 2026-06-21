@@ -17,24 +17,6 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
-func TestValidateHTTPS(t *testing.T) {
-	tests := []struct {
-		url     string
-		wantErr bool
-	}{
-		{"https://example.com/binary", false},
-		{"http://example.com/binary", true},
-		{"ftp://example.com/binary", true},
-		{"", true},
-	}
-	for _, tt := range tests {
-		err := validateHTTPS(tt.url)
-		if (err != nil) != tt.wantErr {
-			t.Errorf("validateHTTPS(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
-		}
-	}
-}
-
 func TestGetArchEntry(t *testing.T) {
 	amd := &pb.AgentUpdateArch{BinaryUrl: "https://example.com/amd64"}
 	arm := &pb.AgentUpdateArch{BinaryUrl: "https://example.com/arm64"}

@@ -17,6 +17,7 @@ import (
 	"strings"
 	"time"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
@@ -105,7 +106,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 
 	// Step 3: Validate the binary URL is HTTPS (fail-closed before any
 	// network).
-	if err := validateHTTPS(arch.BinaryUrl); err != nil {
+	if err := sdk.ValidateHTTPSURL(arch.BinaryUrl); err != nil {
 		return nil, false, fmt.Errorf("binary URL validation: %w", err)
 	}
 
@@ -126,7 +127,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		if arch.ChecksumUrl == "" {
 			return nil, false, fmt.Errorf("agent update rejected: action sets neither expected_sha256 nor checksum_url")
 		}
-		if err := validateHTTPS(arch.ChecksumUrl); err != nil {
+		if err := sdk.ValidateHTTPSURL(arch.ChecksumUrl); err != nil {
 			return nil, false, fmt.Errorf("checksum URL validation: %w", err)
 		}
 		fileChecksum, err := downloadAndExtractChecksum(ctx, e.httpClient, arch.ChecksumUrl, extractFilename(arch.BinaryUrl))
@@ -400,18 +401,6 @@ func getArchEntry(params *pb.AgentUpdateParams) *pb.AgentUpdateArch {
 	default:
 		return nil
 	}
-}
-
-// validateHTTPS checks that a URL uses the HTTPS scheme.
-func validateHTTPS(rawURL string) error {
-	u, err := url.Parse(rawURL)
-	if err != nil {
-		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
-	}
-	if u.Scheme != "https" {
-		return fmt.Errorf("URL must use HTTPS, got %q", u.Scheme)
-	}
-	return nil
 }
 
 // downloadToFile downloads a URL to a file and returns the SHA256 hex checksum.

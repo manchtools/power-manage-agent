@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	"github.com/manchtools/power-manage-sdk/sys/repo"
@@ -169,8 +169,8 @@ func (e *Executor) repositoryConfig(ctx context.Context, params *pb.RepositoryPa
 // the network policy (proxy, TLS pinning, rate) is the caller's concern. The
 // scheme is restricted to https (WS7) and the body is bounded to 10 MiB.
 func (e *Executor) downloadAptKey(ctx context.Context, keyURL string) ([]byte, error) {
-	if !strings.HasPrefix(keyURL, "https://") {
-		return nil, fmt.Errorf("GPG key URL must use https:// scheme, got: %s", keyURL)
+	if err := sdk.ValidateHTTPSURL(keyURL); err != nil {
+		return nil, fmt.Errorf("GPG key URL rejected: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", keyURL, nil)
 	if err != nil {

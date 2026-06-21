@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
@@ -54,12 +55,13 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	// https-only — the previous code also allowed http://); derive the
 	// filename from a path segment that has no slashes or other directory
 	// components.
-	parsedURL, err := url.Parse(strings.TrimSpace(params.Url))
-	if err != nil ||
-		parsedURL.Scheme != "https" ||
-		parsedURL.Opaque != "" ||
-		parsedURL.Host == "" {
-		return nil, false, fmt.Errorf("invalid appimage URL (must be https): %q", params.Url)
+	trimmedURL := strings.TrimSpace(params.Url)
+	if err := sdk.ValidateHTTPSURL(trimmedURL); err != nil {
+		return nil, false, fmt.Errorf("invalid appimage URL: %w", err)
+	}
+	parsedURL, err := url.Parse(trimmedURL)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid appimage URL %q: %w", params.Url, err)
 	}
 	filename := filepath.Base(parsedURL.Path)
 	// Reject ".." too — filepath.Base of e.g. https://x.example/.. returns

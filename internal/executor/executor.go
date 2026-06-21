@@ -20,6 +20,7 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
@@ -844,7 +845,7 @@ func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum
 	// makes checksum_sha256 required and the server validates it), so a
 	// CA-signed action always carries one; downloadFile verifies whatever
 	// checksum it is given.
-	if err := validateHTTPS(url); err != nil {
+	if err := sdk.ValidateHTTPSURL(url); err != nil {
 		return fmt.Errorf("download rejected: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
