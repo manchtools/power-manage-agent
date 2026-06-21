@@ -76,43 +76,6 @@ func homeGroupFor(params *pb.UserParams) string {
 	return params.Username
 }
 
-// resolveOwnership turns the action's user/group into the numeric
-// uid/gid an fd-based fchown needs (sysfs.OpenRealDir / FchownNoFollow
-// operate on a descriptor, not a name). It is the numeric counterpart of
-// the "username:homeGroupFor()" string the path-based chown previously
-// took, and mirrors homeGroupFor's preference order exactly so .ssh
-// ownership stays identical to the home-directory chown:
-//   - numeric GID (or numeric PrimaryGroup) is used as a literal GID,
-//     matching how chown treats an all-numeric group token (no name
-//     lookup, so it works even if no group with that name exists);
-//   - otherwise the group name is resolved via the group database;
-//   - the default (no Gid, no PrimaryGroup) resolves the matching group
-//     named after the user, exactly as homeGroupFor returns.
-func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
-	u, err := user.Lookup(params.Username)
-	if err != nil {
-		return 0, 0, fmt.Errorf("look up user %s: %w", params.Username, err)
-	}
-	uid, err = strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse uid %q for %s: %w", u.Uid, params.Username, err)
-	}
-
-	group := homeGroupFor(params)
-	if n, convErr := strconv.Atoi(group); convErr == nil {
-		return uid, n, nil
-	}
-	g, err := user.LookupGroup(group)
-	if err != nil {
-		return 0, 0, fmt.Errorf("look up group %s: %w", group, err)
-	}
-	gid, err = strconv.Atoi(g.Gid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse gid %q for group %s: %w", g.Gid, group, err)
-	}
-	return uid, gid, nil
-}
-
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists, err := userExists(ctx, params.Username)
@@ -479,54 +442,59 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	}, true, nil
 }
 
-// accountsServicePath returns the AccountsService override file path for a user.
+// accountsServiceDir is the AccountsService per-user override directory. The
+// agent keeps the path + the SystemAccount content string ONLY for the
+// idempotency/"was it ours" pre-check below; the actual write/remove is
+// delegated to the SDK (user.SetHiddenOnLoginScreen), which owns the file format.
 const accountsServiceDir = "/var/lib/AccountsService/users"
 
-// setUserHidden writes or removes the AccountsService override to hide/show a user
-// on graphical login screens. Returns whether a change was made. Skips silently if
-// AccountsService is not installed (headless systems).
+// accountsServiceHiddenContent is the SDK-written AccountsService override body;
+// the agent compares against it to decide whether a change is needed and whether
+// an existing override is one it (the SDK) wrote.
+const accountsServiceHiddenContent = "[User]\nSystemAccount=true\n"
+
+// setUserHidden shows or hides a user on graphical login screens, delegating the
+// actual AccountsService write/remove to the SDK's user.SetHiddenOnLoginScreen.
+// The agent keeps three behaviours on top of the SDK call: skip SILENTLY on a
+// headless box (AccountsService not installed) rather than surfacing the SDK's
+// "not installed" error; idempotency (no change when already in the desired
+// state); and, on unhide, only remove an override that matches what the SDK
+// writes (don't delete a foreign override). Returns whether a change was made.
 func setUserHidden(ctx context.Context, username string, hidden bool, output *strings.Builder) bool {
-	filePath := accountsServiceDir + "/" + username
-
 	if _, err := os.Stat(accountsServiceDir); os.IsNotExist(err) {
-		return false // AccountsService not installed, skip
+		return false // AccountsService not installed (headless), skip silently
 	}
 
-	desiredContent := "[User]\nSystemAccount=true\n"
-
-	if hidden {
-		// Check idempotency
-		existing, _ := readFileWithSudo(ctx, filePath)
-		if existing == desiredContent {
-			return false
-		}
-		if err := atomicWriteFile(ctx, filePath, desiredContent, "0644", "root", "root"); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to hide user from login screen: %v\n", err))
-			return false
-		}
-		output.WriteString("hidden from login screen (AccountsService)\n")
-		return true
-	}
-
-	// hidden=false: remove the file if it exists and was set by us
-	existing, err := readFileWithSudo(ctx, filePath)
-	if err != nil || existing != desiredContent {
-		return false // File doesn't exist or wasn't ours
-	}
-	if err := removeFileStrict(ctx, filePath); err != nil {
-		output.WriteString(fmt.Sprintf("warning: failed to unhide user from login screen: %v\n", err))
+	// Idempotency + was-ours: a file matching accountsServiceHiddenContent means
+	// "hidden, written by us". (existing==content)==hidden ⇒ already converged;
+	// and on unhide a non-matching/foreign file reads as "not hidden", so we skip
+	// rather than remove it.
+	existing, _ := readFileWithSudo(ctx, accountsServiceDir+"/"+username)
+	if (existing == accountsServiceHiddenContent) == hidden {
 		return false
 	}
-	output.WriteString("visible on login screen (AccountsService removed)\n")
+
+	if err := userMgr.SetHiddenOnLoginScreen(ctx, username, hidden); err != nil {
+		verb := "hide"
+		if !hidden {
+			verb = "unhide"
+		}
+		output.WriteString(fmt.Sprintf("warning: failed to %s user on login screen: %v\n", verb, err))
+		return false
+	}
+	if hidden {
+		output.WriteString("hidden from login screen (AccountsService)\n")
+	} else {
+		output.WriteString("visible on login screen (AccountsService removed)\n")
+	}
 	return true
 }
 
-// removeAccountsServiceFile removes the AccountsService override for a user during user deletion.
+// removeAccountsServiceFile removes the AccountsService override for a user during
+// user deletion, via the SDK (SetHiddenOnLoginScreen(false) is an rm -f that
+// no-ops when the override is absent).
 func removeAccountsServiceFile(ctx context.Context, username string) {
-	filePath := accountsServiceDir + "/" + username
-	if fileExistsWithSudo(ctx, filePath) {
-		removeFileStrict(ctx, filePath)
-	}
+	_ = userMgr.SetHiddenOnLoginScreen(ctx, username, false)
 }
 
 // setupSSHKeys configures SSH authorized keys for a user.
@@ -605,7 +573,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	}
 	defer sshFd.Close()
 
-	uid, gid, err := resolveOwnership(params)
+	uid, gid, err := sysfs.ResolveOwnership(params.Username, homeGroupFor(params))
 	if err != nil {
 		return false, fmt.Errorf("resolve .ssh ownership: %w", err)
 	}
