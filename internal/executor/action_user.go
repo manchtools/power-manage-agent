@@ -577,8 +577,12 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, nil
 	}
 
-	// Create .ssh directory
-	if _, err := runSudoCmd(ctx, "mkdir", "-p", "--", sshDir); err != nil {
+	// Create .ssh directory via the SDK fs manager (privilege-keyed, like the
+	// fsMgr.WriteFile below) instead of a raw `sudo mkdir`. No Mode is set on
+	// purpose: MkdirOptions.Mode chmods by PATH, which would follow a
+	// user-planted ~/.ssh symlink — the very class the OpenRealDir + fd-chmod
+	// below close. The 0700 mode is applied through the O_NOFOLLOW FD.
+	if err := fsMgr.Mkdir(ctx, sshDir, sysfs.MkdirOptions{Recursive: true}); err != nil {
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
