@@ -56,11 +56,15 @@ func newTestExecutor() *Executor {
 	// which is only set when a runner is supplied.
 	e := NewExecutor(nil, testRunner())
 	// Downloads are https-only (WS7 #2). The test file servers
-	// (startFileServer) are TLS with self-signed certs, so trust any cert
-	// here — this is integration-test-only code.
-	e.httpClient = &http.Client{
+	// (startFileServer) are TLS with self-signed certs, so trust any cert here —
+	// this is integration-test-only code. e.httpClient covers the agent's own
+	// fetches (checksum URL, GPG key); remoteHTTPClient covers the artifact
+	// downloads that now route through the SDK remote source (deb/rpm/appimage).
+	insecure := &http.Client{
 		Transport: &http.Transport{TLSClientConfig: &tls.Config{InsecureSkipVerify: true}},
 	}
+	e.httpClient = insecure
+	remoteHTTPClient = insecure
 	tmpDir, err := os.MkdirTemp("", "pm-executor-test-*")
 	if err != nil {
 		panic("failed to create temp dir: " + err.Error())
