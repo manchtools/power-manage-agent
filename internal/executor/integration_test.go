@@ -2659,8 +2659,11 @@ func TestIntegration_EdgeCase_DownloadChecksumMismatch(t *testing.T) {
 	}}
 	result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 	assertFailed(t, result)
-	if !strings.Contains(result.Error, "checksum") {
-		t.Errorf("expected checksum error, got: %s", result.Error)
+	// remote.Fetch reports a wrong checksum as "integrity check failed: sha256
+	// mismatch …"; assert the mismatch is surfaced (the agent download now
+	// delegates to the SDK remote source, which owns the verify).
+	if !strings.Contains(result.Error, "mismatch") {
+		t.Errorf("expected an integrity/sha256-mismatch error, got: %s", result.Error)
 	}
 
 	// Verify no partial file left behind
