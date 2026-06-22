@@ -64,7 +64,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
 
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
@@ -112,7 +112,7 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); err != nil {
 			// Unlike .deb, an .rpm filename has no reliable name field
 			// (the name itself can contain hyphens), so a dead URL leaves
 			// us with no way to identify the installed package to remove.

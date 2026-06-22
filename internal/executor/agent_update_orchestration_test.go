@@ -71,7 +71,12 @@ func newUpdateHarness(t *testing.T, runningVersion string, serveBody, sumsBody [
 
 	h := &updateHarness{binaryPath: binaryPath, oldBytes: oldBytes, srv: srv, shutdownCh: make(chan struct{})}
 	e := &Executor{logger: slog.Default(), now: time.Now}
-	e.httpClient = srv.Client()
+	e.httpClient = srv.Client() // checksum_url fetch still uses e.httpClient
+	// The binary download routes through fetchArtifact -> remote.Fetch, which uses
+	// the package remoteHTTPClient seam; point it at the test TLS server too.
+	prevRemoteClient := remoteHTTPClient
+	remoteHTTPClient = srv.Client()
+	t.Cleanup(func() { remoteHTTPClient = prevRemoteClient })
 	e.SetUpdateConfig(&AgentUpdateConfig{
 		Version:    runningVersion,
 		DataDir:    t.TempDir(),

@@ -3,15 +3,11 @@ package executor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -19,7 +15,6 @@ import (
 	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
@@ -681,106 +676,6 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 
 	e.logger.Debug("verification passed, remediation successful")
 	return execOutput, verifyOutput, true, nil
-}
-
-// maxDownloadSize is the maximum allowed download size (2 GiB). It is a
-// var, not a const, only so tests can shrink the cap to exercise the
-// oversize-rejection path without streaming 2 GiB; production never
-// reassigns it.
-var maxDownloadSize int64 = 2 << 30
-
-func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
-	// WS7 #2: https-only, fail-closed before any network. Rejects http,
-	// file, ftp, and scheme-relative (//host/x) URLs. deb/rpm/appimage all
-	// route through here, so this is the single download chokepoint. The
-	// mandatory checksum is enforced at the action boundary (the proto
-	// makes checksum_sha256 required and the server validates it), so a
-	// CA-signed action always carries one; downloadFile verifies whatever
-	// checksum it is given.
-	if err := sdk.ValidateHTTPSURL(url); err != nil {
-		return fmt.Errorf("download rejected: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	// Reject downloads that advertise a size larger than the limit.
-	if resp.ContentLength > maxDownloadSize {
-		return fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
-	}
-
-	// Wrap the body with a size limit to protect against servers that
-	// lie about Content-Length or use chunked encoding.
-	body := io.LimitReader(resp.Body, maxDownloadSize+1)
-
-	// Download into a temp file in the destination directory, then
-	// atomically rename over dest only on full success. A failed,
-	// partial, or checksum-mismatched download must NOT destroy an
-	// existing file at dest — e.g. a working AppImage being upgraded
-	// (os.Create truncated it in place before, leaving the user with
-	// nothing on any error).
-	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".download-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	removeTmp := func() { _ = os.Remove(tmpPath) }
-
-	hasher := sha256.New()
-	dst := io.Writer(tmp)
-	if expectedChecksum != "" {
-		dst = io.MultiWriter(tmp, hasher)
-	}
-	written, err := io.Copy(dst, body)
-	if err != nil {
-		_ = tmp.Close()
-		removeTmp()
-		return err
-	}
-	if written > maxDownloadSize {
-		_ = tmp.Close()
-		removeTmp()
-		return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
-	}
-	if expectedChecksum != "" {
-		actual := hex.EncodeToString(hasher.Sum(nil))
-		// EqualFold + TrimSpace: actual is lowercase hex, but operators
-		// commonly paste uppercase / whitespace-padded hashes. A
-		// case-sensitive compare here rejected an uppercase-but-correct
-		// checksum even though the idempotency skip-check already
-		// normalizes (see action_appimage.go), so installs failed on a
-		// correct file.
-		if !strings.EqualFold(actual, strings.TrimSpace(expectedChecksum)) {
-			_ = tmp.Close()
-			removeTmp()
-			return fmt.Errorf("checksum mismatch: expected %s, got %s", strings.TrimSpace(expectedChecksum), actual)
-		}
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		removeTmp()
-		return fmt.Errorf("fsync downloaded file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		removeTmp()
-		return fmt.Errorf("close downloaded file: %w", err)
-	}
-	if err := os.Rename(tmpPath, dest); err != nil {
-		removeTmp()
-		return fmt.Errorf("install downloaded file to %s: %w", dest, err)
-	}
-	return nil
 }
 
 // IsInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).

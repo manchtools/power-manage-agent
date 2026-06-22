@@ -3,11 +3,9 @@ package executor
 import (
 	"bufio"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
-	"io"
 	"net/http"
 	"net/url"
 	"os"
@@ -21,6 +19,7 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
+	"github.com/manchtools/power-manage-sdk/sys/remote"
 )
 
 // AgentUpdateConfig holds configuration for the agent self-update executor.
@@ -149,24 +148,18 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("create temp file: %w", err)
 	}
 	tmpPath := tmpFile.Name()
-	defer func() {
-		tmpFile.Close()
-		os.Remove(tmpPath) // cleanup on any failure path
-	}()
+	_ = tmpFile.Close() // remote.Fetch writes via its own temp + atomic rename onto tmpPath
+	defer os.Remove(tmpPath)
 
-	actualChecksum, err := downloadToFile(ctx, e.httpClient, arch.BinaryUrl, tmpFile)
-	if err != nil {
+	// Download the binary, verify it against the (operator-or-CA-pinned)
+	// expected sha256, and place it at mode 0755 (executable for the version
+	// self-test below) — all in one atomic step via the SDK remote source. An
+	// integrity failure is the binary-doesn't-match-the-pin case.
+	if err := fetchArtifact(ctx, arch.BinaryUrl, tmpPath, expectedChecksum, "0755"); err != nil {
+		if errors.Is(err, remote.ErrIntegrity) {
+			return nil, false, fmt.Errorf("binary does not match the expected_sha256 pin: %w", err)
+		}
 		return nil, false, fmt.Errorf("download binary: %w", err)
-	}
-	tmpFile.Close()
-
-	if !strings.EqualFold(actualChecksum, expectedChecksum) {
-		return nil, false, fmt.Errorf("checksum mismatch: binary does not match CA-signed expected_sha256 (expected %s, got %s)", expectedChecksum, actualChecksum)
-	}
-
-	// Make executable
-	if err := os.Chmod(tmpPath, 0755); err != nil {
-		return nil, false, fmt.Errorf("chmod: %w", err)
 	}
 
 	// Step 6: Run version command on downloaded binary
@@ -401,44 +394,6 @@ func getArchEntry(params *pb.AgentUpdateParams) *pb.AgentUpdateArch {
 	default:
 		return nil
 	}
-}
-
-// downloadToFile downloads a URL to a file and returns the SHA256 hex checksum.
-// Downloads are capped at maxDownloadSize (2 GiB).
-func downloadToFile(ctx context.Context, client *http.Client, downloadURL string, dst *os.File) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, downloadURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-
-	resp, err := client.Do(req)
-	if err != nil {
-		return "", fmt.Errorf("download: %w", err)
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
-
-	if resp.ContentLength > maxDownloadSize {
-		return "", fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
-	}
-
-	hasher := sha256.New()
-	w := io.MultiWriter(dst, hasher)
-
-	// Cap the download at maxDownloadSize + 1 to detect overflows.
-	reader := io.LimitReader(resp.Body, maxDownloadSize+1)
-	written, err := io.Copy(w, reader)
-	if err != nil {
-		return "", fmt.Errorf("write: %w", err)
-	}
-	if written > maxDownloadSize {
-		return "", fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
-	}
-
-	return hex.EncodeToString(hasher.Sum(nil)), nil
 }
 
 // getBinaryVersion runs the binary with "version" subcommand and returns the trimmed output.

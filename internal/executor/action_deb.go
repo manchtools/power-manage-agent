@@ -80,7 +80,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
 
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
@@ -162,7 +162,7 @@ func (e *Executor) debAbsentPackageName(ctx context.Context, mgr pkg.Manager, pa
 	defer os.Remove(tmpFile.Name())
 	_ = tmpFile.Close()
 
-	if dlErr := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); dlErr == nil {
+	if dlErr := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); dlErr == nil {
 		// Download (and checksum) succeeded, so the file is exactly what
 		// the action specified. The canonical name is authoritative; a
 		// parse failure here is a real corruption/format error, NOT a
