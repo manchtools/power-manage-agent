@@ -6,7 +6,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"os"
 	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
@@ -104,22 +103,17 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 		}
 	}
 
-	// apt/dnf/pacman repair is fully covered by the SDK pkg.Manager.Repair
-	// (stale-lock removal, dpkg --configure / dnf history-redo / pacman-key init,
-	// fix-broken, refresh) — delegate to it. zypper is the exception: the SDK's
-	// zypper Repair does refresh + a fuser-based stale-lock, but the agent also
-	// needs clean --all + verify + rpm-db rebuild and a PID-based zypp.pid probe,
-	// which are not yet in the SDK (filed: SDK gap E2) — keep repairZypper until
-	// E2 lands.
-	switch e.pkgBackend {
-	case pkg.Apt, pkg.Dnf, pkg.Pacman:
-		if mgr := e.pkgManagerForCtx(ctx); mgr != nil {
-			if _, err := mgr.Repair(ctx); err != nil {
-				slog.Warn("package manager repair failed", "backend", e.pkgBackend, "error", err)
-			}
+	// All four backends' repair is owned by the SDK pkg.Manager.Repair:
+	//   apt    — stale-lock removal + dpkg --configure + fix-broken + update
+	//   dnf    — history redo + remove --duplicates + rpmdb verify/rebuild
+	//   pacman — stale-lock + pacman-key init/populate + -Syy
+	//   zypper — PID-probe stale-lock + clean --all/refresh/verify + rpmdb rebuild
+	//            (SDK #250)
+	// The agent no longer hand-rolls any per-distro repair.
+	if mgr := e.pkgManagerForCtx(ctx); mgr != nil {
+		if _, err := mgr.Repair(ctx); err != nil {
+			slog.Warn("package manager repair failed", "backend", e.pkgBackend, "error", err)
 		}
-	case pkg.Zypper:
-		e.repairZypper(ctx)
 	}
 
 	// Flatpak can coexist with any traditional package manager, so check
@@ -128,104 +122,6 @@ func (e *Executor) repairPackageManager(ctx context.Context) {
 		if b == pkg.Flatpak {
 			e.repairFlatpak(ctx)
 			break
-		}
-	}
-}
-
-// removeStaleZyppPidFile removes a zypper PID file ONLY if the
-// recorded PID does not belong to a running process. zypp.pid
-// records zypper's PID; the daemonized process closes the fd
-// after writing, so a fuser-based lock check would report no holder
-// even when zypper is mid-flight and mis-classify a running zypper
-// as stale, yanking the lock from under it.
-//
-// Liveness check uses `kill -0 <pid>`: exit 0 means the process
-// exists (skip removal), nonzero means no such process (safe to
-// remove). A malformed file (no parseable PID) is treated as
-// stale and removed. We never delete a PID file we couldn't prove
-// stale via a successful kill -0 negative.
-//
-// This (and repairZypper) stay agent-side until the SDK's zypper Repair gains
-// clean --all / verify / rpm-db rebuild and a PID-based zypp.pid probe — see the
-// SDK-GAPS-REPORT "E2" extension; apt/dnf/pacman repair already delegate to
-// pkg.Manager.Repair.
-func (e *Executor) removeStaleZyppPidFile(ctx context.Context, path string) {
-	if _, err := os.Stat(path); err != nil {
-		return
-	}
-	out, readErr := runSudoCmd(ctx, "cat", "--", path)
-	if readErr != nil || out == nil {
-		slog.Warn("repair: cannot read zypp PID file; skipping unlink",
-			"path", path, "error", readErr)
-		return
-	}
-	pid := strings.TrimSpace(out.Stdout)
-	if pid == "" {
-		// Empty PID file — no live holder to harm; remove it.
-		if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
-			slog.Warn("repair: failed to remove empty zypp PID file",
-				"path", path, "error", err)
-		}
-		return
-	}
-	// Validate PID is purely numeric before splicing into kill.
-	for _, r := range pid {
-		if r < '0' || r > '9' {
-			slog.Warn("repair: zypp PID file contains non-numeric content; skipping unlink",
-				"path", path, "content", pid)
-			return
-		}
-	}
-	killOut, killErr := runSudoCmd(ctx, "kill", "-0", pid)
-	if killErr == nil {
-		slog.Warn("repair: zypper process is still running; refusing to unlink PID file",
-			"path", path, "pid", pid)
-		return
-	}
-	if killOut == nil || killOut.ExitCode != 1 {
-		// kill -0 returns 1 for "no such process" and 2 for permission/usage.
-		// Anything other than 1 means we couldn't prove the process is gone.
-		slog.Warn("repair: cannot probe zypp PID liveness; skipping unlink",
-			"path", path, "pid", pid, "error", killErr)
-		return
-	}
-	if _, err := runSudoCmd(ctx, "rm", "-f", "--", path); err != nil {
-		slog.Warn("repair: failed to remove confirmed-stale zypp PID file",
-			"path", path, "error", err)
-	}
-}
-
-// repairZypper fixes common zypper/rpm issues:
-// - Stale lock files
-// - Corrupted rpm database
-// - Repository metadata issues
-// - Broken dependencies
-func (e *Executor) repairZypper(ctx context.Context) {
-	// /var/run/zypp.pid is a PID file, not a flock-style lockfile.
-	// `fuser` would report no holder even when zypper is running
-	// because the daemonized zypper writes the PID and closes the
-	// file descriptor. Use a PID-based liveness probe instead.
-	e.removeStaleZyppPidFile(ctx, "/var/run/zypp.pid")
-
-	// Clean repository metadata cache to fix stale metadata issues
-	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "clean", "--all"); err != nil {
-		slog.Warn("repairZypper: clean failed", "error", err)
-	}
-
-	// Refresh repositories to get fresh metadata
-	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "refresh"); err != nil {
-		slog.Warn("repairZypper: refresh failed", "error", err)
-	}
-
-	// Verify and fix dependency issues
-	if _, err := runSudoCmd(ctx, "zypper", "--non-interactive", "verify", "--recommends"); err != nil {
-		slog.Warn("repairZypper: verify failed", "error", err)
-	}
-
-	// Rebuild rpm database if corrupted
-	if output, err := runSudoCmd(ctx, "rpm", "--verifydb"); err != nil || output.ExitCode != 0 {
-		if _, err := runSudoCmd(ctx, "rpm", "--rebuilddb"); err != nil {
-			slog.Warn("repairZypper: rpm --rebuilddb failed", "error", err)
 		}
 	}
 }
