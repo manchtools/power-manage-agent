@@ -4,7 +4,6 @@ package executor
 import (
 	"context"
 	"net/http"
-	"strings"
 
 	"github.com/manchtools/power-manage-sdk/sys/remote"
 )
@@ -17,21 +16,19 @@ import (
 var remoteHTTPClient *http.Client
 
 // fetchArtifact downloads url to dest through the SDK's remote.HTTP source, which
-// validates the scheme, enforces the size cap, optionally verifies the sha256,
-// fsyncs, and atomically renames onto dest (applying mode when set). It replaces
-// the agent's former hand-rolled downloadFile/downloadToFile, which reimplemented
-// exactly this. checksum "" skips verification; mode "" leaves the temp's default
-// mode. Callers that need https-only must still gate the URL up front
-// (requireVerifiedArtifact) — remote accepts http too.
+// validates the scheme, normalizes (trims) the URL, enforces the size cap,
+// optionally verifies the sha256, fsyncs, and atomically renames onto dest
+// (applying mode when set). It replaces the agent's former hand-rolled
+// downloadFile/downloadToFile, which reimplemented exactly this. checksum ""
+// skips verification; mode "" leaves the temp's default mode. Callers that need
+// https-only must still gate the URL up front (requireVerifiedArtifact) — remote
+// accepts http too.
 func fetchArtifact(ctx context.Context, url, dest, checksum, mode string) error {
-	// Trim the URL before use: the agent's URL validators (sdk.ValidateHTTPSURL
-	// via requireVerifiedArtifact) trim internally before checking scheme/host,
-	// but remote.NewHTTP's parser does NOT trim, so a whitespace-padded URL would
-	// pass validation and then fail the fetch as "not absolute". Trimming here
-	// keeps the fetched URL identical to the form validation blessed, for every
-	// fetchArtifact call site (appimage/deb/rpm/agent_update).
+	// No pre-trim: remote.NewHTTP trims the URL internally, matching
+	// sdk.ValidateHTTPSURL (used by requireVerifiedArtifact), so a whitespace-padded
+	// URL that passes validation still fetches rather than failing as "not absolute".
 	src, err := remote.NewHTTP(remote.HTTPConfig{
-		URL:            strings.TrimSpace(url),
+		URL:            url,
 		ChecksumSHA256: checksum,
 		Mode:           mode,
 		Client:         remoteHTTPClient,

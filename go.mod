@@ -4,7 +4,7 @@ go 1.25.11
 
 require (
 	connectrpc.com/connect v1.18.1
-	github.com/manchtools/power-manage-sdk v0.4.1-0.20260621210059-119fbffd4160
+	github.com/manchtools/power-manage-sdk v0.5.0
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
@@ -33,6 +33,7 @@ require (
 
 require (
 	dario.cat/mergo v1.0.0 // indirect
+	github.com/Microsoft/go-winio v0.6.2 // indirect
 	github.com/ProtonMail/go-crypto v1.1.6 // indirect
 	github.com/cloudflare/circl v1.6.3 // indirect
 	github.com/creack/pty v1.1.24 // indirect

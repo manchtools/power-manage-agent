@@ -9,16 +9,14 @@ import (
 	"testing"
 )
 
-// TestFetchArtifact_TrimsWhitespacePaddedURL pins the divergence fix between the
-// agent's URL validation and its fetch. sdk.ValidateHTTPSURL (used by
-// requireVerifiedArtifact for appimage/deb/rpm) trims the URL internally before
-// checking scheme/host, so a whitespace-padded-but-otherwise-valid URL PASSES
-// validation. remote.NewHTTP's parser does NOT trim, so without fetchArtifact
-// trimming the padded URL reaches the fetch and is rejected ("not absolute" /
-// "control characters") — an artifact that validated cleanly then fails to
-// download. fetchArtifact must trim so the fetched URL matches the form
-// validation blessed.
-func TestFetchArtifact_TrimsWhitespacePaddedURL(t *testing.T) {
+// TestFetchArtifact_AcceptsWhitespacePaddedURL pins that a URL which passes the
+// agent's validation also fetches. sdk.ValidateHTTPSURL (used by
+// requireVerifiedArtifact for appimage/deb/rpm) trims the URL before checking
+// scheme/host, so a whitespace-padded-but-otherwise-valid URL PASSES validation;
+// remote.NewHTTP likewise trims its URL internally, so the padded URL fetches
+// rather than being rejected as "not absolute". This guards that the two trim
+// behaviours stay aligned end to end — fetchArtifact no longer pre-trims.
+func TestFetchArtifact_AcceptsWhitespacePaddedURL(t *testing.T) {
 	const body = "artifact-bytes"
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/app" {
