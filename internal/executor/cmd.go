@@ -66,9 +66,3 @@ var runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.Com
 	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Escalate: true})
 	return toOutput(&r), asCmdError(name, r, err)
 }
-
-// checkCmdSuccess runs an unprivileged command and returns true if it succeeds (exit 0).
-func checkCmdSuccess(name string, args ...string) bool {
-	r, err := executorRunner.Run(context.Background(), sysexec.Command{Name: name, Args: args})
-	return err == nil && r.ExitCode == 0
-}
