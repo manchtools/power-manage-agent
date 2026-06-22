@@ -82,6 +82,13 @@ func homeGroupFor(params *pb.UserParams) string {
 // orchestrating mkdir / cp -a / chown / chmod by hand. It returns true only
 // when a missing home was actually created.
 //
+// Path safety: params.HomeDir is already validated at the ExecuteUserAction
+// entry point (filepath.IsAbs + isProtectedPath, which filepath.Clean's the
+// path before rejecting protected/traversal-escaping targets) before this runs.
+// EnsureHome resolves the directory to create from the user's passwd entry —
+// NOT from this path — so the path here only selects which location the
+// read-only Exists probe checks; it is never a write target.
+//
 // The presence probe fails CLOSED: if fsMgr.Exists cannot determine whether the
 // home exists (an I/O / permission error rather than a clean "no such file"),
 // the state is indeterminate, so we surface a warning and skip EnsureHome rather
