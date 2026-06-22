@@ -113,17 +113,32 @@ func flipLastByte(b []byte) []byte {
 	return out
 }
 
-// fakeJournalctl swaps runCommand for the duration of the test, recording the
-// args journalctl would receive. Returns a pointer to a slice of arg-sets.
+// recordingRunner is a fake exec.Runner that records each command (OnLogQuery now
+// runs journalctl through the SDK sys/log source, which dispatches via
+// handlerRunner) and returns a canned success — so the WS4 charter can assert
+// journalctl is NOT invoked for an unsigned/invalid/over-cap log query.
+type recordingRunner struct{ calls *[][]string }
+
+func (r recordingRunner) Run(_ context.Context, c sysexec.Command) (sysexec.Result, error) {
+	*r.calls = append(*r.calls, append([]string{c.Name}, c.Args...))
+	return sysexec.Result{ExitCode: 0, Stdout: "logline\n"}, nil
+}
+
+func (r recordingRunner) Stream(_ context.Context, c sysexec.Command, _ sysexec.OutputCallback) (sysexec.Result, error) {
+	return r.Run(context.Background(), c)
+}
+
+func (r recordingRunner) Backend() sysexec.PrivilegeBackend { return sysexec.Direct }
+
+// fakeJournalctl swaps the handler's runner for the duration of the test,
+// recording the args journalctl receives via the SDK sys/log source. Returns a
+// pointer to a slice of arg-sets (each prefixed with the command name).
 func fakeJournalctl(t *testing.T) *[][]string {
 	t.Helper()
 	var calls [][]string
-	orig := runCommand
-	t.Cleanup(func() { runCommand = orig })
-	runCommand = func(_ context.Context, name string, args ...string) (*sysexec.Result, error) {
-		calls = append(calls, append([]string{name}, args...))
-		return &sysexec.Result{ExitCode: 0, Stdout: "logline\n"}, nil
-	}
+	orig := handlerRunner
+	t.Cleanup(func() { handlerRunner = orig })
+	handlerRunner = recordingRunner{calls: &calls}
 	return &calls
 }
 
@@ -383,7 +398,7 @@ func TestOnLogQuery_PriorityAllowList(t *testing.T) {
 			res, err := h.OnLogQuery(context.Background(), q)
 			require.NoError(t, err)
 			assert.False(t, res.Success, "priority %q must be rejected", p)
-			assert.Contains(t, res.Error, "invalid priority")
+			assert.Contains(t, res.Error, "priority")
 			assert.Empty(t, *calls, "rejected priority must not reach journalctl")
 		})
 	}

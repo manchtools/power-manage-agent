@@ -16,6 +16,7 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/sys/inventory"
+	syslog "github.com/manchtools/power-manage-sdk/sys/log"
 	"github.com/manchtools/power-manage-sdk/sys/osquery"
 	"github.com/manchtools/power-manage-sdk/validate"
 	"github.com/manchtools/power-manage/agent/internal/executor"
@@ -39,20 +40,6 @@ var handlerRunner = func() sysexec.Runner {
 	}
 	return r
 }()
-
-// runCommand is the seam through which OnLogQuery shells out to journalctl.
-// It defaults to a runner-backed dispatch and is overridable from tests so the
-// WS4 charter can record the args journalctl would receive — and assert it is
-// NOT invoked when a log query's signature is missing or invalid. A non-zero
-// exit is mapped to an error so callers keep treating a failed journalctl run as
-// a failure (the Runner itself reports non-zero exit in Result.ExitCode).
-var runCommand = func(ctx context.Context, name string, args ...string) (*sysexec.Result, error) {
-	r, err := handlerRunner.Run(ctx, sysexec.Command{Name: name, Args: args})
-	if err == nil && r.ExitCode != 0 {
-		err = &sysexec.CommandError{Name: name, ExitCode: r.ExitCode, Stderr: r.Stderr}
-	}
-	return &r, err
-}
 
 // osqueryRunner is the minimal osquery surface the handler uses. Declared as an
 // interface (vs the concrete osquery client) so tests can inject a fake that
@@ -366,195 +353,6 @@ func isBase64Char(b byte) bool {
 		b == '+' || b == '/' || b == '='
 }
 
-// isPathologicalGrepPattern flags regex shapes that are known to
-// drive PCRE / RE2 into catastrophic backtracking (audit F-35).
-// Returns a non-empty reason string when the pattern is rejected.
-//
-// The detector is intentionally conservative — it rejects on
-// structural heuristics rather than trying to actually evaluate
-// catastrophic-backtracking risk (which is undecidable in general).
-// False positives are acceptable here: a rejected pattern returns a
-// clean error to the caller; the worst-case is the operator has to
-// rephrase a query. False negatives are not: a pathological pattern
-// that slips through hangs `journalctl --grep` on the agent and
-// denies log-query service.
-//
-// Rules (each independently disqualifying):
-//   - nested quantifier on a group: `(...)*`, `(...)+`, `(...){n,}`
-//     where the inner group contains its own quantifier (`*`, `+`,
-//     `{n,}`). Classic `(a+)+`, `(a*)*`, `(a{1,})+` shapes.
-//   - overlapping alternation under a quantifier: `(a|a)+`,
-//     `(a|ab)+` — flagged by any `|` inside a quantified group.
-//   - more than 5 unbounded quantifiers (`*`, `+`, `{n,}`) total —
-//     compounds with the above rules to catch staircase patterns.
-func isPathologicalGrepPattern(p string) string {
-	// Count unbounded quantifiers — `*`, `+`, `{n,}`. `\` escapes
-	// the following metachar so we skip a pair when we see one.
-	unbounded := 0
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		if c == '\\' && i+1 < len(p) {
-			i++
-			continue
-		}
-		switch c {
-		case '*', '+':
-			unbounded++
-		case '{':
-			if quantifierUnbounded(p[i:]) {
-				unbounded++
-			}
-		}
-	}
-	if unbounded > 5 {
-		return "too many unbounded quantifiers (max 5)"
-	}
-
-	// Walk groups and look for nested-quantifier / alternation-
-	// under-quantifier shapes.
-	depth := 0
-	type groupState struct {
-		start         int
-		hasAlt        bool
-		hasInnerQuant bool
-	}
-	var stack []groupState
-	for i := 0; i < len(p); i++ {
-		c := p[i]
-		// Skip escapes — `\(` and `\|` are literal characters, not
-		// regex metas.
-		if c == '\\' && i+1 < len(p) {
-			i++
-			continue
-		}
-		switch c {
-		case '(':
-			stack = append(stack, groupState{start: i})
-			depth++
-		case ')':
-			if depth == 0 {
-				continue
-			}
-			top := stack[len(stack)-1]
-			stack = stack[:len(stack)-1]
-			depth--
-			// Propagate the closed group's quantifier/alternation state up to its
-			// parent, so an outer quantifier still sees an unbounded quantifier or
-			// alternation nested one level deeper — `((a+))+`, `((a|ab))+`,
-			// `((.*a)){2}` would otherwise bypass the guard. (`((a)*)*` is caught
-			// without this because the `*` after the inner `)` re-attaches to the
-			// still-open outer group; these shapes have no such trailing quantifier.)
-			if len(stack) > 0 {
-				if top.hasInnerQuant {
-					stack[len(stack)-1].hasInnerQuant = true
-				}
-				if top.hasAlt {
-					stack[len(stack)-1].hasAlt = true
-				}
-			}
-			// Is the closing paren followed by an unbounded quantifier?
-			if i+1 < len(p) {
-				next := p[i+1]
-				if next == '*' || next == '+' || (next == '{' && quantifierUnbounded(p[i+1:])) {
-					if top.hasInnerQuant {
-						return "nested unbounded quantifier (catastrophic backtracking shape)"
-					}
-					if top.hasAlt {
-						return "alternation under unbounded quantifier (catastrophic backtracking shape)"
-					}
-				}
-				// Bounded `{n}`/`{n,m}` repetition of a group that itself
-				// contains an unbounded quantifier is degree-N polynomial
-				// backtracking — `(.*a){11}` is catastrophic even though `{11}`
-				// is "bounded". The UPPER bound drives the worst case, so
-				// `(.*a){1,11}` is just as bad as `(.*a){11}` (lo=1 is
-				// irrelevant). Flag when the max repetition count is >= 2.
-				// (Alternation under a BOUNDED repeat is fine — bounded
-				// branching — so only hasInnerQuant qualifies here.)
-				if next == '{' && top.hasInnerQuant {
-					if _, hi, ok := boundedRepeatBounds(p[i+1:]); ok && hi >= 2 {
-						return "bounded repetition of an unbounded group (catastrophic backtracking shape)"
-					}
-				}
-			}
-		case '|':
-			if depth > 0 {
-				stack[len(stack)-1].hasAlt = true
-			}
-		case '*', '+':
-			if depth > 0 {
-				stack[len(stack)-1].hasInnerQuant = true
-			}
-		case '{':
-			if j := strings.IndexByte(p[i:], '}'); j > 0 && quantifierUnbounded(p[i:]) {
-				if depth > 0 {
-					stack[len(stack)-1].hasInnerQuant = true
-				}
-				i += j
-			}
-		}
-	}
-	return ""
-}
-
-// boundedRepeatBounds parses a BOUNDED `{n}` or `{n,m}` token starting at p[0]
-// and returns (lo, hi, ok). For `{n}`, lo==hi==n. Returns ok=false for a
-// non-quantifier, a malformed token, or an unbounded `{n,}` (those are handled
-// by quantifierUnbounded). The HI bound is what drives worst-case backtracking
-// when the repeated group contains an unbounded quantifier — `(...){1,1000}`
-// can still try up to 1000 repetitions.
-func boundedRepeatBounds(p string) (lo, hi int, ok bool) {
-	if len(p) == 0 || p[0] != '{' {
-		return 0, 0, false
-	}
-	j := strings.IndexByte(p, '}')
-	if j <= 0 {
-		return 0, 0, false
-	}
-	body := p[1:j]
-	if strings.HasSuffix(body, ",") {
-		return 0, 0, false // `{n,}` — unbounded
-	}
-	k := strings.IndexByte(body, ',')
-	if k < 0 {
-		// `{n}` — lo == hi == n
-		n, err := strconv.Atoi(strings.TrimSpace(body))
-		if err != nil {
-			return 0, 0, false
-		}
-		return n, n, true
-	}
-	// `{n,m}` — lo = n, hi = m
-	n, err := strconv.Atoi(strings.TrimSpace(body[:k]))
-	if err != nil {
-		return 0, 0, false
-	}
-	m, err := strconv.Atoi(strings.TrimSpace(body[k+1:]))
-	if err != nil {
-		return 0, 0, false
-	}
-	return n, m, true
-}
-
-// quantifierUnbounded reports whether a `{n,m?}` token starting at
-// p[0] is unbounded — `{n,}` is unbounded; `{n}` and `{n,m}` are
-// bounded.
-func quantifierUnbounded(p string) bool {
-	if len(p) == 0 || p[0] != '{' {
-		return false
-	}
-	j := strings.IndexByte(p, '}')
-	if j <= 0 {
-		return false
-	}
-	body := p[1:j]
-	if !strings.Contains(body, ",") {
-		return false // `{n}` — bounded
-	}
-	parts := strings.SplitN(body, ",", 2)
-	return len(parts) == 2 && parts[1] == "" // `{n,}` — unbounded
-}
-
 // OnActionRemove handles action removal from the server.
 func (h *Handler) OnActionRemove(ctx context.Context, actionID string) error {
 	h.logger.Info("received action removal", "action_id", actionID)
@@ -708,88 +506,37 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 		}, nil
 	}
 
-	args := []string{"--no-pager"}
-
-	lines := query.Lines
-	if lines <= 0 {
-		lines = 100
-	}
-	if lines > 10000 {
-		lines = 10000
-	}
-	args = append(args, "-n", strconv.Itoa(int(lines)))
-
-	if query.Unit != "" {
-		args = append(args, "-u", query.Unit)
-	}
-	if query.Since != "" {
-		args = append(args, "--since", query.Since)
-	}
-	if query.Until != "" {
-		args = append(args, "--until", query.Until)
-	}
-	if query.Priority != "" {
-		// Validate priority against known values
-		switch strings.ToLower(query.Priority) {
-		case "0", "1", "2", "3", "4", "5", "6", "7",
-			"emerg", "alert", "crit", "err", "warning", "notice", "info", "debug":
-			args = append(args, "-p", query.Priority)
-		default:
-			return &pb.LogQueryResult{
-				QueryId: query.QueryId,
-				Success: false,
-				Error:   "invalid priority value",
-			}, nil
-		}
-	}
-	if query.Grep != "" {
-		// Length cap + complexity check (audit F-35). The 256-char
-		// length bound stops the most obvious DoS, but doesn't catch
-		// adversarial ReDoS — `(a+)+b` is only 6 chars yet drives the
-		// underlying PCRE engine into exponential backtracking. The
-		// complexity guard refuses patterns whose **structure** is a
-		// known catastrophic-backtracking shape, regardless of length.
-		if len(query.Grep) > 256 {
-			return &pb.LogQueryResult{
-				QueryId: query.QueryId,
-				Success: false,
-				Error:   "grep pattern too long (max 256 characters)",
-			}, nil
-		}
-		if reason := isPathologicalGrepPattern(query.Grep); reason != "" {
-			return &pb.LogQueryResult{
-				QueryId: query.QueryId,
-				Success: false,
-				Error:   "grep pattern rejected: " + reason,
-			}, nil
-		}
-		args = append(args, "--grep", query.Grep)
-	}
-	if query.Kernel {
-		args = append(args, "-k")
-	}
-
-	result, err := runCommand(ctx, "journalctl", args...)
+	// The journalctl invocation — including the line cap, the priority
+	// allow-list, the grep length cap + ReDoS guard, and the -k kernel filter —
+	// is owned by the SDK sys/log source (it ported the agent's grep-guard
+	// verbatim). Build the query and let it validate + run. handlerRunner is the
+	// agent's Direct runner: the SDK marks the journalctl command Escalate:true,
+	// which is a no-op on Direct (the agent already runs as root), so behaviour is
+	// unchanged.
+	src, err := syslog.New(syslog.Journald, handlerRunner)
 	if err != nil {
-		// journalctl's human-readable failure message is on stderr;
-		// surface that to the caller rather than the bare Go error.
-		errMsg := ""
-		if result != nil {
-			errMsg = strings.TrimSpace(result.Stderr)
-		}
-		if errMsg == "" {
-			errMsg = err.Error()
-		}
-		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", errMsg)
-		return &pb.LogQueryResult{
-			QueryId: query.QueryId,
-			Success: false,
-			Error:   errMsg,
-		}, nil
+		h.logger.Warn("log query setup failed", "query_id", query.QueryId, "error", err)
+		return &pb.LogQueryResult{QueryId: query.QueryId, Success: false, Error: err.Error()}, nil
+	}
+	lines, err := src.Query(ctx, syslog.Query{
+		Unit:     query.Unit,
+		Since:    query.Since,
+		Until:    query.Until,
+		Priority: query.Priority,
+		Grep:     query.Grep,
+		Kernel:   query.Kernel,
+		Lines:    int(query.Lines),
+	})
+	if err != nil {
+		// Surfaces both the SDK's validation rejections (invalid priority,
+		// over-cap/pathological grep) and journalctl's own failure (the
+		// CommandError carries stderr).
+		h.logger.Warn("log query failed", "query_id", query.QueryId, "error", err)
+		return &pb.LogQueryResult{QueryId: query.QueryId, Success: false, Error: err.Error()}, nil
 	}
 
-	logs := result.Stdout
-	// Truncate to 1MB if needed (keep the tail)
+	logs := strings.Join(lines, "\n")
+	// Truncate to 1MB if needed (keep the tail).
 	if len(logs) > 1<<20 {
 		logs = logs[len(logs)-(1<<20):]
 	}
