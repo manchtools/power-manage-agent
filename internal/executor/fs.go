@@ -7,22 +7,12 @@ import (
 	"os"
 	"strconv"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // getFileOwnership retrieves the current owner:group of a file using stat.
 func getFileOwnership(path string) (owner, group string) {
 	return sysfs.GetOwnership(path)
-}
-
-// writeFileWithSudo writes content to a file through the fs Manager (fd-anchored
-// on the Direct/root backend; escalated tee otherwise).
-func writeFileWithSudo(ctx context.Context, path, content string) (*pb.CommandOutput, error) {
-	if err := fsMgr.WriteFile(ctx, path, []byte(content), sysfs.WriteOptions{}); err != nil {
-		return &pb.CommandOutput{ExitCode: 1, Stderr: err.Error()}, err
-	}
-	return &pb.CommandOutput{ExitCode: 0}, nil
 }
 
 // atomicWriteFile writes content to a file atomically with the specified

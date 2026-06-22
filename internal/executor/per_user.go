@@ -7,7 +7,6 @@ package executor
 
 import (
 	"context"
-	"os/exec"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/sys/desktop"
@@ -92,27 +91,6 @@ func mustEncManager(r sysexec.Runner) sysenc.Manager {
 		panic("executor: encryption manager must construct: " + err.Error())
 	}
 	return m
-}
-
-// runCapturedCapped runs cmd, capturing stdout/stderr through the SDK's
-// MaxOutputBytes-bounded buffer so a child emitting unbounded output
-// cannot exhaust the root agent's memory (WS6 #14). Truncated streams
-// carry the "[output truncated]" marker. Extracted so the cap is testable
-// without runuser/root.
-func runCapturedCapped(cmd *exec.Cmd) (*pb.CommandOutput, error) {
-	stdout := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
-	stderr := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	runErr := cmd.Run()
-	out := &pb.CommandOutput{
-		Stdout: stdout.String(),
-		Stderr: stderr.String(),
-	}
-	if cmd.ProcessState != nil {
-		out.ExitCode = int32(cmd.ProcessState.ExitCode())
-	}
-	return out, runErr
 }
 
 // runAsUserStreaming runs `name args...` as the given session's user
