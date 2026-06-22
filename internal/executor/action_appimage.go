@@ -126,38 +126,18 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 			return out, false, err
 		}
 
-		// Download + checksum-verify into an unprivileged temp (the HTTP fetch
-		// and verification are the agent's concern; an os.TempDir temp is always
-		// agent-writable), then stream the verified file into the privileged
-		// install path via the fs Manager's WriteReader. WriteReader mktemps in
-		// the destination dir and renames into place — so the placement is atomic
-		// (a failed copy never clobbers an existing AppImage), streamed (no
-		// buffering a hundred-MB payload), mode-set, and escalated when the agent
-		// is not root. This replaces the os.MkdirAll + os.CreateTemp-in-dest +
-		// os.Rename + os.Chmod dance, which only worked when the agent already
-		// had write access to the install dir.
-		tmpFile, err := os.CreateTemp("", "*.appimage")
-		if err != nil {
-			return nil, false, fmt.Errorf("create temp file: %w", err)
-		}
-		defer os.Remove(tmpFile.Name())
-		_ = tmpFile.Close()
-
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
-			return nil, false, fmt.Errorf("download: %w", err)
-		}
-
+		// Download straight into the install dir via the SDK remote source: it
+		// streams the body to a temp IN the destination directory, verifies the
+		// sha256, fsyncs, and atomically renames onto resolvedPath at mode 0755 —
+		// no buffering of the (hundreds-of-MB) payload and no second copy, and a
+		// failed/mismatched download never clobbers an existing AppImage.
+		// requireVerifiedArtifact above already enforced https + a present
+		// checksum (remote accepts http too, so the agent keeps that gate).
 		if err := createDirectory(ctx, filepath.Dir(resolvedPath), true); err != nil {
 			return nil, false, fmt.Errorf("create directory: %w", err)
 		}
-
-		src, err := os.Open(tmpFile.Name())
-		if err != nil {
-			return nil, false, fmt.Errorf("open downloaded file: %w", err)
-		}
-		defer src.Close()
-		if err := fsMgr.WriteReader(ctx, resolvedPath, src, sysfs.WriteOptions{Mode: 0o755}); err != nil {
-			return nil, false, fmt.Errorf("install appimage: %w", err)
+		if err := fetchArtifact(ctx, params.Url, resolvedPath, params.ChecksumSha256, "0755"); err != nil {
+			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
 		return &pb.CommandOutput{
