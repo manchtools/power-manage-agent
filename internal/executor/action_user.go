@@ -76,6 +76,49 @@ func homeGroupFor(params *pb.UserParams) string {
 	return params.Username
 }
 
+// ensureHomeIfMissing repairs a missing home directory for a create_home user
+// by delegating the create+seed+own+mode work to the SDK's idempotent
+// EnsureHome (mkdir + /etc/skel seed + recursive ownership + 0700) instead of
+// orchestrating mkdir / cp -a / chown / chmod by hand. It returns true only
+// when a missing home was actually created.
+//
+// The presence probe fails CLOSED: if fsMgr.Exists cannot determine whether the
+// home exists (an I/O / permission error rather than a clean "no such file"),
+// the state is indeterminate, so we surface a warning and skip EnsureHome rather
+// than treating the error as "missing". Swallowing the probe error would invert
+// an unknown into a confident "create it", running EnsureHome on every reconcile
+// cycle (and reporting changed=true forever) against a home that may already be
+// present.
+func (e *Executor) ensureHomeIfMissing(ctx context.Context, params *pb.UserParams, currentHome string, output *strings.Builder) bool {
+	if !params.CreateHome {
+		return false
+	}
+	homeDir := params.HomeDir
+	if homeDir == "" {
+		homeDir = currentHome
+	}
+	if homeDir == "" {
+		homeDir = "/home/" + params.Username
+	}
+	ok, err := fsMgr.Exists(ctx, homeDir)
+	if err != nil {
+		output.WriteString(fmt.Sprintf("warning: could not check home directory %s: %v\n", homeDir, err))
+		return false
+	}
+	if ok {
+		return false
+	}
+	// Home is missing (a prior run failed, or the account was created with -M).
+	// EnsureHome resolves the home from the user's passwd entry, which any
+	// preceding Modify has already set to the desired path.
+	if hErr := userMgr.EnsureHome(ctx, params.Username, sysuser.EnsureHomeOptions{Group: homeGroupFor(params), Mode: 0o700}); hErr != nil {
+		output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", hErr))
+		return false
+	}
+	output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
+	return true
+}
+
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists, err := userExists(ctx, params.Username)
@@ -312,29 +355,8 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	// failed). Same change as in createUser — honour the explicit
 	// create_home value from the proto rather than inverting false
 	// to true for non-system users.
-	createHome := params.CreateHome
-	if createHome {
-		homeDir := params.HomeDir
-		if homeDir == "" {
-			homeDir = currentInfo.HomeDir
-		}
-		if homeDir == "" {
-			homeDir = "/home/" + params.Username
-		}
-		if ok, _ := fsMgr.Exists(ctx, homeDir); !ok {
-			// Home is missing (a prior run failed, or the account was created
-			// with -M). Delegate the create+seed+own+mode repair to the SDK's
-			// idempotent EnsureHome (mkdir + /etc/skel seed + recursive ownership
-			// + 0700) instead of orchestrating mkdir / cp -a / chown / chmod by
-			// hand. EnsureHome resolves the home from the user's passwd entry,
-			// which Modify above has already set to the desired path.
-			if hErr := userMgr.EnsureHome(ctx, params.Username, sysuser.EnsureHomeOptions{Group: homeGroupFor(params), Mode: 0o700}); hErr != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", hErr))
-			} else {
-				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
-				changed = true
-			}
-		}
+	if e.ensureHomeIfMissing(ctx, params, currentInfo.HomeDir, output) {
+		changed = true
 	}
 
 	// Handle disabled/locked state - only change if different.

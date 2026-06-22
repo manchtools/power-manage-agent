@@ -4,6 +4,7 @@ package executor
 import (
 	"context"
 	"net/http"
+	"strings"
 
 	"github.com/manchtools/power-manage-sdk/sys/remote"
 )
@@ -23,8 +24,14 @@ var remoteHTTPClient *http.Client
 // mode. Callers that need https-only must still gate the URL up front
 // (requireVerifiedArtifact) — remote accepts http too.
 func fetchArtifact(ctx context.Context, url, dest, checksum, mode string) error {
+	// Trim the URL before use: the agent's URL validators (sdk.ValidateHTTPSURL
+	// via requireVerifiedArtifact) trim internally before checking scheme/host,
+	// but remote.NewHTTP's parser does NOT trim, so a whitespace-padded URL would
+	// pass validation and then fail the fetch as "not absolute". Trimming here
+	// keeps the fetched URL identical to the form validation blessed, for every
+	// fetchArtifact call site (appimage/deb/rpm/agent_update).
 	src, err := remote.NewHTTP(remote.HTTPConfig{
-		URL:            url,
+		URL:            strings.TrimSpace(url),
 		ChecksumSHA256: checksum,
 		Mode:           mode,
 		Client:         remoteHTTPClient,
