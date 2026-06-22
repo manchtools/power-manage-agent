@@ -19,11 +19,6 @@ import (
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
 
-// runuserPath mirrors desktop.runuserPath. Pinned here as well so a
-// future move of the runuser invocation off the helper layer (e.g.
-// streaming variant below) doesn't have to import the SDK constant.
-const runuserPath = "/usr/sbin/runuser"
-
 // desktopMgr is the process-wide desktop fan-out Manager (session enumeration +
 // run-as-user). It defaults to a Direct-runner Manager and is rebuilt by
 // NewExecutor with the configured backend so loginctl probes escalate when the
@@ -139,22 +134,20 @@ func runAsUserStreaming(ctx context.Context, s desktop.Session, extraEnv []strin
 	if s.Username == "" {
 		return nil, errEmptyUsername
 	}
-	full := append([]string{"-u", s.Username, "--", name}, args...)
-	env := append(desktop.EnvFor(s), extraEnv...)
 	if dir == "" {
 		dir = s.Home
 	}
-	// Run with the target user's curated PATH, not the agent's (root's).
-	// PATH is blocklisted from envVars, so it must be passed as the
-	// trusted child PATH — otherwise the user script inherits root's
-	// PATH and ~/.local/bin is ignored (see desktop.UserPath).
-	r, err := executorRunner.Stream(ctx, sysexec.Command{
-		Name:      runuserPath,
-		Args:      full,
-		Env:       env,
-		ChildPath: desktop.UserPath(s),
-		Dir:       dir,
-	}, callback)
+	// desktop.RunAsRunner wraps the command to run AS the session user: it builds
+	// `runuser -u <user> -- env <session-env> PATH=<curated UserPath> <name>
+	// <args>` and runs it in Command.Dir. So the per-user env (HOME/USER/
+	// XDG_RUNTIME_DIR/…), the curated per-user PATH (not root's), and the working
+	// directory are all owned by the SDK now — no hand-built runuser/env splicing
+	// here. extraEnv is screened + merged by RunAsRunner.
+	ru, err := desktop.RunAsRunner(executorRunner, s)
+	if err != nil {
+		return nil, err
+	}
+	r, err := ru.Stream(ctx, sysexec.Command{Name: name, Args: args, Env: extraEnv, Dir: dir}, callback)
 	return toOutput(&r), err
 }
 
