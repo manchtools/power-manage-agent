@@ -9,9 +9,9 @@ import (
 	"os/exec"
 	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
-	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, state pb.DesiredState) (*pb.CommandOutput, bool, error) {
@@ -34,6 +34,11 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 			return &pb.CommandOutput{Stdout: "skipped: rpm not available on this system"}, false, nil
 		}
 		return nil, false, fmt.Errorf("rpm lookup: %w", err)
+	}
+
+	mgr := e.pkgManagerForCtx(ctx)
+	if mgr == nil {
+		return nil, false, fmt.Errorf("no usable package manager for .rpm (context expired or none detected)")
 	}
 
 	switch state {
@@ -59,20 +64,23 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
 
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
-		// Ask rpm itself for the canonical package NAME from the
-		// downloaded file — authoritative across naming conventions —
-		// and validate it: a crafted .rpm can set %{NAME} to a
-		// flag-shaped or metacharacter-bearing value.
-		pkgName, err := rpmPackageName(queryCmdOutput, tmpFile.Name())
+		// Ask the SDK for the canonical package NAME from the downloaded
+		// file (LocalPackageInfo -> rpm -qp %{NAME}), validated inside the
+		// SDK against the rpm name grammar (a crafted .rpm can set %{NAME}
+		// to a flag-shaped or metacharacter-bearing value).
+		info, err := mgr.LocalPackageInfo(ctx, tmpFile.Name())
 		if err != nil {
 			return nil, false, err
 		}
+		pkgName := info.Name
 
-		if e.isRpmInstalled(pkgName) {
+		if installed, err := mgr.IsInstalled(ctx, pkgName); err != nil {
+			return nil, false, fmt.Errorf("check %s installed: %w", pkgName, err)
+		} else if installed {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("rpm package %s is already installed", pkgName),
@@ -86,10 +94,6 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		// SHA256 checksum (requireVerifiedArtifact above), NOT a per-file GPG
 		// signature — operator-provided rpms typically carry none — so dnf/zypper
 		// must not reject the file as unsigned.
-		mgr := e.pkgManagerForCtx(ctx)
-		if mgr == nil {
-			return nil, false, fmt.Errorf("no usable package manager to install %s (context expired or none detected)", pkgName)
-		}
 		return packageResult(mgr.InstallLocal(ctx, tmpFile.Name(), pkg.InstallLocalOptions{AllowUnsigned: true}))
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
@@ -108,18 +112,21 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		}
 		defer os.Remove(tmpFile.Name())
 		_ = tmpFile.Close()
-		if err := e.downloadFile(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, tmpFile.Name(), params.ChecksumSha256, ""); err != nil {
 			// Unlike .deb, an .rpm filename has no reliable name field
 			// (the name itself can contain hyphens), so a dead URL leaves
 			// us with no way to identify the installed package to remove.
 			// Surface that explicitly instead of a bare "download" error.
 			return nil, false, fmt.Errorf("cannot determine rpm package to remove: artifact %s is unreachable (%w); re-point the action at a reachable URL or remove the package manually", params.Url, err)
 		}
-		pkgName, err := rpmPackageName(queryCmdOutput, tmpFile.Name())
+		info, err := mgr.LocalPackageInfo(ctx, tmpFile.Name())
 		if err != nil {
 			return nil, false, err
 		}
-		if !e.isRpmInstalled(pkgName) {
+		pkgName := info.Name
+		if installed, err := mgr.IsInstalled(ctx, pkgName); err != nil {
+			return nil, false, fmt.Errorf("check %s installed: %w", pkgName, err)
+		} else if !installed {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("rpm package %s is already not installed", pkgName),
@@ -129,48 +136,11 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		// Remove through the SDK manager (dnf/zypper remove <name>) rather than a
 		// direct `rpm -e`, so the package manager runs the scriptlets with a
 		// proper PATH — symmetric with the install path and the deb executor.
-		mgr := e.pkgManagerForCtx(ctx)
-		if mgr == nil {
-			return nil, false, fmt.Errorf("no usable package manager to remove %s (context expired or none detected)", pkgName)
-		}
 		return packageResult(mgr.Remove(ctx, pkg.RemoveOptions{}, pkgName))
 	}
 
 	return nil, false, fmt.Errorf("unknown desired state: %v", state)
 }
-
-// isRpmInstalled checks if an rpm package is installed.
-func (e *Executor) isRpmInstalled(pkgName string) bool {
-	return checkCmdSuccess("rpm", rpmQueryArgs(pkgName)...)
-}
-
-// rpmQueryFunc matches queryCmdOutput's signature; injectable so tests
-// can supply a crafted %{NAME} without a real rpm binary or .rpm file.
-type rpmQueryFunc func(name string, args ...string) (string, int, error)
-
-// rpmPackageName asks rpm for the canonical %{NAME} of the .rpm at path
-// and validates it. The name a (possibly crafted) .rpm reports is
-// untrusted input, so it MUST pass pkg.ValidateRpmPackageName before it
-// can reach `rpm -q`/`rpm -e` argv — parity with the deb-side
-// validDebPkgName check. An empty/whitespace name is rejected by the
-// validator (no separate empty check needed).
-func rpmPackageName(queryFn rpmQueryFunc, path string) (string, error) {
-	out, _, err := queryFn("rpm", "-qp", "--qf", "%{NAME}", path)
-	if err != nil {
-		return "", fmt.Errorf("rpm -qp NAME: %w", err)
-	}
-	name := strings.TrimSpace(out)
-	if err := pkg.ValidateRpmPackageName(name); err != nil {
-		return "", fmt.Errorf("rpm reported an unsafe package name: %w", err)
-	}
-	return name, nil
-}
-
-// rpmQueryArgs builds `rpm -q -- <name>` so the package NAME is passed after a
-// `--` end-of-options separator and can never be reparsed as an rpm option, even
-// if a crafted .rpm made it flag-shaped. (Install/erase now go through the SDK
-// pkg.Manager InstallLocal/Remove, not a direct rpm invocation.)
-func rpmQueryArgs(name string) []string { return sysexec.SeparatePositionals([]string{"-q"}, name) }
 
 // requireVerifiedArtifact fails closed unless rawURL is https and a
 // non-empty checksum is present. A download-and-install artifact whose
@@ -179,7 +149,7 @@ func rpmQueryArgs(name string) []string { return sysexec.SeparatePositionals([]s
 // plane mandates both (proto + server validation); this is the
 // agent-side defense in depth at the executor boundary.
 func requireVerifiedArtifact(rawURL, checksum string) error {
-	if err := validateHTTPS(rawURL); err != nil {
+	if err := sdk.ValidateHTTPSURL(rawURL); err != nil {
 		return fmt.Errorf("artifact rejected: %w", err)
 	}
 	checksum = strings.TrimSpace(checksum)

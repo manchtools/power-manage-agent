@@ -2,11 +2,7 @@ package executor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"fmt"
-	"net/http"
-	"net/http/httptest"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,24 +12,6 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
-
-func TestValidateHTTPS(t *testing.T) {
-	tests := []struct {
-		url     string
-		wantErr bool
-	}{
-		{"https://example.com/binary", false},
-		{"http://example.com/binary", true},
-		{"ftp://example.com/binary", true},
-		{"", true},
-	}
-	for _, tt := range tests {
-		err := validateHTTPS(tt.url)
-		if (err != nil) != tt.wantErr {
-			t.Errorf("validateHTTPS(%q) error = %v, wantErr %v", tt.url, err, tt.wantErr)
-		}
-	}
-}
 
 func TestGetArchEntry(t *testing.T) {
 	amd := &pb.AgentUpdateArch{BinaryUrl: "https://example.com/amd64"}
@@ -55,30 +33,11 @@ func TestGetArchEntry_NilForMissing(t *testing.T) {
 	}
 }
 
-func TestDownloadToFile(t *testing.T) {
-	content := []byte("test binary content")
-	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.Write(content)
-	}))
-	defer srv.Close()
-
-	tmpFile, err := os.CreateTemp(t.TempDir(), "dl-test-*")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer tmpFile.Close()
-
-	checksum, err := downloadToFile(context.Background(), srv.Client(), srv.URL+"/binary", tmpFile)
-	if err != nil {
-		t.Fatal(err)
-	}
-
-	expectedHash := sha256.Sum256(content)
-	expected := hex.EncodeToString(expectedHash[:])
-	if checksum != expected {
-		t.Errorf("checksum mismatch: got %s, want %s", checksum, expected)
-	}
-}
+// The binary download + sha256 verification is the SDK remote source's job now
+// (agent_update calls fetchArtifact -> remote.Fetch with the expected pin); the
+// SDK tests that mechanism, and the agent-update orchestration test covers the
+// integrity-failure path. The former TestDownloadToFile (which exercised the
+// agent's deleted downloadToFile) was removed with that function.
 
 // writeStateForTest writes the legacy update/state.json that the
 // production self-test path no longer creates. The reader and the

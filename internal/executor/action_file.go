@@ -4,6 +4,7 @@ package executor
 import (
 	"context"
 	"crypto/sha256"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -68,19 +69,15 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 		var finalContent string
 		actionVerb := "created"
 		if params.ManagedBlock {
-			// For managed block: read existing content and append block if not present
-			// Use sudo cat to read files with restrictive permissions
-			var existingContent []byte
-			if output, err := runSudoCmd(ctx, "cat", "--", resolvedPath); err == nil {
-				existingContent = []byte(output.Stdout)
-			} else if output != nil && strings.Contains(output.Stderr, "No such file") {
-				// File doesn't exist, that's fine
-				existingContent = nil
-			} else {
+			// For managed block: read the existing content (via the fs Manager)
+			// and append the block. A missing file (fs.ErrNotExist) means an empty
+			// managed-block base — create fresh; a real read error (permissions,
+			// I/O) fails the action.
+			existing, err := readFileWithSudo(ctx, resolvedPath)
+			if err != nil && !errors.Is(err, os.ErrNotExist) {
 				return nil, false, fmt.Errorf("read existing file: %w", err)
 			}
 			// Ensure there's a newline before appending block if file exists and doesn't end with newline
-			existing := string(existingContent)
 			if len(existing) > 0 && !strings.HasSuffix(existing, "\n") {
 				existing += "\n"
 			}
@@ -244,32 +241,6 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 	return true
 }
 
-// protectedPaths contains directories that should never be deleted as a whole.
-var protectedPaths = []string{
-	"/",
-	"/bin",
-	"/boot",
-	"/dev",
-	"/etc",
-	"/home",
-	"/lib",
-	"/lib32",
-	"/lib64",
-	"/libx32",
-	"/media",
-	"/mnt",
-	"/opt",
-	"/proc",
-	"/root",
-	"/run",
-	"/sbin",
-	"/srv",
-	"/sys",
-	"/tmp",
-	"/usr",
-	"/var",
-}
-
 // criticalFiles lists individual files whose removal would render the
 // system unbootable, lock the operator out, or destroy account/auth
 // state. Their parent directories (e.g. /etc) are not blanket-protected
@@ -296,10 +267,12 @@ var criticalFiles = []string{
 func isProtectedPath(path string) bool {
 	cleanPath := filepath.Clean(path)
 
-	for _, protected := range protectedPaths {
-		if cleanPath == protected {
-			return true
-		}
+	// Whole-directory protection for system dirs is the SDK's
+	// sysfs.IsProtectedPath (a superset of the agent's former list — it also
+	// covers /snap). The agent keeps two rules the SDK does not: a critical-FILE
+	// denylist, and "any immediate child of / is protected".
+	if sysfs.IsProtectedPath(cleanPath) {
+		return true
 	}
 
 	if isCriticalFile(cleanPath) {

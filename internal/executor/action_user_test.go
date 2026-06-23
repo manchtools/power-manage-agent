@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // The ~/.ssh TOCTOU (audit F022) is closed by FD-based ops: setupSSHKeys
@@ -16,15 +17,17 @@ import (
 // ownership/mode through the FD (fchown/fchmod), and hands authorized_keys
 // back via sysfs.FchownNoFollow. The symlink/non-dir rejection and the
 // fd-acts-on-the-opened-inode property are unit-tested in the SDK
-// (sdk/go/sys/fs/safe_fd_unix_test.go). resolveOwnership — the numeric
-// uid/gid those FD calls require — is tested below against homeGroupFor.
+// (sdk/go/sys/fs/safe_fd_unix_test.go). The numeric uid/gid those FD calls
+// require now come from sdk sysfs.ResolveOwnership fed the agent's homeGroupFor
+// group string; this test pins that the agent's homeGroupFor PREFERENCE ORDER
+// resolves to the right ids through the SDK (the SDK owns the name/numeric
+// resolution; the agent owns homeGroupFor).
 
-// resolveOwnership must produce the numeric ids equivalent to the
-// "username:homeGroupFor()" string the path-based chown previously used,
-// mirroring homeGroupFor's preference order. We anchor on the test
-// runner's own account (guaranteed present in the user/group database)
-// so the lookups resolve deterministically without root.
-func TestResolveOwnership_MirrorsHomeGroupFor(t *testing.T) {
+// homeGroupFor + sysfs.ResolveOwnership must produce the numeric ids equivalent
+// to the "username:homeGroupFor()" string the path-based chown previously used.
+// We anchor on the test runner's own account (guaranteed present in the
+// user/group database) so the lookups resolve deterministically without root.
+func TestHomeGroupForOwnership_ResolvesViaSDK(t *testing.T) {
 	cur, err := user.Current()
 	require.NoError(t, err)
 	wantUID, err := strconv.Atoi(cur.Uid)
@@ -32,10 +35,14 @@ func TestResolveOwnership_MirrorsHomeGroupFor(t *testing.T) {
 	wantPrimaryGID, err := strconv.Atoi(cur.Gid)
 	require.NoError(t, err)
 
+	resolve := func(p *pb.UserParams) (int, int, error) {
+		return sysfs.ResolveOwnership(p.Username, homeGroupFor(p))
+	}
+
 	t.Run("numeric Gid is used as a literal GID (no name lookup)", func(t *testing.T) {
 		// 4242 need not exist as a named group; chown treats a numeric
-		// token literally, and so must resolveOwnership.
-		uid, gid, err := resolveOwnership(&pb.UserParams{Username: cur.Username, Gid: 4242})
+		// token literally, and so must the resolution.
+		uid, gid, err := resolve(&pb.UserParams{Username: cur.Username, Gid: 4242})
 		require.NoError(t, err)
 		assert.Equal(t, wantUID, uid)
 		assert.Equal(t, 4242, gid)
@@ -44,14 +51,14 @@ func TestResolveOwnership_MirrorsHomeGroupFor(t *testing.T) {
 	t.Run("named PrimaryGroup is resolved via the group database", func(t *testing.T) {
 		grp, err := user.LookupGroupId(cur.Gid)
 		require.NoError(t, err)
-		uid, gid, err := resolveOwnership(&pb.UserParams{Username: cur.Username, PrimaryGroup: grp.Name})
+		uid, gid, err := resolve(&pb.UserParams{Username: cur.Username, PrimaryGroup: grp.Name})
 		require.NoError(t, err)
 		assert.Equal(t, wantUID, uid)
 		assert.Equal(t, wantPrimaryGID, gid)
 	})
 
 	t.Run("unknown user is an error, not a silent uid 0", func(t *testing.T) {
-		_, _, err := resolveOwnership(&pb.UserParams{Username: "pm-definitely-no-such-user-xyz"})
+		_, _, err := resolve(&pb.UserParams{Username: "pm-definitely-no-such-user-xyz"})
 		assert.Error(t, err, "a failed user lookup must error so .ssh is never chowned to root")
 	})
 }

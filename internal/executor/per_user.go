@@ -7,7 +7,6 @@ package executor
 
 import (
 	"context"
-	"os/exec"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/sys/desktop"
@@ -18,11 +17,6 @@ import (
 	sysservice "github.com/manchtools/power-manage-sdk/sys/service"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 )
-
-// runuserPath mirrors desktop.runuserPath. Pinned here as well so a
-// future move of the runuser invocation off the helper layer (e.g.
-// streaming variant below) doesn't have to import the SDK constant.
-const runuserPath = "/usr/sbin/runuser"
 
 // desktopMgr is the process-wide desktop fan-out Manager (session enumeration +
 // run-as-user). It defaults to a Direct-runner Manager and is rebuilt by
@@ -99,63 +93,6 @@ func mustEncManager(r sysexec.Runner) sysenc.Manager {
 	return m
 }
 
-// runAsUserCmd runs `name args...` as the user owning the given
-// session and returns the result as a *pb.CommandOutput, matching
-// runSudoCmd's signature so per-user call sites don't need a
-// different result-handling path.
-//
-// Caller-supplied extraEnv is merged on top of the desktop default
-// env (HOME / USER / LOGNAME / XDG_RUNTIME_DIR / DBUS_SESSION_BUS_ADDRESS);
-// duplicate keys win on the extraEnv side, matching Go's exec.Cmd
-// last-write-wins semantics. Pass nil for extraEnv when the
-// desktop defaults suffice.
-func runAsUserCmd(ctx context.Context, s desktop.Session, extraEnv []string, name string, args ...string) (*pb.CommandOutput, error) {
-	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{ExtraEnv: extraEnv}, name, args...)
-	if err != nil {
-		return nil, err
-	}
-	return runCapturedCapped(cmd)
-}
-
-// runCapturedCapped runs cmd, capturing stdout/stderr through the SDK's
-// MaxOutputBytes-bounded buffer so a child emitting unbounded output
-// cannot exhaust the root agent's memory (WS6 #14). Truncated streams
-// carry the "[output truncated]" marker. Extracted so the cap is testable
-// without runuser/root.
-func runCapturedCapped(cmd *exec.Cmd) (*pb.CommandOutput, error) {
-	stdout := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
-	stderr := sysexec.NewCappedBuffer(sysexec.MaxOutputBytes)
-	cmd.Stdout = stdout
-	cmd.Stderr = stderr
-	runErr := cmd.Run()
-	out := &pb.CommandOutput{
-		Stdout: stdout.String(),
-		Stderr: stderr.String(),
-	}
-	if cmd.ProcessState != nil {
-		out.ExitCode = int32(cmd.ProcessState.ExitCode())
-	}
-	return out, runErr
-}
-
-// runAsUserCheck runs `name args...` as the given session's user
-// and reports whether the command exited 0. Mirrors checkCmdSuccess
-// for the per-user execution path — used for "is X installed for
-// this user" idempotency probes where stdout/stderr would be
-// discarded anyway.
-//
-// A failure to construct the command (zero-value session, etc.) is
-// reported as "false" rather than a separate error path because the
-// callers (idempotency checks) treat any inability-to-determine as
-// "not installed, attempt the install."
-func runAsUserCheck(ctx context.Context, s desktop.Session, name string, args ...string) bool {
-	cmd, err := desktopMgr.RunAsCommand(ctx, s, desktop.RunAsOptions{}, name, args...)
-	if err != nil {
-		return false
-	}
-	return cmd.Run() == nil
-}
-
 // runAsUserStreaming runs `name args...` as the given session's user
 // with real-time line-streaming via callback, mirroring
 // runCmdStreaming for the per-user execution path. The wrapper
@@ -175,22 +112,20 @@ func runAsUserStreaming(ctx context.Context, s desktop.Session, extraEnv []strin
 	if s.Username == "" {
 		return nil, errEmptyUsername
 	}
-	full := append([]string{"-u", s.Username, "--", name}, args...)
-	env := append(desktop.EnvFor(s), extraEnv...)
 	if dir == "" {
 		dir = s.Home
 	}
-	// Run with the target user's curated PATH, not the agent's (root's).
-	// PATH is blocklisted from envVars, so it must be passed as the
-	// trusted child PATH — otherwise the user script inherits root's
-	// PATH and ~/.local/bin is ignored (see desktop.UserPath).
-	r, err := executorRunner.Stream(ctx, sysexec.Command{
-		Name:      runuserPath,
-		Args:      full,
-		Env:       env,
-		ChildPath: desktop.UserPath(s),
-		Dir:       dir,
-	}, callback)
+	// desktop.RunAsRunner wraps the command to run AS the session user: it builds
+	// `runuser -u <user> -- env <session-env> PATH=<curated UserPath> <name>
+	// <args>` and runs it in Command.Dir. So the per-user env (HOME/USER/
+	// XDG_RUNTIME_DIR/…), the curated per-user PATH (not root's), and the working
+	// directory are all owned by the SDK now — no hand-built runuser/env splicing
+	// here. extraEnv is screened + merged by RunAsRunner.
+	ru, err := desktop.RunAsRunner(executorRunner, s)
+	if err != nil {
+		return nil, err
+	}
+	r, err := ru.Stream(ctx, sysexec.Command{Name: name, Args: args, Env: extraEnv, Dir: dir}, callback)
 	return toOutput(&r), err
 }
 

@@ -3,16 +3,11 @@ package executor
 
 import (
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"os"
-	"path/filepath"
-	"regexp"
 	"strings"
 	"sync"
 	"time"
@@ -27,152 +22,10 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
-// validRepoName restricts repository names to safe characters only.
-// This prevents path traversal, shell injection, and sed/regex injection.
-var validRepoName = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-
-// Repo-field shape constraints. These run in addition to the
-// newline-rejection pass in validateRepositoryParams — newlines are
-// the classic config-injection vector (they let a signed action
-// smuggle extra lines into apt/dnf/pacman configuration), but the
-// fields below also have a naturally narrow grammar, so an allow-list
-// of permitted characters costs nothing and eliminates shell /
-// argument-confusion attacks on runSudoCmd calls that splice these
-// values into a command line.
-var (
-	// APT distribution codenames: "jammy", "bookworm", "focal-updates".
-	validAptDistribution = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-	// APT components: "main", "contrib", "non-free-firmware".
-	validAptComponent = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]*$`)
-	// APT architecture filter: "amd64", "arm64", comma-separated list.
-	validAptArch = regexp.MustCompile(`^[a-z0-9][a-z0-9,_-]*$`)
-	// Pacman SigLevel: space-separated tokens, e.g. "Optional TrustAll".
-	validPacmanSigLevel = regexp.MustCompile(`^[a-zA-Z ]+$`)
-	// Zypper repository type: "rpm-md", "yast2", "plaindir".
-	validZypperType = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9-]*$`)
-)
-
-// validateRepositoryParams refuses repository configurations that
-// contain newlines in any string field the agent later splices into
-// a config file or shell argument, plus tight regex grammars on the
-// enum-like fields (distribution, component, architecture, siglevel,
-// zypper type). Since actions are signed and admin-controlled, this
-// is not "untrusted input" in the classic sense — but a compromised
-// or malformed admin action should not be able to inject extra
-// directives into /etc/apt/sources.list.d/*, /etc/yum.repos.d/*,
-// /etc/pacman.conf, or zypper metadata.
-func validateRepositoryParams(params *pb.RepositoryParams) error {
-	// Field-level errors name the offending field but do NOT echo
-	// the rejected value. Repository URLs / GPG key URLs / descriptions
-	// can carry secrets or per-deployment URLs that should not leak
-	// into task-result payloads, audit projections, or log sinks. A
-	// named field tells the operator enough to go check the action
-	// definition — the full value is one click away in the UI.
-	reject := func(field string) error {
-		return fmt.Errorf("repository field %q contains newline or control character", field)
-	}
-	badShape := func(field string) error {
-		return fmt.Errorf("repository field %q has invalid shape", field)
-	}
-
-	if apt := params.Apt; apt != nil {
-		if containsNewline(apt.Url) {
-			return reject("apt.url")
-		}
-		if containsNewline(apt.Distribution) {
-			return reject("apt.distribution")
-		}
-		if apt.Distribution != "" && !validAptDistribution.MatchString(apt.Distribution) {
-			return badShape("apt.distribution")
-		}
-		for _, c := range apt.Components {
-			if containsNewline(c) {
-				return reject("apt.components entry")
-			}
-			if !validAptComponent.MatchString(c) {
-				return badShape("apt.components entry")
-			}
-		}
-		if containsNewline(apt.Arch) {
-			return reject("apt.arch")
-		}
-		if apt.Arch != "" && !validAptArch.MatchString(apt.Arch) {
-			return badShape("apt.arch")
-		}
-		if containsNewline(apt.GpgKeyUrl) {
-			return reject("apt.gpg_key_url")
-		}
-		// apt.gpg_key (the ASCII-armored key BLOB, distinct from
-		// gpg_key_url) is intentionally NOT newline-guarded: it is
-		// multi-line content written verbatim to a keyring file, never
-		// spliced into a config line or argv. The self-discovering
-		// coverage test (repository_validation_test.go) lists it as the
-		// sole multi-line-content exclusion.
-	}
-	if dnf := params.Dnf; dnf != nil {
-		if containsNewline(dnf.Baseurl) {
-			return reject("dnf.baseurl")
-		}
-		if containsNewline(dnf.Description) {
-			return reject("dnf.description")
-		}
-		if containsNewline(dnf.Gpgkey) {
-			return reject("dnf.gpgkey")
-		}
-		if dnf.Baseurl != "" && pkg.ValidateRepoBaseURL(dnf.Baseurl) != nil {
-			return badShape("dnf.baseurl")
-		}
-		if dnf.Gpgkey != "" && pkg.ValidateGpgKeyRef(dnf.Gpgkey) != nil {
-			return badShape("dnf.gpgkey")
-		}
-	}
-	if pac := params.Pacman; pac != nil {
-		if containsNewline(pac.Server) {
-			return reject("pacman.server")
-		}
-		if containsNewline(pac.SigLevel) {
-			return reject("pacman.sig_level")
-		}
-		if pac.SigLevel != "" && !validPacmanSigLevel.MatchString(pac.SigLevel) {
-			return badShape("pacman.sig_level")
-		}
-		if pac.Server != "" && pkg.ValidateRepoBaseURL(pac.Server) != nil {
-			return badShape("pacman.server")
-		}
-	}
-	if zyp := params.Zypper; zyp != nil {
-		if containsNewline(zyp.Url) {
-			return reject("zypper.url")
-		}
-		if containsNewline(zyp.Description) {
-			return reject("zypper.description")
-		}
-		if containsNewline(zyp.Gpgkey) {
-			return reject("zypper.gpgkey")
-		}
-		if containsNewline(zyp.Type) {
-			return reject("zypper.type")
-		}
-		if zyp.Type != "" && !validZypperType.MatchString(zyp.Type) {
-			return badShape("zypper.type")
-		}
-		if zyp.Url != "" && pkg.ValidateRepoBaseURL(zyp.Url) != nil {
-			return badShape("zypper.url")
-		}
-		if zyp.Gpgkey != "" && pkg.ValidateGpgKeyRef(zyp.Gpgkey) != nil {
-			return badShape("zypper.gpgkey")
-		}
-	}
-	// NOTE — gpgcheck is an OPERATOR CHOICE, not a hard gate. We enforce
-	// the https transport on base URLs (above), but a dnf/zypper repo with
-	// gpgcheck=false is permitted: package-signature verification is the
-	// operator's call, mirroring the WS7 checksum_url "lenient but the
-	// transport is still verified" posture. Re-introducing a refusal here
-	// would break legitimate internal-mirror configurations; the accepted
-	// risk is documented in ADR 0012. See
-	// TestValidateRepositoryParams_AllowsOperatorChoiceGpgcheck.
-	return nil
-}
+// Repository configuration validation (name grammar, per-backend URL/baseurl
+// shape, control-char/newline rejection on every field, gpgkey ref) is owned by
+// the SDK's repo.Manager.Validate, which executeRepository calls as its
+// pre-flight gate. The agent no longer re-derives the field regexes here.
 
 // maxScriptSize is the maximum allowed size for shell scripts (1 MiB).
 const maxScriptSize = 1 << 20
@@ -206,11 +59,6 @@ func defaultTimeoutForAction(actionType pb.ActionType, requested int32) int32 {
 	default:
 		return 0
 	}
-}
-
-// containsNewline returns true if s contains \n or \r.
-func containsNewline(s string) bool {
-	return strings.ContainsAny(s, "\n\r")
 }
 
 // Executor handles the execution of actions.
@@ -828,106 +676,6 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 
 	e.logger.Debug("verification passed, remediation successful")
 	return execOutput, verifyOutput, true, nil
-}
-
-// maxDownloadSize is the maximum allowed download size (2 GiB). It is a
-// var, not a const, only so tests can shrink the cap to exercise the
-// oversize-rejection path without streaming 2 GiB; production never
-// reassigns it.
-var maxDownloadSize int64 = 2 << 30
-
-func (e *Executor) downloadFile(ctx context.Context, url, dest, expectedChecksum string) error {
-	// WS7 #2: https-only, fail-closed before any network. Rejects http,
-	// file, ftp, and scheme-relative (//host/x) URLs. deb/rpm/appimage all
-	// route through here, so this is the single download chokepoint. The
-	// mandatory checksum is enforced at the action boundary (the proto
-	// makes checksum_sha256 required and the server validates it), so a
-	// CA-signed action always carries one; downloadFile verifies whatever
-	// checksum it is given.
-	if err := validateHTTPS(url); err != nil {
-		return fmt.Errorf("download rejected: %w", err)
-	}
-	req, err := http.NewRequestWithContext(ctx, "GET", url, nil)
-	if err != nil {
-		return err
-	}
-
-	resp, err := e.httpClient.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != http.StatusOK {
-		return fmt.Errorf("download failed: %s", resp.Status)
-	}
-
-	// Reject downloads that advertise a size larger than the limit.
-	if resp.ContentLength > maxDownloadSize {
-		return fmt.Errorf("download rejected: Content-Length %d exceeds maximum %d bytes", resp.ContentLength, maxDownloadSize)
-	}
-
-	// Wrap the body with a size limit to protect against servers that
-	// lie about Content-Length or use chunked encoding.
-	body := io.LimitReader(resp.Body, maxDownloadSize+1)
-
-	// Download into a temp file in the destination directory, then
-	// atomically rename over dest only on full success. A failed,
-	// partial, or checksum-mismatched download must NOT destroy an
-	// existing file at dest — e.g. a working AppImage being upgraded
-	// (os.Create truncated it in place before, leaving the user with
-	// nothing on any error).
-	tmp, err := os.CreateTemp(filepath.Dir(dest), "."+filepath.Base(dest)+".download-*")
-	if err != nil {
-		return err
-	}
-	tmpPath := tmp.Name()
-	removeTmp := func() { _ = os.Remove(tmpPath) }
-
-	hasher := sha256.New()
-	dst := io.Writer(tmp)
-	if expectedChecksum != "" {
-		dst = io.MultiWriter(tmp, hasher)
-	}
-	written, err := io.Copy(dst, body)
-	if err != nil {
-		_ = tmp.Close()
-		removeTmp()
-		return err
-	}
-	if written > maxDownloadSize {
-		_ = tmp.Close()
-		removeTmp()
-		return fmt.Errorf("download exceeded maximum size of %d bytes", maxDownloadSize)
-	}
-	if expectedChecksum != "" {
-		actual := hex.EncodeToString(hasher.Sum(nil))
-		// EqualFold + TrimSpace: actual is lowercase hex, but operators
-		// commonly paste uppercase / whitespace-padded hashes. A
-		// case-sensitive compare here rejected an uppercase-but-correct
-		// checksum even though the idempotency skip-check already
-		// normalizes (see action_appimage.go), so installs failed on a
-		// correct file.
-		if !strings.EqualFold(actual, strings.TrimSpace(expectedChecksum)) {
-			_ = tmp.Close()
-			removeTmp()
-			return fmt.Errorf("checksum mismatch: expected %s, got %s", strings.TrimSpace(expectedChecksum), actual)
-		}
-	}
-	if err := tmp.Sync(); err != nil {
-		_ = tmp.Close()
-		removeTmp()
-		return fmt.Errorf("fsync downloaded file: %w", err)
-	}
-	if err := tmp.Close(); err != nil {
-		removeTmp()
-		return fmt.Errorf("close downloaded file: %w", err)
-	}
-	if err := os.Rename(tmpPath, dest); err != nil {
-		removeTmp()
-		return fmt.Errorf("install downloaded file to %s: %w", dest, err)
-	}
-	return nil
 }
 
 // IsInstantAction returns true if the action type is an instant action (agent-builtin, no parameters).

@@ -3,7 +3,6 @@ package executor
 import (
 	"context"
 	"log/slog"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -11,24 +10,12 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
-// TestFlatpakInstallArgs_AfterEndOfOptions pins that the remote and
-// app-id reach `flatpak install` after a "--" so neither can be reparsed
-// as a flatpak option (`--from=…`, `--sideload-repo=…`, …).
-func TestFlatpakInstallArgs_AfterEndOfOptions(t *testing.T) {
-	if got, want := flatpakInstallArgs("--system", "flathub", "org.videolan.VLC"),
-		[]string{"install", "-y", "--noninteractive", "--system", "--", "flathub", "org.videolan.VLC"}; !slices.Equal(got, want) {
-		t.Errorf("flatpakInstallArgs(system) = %v, want %v", got, want)
-	}
-	if got, want := flatpakInstallArgs("--user", "flathub", "org.gnome.Calculator"),
-		[]string{"install", "-y", "--noninteractive", "--user", "--", "flathub", "org.gnome.Calculator"}; !slices.Equal(got, want) {
-		t.Errorf("flatpakInstallArgs(user) = %v, want %v", got, want)
-	}
-	// install/uninstall argv discipline is symmetric.
-	if got, want := flatpakUninstallArgs("--system", "org.videolan.VLC"),
-		[]string{"uninstall", "-y", "--noninteractive", "--system", "--", "org.videolan.VLC"}; !slices.Equal(got, want) {
-		t.Errorf("flatpakUninstallArgs(system) = %v, want %v", got, want)
-	}
-}
+// The remote/app-id end-of-options argv discipline now lives in the SDK flatpak
+// backend (it validates the remote and package names and builds the install
+// argv), so the agent no longer assembles it — the obsolete
+// flatpakInstallArgs/flatpakUninstallArgs unit test was removed with those
+// helpers. The executor-boundary validation gate below is what the agent still
+// owns and must keep proving.
 
 // TestExecuteFlatpak_ValidatesAppIdAndRemote pins finding 7: app-id and
 // remote are validated BEFORE any dispatch, so a flag-shaped value can

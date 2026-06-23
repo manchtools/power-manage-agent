@@ -4,8 +4,6 @@ package executor
 
 import (
 	"context"
-	"io"
-	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
@@ -61,54 +59,10 @@ func asCmdError(name string, r sysexec.Result, err error) error {
 	return nil
 }
 
-// runCmdWithStdin executes an unprivileged command with stdin input.
-func runCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Stdin: stdin})
-	return toOutput(&r), asCmdError(name, r, err)
-}
-
 // runSudoCmd runs a command through the privilege backend. It is a package var
 // (not a plain func) so update/reboot tests can stub the privileged shell-out
 // without a live host; production dispatches through the configured runner.
 var runSudoCmd = func(ctx context.Context, name string, args ...string) (*pb.CommandOutput, error) {
 	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Escalate: true})
 	return toOutput(&r), asCmdError(name, r, err)
-}
-
-// runSudoCmdWithStdin runs a privileged command with stdin input.
-func runSudoCmdWithStdin(ctx context.Context, stdin io.Reader, name string, args ...string) (*pb.CommandOutput, error) {
-	r, err := executorRunner.Run(ctx, sysexec.Command{Name: name, Args: args, Stdin: stdin, Escalate: true})
-	return toOutput(&r), asCmdError(name, r, err)
-}
-
-// runCmdStreaming executes a command with real-time output streaming.
-func runCmdStreaming(ctx context.Context, name string, args []string, envVars []string, dir string, callback OutputCallback) (*pb.CommandOutput, error) {
-	r, err := executorRunner.Stream(ctx, sysexec.Command{Name: name, Args: args, Env: envVars, Dir: dir}, callback)
-	return toOutput(&r), err
-}
-
-// queryCmdOutput runs an unprivileged command and returns stdout, exit code, and any error.
-func queryCmdOutput(name string, args ...string) (stdout string, exitCode int, err error) {
-	r, err := executorRunner.Run(context.Background(), sysexec.Command{Name: name, Args: args})
-	return r.Stdout, r.ExitCode, err
-}
-
-// checkCmdSuccess runs an unprivileged command and returns true if it succeeds (exit 0).
-func checkCmdSuccess(name string, args ...string) bool {
-	r, err := executorRunner.Run(context.Background(), sysexec.Command{Name: name, Args: args})
-	return err == nil && r.ExitCode == 0
-}
-
-// stderrSuffix returns " (<stderr>)" if the result has stderr content, or "".
-// Used to enrich human-readable error messages with the underlying command's
-// stderr — important for surfacing things like "user 'foo' already exists".
-func stderrSuffix(r *sysexec.Result) string {
-	if r == nil {
-		return ""
-	}
-	stderr := strings.TrimSpace(r.Stderr)
-	if stderr == "" {
-		return ""
-	}
-	return " (" + stderr + ")"
 }

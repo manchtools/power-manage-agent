@@ -5,117 +5,120 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/stretchr/testify/require"
 	"google.golang.org/protobuf/proto"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+	"github.com/manchtools/power-manage-sdk/sys/exec/exectest"
+	"github.com/manchtools/power-manage-sdk/sys/repo"
 )
 
-// TestValidateRepositoryParams_AcceptsRealistic pins the expected
-// shapes of legitimate repository configurations — regressions in
-// the validator grammar must not reject these.
-func TestValidateRepositoryParams_AcceptsRealistic(t *testing.T) {
+// Repository field validation is now owned by the SDK's repo.Manager.Validate;
+// executeRepository runs it (on the agent's repositoryFields mapping) as its
+// pre-flight gate. These tests drive that exact path: they prove the agent's
+// proto->repo mapping reaches repo.Validate and that injection is rejected, and
+// pin the agent-level decisions the SDK can't (ADR 0012 operator-choice gpgcheck;
+// which fields are validated at this gate vs. later in downloadAptKey).
+
+// validateRepoViaSDK builds the SDK repo.Manager for whichever backend the params
+// configure and validates the agent's field mapping through it — the path
+// executeRepository uses. The runner is a fake (Validate runs no commands).
+func validateRepoViaSDK(t *testing.T, p *pb.RepositoryParams) error {
+	t.Helper()
+	var backend pkg.Backend
+	switch {
+	case p.Apt != nil:
+		backend = pkg.Apt
+	case p.Dnf != nil:
+		backend = pkg.Dnf
+	case p.Pacman != nil:
+		backend = pkg.Pacman
+	case p.Zypper != nil:
+		backend = pkg.Zypper
+	default:
+		t.Fatal("test params configure no backend")
+	}
+	mgr, err := repo.New(backend, exectest.New(sysexec.Direct))
+	require.NoError(t, err)
+	e := &Executor{pkgBackend: backend}
+	return mgr.Validate(e.repositoryFields(p))
+}
+
+// TestRepository_AcceptsRealistic pins that legitimate configurations pass the
+// SDK validation through the agent's mapping — a regression in the mapping or a
+// grammar over-tightening must not reject these.
+func TestRepository_AcceptsRealistic(t *testing.T) {
 	cases := map[string]*pb.RepositoryParams{
-		"apt": {
-			Apt: &pb.AptRepository{
-				Url:          "https://apt.example.com/debian",
-				Distribution: "bookworm",
-				Components:   []string{"main", "contrib", "non-free-firmware"},
-				Arch:         "amd64,arm64",
-				GpgKeyUrl:    "https://apt.example.com/signing.asc",
-			},
-		},
-		"dnf": {
-			Dnf: &pb.DnfRepository{
-				Baseurl:     "https://dnf.example.com/fedora/$releasever",
-				Description: "Example DNF repo",
-				Gpgkey:      "https://dnf.example.com/key.asc",
-				Gpgcheck:    true,
-			},
-		},
-		"pacman-optional-trustall": {
-			Pacman: &pb.PacmanRepository{
-				Server:   "https://arch.example.com/os/$arch",
-				SigLevel: "Optional TrustAll",
-			},
-		},
-		"zypper": {
-			Zypper: &pb.ZypperRepository{
-				Url:         "https://zypper.example.com/15.5",
-				Description: "Example Zypper repo",
-				Gpgkey:      "https://zypper.example.com/key.asc",
-				Type:        "rpm-md",
-			},
-		},
+		"apt": {Name: "r", Apt: &pb.AptRepository{
+			Url: "https://apt.example.com/debian", Distribution: "bookworm",
+			Components: []string{"main", "contrib", "non-free-firmware"}, Arch: "amd64,arm64",
+		}},
+		"dnf": {Name: "r", Dnf: &pb.DnfRepository{
+			Baseurl: "https://dnf.example.com/fedora/$releasever", Description: "Example DNF repo",
+			Gpgkey: "https://dnf.example.com/key.asc", Gpgcheck: true,
+		}},
+		"pacman": {Name: "r", Pacman: &pb.PacmanRepository{
+			Server: "https://arch.example.com/os/$arch", SigLevel: "Optional TrustAll",
+		}},
+		"zypper": {Name: "r", Zypper: &pb.ZypperRepository{
+			Url: "https://zypper.example.com/15.5", Description: "Example Zypper repo",
+			Gpgkey: "https://zypper.example.com/key.asc", Type: "rpm-md",
+		}},
 	}
 	for name, p := range cases {
 		t.Run(name, func(t *testing.T) {
-			if err := validateRepositoryParams(p); err != nil {
+			if err := validateRepoViaSDK(t, p); err != nil {
 				t.Fatalf("legitimate config rejected: %v", err)
 			}
 		})
 	}
 }
 
-// TestValidateRepositoryParams_RejectsInjection is the regression:
-// every repo string field must refuse newline injection and the
-// enum-like fields must reject out-of-grammar values. A malformed
-// signed action must NOT be able to smuggle extra directives into
-// apt/dnf/pacman/zypper config.
-func TestValidateRepositoryParams_RejectsInjection(t *testing.T) {
-	cases := map[string]*pb.RepositoryParams{
-		"apt distribution newline": {
-			Apt: &pb.AptRepository{Distribution: "bookworm\nEvil: yes"},
-		},
-		"apt component newline": {
-			Apt: &pb.AptRepository{Components: []string{"main", "contrib\nEvil: 1"}},
-		},
-		"apt component shape": {
-			Apt: &pb.AptRepository{Components: []string{"main", "non-free evil"}},
-		},
-		"apt arch newline": {
-			Apt: &pb.AptRepository{Arch: "amd64\n"},
-		},
-		"apt arch shape": {
-			Apt: &pb.AptRepository{Arch: "amd64 arm64"}, // space not allowed
-		},
-		"apt gpg_key_url newline": {
-			Apt: &pb.AptRepository{GpgKeyUrl: "https://a\nhttps://b"},
-		},
-		"dnf gpgkey newline": {
-			Dnf: &pb.DnfRepository{Gpgkey: "https://a\nhttps://b"},
-		},
-		"pacman siglevel newline": {
-			Pacman: &pb.PacmanRepository{SigLevel: "Required\nInjected=1"},
-		},
-		"pacman siglevel shape": {
-			Pacman: &pb.PacmanRepository{SigLevel: "Required! TrustAll"},
-		},
-		"zypper type newline": {
-			Zypper: &pb.ZypperRepository{Type: "rpm-md\nEvil: 1"},
-		},
-		"zypper type shape": {
-			Zypper: &pb.ZypperRepository{Type: "rpm md"},
-		},
-		"zypper gpgkey newline": {
-			Zypper: &pb.ZypperRepository{Gpgkey: "https://a\nhttps://b"},
-		},
+// TestRepository_RejectsBadBaseURLAndGpgKey pins the load-bearing security
+// properties through the delegation: dnf/zypper/pacman base URLs where ROOT
+// packages are fetched must be https, and a dnf/zypper gpgkey ref passed to
+// `rpm --import` must be a safe https/file/abs-path (never a flag, plaintext
+// http, or rpm's ext:: command transport). A future swap of the SDK call must
+// not silently drop these.
+func TestRepository_RejectsBadBaseURLAndGpgKey(t *testing.T) {
+	reject := []*pb.RepositoryParams{
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "http://m/r", Gpgcheck: true}},
+		{Name: "r", Zypper: &pb.ZypperRepository{Url: "http://m/r", Gpgcheck: true}},
+		{Name: "r", Pacman: &pb.PacmanRepository{Server: "http://m/r"}},
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "ftp://x", Gpgcheck: true}},
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "http://evil/key"}},
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "ext::sh -c id"}},
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "--import=/etc/shadow"}},
 	}
-	for name, p := range cases {
-		t.Run(name, func(t *testing.T) {
-			err := validateRepositoryParams(p)
-			if err == nil {
-				t.Fatalf("expected rejection, got nil")
-			}
-			if !strings.Contains(err.Error(), "repository") {
-				t.Errorf("error should name the repository field; got: %v", err)
-			}
-		})
+	for i, p := range reject {
+		if err := validateRepoViaSDK(t, p); err == nil {
+			t.Errorf("reject case %d accepted a non-https base URL or unsafe gpg key ref", i)
+		}
 	}
 }
 
-// protoFieldName extracts the snake_case proto field name from the
-// generated struct's `protobuf:"...,name=foo,..."` tag, or "" for the
-// proto-internal fields (state/sizeCache/unknownFields have no tag).
+// TestRepository_AllowsOperatorChoiceGpgcheck pins ADR 0012 through the
+// delegation: gpgcheck is an OPERATOR CHOICE, not a hard gate. An https base URL
+// with gpgcheck=false (and no key) is a legitimate internal-mirror config and
+// must NOT be rejected. Guards against a future contributor (or SDK change)
+// re-introducing a refusal that would break real operators.
+func TestRepository_AllowsOperatorChoiceGpgcheck(t *testing.T) {
+	accept := []*pb.RepositoryParams{
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: false}},
+		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: false, Gpgkey: "https://m/k"}},
+		{Name: "r", Zypper: &pb.ZypperRepository{Url: "https://m/r", Gpgcheck: false}},
+	}
+	for i, p := range accept {
+		if err := validateRepoViaSDK(t, p); err != nil {
+			t.Errorf("accept case %d: legitimate operator-choice config rejected: %v", i, err)
+		}
+	}
+}
+
+// protoFieldName extracts the snake_case proto field name from the generated
+// struct's `protobuf:"...,name=foo,..."` tag, or "" for proto-internal fields.
 func protoFieldName(f reflect.StructField) string {
 	for _, part := range strings.Split(f.Tag.Get("protobuf"), ",") {
 		if strings.HasPrefix(part, "name=") {
@@ -125,46 +128,62 @@ func protoFieldName(f reflect.StructField) string {
 	return ""
 }
 
-// TestValidateRepositoryParams_SelfDiscoversEveryStringField is the
-// self-discovering replacement for the stale hardcoded subset (finding
-// 4). It reflection-walks every string / []string field of every repo
-// proto, injects a newline-bearing value into exactly one field, and
-// asserts the validator rejects it AND names that field. A newly-added
-// proto field that forgets its newline guard makes this FAIL — the test
-// fails CLOSED: a field is "must be guarded" unless it is consciously
-// listed in `multiLineContent` with a justification.
-func TestValidateRepositoryParams_SelfDiscoversEveryStringField(t *testing.T) {
-	// Fields whose value is legitimately multi-line content written to a
-	// file (not spliced into a config line or argv), so the newline guard
-	// must NOT apply. NOT a fail-open allowlist: a new field is absent
-	// here by default and therefore REQUIRED to carry the newline guard.
-	multiLineContent := map[string]bool{
-		"apt.gpg_key": true, // ASCII-armored key blob, written verbatim to a keyring file
+// TestRepository_SelfDiscoversEveryStringField is the self-discovering guard
+// (finding 4): reflection-walk every string / []string field of every repo
+// proto, inject a control-char value into exactly that field on an otherwise
+// VALID base config (so the SDK's required-field checks don't mask it), and
+// assert the agent's mapping + repo.Validate reject it. A newly-added proto
+// field that the agent forgets to map (repositoryFields) or that repo.Validate
+// forgets to guard makes this FAIL — it fails CLOSED: a field is "must be
+// guarded" unless consciously excluded with a justification.
+func TestRepository_SelfDiscoversEveryStringField(t *testing.T) {
+	// Excluded: fields NOT validated at the repo.Validate gate.
+	//   - apt.gpg_key:     ASCII-armored key blob written verbatim to a keyring
+	//                      file (legitimate multi-line content, not a config line).
+	//   - apt.gpg_key_url: the agent's OWN field (resolved by downloadAptKey, which
+	//                      validates it via sdk.ValidateHTTPSURL — see
+	//                      TestDownloadAptKey_RejectsNonHTTPS); it is not part of the
+	//                      repositoryFields mapping that reaches repo.Validate.
+	// NOT a fail-open allowlist: a new field is absent here by default and
+	// therefore REQUIRED to be mapped + guarded.
+	excluded := map[string]bool{
+		"apt.gpg_key":     true,
+		"apt.gpg_key_url": true,
 	}
 
 	managers := []struct {
 		prefix string
-		empty  func() proto.Message
+		base   func() proto.Message // a VALID config (required fields set)
 		wrap   func(proto.Message) *pb.RepositoryParams
 	}{
-		{"apt", func() proto.Message { return &pb.AptRepository{} }, func(m proto.Message) *pb.RepositoryParams {
-			return &pb.RepositoryParams{Name: "r", Apt: m.(*pb.AptRepository)}
-		}},
-		{"dnf", func() proto.Message { return &pb.DnfRepository{} }, func(m proto.Message) *pb.RepositoryParams {
-			return &pb.RepositoryParams{Name: "r", Dnf: m.(*pb.DnfRepository)}
-		}},
-		{"pacman", func() proto.Message { return &pb.PacmanRepository{} }, func(m proto.Message) *pb.RepositoryParams {
-			return &pb.RepositoryParams{Name: "r", Pacman: m.(*pb.PacmanRepository)}
-		}},
-		{"zypper", func() proto.Message { return &pb.ZypperRepository{} }, func(m proto.Message) *pb.RepositoryParams {
-			return &pb.RepositoryParams{Name: "r", Zypper: m.(*pb.ZypperRepository)}
-		}},
+		{"apt",
+			func() proto.Message {
+				return &pb.AptRepository{Url: "https://m/d", Distribution: "stable", Components: []string{"main"}, Arch: "amd64"}
+			},
+			func(m proto.Message) *pb.RepositoryParams {
+				return &pb.RepositoryParams{Name: "r", Apt: m.(*pb.AptRepository)}
+			}},
+		{"dnf",
+			func() proto.Message { return &pb.DnfRepository{Baseurl: "https://m/r"} },
+			func(m proto.Message) *pb.RepositoryParams {
+				return &pb.RepositoryParams{Name: "r", Dnf: m.(*pb.DnfRepository)}
+			}},
+		{"pacman",
+			func() proto.Message { return &pb.PacmanRepository{Server: "https://m/x"} },
+			func(m proto.Message) *pb.RepositoryParams {
+				return &pb.RepositoryParams{Name: "r", Pacman: m.(*pb.PacmanRepository)}
+			}},
+		{"zypper",
+			func() proto.Message { return &pb.ZypperRepository{Url: "https://m/r"} },
+			func(m proto.Message) *pb.RepositoryParams {
+				return &pb.RepositoryParams{Name: "r", Zypper: m.(*pb.ZypperRepository)}
+			}},
 	}
 
 	const payload = "x\nEvil: 1"
 	covered, urlish := 0, 0
 	for _, mgr := range managers {
-		rt := reflect.TypeOf(mgr.empty()).Elem()
+		rt := reflect.TypeOf(mgr.base()).Elem()
 		for i := 0; i < rt.NumField(); i++ {
 			f := rt.Field(i)
 			snake := protoFieldName(f)
@@ -177,29 +196,26 @@ func TestValidateRepositoryParams_SelfDiscoversEveryStringField(t *testing.T) {
 				continue
 			}
 			key := mgr.prefix + "." + snake
-			if multiLineContent[key] {
+			if excluded[key] {
 				continue
 			}
 
-			fresh := reflect.New(rt)
-			fv := fresh.Elem().Field(i)
+			// Start from a VALID base, then poison exactly the field under test.
+			fresh := mgr.base()
+			fv := reflect.ValueOf(fresh).Elem().Field(i)
 			if isString {
 				fv.SetString(payload)
 			} else {
 				fv.Set(reflect.ValueOf([]string{payload}))
 			}
-			params := mgr.wrap(fresh.Interface().(proto.Message))
 
-			err := validateRepositoryParams(params)
-			if err == nil {
-				t.Errorf("%s: newline-injected value accepted (field unguarded)", key)
+			if err := validateRepoViaSDK(t, mgr.wrap(fresh)); err == nil {
+				t.Errorf("%s: control-char value accepted (field unmapped or unguarded)", key)
 				continue
 			}
-			if !strings.Contains(err.Error(), snake) {
-				t.Errorf("%s: error should name the field %q; got: %v", key, snake, err)
-			}
 			covered++
-			if l := strings.ToLower(snake); strings.Contains(l, "url") || strings.Contains(l, "server") || strings.Contains(l, "gpgkey") {
+			if strings.Contains(snake, "url") || strings.Contains(snake, "server") ||
+				strings.Contains(snake, "gpgkey") || strings.Contains(snake, "baseurl") {
 				urlish++
 			}
 		}
@@ -208,84 +224,6 @@ func TestValidateRepositoryParams_SelfDiscoversEveryStringField(t *testing.T) {
 		t.Fatal("self-discovering walk covered 0 fields — reflection is broken")
 	}
 	if urlish == 0 {
-		t.Fatal("no URL-ish field (url/server/gpgkey) was exercised — guard/walk mismatch")
-	}
-}
-
-// TestValidateRepositoryParams_RejectsNonHttpsBaseURL pins finding 3:
-// dnf baseurl / zypper url / pacman server (where ROOT packages are
-// fetched) must be https. Gpgcheck is set so the zero-integrity rule
-// does not mask the scheme check.
-func TestValidateRepositoryParams_RejectsNonHttpsBaseURL(t *testing.T) {
-	reject := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "http://m/r", Gpgcheck: true}},
-		{Name: "r", Zypper: &pb.ZypperRepository{Url: "http://m/r", Gpgcheck: true}},
-		{Name: "r", Pacman: &pb.PacmanRepository{Server: "http://m/r"}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "ftp://x", Gpgcheck: true}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "file:///etc", Gpgcheck: true}},
-	}
-	for i, p := range reject {
-		if err := validateRepositoryParams(p); err == nil {
-			t.Errorf("reject case %d: non-https base URL accepted", i)
-		}
-	}
-	accept := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/$releasever", Gpgcheck: true}},
-		{Name: "r", Pacman: &pb.PacmanRepository{Server: "https://m/$arch", SigLevel: "Optional TrustAll"}},
-	}
-	for i, p := range accept {
-		if err := validateRepositoryParams(p); err != nil {
-			t.Errorf("accept case %d: https base URL rejected: %v", i, err)
-		}
-	}
-}
-
-// TestValidateRepositoryParams_RejectsBadGpgKeyRef pins finding 2:
-// dnf/zypper Gpgkey passed to `rpm --import` must be https/file/abs-path
-// — never a flag, plaintext http, or rpm's ext:: command transport.
-func TestValidateRepositoryParams_RejectsBadGpgKeyRef(t *testing.T) {
-	reject := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "http://evil/key"}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "-"}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "--import=/etc/shadow"}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "ext::sh -c id"}},
-		{Name: "r", Zypper: &pb.ZypperRepository{Url: "https://m/r", Gpgcheck: true, Gpgkey: "http://evil/key"}},
-	}
-	for i, p := range reject {
-		if err := validateRepositoryParams(p); err == nil {
-			t.Errorf("reject case %d: bad gpg key ref accepted", i)
-		}
-	}
-	accept := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "https://m/key.asc"}},
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true, Gpgkey: "file:///etc/pki/rpm-gpg/KEY"}},
-		{Name: "r", Zypper: &pb.ZypperRepository{Url: "https://m/r", Gpgcheck: true, Gpgkey: "/etc/pki/rpm-gpg/KEY"}},
-	}
-	for i, p := range accept {
-		if err := validateRepositoryParams(p); err != nil {
-			t.Errorf("accept case %d: good gpg key ref rejected: %v", i, err)
-		}
-	}
-}
-
-// TestValidateRepositoryParams_AllowsOperatorChoiceGpgcheck pins the
-// deliberate decision (ADR 0012): gpgcheck is an OPERATOR CHOICE, not a
-// hard gate. An https base URL with gpgcheck=false and no key is a
-// legitimate (if less-verified) internal-mirror configuration and must
-// NOT be rejected — mirroring the WS7 checksum_url posture (the https
-// transport is still enforced; package-signature verification is the
-// operator's call). This guards against a future contributor
-// re-introducing a refusal that would break real operators.
-func TestValidateRepositoryParams_AllowsOperatorChoiceGpgcheck(t *testing.T) {
-	accept := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: false}},                        // gpgcheck off, no key — operator choice
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: true}},                         // gpgcheck on
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "https://m/r", Gpgcheck: false, Gpgkey: "https://m/k"}}, // key supplied
-		{Name: "r", Zypper: &pb.ZypperRepository{Url: "https://m/r", Gpgcheck: false}},
-	}
-	for i, p := range accept {
-		if err := validateRepositoryParams(p); err != nil {
-			t.Errorf("accept case %d: legitimate operator-choice config rejected: %v", i, err)
-		}
+		t.Fatal("no URL-ish field (url/server/baseurl/gpgkey) was exercised — mapping/walk mismatch")
 	}
 }

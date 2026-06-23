@@ -60,7 +60,11 @@ func syncGroupMembers(ctx context.Context, groupName string, desiredUsers []stri
 
 	// Add missing members
 	for _, username := range desiredUsers {
-		if !userExists(username) {
+		uExists, err := userExists(ctx, username)
+		if err != nil {
+			return changed, fmt.Errorf("check user %s: %w", username, err)
+		}
+		if !uExists {
 			output.WriteString(fmt.Sprintf("warning: user %q does not exist, skipping group membership\n", username))
 			continue
 		}
@@ -147,7 +151,11 @@ func (e *Executor) removeGroupWithConfig(ctx context.Context, groupName, configP
 	}
 
 	// Remove group and membership
-	if groupExists(groupName) {
+	gExists, err := groupExists(ctx, groupName)
+	if err != nil {
+		return changed, fmt.Errorf("check group %s: %w", groupName, err)
+	}
+	if gExists {
 		if !changed {
 			// Need writable FS for group operations (may not have been checked above)
 			if _, err := e.requireWritableFS(ctx); err != nil {

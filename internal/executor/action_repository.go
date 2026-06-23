@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"io"
 	"net/http"
-	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	"github.com/manchtools/power-manage-sdk/sys/repo"
@@ -32,26 +32,10 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name required")
 	}
 
-	// Validate BEFORE requireWritableFS: requireWritableFS can invoke a
-	// sudo-backed remount/repair on a read-only root, so dispatching it for a
-	// malformed action (invalid name, oversized name, newline injection in a
-	// URL/GPG field, etc.) leaks privileged side-effects the action should have
-	// been rejected for up front. Keep validation cheap and before any system
-	// mutation. The Manager re-validates internally regardless.
-	if !validRepoName.MatchString(params.Name) {
-		return nil, false, fmt.Errorf("invalid repository name: must match [a-zA-Z0-9][a-zA-Z0-9._-]*")
-	}
-	if len(params.Name) > 128 {
-		return nil, false, fmt.Errorf("repository name too long: max 128 characters")
-	}
-	if err := validateRepositoryParams(params); err != nil {
-		return nil, false, err
-	}
-
-	// Per-manager skip-check BEFORE requireWritableFS: if the action carries no
-	// config for the host's package manager, it's a no-op and shouldn't trigger
-	// a sudo-backed remount on a read-only root just to bail out. The skip path
-	// returns changed=false; remount only fires when there is work to do.
+	// Per-manager skip-check BEFORE any validation or remount: if the action
+	// carries no config for the host's package manager, it's a no-op and
+	// shouldn't trigger validation or a sudo-backed remount on a read-only root.
+	// The skip path returns changed=false; remount only fires when there is work.
 	switch e.pkgBackend {
 	case pkg.Apt:
 		if params.Apt == nil || params.Apt.Disabled {
@@ -83,6 +67,18 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
 	}
 
+	// Validate BEFORE requireWritableFS via the SDK's repo.Manager.Validate — the
+	// single source of the per-backend field grammar (name shape + length,
+	// URL/baseurl shape, control-char/newline rejection on every field, gpgkey
+	// ref). requireWritableFS can invoke a sudo-backed remount on a read-only
+	// root, so a malformed action must be rejected up front; a field-only
+	// Repository is validated (no GPG-key download) so this stays a cheap,
+	// network-free gate. apt's gpg_key_url is the agent's own field — validated in
+	// downloadAptKey via sdk.ValidateHTTPSURL.
+	if err := mgr.Validate(e.repositoryFields(params)); err != nil {
+		return nil, false, err
+	}
+
 	// Repair filesystem if mounted read-only. Only reached once we know there is
 	// actual work to do for THIS host's package manager.
 	if out, err := e.requireWritableFS(ctx); err != nil {
@@ -105,34 +101,22 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 	}
 }
 
-// repositoryConfig maps the proto request to the SDK repo.Repository for the
-// host's package manager. For apt it resolves the signing key into bytes (the
-// SDK dearmors and installs it): either downloaded from gpg_key_url or taken
-// from the inline gpg_key field. The non-apt backends pass the GPG key as a
-// reference string (the SDK imports it with `rpm --import`).
-func (e *Executor) repositoryConfig(ctx context.Context, params *pb.RepositoryParams) (repo.Repository, error) {
+// repositoryFields maps the proto request to the SDK repo.Repository for the
+// host's package manager WITHOUT resolving the apt signing key (no network).
+// Used for the pre-flight repo.Manager.Validate gate; the PRESENT path then
+// resolves the key via repositoryConfig before Apply.
+func (e *Executor) repositoryFields(params *pb.RepositoryParams) repo.Repository {
 	r := repo.Repository{Name: params.Name}
 	switch e.pkgBackend {
 	case pkg.Apt:
 		a := params.Apt
-		cfg := &repo.AptConfig{
+		r.Apt = &repo.AptConfig{
 			URL:          a.Url,
 			Distribution: a.Distribution,
 			Components:   a.Components,
 			Arch:         a.Arch,
 			Trusted:      a.Trusted,
 		}
-		switch {
-		case a.GpgKeyUrl != "":
-			key, err := e.downloadAptKey(ctx, a.GpgKeyUrl)
-			if err != nil {
-				return repo.Repository{}, err
-			}
-			cfg.GPGKey = key
-		case a.GpgKey != "":
-			cfg.GPGKey = []byte(a.GpgKey)
-		}
-		r.Apt = cfg
 	case pkg.Dnf:
 		d := params.Dnf
 		r.Dnf = &repo.DnfConfig{
@@ -161,6 +145,27 @@ func (e *Executor) repositoryConfig(ctx context.Context, params *pb.RepositoryPa
 			Type:        z.Type,
 		}
 	}
+	return r
+}
+
+// repositoryConfig builds the full SDK repo.Repository, resolving the apt signing
+// key into bytes (the SDK dearmors and installs it): either downloaded from
+// gpg_key_url or taken from the inline gpg_key field. The non-apt backends pass
+// the GPG key as a reference string (the SDK imports it with `rpm --import`).
+func (e *Executor) repositoryConfig(ctx context.Context, params *pb.RepositoryParams) (repo.Repository, error) {
+	r := e.repositoryFields(params)
+	if e.pkgBackend == pkg.Apt && r.Apt != nil {
+		switch a := params.Apt; {
+		case a.GpgKeyUrl != "":
+			key, err := e.downloadAptKey(ctx, a.GpgKeyUrl)
+			if err != nil {
+				return repo.Repository{}, err
+			}
+			r.Apt.GPGKey = key
+		case a.GpgKey != "":
+			r.Apt.GPGKey = []byte(a.GpgKey)
+		}
+	}
 	return r, nil
 }
 
@@ -169,8 +174,8 @@ func (e *Executor) repositoryConfig(ctx context.Context, params *pb.RepositoryPa
 // the network policy (proxy, TLS pinning, rate) is the caller's concern. The
 // scheme is restricted to https (WS7) and the body is bounded to 10 MiB.
 func (e *Executor) downloadAptKey(ctx context.Context, keyURL string) ([]byte, error) {
-	if !strings.HasPrefix(keyURL, "https://") {
-		return nil, fmt.Errorf("GPG key URL must use https:// scheme, got: %s", keyURL)
+	if err := sdk.ValidateHTTPSURL(keyURL); err != nil {
+		return nil, fmt.Errorf("GPG key URL rejected: %w", err)
 	}
 	req, err := http.NewRequestWithContext(ctx, "GET", keyURL, nil)
 	if err != nil {

@@ -2,59 +2,13 @@ package executor
 
 import (
 	"context"
-	"fmt"
 	"log/slog"
-	"slices"
 	"strings"
 	"testing"
 	"time"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
-
-// TestRpmQueryArgv_PassesNameAfterEndOfOptions pins the intent that the
-// package NAME reaches `rpm -q` as an operand, never an option — even when a
-// crafted .rpm makes the name flag-shaped. (Erase/install now go through the SDK
-// pkg.Manager Remove/InstallLocal; only the read-only query still shells rpm.)
-func TestRpmQueryArgv_PassesNameAfterEndOfOptions(t *testing.T) {
-	if got, want := rpmQueryArgs("bash"), []string{"-q", "--", "bash"}; !slices.Equal(got, want) {
-		t.Errorf("rpmQueryArgs(bash) = %v, want %v", got, want)
-	}
-	// present-but-WRONG: a flag-shaped "name" must be the final operand,
-	// preceded by the "--" separator (so it can never be reparsed as an
-	// option even though it equals a flag).
-	for _, name := range []string{"-e", "--eval=%{lua:os.execute('id')}"} {
-		args := rpmQueryArgs(name)
-		if n := len(args); n < 2 || args[n-1] != name || args[n-2] != "--" {
-			t.Errorf("name %q must be the final operand preceded by --; args=%v", name, args)
-		}
-	}
-}
-
-// TestRpmPackageName_RejectsCraftedName drives the real rpmPackageName
-// extraction through a swappable query seam — intent: a malicious .rpm
-// can set %{NAME} to anything, so the value rpm reports is untrusted and
-// must be validated before it reaches argv.
-func TestRpmPackageName_RejectsCraftedName(t *testing.T) {
-	reports := func(name string) rpmQueryFunc {
-		return func(string, ...string) (string, int, error) { return name, 0, nil }
-	}
-	// correct
-	if got, err := rpmPackageName(reports("bash"), "/tmp/x.rpm"); err != nil || got != "bash" {
-		t.Errorf("rpmPackageName(bash) = %q, %v; want bash, nil", got, err)
-	}
-	// present-but-WRONG crafted names (sourced from intent, not the regex)
-	for _, bad := range []string{"--eval=%{lua:os.execute('id')}", "-e", "  ", "", "pkg;rm -rf /"} {
-		if got, err := rpmPackageName(reports(bad), "/tmp/x.rpm"); err == nil {
-			t.Errorf("rpmPackageName(%q) = %q, nil; want error", bad, got)
-		}
-	}
-	// the underlying rpm query failing must propagate, not yield a name
-	failing := func(string, ...string) (string, int, error) { return "", 1, fmt.Errorf("boom") }
-	if _, err := rpmPackageName(failing, "/tmp/x.rpm"); err == nil {
-		t.Error("rpmPackageName must propagate a query error")
-	}
-}
 
 // TestRequireVerifiedArtifact pins the MITM-hardening contract for a
 // download-and-install artifact: https only, and a non-empty checksum

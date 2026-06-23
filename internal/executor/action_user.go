@@ -76,46 +76,62 @@ func homeGroupFor(params *pb.UserParams) string {
 	return params.Username
 }
 
-// resolveOwnership turns the action's user/group into the numeric
-// uid/gid an fd-based fchown needs (sysfs.OpenRealDir / FchownNoFollow
-// operate on a descriptor, not a name). It is the numeric counterpart of
-// the "username:homeGroupFor()" string the path-based chown previously
-// took, and mirrors homeGroupFor's preference order exactly so .ssh
-// ownership stays identical to the home-directory chown:
-//   - numeric GID (or numeric PrimaryGroup) is used as a literal GID,
-//     matching how chown treats an all-numeric group token (no name
-//     lookup, so it works even if no group with that name exists);
-//   - otherwise the group name is resolved via the group database;
-//   - the default (no Gid, no PrimaryGroup) resolves the matching group
-//     named after the user, exactly as homeGroupFor returns.
-func resolveOwnership(params *pb.UserParams) (uid, gid int, err error) {
-	u, err := user.Lookup(params.Username)
+// ensureHomeIfMissing repairs a missing home directory for a create_home user
+// by delegating the create+seed+own+mode work to the SDK's idempotent
+// EnsureHome (mkdir + /etc/skel seed + recursive ownership + 0700) instead of
+// orchestrating mkdir / cp -a / chown / chmod by hand. It returns true only
+// when a missing home was actually created.
+//
+// Path safety: params.HomeDir is already validated at the ExecuteUserAction
+// entry point (filepath.IsAbs + isProtectedPath, which filepath.Clean's the
+// path before rejecting protected/traversal-escaping targets) before this runs.
+// EnsureHome resolves the directory to create from the user's passwd entry —
+// NOT from this path — so the path here only selects which location the
+// read-only Exists probe checks; it is never a write target.
+//
+// The presence probe fails CLOSED: if fsMgr.Exists cannot determine whether the
+// home exists (an I/O / permission error rather than a clean "no such file"),
+// the state is indeterminate, so we surface a warning and skip EnsureHome rather
+// than treating the error as "missing". Swallowing the probe error would invert
+// an unknown into a confident "create it", running EnsureHome on every reconcile
+// cycle (and reporting changed=true forever) against a home that may already be
+// present.
+func (e *Executor) ensureHomeIfMissing(ctx context.Context, params *pb.UserParams, currentHome string, output *strings.Builder) bool {
+	if !params.CreateHome {
+		return false
+	}
+	homeDir := params.HomeDir
+	if homeDir == "" {
+		homeDir = currentHome
+	}
+	if homeDir == "" {
+		homeDir = "/home/" + params.Username
+	}
+	ok, err := fsMgr.Exists(ctx, homeDir)
 	if err != nil {
-		return 0, 0, fmt.Errorf("look up user %s: %w", params.Username, err)
+		output.WriteString(fmt.Sprintf("warning: could not check home directory %s: %v\n", homeDir, err))
+		return false
 	}
-	uid, err = strconv.Atoi(u.Uid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse uid %q for %s: %w", u.Uid, params.Username, err)
+	if ok {
+		return false
 	}
-
-	group := homeGroupFor(params)
-	if n, convErr := strconv.Atoi(group); convErr == nil {
-		return uid, n, nil
+	// Home is missing (a prior run failed, or the account was created with -M).
+	// EnsureHome resolves the home from the user's passwd entry, which any
+	// preceding Modify has already set to the desired path.
+	if hErr := userMgr.EnsureHome(ctx, params.Username, sysuser.EnsureHomeOptions{Group: homeGroupFor(params), Mode: 0o700}); hErr != nil {
+		output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", hErr))
+		return false
 	}
-	g, err := user.LookupGroup(group)
-	if err != nil {
-		return 0, 0, fmt.Errorf("look up group %s: %w", group, err)
-	}
-	gid, err = strconv.Atoi(g.Gid)
-	if err != nil {
-		return 0, 0, fmt.Errorf("parse gid %q for group %s: %w", g.Gid, group, err)
-	}
-	return uid, gid, nil
+	output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
+	return true
 }
 
 func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
-	exists := userExists(params.Username)
+	exists, err := userExists(ctx, params.Username)
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("check user %s: %w", params.Username, err)
+	}
 
 	if exists {
 		// Update existing user
@@ -346,28 +362,8 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	// failed). Same change as in createUser — honour the explicit
 	// create_home value from the proto rather than inverting false
 	// to true for non-system users.
-	createHome := params.CreateHome
-	if createHome {
-		homeDir := params.HomeDir
-		if homeDir == "" {
-			homeDir = currentInfo.HomeDir
-		}
-		if homeDir == "" {
-			homeDir = "/home/" + params.Username
-		}
-		if _, err := os.Stat(homeDir); os.IsNotExist(err) {
-			if _, mkErr := runSudoCmd(ctx, "mkdir", "-p", "--", homeDir); mkErr != nil {
-				output.WriteString(fmt.Sprintf("warning: failed to create home directory: %v\n", mkErr))
-			} else {
-				runSudoCmd(ctx, "cp", "-a", "--", "/etc/skel/.", homeDir)
-				if chownErr := fsMgr.SetOwnershipRecursive(ctx, homeDir, params.Username, homeGroupFor(params)); chownErr != nil {
-					output.WriteString(fmt.Sprintf("warning: failed to chown home directory: %v\n", chownErr))
-				}
-				runSudoCmd(ctx, "chmod", "0700", "--", homeDir)
-				output.WriteString(fmt.Sprintf("created missing home directory: %s\n", homeDir))
-				changed = true
-			}
-		}
+	if e.ensureHomeIfMissing(ctx, params, currentInfo.HomeDir, output) {
+		changed = true
 	}
 
 	// Handle disabled/locked state - only change if different.
@@ -434,7 +430,11 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 		}, false, fmt.Errorf("cannot remove protected user: power-manage")
 	}
 
-	if !userExists(username) {
+	uExists, err := userExists(ctx, username)
+	if err != nil {
+		return nil, false, fmt.Errorf("check user %s: %w", username, err)
+	}
+	if !uExists {
 		// User doesn't exist, no change needed
 		return &pb.CommandOutput{
 			ExitCode: 0,
@@ -449,7 +449,7 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	removeAccountsServiceFile(ctx, username)
 
 	// Remove user and their home directory
-	err := userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
+	err = userMgr.Delete(ctx, username, sysuser.DeleteOptions{RemoveHome: true})
 	if err != nil {
 		// userdel -r can report an error when only the home directory was missing
 		// yet the account was removed. Confirm via Exists — but if THAT probe
@@ -471,54 +471,59 @@ func (e *Executor) removeUser(ctx context.Context, username string) (*pb.Command
 	}, true, nil
 }
 
-// accountsServicePath returns the AccountsService override file path for a user.
+// accountsServiceDir is the AccountsService per-user override directory. The
+// agent keeps the path + the SystemAccount content string ONLY for the
+// idempotency/"was it ours" pre-check below; the actual write/remove is
+// delegated to the SDK (user.SetHiddenOnLoginScreen), which owns the file format.
 const accountsServiceDir = "/var/lib/AccountsService/users"
 
-// setUserHidden writes or removes the AccountsService override to hide/show a user
-// on graphical login screens. Returns whether a change was made. Skips silently if
-// AccountsService is not installed (headless systems).
+// accountsServiceHiddenContent is the SDK-written AccountsService override body;
+// the agent compares against it to decide whether a change is needed and whether
+// an existing override is one it (the SDK) wrote.
+const accountsServiceHiddenContent = "[User]\nSystemAccount=true\n"
+
+// setUserHidden shows or hides a user on graphical login screens, delegating the
+// actual AccountsService write/remove to the SDK's user.SetHiddenOnLoginScreen.
+// The agent keeps three behaviours on top of the SDK call: skip SILENTLY on a
+// headless box (AccountsService not installed) rather than surfacing the SDK's
+// "not installed" error; idempotency (no change when already in the desired
+// state); and, on unhide, only remove an override that matches what the SDK
+// writes (don't delete a foreign override). Returns whether a change was made.
 func setUserHidden(ctx context.Context, username string, hidden bool, output *strings.Builder) bool {
-	filePath := accountsServiceDir + "/" + username
-
 	if _, err := os.Stat(accountsServiceDir); os.IsNotExist(err) {
-		return false // AccountsService not installed, skip
+		return false // AccountsService not installed (headless), skip silently
 	}
 
-	desiredContent := "[User]\nSystemAccount=true\n"
-
-	if hidden {
-		// Check idempotency
-		existing, _ := readFileWithSudo(ctx, filePath)
-		if existing == desiredContent {
-			return false
-		}
-		if err := atomicWriteFile(ctx, filePath, desiredContent, "0644", "root", "root"); err != nil {
-			output.WriteString(fmt.Sprintf("warning: failed to hide user from login screen: %v\n", err))
-			return false
-		}
-		output.WriteString("hidden from login screen (AccountsService)\n")
-		return true
-	}
-
-	// hidden=false: remove the file if it exists and was set by us
-	existing, err := readFileWithSudo(ctx, filePath)
-	if err != nil || existing != desiredContent {
-		return false // File doesn't exist or wasn't ours
-	}
-	if err := removeFileStrict(ctx, filePath); err != nil {
-		output.WriteString(fmt.Sprintf("warning: failed to unhide user from login screen: %v\n", err))
+	// Idempotency + was-ours: a file matching accountsServiceHiddenContent means
+	// "hidden, written by us". (existing==content)==hidden ⇒ already converged;
+	// and on unhide a non-matching/foreign file reads as "not hidden", so we skip
+	// rather than remove it.
+	existing, _ := readFileWithSudo(ctx, accountsServiceDir+"/"+username)
+	if (existing == accountsServiceHiddenContent) == hidden {
 		return false
 	}
-	output.WriteString("visible on login screen (AccountsService removed)\n")
+
+	if err := userMgr.SetHiddenOnLoginScreen(ctx, username, hidden); err != nil {
+		verb := "hide"
+		if !hidden {
+			verb = "unhide"
+		}
+		output.WriteString(fmt.Sprintf("warning: failed to %s user on login screen: %v\n", verb, err))
+		return false
+	}
+	if hidden {
+		output.WriteString("hidden from login screen (AccountsService)\n")
+	} else {
+		output.WriteString("visible on login screen (AccountsService removed)\n")
+	}
 	return true
 }
 
-// removeAccountsServiceFile removes the AccountsService override for a user during user deletion.
+// removeAccountsServiceFile removes the AccountsService override for a user during
+// user deletion, via the SDK (SetHiddenOnLoginScreen(false) is an rm -f that
+// no-ops when the override is absent).
 func removeAccountsServiceFile(ctx context.Context, username string) {
-	filePath := accountsServiceDir + "/" + username
-	if fileExistsWithSudo(ctx, filePath) {
-		removeFileStrict(ctx, filePath)
-	}
+	_ = userMgr.SetHiddenOnLoginScreen(ctx, username, false)
 }
 
 // setupSSHKeys configures SSH authorized keys for a user.
@@ -572,8 +577,12 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 		return false, nil
 	}
 
-	// Create .ssh directory
-	if _, err := runSudoCmd(ctx, "mkdir", "-p", "--", sshDir); err != nil {
+	// Create .ssh directory via the SDK fs manager (privilege-keyed, like the
+	// fsMgr.WriteFile below) instead of a raw `sudo mkdir`. No Mode is set on
+	// purpose: MkdirOptions.Mode chmods by PATH, which would follow a
+	// user-planted ~/.ssh symlink — the very class the OpenRealDir + fd-chmod
+	// below close. The 0700 mode is applied through the O_NOFOLLOW FD.
+	if err := fsMgr.Mkdir(ctx, sshDir, sysfs.MkdirOptions{Recursive: true}); err != nil {
 		return false, fmt.Errorf("failed to create .ssh directory: %w", err)
 	}
 
@@ -597,7 +606,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 	}
 	defer sshFd.Close()
 
-	uid, gid, err := resolveOwnership(params)
+	uid, gid, err := sysfs.ResolveOwnership(params.Username, homeGroupFor(params))
 	if err != nil {
 		return false, fmt.Errorf("resolve .ssh ownership: %w", err)
 	}
@@ -642,15 +651,15 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 // reloadSshd reloads the sshd service, falling back to the "ssh" service name
 // for Debian/Ubuntu. Writes the result to output.
 func reloadSshd(ctx context.Context, output *strings.Builder) {
-	reloadOut, reloadErr := runSudoCmd(ctx, "systemctl", "reload", "sshd")
-	if reloadErr != nil {
-		reloadOut, reloadErr = runSudoCmd(ctx, "systemctl", "reload", "ssh")
+	// Reload via the SDK service Manager, falling back to the Debian/Ubuntu
+	// "ssh" unit name when "sshd" is not the unit on this host.
+	err := serviceMgr.Reload(ctx, "sshd")
+	if err != nil {
+		err = serviceMgr.Reload(ctx, "ssh")
 	}
-	if reloadErr != nil {
+	if err != nil {
 		output.WriteString("warning: failed to reload sshd\n")
-		if reloadOut != nil && reloadOut.Stderr != "" {
-			output.WriteString(strings.TrimSpace(reloadOut.Stderr) + "\n")
-		}
+		output.WriteString(strings.TrimSpace(err.Error()) + "\n")
 	} else {
 		output.WriteString("reloaded sshd\n")
 	}

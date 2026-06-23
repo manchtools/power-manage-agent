@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"strings"
 
+	sdk "github.com/manchtools/power-manage-sdk"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
@@ -54,12 +55,13 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 	// https-only — the previous code also allowed http://); derive the
 	// filename from a path segment that has no slashes or other directory
 	// components.
-	parsedURL, err := url.Parse(strings.TrimSpace(params.Url))
-	if err != nil ||
-		parsedURL.Scheme != "https" ||
-		parsedURL.Opaque != "" ||
-		parsedURL.Host == "" {
-		return nil, false, fmt.Errorf("invalid appimage URL (must be https): %q", params.Url)
+	trimmedURL := strings.TrimSpace(params.Url)
+	if err := sdk.ValidateHTTPSURL(trimmedURL); err != nil {
+		return nil, false, fmt.Errorf("invalid appimage URL: %w", err)
+	}
+	parsedURL, err := url.Parse(trimmedURL)
+	if err != nil {
+		return nil, false, fmt.Errorf("invalid appimage URL %q: %w", params.Url, err)
 	}
 	filename := filepath.Base(parsedURL.Path)
 	// Reject ".." too — filepath.Base of e.g. https://x.example/.. returns
@@ -111,7 +113,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 					}, false, nil
 				}
 			}
-		} else if _, err := os.Stat(resolvedPath); err == nil {
+		} else if ok, _ := fsMgr.Exists(ctx, resolvedPath); ok {
 			// No checksum specified, file exists
 			return &pb.CommandOutput{
 				ExitCode: 0,
@@ -124,19 +126,18 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 			return out, false, err
 		}
 
-		// Create directory
-		if err := os.MkdirAll(filepath.Dir(resolvedPath), 0755); err != nil {
+		// Download straight into the install dir via the SDK remote source: it
+		// streams the body to a temp IN the destination directory, verifies the
+		// sha256, fsyncs, and atomically renames onto resolvedPath at mode 0755 —
+		// no buffering of the (hundreds-of-MB) payload and no second copy, and a
+		// failed/mismatched download never clobbers an existing AppImage.
+		// requireVerifiedArtifact above already enforced https + a present
+		// checksum (remote accepts http too, so the agent keeps that gate).
+		if err := createDirectory(ctx, filepath.Dir(resolvedPath), true); err != nil {
 			return nil, false, fmt.Errorf("create directory: %w", err)
 		}
-
-		// Download file
-		if err := e.downloadFile(ctx, params.Url, resolvedPath, params.ChecksumSha256); err != nil {
+		if err := fetchArtifact(ctx, params.Url, resolvedPath, params.ChecksumSha256, "0755"); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
-		}
-
-		// Make executable
-		if err := os.Chmod(resolvedPath, 0755); err != nil {
-			return nil, false, fmt.Errorf("chmod: %w", err)
 		}
 
 		return &pb.CommandOutput{
@@ -145,8 +146,10 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		}, true, nil
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
-		// Check if file already doesn't exist
-		if _, err := os.Stat(resolvedPath); os.IsNotExist(err) {
+		// Check if file already doesn't exist. Only short-circuit on a definite
+		// "absent" (no probe error); a probe error falls through to the remove,
+		// which surfaces the real failure rather than falsely reporting absence.
+		if ok, existErr := fsMgr.Exists(ctx, resolvedPath); existErr == nil && !ok {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("appimage %s already not present", filename),
@@ -158,7 +161,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 			return out, false, err
 		}
 
-		if err := os.Remove(resolvedPath); err != nil {
+		if err := removeFileStrict(ctx, resolvedPath); err != nil {
 			return nil, false, fmt.Errorf("remove: %w", err)
 		}
 		return &pb.CommandOutput{
