@@ -19,7 +19,6 @@ import (
 
 	"github.com/pressly/goose/v3"
 	"github.com/robfig/cron/v3"
-	"google.golang.org/protobuf/encoding/protojson"
 	"google.golang.org/protobuf/proto"
 	_ "modernc.org/sqlite"
 
@@ -188,39 +187,25 @@ func (s *Store) Close() error {
 	return s.db.Close()
 }
 
-// canonicalProtoJSON marshals m to JSON and strips the per-binary
-// random whitespace protojson injects. protojson deliberately varies
-// insignificant whitespace (seeded from a hash of the running binary)
-// as an anti-pinning measure, so a blob stored by one agent binary can
-// compare byte-unequal to the identical message marshaled by a
-// different binary after a self-update. The store uses these blobs for
-// change detection (SyncActions / SyncStandaloneAndGrouped); without
-// normalization a single self-update would flag EVERY action as changed
-// and re-execute the whole set, resetting all schedules. Compaction
-// yields a stable byte form — protojson's field order is already
-// deterministic, only the whitespace is not.
 // The store keeps proto blobs (actions, schedules, execution outputs) as
-// DETERMINISTIC BINARY protobuf, not protojson. Binary is compact, stable across
+// DETERMINISTIC BINARY protobuf, never protojson. Binary is compact, stable across
 // agent self-updates (protojson randomizes insignificant whitespace per binary,
-// which once forced the canonicalProtoJSON/compactJSON normalization), and — most
-// importantly — proto.Unmarshal PRESERVES fields the running SDK does not know
-// instead of rejecting them. A stale field from a newer/older SDK (e.g. a removed
-// "paramsCanonical") therefore can no longer wedge the whole offline scheduler
-// (GetDueActions aborts the entire query on a single decode failure).
+// which once forced a canonicalProtoJSON/compactJSON normalization step), and —
+// most importantly — proto.Unmarshal PRESERVES fields the running SDK does not
+// know instead of rejecting them, so a stale field from a different SDK revision
+// (e.g. a removed "paramsCanonical") can never wedge the offline scheduler
+// (GetDueActions aborts the whole query on a single decode failure). There is NO
+// protojson read-fallback: migration 004 clears the server-synced cache on the
+// cutover, so a legacy protojson row is never read.
 //
 // binaryProtoPrefix tags a stored blob as binary. It is 0x00 — the first byte of
 // neither protojson (always '{') nor a valid protobuf message (field number 0 is
-// illegal) — so a stored blob is classified unambiguously on read with no schema
-// column and no data migration; rows written as protojson before this cutover
-// still decode via the tolerant fallback in unmarshalStoredProto.
+// illegal) — so a corrupt/foreign blob is rejected rather than silently
+// misparsed.
 const binaryProtoPrefix byte = 0x00
 
-// tolerantProtoJSON decodes a legacy protojson blob permissively (DiscardUnknown)
-// so a pre-cutover row carrying an unknown field still parses.
-var tolerantProtoJSON = protojson.UnmarshalOptions{DiscardUnknown: true}
-
 // canonicalProtoBytes returns the deterministic binary encoding of m — the stable
-// form used for change detection (replaces compactJSON's whitespace stripping).
+// form used for change detection.
 func canonicalProtoBytes(m proto.Message) ([]byte, error) {
 	return proto.MarshalOptions{Deterministic: true}.Marshal(m)
 }
@@ -235,14 +220,13 @@ func marshalStoredProto(m proto.Message) ([]byte, error) {
 	return append([]byte{binaryProtoPrefix}, b...), nil
 }
 
-// unmarshalStoredProto decodes a stored blob into m, accepting BOTH the binary
-// form written by marshalStoredProto and a legacy protojson row. Binary preserves
-// unknown fields; the protojson fallback tolerates them.
+// unmarshalStoredProto decodes a binary stored blob into m. A blob lacking the
+// binary tag (corrupt, or a foreign format) is rejected, not guessed at.
 func unmarshalStoredProto(raw []byte, m proto.Message) error {
-	if len(raw) > 0 && raw[0] == binaryProtoPrefix {
-		return proto.Unmarshal(raw[1:], m)
+	if len(raw) == 0 || raw[0] != binaryProtoPrefix {
+		return fmt.Errorf("stored blob is not binary protobuf")
 	}
-	return tolerantProtoJSON.Unmarshal(raw, m)
+	return proto.Unmarshal(raw[1:], m)
 }
 
 // sameStoredProto reports whether the stored blob decodes (into the empty message

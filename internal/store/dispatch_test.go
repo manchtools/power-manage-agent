@@ -7,39 +7,50 @@ import (
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
+	"google.golang.org/protobuf/encoding/protowire"
+	"google.golang.org/protobuf/proto"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 )
 
-// TestStore_DecodesLegacyProtojsonRowWithUnknownField pins the forward-compat
-// fix: a row written by a different SDK revision can carry a field this binary's
-// proto no longer knows (here the removed "paramsCanonical"). With the old strict
-// protojson.Unmarshal, ONE such row failed to decode and aborted the entire
-// GetDueActions query — disabling the whole offline scheduler. The binary store +
-// tolerant protojson fallback must decode it (dropping the unknown field) so the
-// scheduler keeps running.
-func TestStore_DecodesLegacyProtojsonRowWithUnknownField(t *testing.T) {
+// TestStore_BinaryDecodePreservesUnknownFields pins the forward-compat guarantee
+// that motivated binary storage: a stored action carrying a wire field this
+// binary's proto does not know — exactly what a NEWER server would send — still
+// decodes, because proto.Unmarshal KEEPS unknown fields instead of rejecting them.
+// One such row therefore can never abort GetDueActions and disable the offline
+// scheduler. (Strict protojson, the old format, failed this case as an "unknown
+// field" error, e.g. the removed "paramsCanonical".)
+func TestStore_BinaryDecodePreservesUnknownFields(t *testing.T) {
 	st, err := New(t.TempDir())
 	require.NoError(t, err)
 	defer st.Close()
 
-	const id = "legacy-act"
+	const id = "unknown-field-act"
 	require.NoError(t, st.SaveAction(&pb.Action{
 		Id:       &pb.ActionId{Value: id},
 		Type:     pb.ActionType_ACTION_TYPE_SHELL,
 		Schedule: &pb.ActionSchedule{IntervalHours: 1},
 	}))
 
-	// Simulate a pre-cutover row: legacy protojson carrying an unknown field.
-	legacy := `{"id":{"value":"legacy-act"},"type":"ACTION_TYPE_SHELL","paramsCanonical":"c29tZQ=="}`
-	_, err = st.db.Exec("UPDATE actions SET action_json = ? WHERE id = ?", legacy, id)
+	// Re-write the row as binary protobuf carrying an extra UNKNOWN field (field
+	// number 50000) — what a newer SDK would add and this binary cannot name.
+	b, err := proto.Marshal(&pb.Action{
+		Id:       &pb.ActionId{Value: id},
+		Type:     pb.ActionType_ACTION_TYPE_SHELL,
+		Schedule: &pb.ActionSchedule{IntervalHours: 1},
+	})
+	require.NoError(t, err)
+	b = protowire.AppendTag(b, 50000, protowire.VarintType)
+	b = protowire.AppendVarint(b, 1)
+	blob := append([]byte{binaryProtoPrefix}, b...)
+	_, err = st.db.Exec("UPDATE actions SET action_json = ? WHERE id = ?", blob, id)
 	require.NoError(t, err)
 
-	// Advance the clock so the action is due, then read it. This must NOT error on
-	// the unknown field, and must return the decoded action.
+	// Advance the clock so the action is due, then read it: the unknown field must
+	// NOT error, and the action must decode and be returned.
 	st.SetClockForTest(func() time.Time { return time.Now().Add(48 * time.Hour) })
 	due, err := st.GetDueActions(context.Background())
-	require.NoError(t, err, "an unknown field in a stored row must not wedge the scheduler")
+	require.NoError(t, err, "an unknown wire field must not wedge the scheduler")
 
 	var found bool
 	for _, d := range due {
@@ -48,7 +59,7 @@ func TestStore_DecodesLegacyProtojsonRowWithUnknownField(t *testing.T) {
 			assert.Equal(t, pb.ActionType_ACTION_TYPE_SHELL, d.Action.Type)
 		}
 	}
-	assert.True(t, found, "the legacy-protojson action must decode (unknown field dropped) and be returned")
+	assert.True(t, found, "an action carrying an unknown field must still decode and be returned")
 }
 
 // SaveAction is the dispatch path: the handler stores the action AND
