@@ -23,7 +23,14 @@ var remoteHTTPClient *http.Client
 // skips verification; mode "" leaves the temp's default mode. Callers that need
 // https-only must still gate the URL up front (requireVerifiedArtifact) — remote
 // accepts http too.
-func fetchArtifact(ctx context.Context, url, dest, checksum, mode string) error {
+//
+// redirect selects the SDK redirect policy for this download (see
+// redirectForArtifact for the pin-aware default, or updateRedirectPolicy for the
+// operator-driven self-update choice). A cross-origin policy lets operator-chosen
+// URLs that are CDN-redirected resolve (e.g. GitHub releases bounce github.com ->
+// release-assets.githubusercontent.com); the sha256 pin keeps the bytes honest
+// across the hop, and an https->http downgrade stays refused by the SDK.
+func fetchArtifact(ctx context.Context, url, dest, checksum, mode string, redirect remote.RedirectPolicy) error {
 	// No pre-trim: remote.NewHTTP trims the URL internally, matching
 	// sdk.ValidateHTTPSURL (used by requireVerifiedArtifact), so a whitespace-padded
 	// URL that passes validation still fetches rather than failing as "not absolute".
@@ -31,6 +38,7 @@ func fetchArtifact(ctx context.Context, url, dest, checksum, mode string) error 
 		URL:            url,
 		ChecksumSHA256: checksum,
 		Mode:           mode,
+		Redirect:       redirect,
 		Client:         remoteHTTPClient,
 	})
 	if err != nil {
@@ -38,4 +46,17 @@ func fetchArtifact(ctx context.Context, url, dest, checksum, mode string) error 
 	}
 	_, err = src.Fetch(ctx, dest)
 	return err
+}
+
+// redirectForArtifact picks the redirect policy for an artifact download from
+// whether it is sha256-pinned. A pinned download may follow a cross-origin
+// redirect safely — the pin catches any substituted bytes — so CDN-backed URLs
+// (e.g. GitHub releases bouncing to release-assets.githubusercontent.com) work.
+// An unpinned download stays same-origin: with no pin, a host-changing redirect
+// could swap the bytes undetected.
+func redirectForArtifact(checksum string) remote.RedirectPolicy {
+	if checksum != "" {
+		return remote.RedirectCrossOrigin
+	}
+	return remote.RedirectSameOrigin
 }

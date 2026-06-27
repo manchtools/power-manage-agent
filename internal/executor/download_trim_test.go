@@ -30,7 +30,7 @@ func TestFetchArtifact_AcceptsWhitespacePaddedURL(t *testing.T) {
 
 	dest := filepath.Join(t.TempDir(), "app")
 	padded := "  " + srv.URL + "/app\n" // leading spaces + trailing newline
-	if err := fetchArtifact(context.Background(), padded, dest, "", "0644"); err != nil {
+	if err := fetchArtifact(context.Background(), padded, dest, "", "0644", redirectForArtifact("")); err != nil {
 		t.Fatalf("fetchArtifact on a whitespace-padded URL: %v", err)
 	}
 	got, err := os.ReadFile(dest)
