@@ -2,11 +2,11 @@ package executor
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
-	"net/http"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -129,7 +129,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		if err := sdk.ValidateHTTPSURL(arch.ChecksumUrl); err != nil {
 			return nil, false, fmt.Errorf("checksum URL validation: %w", err)
 		}
-		fileChecksum, err := downloadAndExtractChecksum(ctx, e.httpClient, arch.ChecksumUrl, extractFilename(arch.BinaryUrl))
+		fileChecksum, err := downloadAndExtractChecksum(ctx, arch.ChecksumUrl, extractFilename(arch.BinaryUrl), updateRedirectPolicy(params))
 		if err != nil {
 			return nil, false, fmt.Errorf("download checksum: %w", err)
 		}
@@ -155,7 +155,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	// expected sha256, and place it at mode 0755 (executable for the version
 	// self-test below) — all in one atomic step via the SDK remote source. An
 	// integrity failure is the binary-doesn't-match-the-pin case.
-	if err := fetchArtifact(ctx, arch.BinaryUrl, tmpPath, expectedChecksum, "0755"); err != nil {
+	if err := fetchArtifact(ctx, arch.BinaryUrl, tmpPath, expectedChecksum, "0755", updateRedirectPolicy(params)); err != nil {
 		if errors.Is(err, remote.ErrIntegrity) {
 			return nil, false, fmt.Errorf("binary does not match the expected_sha256 pin: %w", err)
 		}
@@ -341,25 +341,39 @@ func extractFilename(rawURL string) string {
 	return filepath.Base(u.Path)
 }
 
+// updateRedirectPolicy resolves the redirect policy for a self-update download
+// from the operator's explicit AllowRedirect choice on the action. Default false
+// keeps the strict same-origin guard; true follows cross-origin redirects (e.g.
+// a CDN such as GitHub releases). The binary is always sha256-pinned and an
+// https->http downgrade is refused by the SDK regardless, so the flag opts into
+// a host-changing hop, not into unverified bytes — mirroring allow_downgrade as
+// a security-sensitive operator decision that rides inside the signed action.
+func updateRedirectPolicy(params *pb.AgentUpdateParams) remote.RedirectPolicy {
+	if params.GetAllowRedirect() {
+		return remote.RedirectCrossOrigin
+	}
+	return remote.RedirectSameOrigin
+}
+
 // downloadAndExtractChecksum downloads a SHA256SUMS-style file and extracts
 // the checksum for the given filename (format: "<hex>  <filename>"). Used
 // as the default integrity source when the action does not pin
 // expected_sha256 (WS7: operator tracks "latest" via checksum_url).
-func downloadAndExtractChecksum(ctx context.Context, client *http.Client, checksumURL, filename string) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, http.MethodGet, checksumURL, nil)
-	if err != nil {
-		return "", fmt.Errorf("create request: %w", err)
-	}
-	resp, err := client.Do(req)
+func downloadAndExtractChecksum(ctx context.Context, checksumURL, filename string, redirect remote.RedirectPolicy) (string, error) {
+	// Fetch the manifest through the SDK remote path (size-capped, scheme-validated,
+	// same redirect policy as the binary — including the https->http downgrade
+	// refusal) rather than a bespoke client. The manifest is the integrity source,
+	// so it carries no ChecksumSHA256 of its own.
+	body, err := remote.FetchBytes(ctx, remote.HTTPConfig{
+		URL:      checksumURL,
+		Redirect: redirect,
+		Client:   remoteHTTPClient, // nil in prod (default client honours Redirect); tests inject a TLS client
+	})
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
 	}
-	defer resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		return "", fmt.Errorf("unexpected status %d", resp.StatusCode)
-	}
 
-	scanner := bufio.NewScanner(resp.Body)
+	scanner := bufio.NewScanner(bytes.NewReader(body))
 	for scanner.Scan() {
 		line := strings.TrimSpace(scanner.Text())
 		if line == "" {

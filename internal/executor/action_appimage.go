@@ -136,7 +136,7 @@ func (e *Executor) executeAppImage(ctx context.Context, params *pb.AppInstallPar
 		if err := createDirectory(ctx, filepath.Dir(resolvedPath), true); err != nil {
 			return nil, false, fmt.Errorf("create directory: %w", err)
 		}
-		if err := fetchArtifact(ctx, params.Url, resolvedPath, params.ChecksumSha256, "0755"); err != nil {
+		if err := fetchArtifact(ctx, params.Url, resolvedPath, params.ChecksumSha256, "0755", redirectForArtifact(params.ChecksumSha256)); err != nil {
 			return nil, false, fmt.Errorf("download: %w", err)
 		}
 
