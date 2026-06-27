@@ -344,10 +344,11 @@ func extractFilename(rawURL string) string {
 // updateRedirectPolicy resolves the redirect policy for a self-update download
 // from the operator's explicit AllowRedirect choice on the action. Default false
 // keeps the strict same-origin guard; true follows cross-origin redirects (e.g.
-// a CDN such as GitHub releases). The binary is always sha256-pinned and an
-// https->http downgrade is refused by the SDK regardless, so the flag opts into
-// a host-changing hop, not into unverified bytes — mirroring allow_downgrade as
-// a security-sensitive operator decision that rides inside the signed action.
+// a CDN such as GitHub releases). The binary is always verified against a SHA-256
+// (expected_sha256, or the hash resolved from checksum_url) and an https->http
+// downgrade is refused by the SDK regardless, so the flag opts into a
+// host-changing hop, not into unchecked bytes — mirroring allow_downgrade as a
+// security-sensitive operator decision that rides inside the signed action.
 func updateRedirectPolicy(params *pb.AgentUpdateParams) remote.RedirectPolicy {
 	if params.GetAllowRedirect() {
 		return remote.RedirectCrossOrigin
