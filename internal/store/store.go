@@ -9,7 +9,6 @@ import (
 	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
-	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -200,23 +199,64 @@ func (s *Store) Close() error {
 // and re-execute the whole set, resetting all schedules. Compaction
 // yields a stable byte form — protojson's field order is already
 // deterministic, only the whitespace is not.
-func canonicalProtoJSON(m proto.Message) (string, error) {
-	b, err := protojson.Marshal(m)
-	if err != nil {
-		return "", err
-	}
-	return compactJSON(b), nil
+// The store keeps proto blobs (actions, schedules, execution outputs) as
+// DETERMINISTIC BINARY protobuf, not protojson. Binary is compact, stable across
+// agent self-updates (protojson randomizes insignificant whitespace per binary,
+// which once forced the canonicalProtoJSON/compactJSON normalization), and — most
+// importantly — proto.Unmarshal PRESERVES fields the running SDK does not know
+// instead of rejecting them. A stale field from a newer/older SDK (e.g. a removed
+// "paramsCanonical") therefore can no longer wedge the whole offline scheduler
+// (GetDueActions aborts the entire query on a single decode failure).
+//
+// binaryProtoPrefix tags a stored blob as binary. It is 0x00 — the first byte of
+// neither protojson (always '{') nor a valid protobuf message (field number 0 is
+// illegal) — so a stored blob is classified unambiguously on read with no schema
+// column and no data migration; rows written as protojson before this cutover
+// still decode via the tolerant fallback in unmarshalStoredProto.
+const binaryProtoPrefix byte = 0x00
+
+// tolerantProtoJSON decodes a legacy protojson blob permissively (DiscardUnknown)
+// so a pre-cutover row carrying an unknown field still parses.
+var tolerantProtoJSON = protojson.UnmarshalOptions{DiscardUnknown: true}
+
+// canonicalProtoBytes returns the deterministic binary encoding of m — the stable
+// form used for change detection (replaces compactJSON's whitespace stripping).
+func canonicalProtoBytes(m proto.Message) ([]byte, error) {
+	return proto.MarshalOptions{Deterministic: true}.Marshal(m)
 }
 
-// compactJSON removes insignificant whitespace from JSON, returning the
-// input unchanged if it cannot be parsed (defensive; callers feed it
-// protojson output or previously-stored blobs).
-func compactJSON(b []byte) string {
-	var buf bytes.Buffer
-	if err := json.Compact(&buf, b); err != nil {
-		return string(b)
+// marshalStoredProto encodes m for storage: the binary tag byte followed by the
+// deterministic binary encoding.
+func marshalStoredProto(m proto.Message) ([]byte, error) {
+	b, err := canonicalProtoBytes(m)
+	if err != nil {
+		return nil, err
 	}
-	return buf.String()
+	return append([]byte{binaryProtoPrefix}, b...), nil
+}
+
+// unmarshalStoredProto decodes a stored blob into m, accepting BOTH the binary
+// form written by marshalStoredProto and a legacy protojson row. Binary preserves
+// unknown fields; the protojson fallback tolerates them.
+func unmarshalStoredProto(raw []byte, m proto.Message) error {
+	if len(raw) > 0 && raw[0] == binaryProtoPrefix {
+		return proto.Unmarshal(raw[1:], m)
+	}
+	return tolerantProtoJSON.Unmarshal(raw, m)
+}
+
+// sameStoredProto reports whether the stored blob decodes (into the empty message
+// m of the stored type) to a value whose canonical form equals want. It normalizes
+// across the protojson→binary transition, so an unchanged blob stored as legacy
+// protojson is not spuriously flagged "changed" (which would reset an action's or
+// group's cadence). A decode failure counts as different, so a corrupt/legacy row
+// is refreshed.
+func sameStoredProto(stored []byte, m proto.Message, want []byte) bool {
+	if err := unmarshalStoredProto(stored, m); err != nil {
+		return false
+	}
+	got, err := canonicalProtoBytes(m)
+	return err == nil && bytes.Equal(got, want)
 }
 
 // SaveAction stores or updates an action dispatched from the server.
@@ -241,7 +281,7 @@ func (s *Store) SaveAction(action *pb.Action) error {
 		return fmt.Errorf("save action: nil id")
 	}
 
-	actionJSON, err := canonicalProtoJSON(action)
+	actionBlob, err := marshalStoredProto(action)
 	if err != nil {
 		return fmt.Errorf("marshal action: %w", err)
 	}
@@ -261,7 +301,7 @@ func (s *Store) SaveAction(action *pb.Action) error {
 				WHEN actions.last_executed_at IS NULL THEN excluded.next_execute_at
 				ELSE actions.next_execute_at
 			END
-	`, action.Id.Value, actionJSON, nextExecute)
+	`, action.Id.Value, actionBlob, nextExecute)
 
 	return err
 }
@@ -289,7 +329,7 @@ func (s *Store) MarkActionStarted(actionID string) error {
 	}
 
 	action := &pb.Action{}
-	if err := protojson.Unmarshal([]byte(actionJSON), action); err != nil {
+	if err := unmarshalStoredProto([]byte(actionJSON), action); err != nil {
 		return fmt.Errorf("unmarshal action: %w", err)
 	}
 
@@ -346,7 +386,7 @@ func (s *Store) GetAction(actionID string) (*StoredAction, error) {
 	}
 
 	stored.Action = &pb.Action{}
-	if err := protojson.Unmarshal([]byte(actionJSON), stored.Action); err != nil {
+	if err := unmarshalStoredProto([]byte(actionJSON), stored.Action); err != nil {
 		return nil, fmt.Errorf("unmarshal action: %w", err)
 	}
 
@@ -403,7 +443,7 @@ func (s *Store) GetDueActions(ctx context.Context) ([]*StoredAction, error) {
 		}
 
 		stored.Action = &pb.Action{}
-		if err := protojson.Unmarshal([]byte(actionJSON), stored.Action); err != nil {
+		if err := unmarshalStoredProto([]byte(actionJSON), stored.Action); err != nil {
 			return nil, fmt.Errorf("unmarshal action: %w", err)
 		}
 
@@ -450,7 +490,7 @@ func (s *Store) GetAllActions() ([]*StoredAction, error) {
 		}
 
 		stored.Action = &pb.Action{}
-		if err := protojson.Unmarshal([]byte(actionJSON), stored.Action); err != nil {
+		if err := unmarshalStoredProto([]byte(actionJSON), stored.Action); err != nil {
 			return nil, fmt.Errorf("unmarshal action: %w", err)
 		}
 
@@ -474,7 +514,7 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 	}
 
 	action := &pb.Action{}
-	if err := protojson.Unmarshal([]byte(actionJSON), action); err != nil {
+	if err := unmarshalStoredProto([]byte(actionJSON), action); err != nil {
 		return "", fmt.Errorf("unmarshal action: %w", err)
 	}
 
@@ -490,17 +530,17 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 		resultHash = hex.EncodeToString(h.Sum(nil))
 	}
 
-	// Store the result. CommandOutput is a proto message, so it is
-	// serialised with protojson (via canonicalProtoJSON — stable bytes),
-	// never stdlib encoding/json, which works only by snake-case-tag luck
-	// and breaks on any future oneof/enum/int64 field.
-	var outputJSON []byte
+	// Store the result. CommandOutput is a proto message, so it is serialised as
+	// deterministic binary protobuf (via marshalStoredProto), never stdlib
+	// encoding/json, which works only by snake-case-tag luck and breaks on any
+	// future oneof/enum/int64 field.
+	var outputBlob []byte
 	if result.Output != nil {
-		s, err := canonicalProtoJSON(result.Output)
+		b, err := marshalStoredProto(result.Output)
 		if err != nil {
 			slog.Warn("failed to marshal execution output", "error", err)
 		} else {
-			outputJSON = []byte(s)
+			outputBlob = b
 		}
 	}
 
@@ -529,7 +569,7 @@ func (s *Store) RecordExecution(actionID string, result *pb.ActionResult, hasCha
 	_, err = tx.Exec(`
 		INSERT INTO results (id, action_id, executed_at, status, error, output_json, duration_ms, has_changes, synced)
 		VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0)
-	`, resultID, actionID, now, int32(result.Status), result.Error, string(outputJSON), result.DurationMs, hasChanges)
+	`, resultID, actionID, now, int32(result.Status), result.Error, outputBlob, result.DurationMs, hasChanges)
 	if err != nil {
 		return "", err
 	}
@@ -588,7 +628,7 @@ func (s *Store) GetUnsyncedResults() ([]*StoredResult, error) {
 			// protojson is the matching codec for the proto written above;
 			// it also accepts the legacy snake_case stdlib-json shape, so
 			// results stored before this change still decode.
-			if err := protojson.Unmarshal([]byte(outputJSON.String), r.Output); err != nil {
+			if err := unmarshalStoredProto([]byte(outputJSON.String), r.Output); err != nil {
 				slog.Warn("failed to unmarshal stored command output", "result_id", r.ID, "error", err)
 			}
 		}
@@ -769,7 +809,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 			// and the store and device drift apart. Keep the row so a later
 			// sync (after the corruption is resolved) can still revert it.
 			action := &pb.Action{}
-			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
+			if err := unmarshalStoredProto([]byte(la.actionJSON), action); err != nil {
 				return nil, fmt.Errorf("removed action %s has undecodable stored JSON; refusing to delete without revert: %w", localID, err)
 			}
 			result.RemovedActions = append(result.RemovedActions, action)
@@ -790,15 +830,17 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 
 		local, exists := localActions[actionID]
 
-		actionJSON, err := canonicalProtoJSON(action)
+		newCanon, err := canonicalProtoBytes(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
+		actionBlob := append([]byte{binaryProtoPrefix}, newCanon...)
 
-		// Decide "changed" once, in Go, on the COMPACTED JSON so that
-		// insignificant protojson whitespace drift (e.g. after a self-update to
-		// a binary with a different marshal seed) is not mistaken for a change.
-		changed := exists && (local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON)
+		// Decide "changed" once, in Go, by comparing the CANONICAL BINARY form so
+		// that a different stored encoding (legacy protojson, or protojson's
+		// per-binary whitespace drift before this cutover) is not mistaken for a
+		// change. sameStoredProto decodes the stored blob and re-canonicalizes it.
+		changed := exists && (local.desiredState != newDesiredState || !sameStoredProto([]byte(local.actionJSON), &pb.Action{}, newCanon))
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
 		} else if changed {
@@ -830,7 +872,7 @@ func (s *Store) SyncActions(actions []*pb.Action) (*SyncResult, error) {
 					WHEN ? THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, actionJSON, nextExecute, newDesiredState, changed)
+		`, actionID, actionBlob, nextExecute, newDesiredState, changed)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -934,7 +976,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			// WS16 #4: fail closed on an undecodable removed standalone action
 			// rather than deleting it without ever reverting its side effects.
 			action := &pb.Action{}
-			if err := protojson.Unmarshal([]byte(la.actionJSON), action); err != nil {
+			if err := unmarshalStoredProto([]byte(la.actionJSON), action); err != nil {
 				return nil, fmt.Errorf("removed standalone action %s has undecodable stored JSON; refusing to delete without revert: %w", localID, err)
 			}
 			result.RemovedActions = append(result.RemovedActions, action)
@@ -953,18 +995,19 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		actionID := action.Id.Value
 		newDesiredState := int32(action.DesiredState)
 
-		actionJSON, err := canonicalProtoJSON(action)
+		newCanon, err := canonicalProtoBytes(action)
 		if err != nil {
 			return nil, fmt.Errorf("marshal action %s: %w", actionID, err)
 		}
+		actionBlob := append([]byte{binaryProtoPrefix}, newCanon...)
 
-		// Same lockstep decision as SyncActions: compare the COMPACTED JSON in
-		// Go (whitespace drift is not a change) and also treat a grouped→
-		// standalone transition as changed. The SQL CASE consumes this single
-		// decision instead of raw-byte-comparing the JSON, which would reset a
-		// standalone action's cadence on insignificant drift.
+		// Same lockstep decision as SyncActions: compare the CANONICAL BINARY form
+		// in Go (a different stored encoding is not a change) and also treat a
+		// grouped→standalone transition as changed. The SQL CASE consumes this
+		// single decision instead of raw-byte-comparing the blob, which would reset
+		// a standalone action's cadence on an insignificant encoding difference.
 		local, exists := localActions[actionID]
-		changed := exists && (local.desiredState != newDesiredState || compactJSON([]byte(local.actionJSON)) != actionJSON || local.isGrouped != 0)
+		changed := exists && (local.desiredState != newDesiredState || !sameStoredProto([]byte(local.actionJSON), &pb.Action{}, newCanon) || local.isGrouped != 0)
 		if !exists {
 			result.NewActionIDs = append(result.NewActionIDs, actionID)
 		} else if changed {
@@ -984,7 +1027,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					WHEN ? THEN excluded.next_execute_at
 					ELSE actions.next_execute_at
 				END
-		`, actionID, actionJSON, nextExecute, newDesiredState, changed)
+		`, actionID, actionBlob, nextExecute, newDesiredState, changed)
 		if err != nil {
 			return nil, fmt.Errorf("upsert action %s: %w", actionID, err)
 		}
@@ -1000,7 +1043,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 				continue
 			}
 			actionID := action.Id.Value
-			actionJSON, err := canonicalProtoJSON(action)
+			actionBlob, err := marshalStoredProto(action)
 			if err != nil {
 				return nil, fmt.Errorf("marshal grouped action %s: %w", actionID, err)
 			}
@@ -1012,7 +1055,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 					desired_state = excluded.desired_state,
 					is_grouped = 1,
 					next_execute_at = excluded.next_execute_at
-			`, actionID, actionJSON, farFuture, int32(action.DesiredState))
+			`, actionID, actionBlob, farFuture, int32(action.DesiredState))
 			if err != nil {
 				return nil, fmt.Errorf("upsert grouped action %s: %w", actionID, err)
 			}
@@ -1073,17 +1116,18 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 			continue
 		}
 
-		schedJSON, err := canonicalProtoJSON(g.Schedule)
+		schedCanon, err := canonicalProtoBytes(g.Schedule)
 		if err != nil {
 			return nil, fmt.Errorf("marshal group schedule for %s: %w", groupID, err)
 		}
+		schedBlob := append([]byte{binaryProtoPrefix}, schedCanon...)
 
 		// Preserve cadence across syncs when nothing about the group's
 		// schedule changed; otherwise reset to the new schedule's first
 		// slot.
 		var nextExecute time.Time
 		var lastExecutedAt sql.NullTime
-		if prior, ok := existingGroups[groupID]; ok && compactJSON([]byte(prior.scheduleJSON)) == schedJSON {
+		if prior, ok := existingGroups[groupID]; ok && sameStoredProto([]byte(prior.scheduleJSON), &pb.ActionSchedule{}, schedCanon) {
 			nextExecute = prior.nextExecuteAt
 			lastExecutedAt = prior.lastExecutedAt
 		} else {
@@ -1099,7 +1143,7 @@ func (s *Store) SyncStandaloneAndGrouped(standalone []*pb.Action, groups []*pb.A
 		if _, err := tx.Exec(`
 			INSERT INTO action_groups (id, source_label, schedule_json, assigned_at, last_executed_at, next_execute_at)
 			VALUES (?, ?, ?, CURRENT_TIMESTAMP, ?, ?)
-		`, groupID, g.SourceLabel, schedJSON, lastExecutedAt, nextExecute); err != nil {
+		`, groupID, g.SourceLabel, schedBlob, lastExecutedAt, nextExecute); err != nil {
 			return nil, fmt.Errorf("insert action_group %s: %w", groupID, err)
 		}
 
@@ -1157,7 +1201,7 @@ func (s *Store) GetDueGroups(ctx context.Context) ([]StoredActionGroup, error) {
 			return nil, err
 		}
 		var sched pb.ActionSchedule
-		if err := protojson.Unmarshal([]byte(schedJSON), &sched); err != nil {
+		if err := unmarshalStoredProto([]byte(schedJSON), &sched); err != nil {
 			slog.Warn("failed to unmarshal group schedule", "group_id", g.ID, "error", err)
 		} else {
 			g.Schedule = &sched
@@ -1203,7 +1247,7 @@ func (s *Store) GetGroupByID(groupID string) (*StoredActionGroup, error) {
 		return nil, err
 	}
 	var sched pb.ActionSchedule
-	if err := protojson.Unmarshal([]byte(schedJSON), &sched); err == nil {
+	if err := unmarshalStoredProto([]byte(schedJSON), &sched); err == nil {
 		g.Schedule = &sched
 	}
 	if lastExec.Valid {
@@ -1250,7 +1294,7 @@ func (s *Store) MarkGroupExecuted(groupID string, executedAt time.Time) error {
 		return err
 	}
 	var sched pb.ActionSchedule
-	if err := protojson.Unmarshal([]byte(schedJSON), &sched); err != nil {
+	if err := unmarshalStoredProto([]byte(schedJSON), &sched); err != nil {
 		return fmt.Errorf("unmarshal group schedule: %w", err)
 	}
 	executedUTC := executedAt.UTC()
