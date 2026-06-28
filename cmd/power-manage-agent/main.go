@@ -341,6 +341,27 @@ func main() {
 func parseFlags() *Config {
 	cfg := &Config{}
 
+	// Subcommands are dispatched in main() before flags are parsed, so the
+	// default flag usage (flags only) never mentions them. List them here so
+	// `power-manage-agent --help` shows the full surface (notably `tty`, which
+	// operators otherwise can't discover).
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		fmt.Fprintln(out, "power-manage-agent — Power Manage device agent")
+		fmt.Fprintln(out, "\nUsage:")
+		fmt.Fprintln(out, "  power-manage-agent [flags]           run the agent (default)")
+		fmt.Fprintln(out, "  power-manage-agent <command> [args]  run a subcommand")
+		fmt.Fprintln(out, "\nSubcommands:")
+		fmt.Fprintln(out, "  enroll      enroll this device with a control server (token or power-manage:// URI)")
+		fmt.Fprintln(out, "  tty         toggle the device-local remote-terminal gate (enable|disable|status)")
+		fmt.Fprintln(out, "  luks        LUKS passphrase operations")
+		fmt.Fprintln(out, "  query       run a local osquery query")
+		fmt.Fprintln(out, "  self-test   run agent self-diagnostics")
+		fmt.Fprintln(out, "  version     print the agent version")
+		fmt.Fprintln(out, "\nFlags (default run mode):")
+		flag.PrintDefaults()
+	}
+
 	var uri string
 	flag.StringVar(&uri, "uri", "", "Registration URI (power-manage://server:port?token=xxx)")
 	flag.StringVar(&cfg.Token, "token", "", "Registration token for first-time setup")

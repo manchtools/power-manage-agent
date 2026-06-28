@@ -70,7 +70,9 @@ func runTTY(args []string) int {
 		}
 	}
 
-	st, err := store.New(*dataDir)
+	// OpenExisting (not New): the agent service owns migrations, so a CLI toggle
+	// must not run goose on an already-initialised database.
+	st, err := store.OpenExisting(*dataDir)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "Error: open agent store: %v\n", err)
 		return 1
