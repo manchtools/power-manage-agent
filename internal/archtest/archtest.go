@@ -35,6 +35,7 @@
 //   - TestNoUnabstractedTimeNow ........... time_now_test.go
 //   - TestNoStdlibJSONOfProtoMessage ...... proto_json_test.go
 //   - TestNoContextBackgroundInRequestPaths ... context_background_test.go
+//   - TestNoMathRandForCrypto ............. mathrand_test.go
 package archtest
 
 import (
