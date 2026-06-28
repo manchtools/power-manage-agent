@@ -578,7 +578,7 @@ func (h *Handler) CollectInventory(ctx context.Context) *pb.DeviceInventory {
 	// Phase 2: Supplement/override with osquery if available
 	oq := h.getOsquery()
 	if oq != nil {
-		h.supplementWithOsquery(oq, tables)
+		h.supplementWithOsquery(ctx, oq, tables)
 	}
 
 	if len(tables) == 0 {
@@ -728,7 +728,7 @@ var (
 	}
 )
 
-func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*pb.InventoryTable) {
+func (h *Handler) supplementWithOsquery(ctx context.Context, oq osqueryRunner, baseline map[string]*pb.InventoryTable) {
 	// osquery tables that override baseline
 	coreTables := inventoryCoreTables
 
@@ -736,7 +736,7 @@ func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*p
 	packageTables := inventoryPackageTables
 
 	for _, tableName := range coreTables {
-		rows, err := oq.QueryTable(context.Background(), tableName)
+		rows, err := oq.QueryTable(ctx, tableName)
 		if err != nil {
 			h.logger.Debug("osquery table unavailable", "table", tableName, "error", err)
 			continue
@@ -751,7 +751,7 @@ func (h *Handler) supplementWithOsquery(oq osqueryRunner, baseline map[string]*p
 	}
 
 	for _, tableName := range packageTables {
-		rows, err := oq.QueryTable(context.Background(), tableName)
+		rows, err := oq.QueryTable(ctx, tableName)
 		if err != nil {
 			continue
 		}
