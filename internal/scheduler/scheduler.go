@@ -692,7 +692,15 @@ func (s *Scheduler) SyncActions(ctx context.Context, standalone []*pb.Action, gr
 		return err
 	}
 
+	// synced_total counts every action received — standalone PLUS each group's
+	// members — so the line doesn't read as "nothing received" when an action set
+	// arrived but carried no standalone actions (standalone_total=0).
+	syncedTotal := len(standalone)
+	for _, g := range groups {
+		syncedTotal += len(g.GetActions())
+	}
 	s.logger.Info("actions synced successfully",
+		"synced_total", syncedTotal,
 		"standalone_total", len(standalone),
 		"groups_total", len(groups),
 		"new_standalone", len(syncResult.NewActionIDs),
