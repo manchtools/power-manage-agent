@@ -84,7 +84,29 @@ type StoredResult struct {
 }
 
 // New creates a new store with the given data directory.
-func New(dataDir string) (*Store, error) {
+// New opens the agent store (creating the data dir/database if needed) and runs
+// any pending migrations. Used by the agent service, which OWNS the schema.
+func New(dataDir string) (*Store, error) { return open(dataDir, true) }
+
+// OpenExisting opens an already-initialised agent store WITHOUT running
+// migrations. It is for the CLI subcommands (e.g. `tty enable`, `luks`) that only
+// read/write a setting in a database the agent service already created and
+// migrated — re-running goose on every CLI invocation is needless work and log
+// noise (the confusing "goose: no migrations to run" line on a simple toggle).
+// Fails cleanly when the database does not exist yet, rather than silently
+// creating an empty, unmigrated one.
+func OpenExisting(dataDir string) (*Store, error) {
+	dbPath := filepath.Join(dataDir, "agent.db")
+	if _, err := os.Stat(dbPath); err != nil {
+		if os.IsNotExist(err) {
+			return nil, fmt.Errorf("agent database %s does not exist — start the agent service first (it creates and migrates the database)", dbPath)
+		}
+		return nil, fmt.Errorf("stat agent database: %w", err)
+	}
+	return open(dataDir, false)
+}
+
+func open(dataDir string, migrate bool) (*Store, error) {
 	if err := os.MkdirAll(dataDir, 0700); err != nil {
 		return nil, fmt.Errorf("create data directory: %w", err)
 	}
@@ -112,19 +134,24 @@ func New(dataDir string) (*Store, error) {
 	// favour of modernc.org/sqlite's per-conn locking would unlock the
 	// real benefit. Audit F021.
 
-	goose.SetBaseFS(migrations.FS)
-	// Audit F009: goose's dialect name is the legacy "sqlite3" even
-	// though the registered driver is "sqlite" (modernc.org/sqlite).
-	// The discrepancy is intentional — both are correct for their
-	// respective libraries — but called out here so the next reader
-	// doesn't try to "fix" the mismatch.
-	if err := goose.SetDialect("sqlite3"); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("set goose dialect: %w", err)
-	}
-	if err := goose.Up(db, "."); err != nil {
-		db.Close()
-		return nil, fmt.Errorf("run migrations: %w", err)
+	// Migrations are the agent service's responsibility (store.New); the CLI
+	// store-open path (OpenExisting) skips them so a `tty enable` toggle doesn't
+	// run goose on an already-migrated database.
+	if migrate {
+		goose.SetBaseFS(migrations.FS)
+		// Audit F009: goose's dialect name is the legacy "sqlite3" even
+		// though the registered driver is "sqlite" (modernc.org/sqlite).
+		// The discrepancy is intentional — both are correct for their
+		// respective libraries — but called out here so the next reader
+		// doesn't try to "fix" the mismatch.
+		if err := goose.SetDialect("sqlite3"); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("set goose dialect: %w", err)
+		}
+		if err := goose.Up(db, "."); err != nil {
+			db.Close()
+			return nil, fmt.Errorf("run migrations: %w", err)
+		}
 	}
 
 	// WS6 #10: the DB holds action secrets (PSK, WiFi/EAP keys, LUKS
