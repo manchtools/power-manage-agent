@@ -63,36 +63,31 @@ func TestHomeGroupForOwnership_ResolvesViaSDK(t *testing.T) {
 	})
 }
 
-// desiredAccountLocked encodes the single source of truth for whether
-// an account must stay shadow-locked. It MUST agree with createUser's
-// password-skip condition: createUser sets a temp password only when
-// !NoPassword && !SystemUser && !Disabled, leaving the account at the
-// useradd default '!' (locked, no PAM login) otherwise. updateUser's
-// lock reconciliation must therefore treat exactly those three cases as
-// "should be locked" — otherwise a reconcile of a passwordless account
-// runs `usermod -U`, strips the '!', and produces a PASSWORDLESS
-// account (the no_password #94 / pm-tty-* regression).
+// desiredAccountLocked is the agent-side "user is disabled" gate: an account is
+// shadow-LOCKED ("!") iff the control user is disabled. The terminal handler
+// refuses a locked pm-tty-* account, so a "!" unambiguously means disabled —
+// every ENABLED account is driven to an unlocked resting state ("*" for a
+// passwordless pm-tty-* user, a hash for a normal user), so the agent can tell a
+// disabled account apart from a freshly-created passwordless one.
 func TestDesiredAccountLocked(t *testing.T) {
 	cases := []struct {
 		name string
 		p    *pb.UserParams
 		want bool
 	}{
-		// The reported bug: a no_password account that is not disabled
-		// must NOT be unlocked — it has no password hash, so unlocking
-		// yields a passwordless login path.
-		{"no_password, not disabled -> stays locked", &pb.UserParams{NoPassword: true, Disabled: false}, true},
+		// The fix: an ENABLED passwordless account (a pm-tty-* terminal user) is
+		// NOT locked — Manager.Unlock sets it to "*" (no password, not locked),
+		// never an empty/login-able password. Locking it stranded every terminal
+		// session as "tty user is disabled".
+		{"no_password, not disabled -> unlocked", &pb.UserParams{NoPassword: true, Disabled: false}, false},
 		{"no_password, disabled -> locked", &pb.UserParams{NoPassword: true, Disabled: true}, true},
 
-		// Sibling: system users also get no password in createUser, so
-		// the same unlock-to-passwordless trap applies.
-		{"system_user, not disabled -> stays locked", &pb.UserParams{SystemUser: true, Disabled: false}, true},
+		// System users are likewise unlocked-but-passwordless when enabled.
+		{"system_user, not disabled -> unlocked", &pb.UserParams{SystemUser: true, Disabled: false}, false},
+		{"system_user, disabled -> locked", &pb.UserParams{SystemUser: true, Disabled: true}, true},
 
-		// A normal, enabled account DID get a temp password at create,
-		// so it is legitimately unlockable (restores password login).
+		// A normal enabled account is unlocked; an explicitly disabled one locked.
 		{"normal enabled -> unlocked", &pb.UserParams{}, false},
-
-		// A normal account explicitly disabled must be locked.
 		{"normal disabled -> locked", &pb.UserParams{Disabled: true}, true},
 	}
 	for _, tc := range cases {
@@ -102,28 +97,28 @@ func TestDesiredAccountLocked(t *testing.T) {
 	}
 }
 
-// Pin the cross-function invariant by binding to the SHARED predicate, not a
-// hand-copy of it: for every combination of the three password-skip flags,
-// "desiredAccountLocked wants it locked" must equal "createUser did NOT set a
-// password". Both callers consult createUserSetsPassword, so this drives the
-// real function on both sides — a future edit to one cannot diverge from the
-// other without this test (and createUser's call site) catching it. The prior
-// version re-derived the rule inline in the test, which only proved
-// desiredAccountLocked matched a COPY of the rule, not createUser's actual code.
-func TestDesiredAccountLocked_MatchesCreateUserPasswordSkip(t *testing.T) {
+// TestDesiredAccountLocked_IsExactlyDisabled pins that the lock tracks ONLY the
+// disabled flag, for every combination of the password-skip flags. The old
+// "no_password/system_user -> always locked" binding is INTENTIONALLY gone: it
+// existed solely because a bare `usermod -U` on a passwordless account stripped
+// the "!" into an EMPTY (login-able) password — which Manager.Unlock now prevents
+// by setting "*" instead. createUser still skips the temp password for those
+// accounts (asserted below), so a no_password account never gains a password; it
+// is simply left "*" (not "!") when enabled.
+func TestDesiredAccountLocked_IsExactlyDisabled(t *testing.T) {
 	for _, noPass := range []bool{false, true} {
 		for _, sysUser := range []bool{false, true} {
 			for _, disabled := range []bool{false, true} {
 				p := &pb.UserParams{NoPassword: noPass, SystemUser: sysUser, Disabled: disabled}
-				assert.Equal(t, !createUserSetsPassword(p), desiredAccountLocked(p),
-					"no_password=%v system_user=%v disabled=%v", noPass, sysUser, disabled)
+				assert.Equal(t, disabled, desiredAccountLocked(p),
+					"lock must track Disabled only: no_password=%v system_user=%v disabled=%v", noPass, sysUser, disabled)
 			}
 		}
 	}
 
-	// Pin the password-skip contract itself so the binding above can't be
-	// satisfied by a vacuous "both wrong the same way". createUser sets a
-	// temporary password ONLY when none of the three opt-outs is requested.
+	// The password-skip contract is unchanged and still load-bearing: createUser
+	// sets a temp password ONLY for a plain enabled account, so a pm-tty-* account
+	// never gains a real password (the lock decision is just no longer bound to it).
 	assert.True(t, createUserSetsPassword(&pb.UserParams{}),
 		"a plain account (no opt-outs) must get a password")
 	assert.False(t, createUserSetsPassword(&pb.UserParams{NoPassword: true}), "no_password skips the password")

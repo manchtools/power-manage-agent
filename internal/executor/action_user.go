@@ -273,16 +273,23 @@ func createUserSetsPassword(params *pb.UserParams) bool {
 	return !params.NoPassword && !params.SystemUser && !params.Disabled
 }
 
-// desiredAccountLocked reports whether the account described by params
-// must remain shadow-locked (no PAM login path). It is the single
-// source of truth shared between createUser and updateUser, and is bound
-// to createUser's password-skip condition via createUserSetsPassword:
-// createUser sets a temp password only when none of no_password /
-// system_user / disabled is set, leaving the account at the useradd '!'
-// default otherwise. An account with no password must never be unlocked —
-// unlocking a hash-less account yields a passwordless login path.
+// desiredAccountLocked reports whether the account must be shadow-LOCKED ("!")
+// at rest. The lock is the agent-side "user is disabled" gate: the terminal
+// handler refuses a locked pm-tty-* account, and the control rejects a disabled
+// user at StartTerminal — so a disabled user is blocked at BOTH ends, and a
+// locked "!" unambiguously means "disabled" (every enabled account is driven to
+// an unlocked resting state below).
+//
+// Driven purely by params.Disabled. This used to ALSO lock every no_password /
+// system_user account, because the old Manager.Unlock ran a bare `usermod -U`
+// that would strip the "!" off a passwordless account into an EMPTY (login-able)
+// password — so leaving such accounts locked was the only safe option, which in
+// turn stranded enabled pm-tty-* terminal accounts as "disabled". Manager.Unlock
+// now special-cases a passwordless account and sets "*" (no password, NOT
+// locked) instead, so an enabled passwordless account is correctly left
+// unlocked-but-passwordless and no reconcile path ever yields an empty password.
 func desiredAccountLocked(params *pb.UserParams) bool {
-	return !createUserSetsPassword(params)
+	return params.Disabled
 }
 
 // updateUser modifies an existing user account.
