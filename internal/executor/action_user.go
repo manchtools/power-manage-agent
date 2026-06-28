@@ -246,13 +246,21 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 		}
 	}
 
-	// Handle disabled state (lock the account)
-	if params.Disabled {
+	// Reconcile the shadow lock to the lock=disabled model: "!" (locked) iff the
+	// user is disabled, else unlocked. createUser leaves useradd's "!" default and
+	// only sets a password for a plain enabled account, so a no_password/system
+	// account would otherwise stay locked and the terminal handler would refuse it
+	// ("tty user is disabled"). Unlock sets "*" (no password, NOT locked) for a
+	// passwordless account and no-ops on an already-unlocked (password-bearing)
+	// one — never an empty, login-able password. Mirrors updateUser's reconcile.
+	if desiredAccountLocked(params) {
 		if lockErr := userMgr.Lock(ctx, params.Username); lockErr != nil {
 			output.WriteString(fmt.Sprintf("warning: failed to lock user account: %v\n", lockErr))
 		} else {
 			output.WriteString("account locked (disabled)\n")
 		}
+	} else if unlockErr := userMgr.Unlock(ctx, params.Username); unlockErr != nil {
+		output.WriteString(fmt.Sprintf("warning: failed to unlock user account: %v\n", unlockErr))
 	}
 
 	// Hide from login screen if requested
