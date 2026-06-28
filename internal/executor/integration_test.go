@@ -964,18 +964,16 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 }
 
 // TestIntegration_User_NoPassword locks down the contract for the
-// UserParams.no_password flag (added in sdk #77, server #327): when
-// the server sets NoPassword=true on a UserParams payload, the agent
-// must NOT generate a temp password, must NOT call chpasswd, and
-// must NOT emit lps.rotations metadata. The account is left in the
-// shadow-locked default state ('!') that useradd produces, so no
-// PAM-protected login path succeeds; root setuid invocations
-// (the agent's terminal session opener) still work because they
-// bypass PAM.
+// UserParams.no_password flag (sdk #77, server #327): when NoPassword=true the
+// agent must NOT generate a temp password, call chpasswd, or emit lps.rotations.
+// Under the lock=disabled model, an ENABLED no_password account rests at "*" (no
+// password, NOT locked) — so no password LOGIN path succeeds (the #94 guarantee:
+// "*" is never an empty/login-able password), while the agent's terminal handler
+// can still tell it apart from a DISABLED ("!") account, and the setuid terminal
+// opener works because it bypasses PAM entirely.
 //
-// Two sub-tests, both as non-system users to exercise the same
-// branch the temp-password code lives in:
-//   - NoPasswordTrue: lps.rotations absent, account locked
+// Two sub-tests, both non-system users to exercise the temp-password branch:
+//   - NoPasswordTrue: lps.rotations absent, account rests at "*"
 //   - NoPasswordFalse: lps.rotations present (regression guard)
 func TestIntegration_User_NoPassword(t *testing.T) {
 	e := newTestExecutor()
@@ -1005,22 +1003,18 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 				result.Metadata["lps.rotations"])
 		}
 
-		// L2: shadow entry is locked. `passwd -S <user>` second field
-		// is "L" for locked, "P" for active password, "NP" for no
-		// password set at all. useradd leaves a non-system account at
-		// "L" by default (entry starts with "!"), and our skip-block
-		// must not flip it to "P".
-		out, err := sudoRun("passwd", "-S", username).Output()
+		// L2: an ENABLED no_password account is NOT locked — the agent
+		// unlocks the useradd "!" default to "*" (no password, not locked) so
+		// the terminal handler accepts it. Verified THROUGH the SDK Manager —
+		// the same interface the terminal handler and provisioner use — not by
+		// shelling out. The SDK's own Unlock test guarantees "*" (never an
+		// empty/login-able password, the #94 hole).
+		info, err := userMgr.Get(context.Background(), username)
 		if err != nil {
-			t.Fatalf("passwd -S %s failed: %v", username, err)
+			t.Fatalf("userMgr.Get(%s): %v", username, err)
 		}
-		fields := strings.Fields(string(out))
-		if len(fields) < 2 {
-			t.Fatalf("unexpected passwd -S output: %q", string(out))
-		}
-		if fields[1] != "L" && fields[1] != "LK" {
-			t.Errorf("expected locked shadow entry (passwd -S field 2 = 'L'/'LK'), got %q (full: %q)",
-				fields[1], string(out))
+		if info.Locked {
+			t.Error("enabled no_password account must be unlocked (Info.Locked=false) so the terminal handler accepts it; got Locked=true")
 		}
 	})
 
@@ -1044,13 +1038,13 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 	})
 }
 
-// TestIntegration_User_ReapplyNoPasswordStaysLocked pins WS17a #16 (the #94
-// regression) on the RE-APPLY path: a no_password account is created locked, and
-// re-applying the SAME action must NOT silently unlock it (idempotent
-// reconciliation must leave the shadow entry locked and emit no lps rotation).
-// The unit tests cover the create-time lock decision; this drives the real
-// create-then-reapply path end to end.
-func TestIntegration_User_ReapplyNoPasswordStaysLocked(t *testing.T) {
+// TestIntegration_User_ReapplyNoPasswordStaysStar pins the #94 contract on the
+// RE-APPLY path under the lock=disabled model: an ENABLED no_password account
+// rests at "*" (no password, NOT locked), and re-applying the SAME action must
+// keep it "*" — idempotent reconciliation must neither flip it to a real
+// password, strip it to an EMPTY (login-able) password, nor lock it. The unit
+// tests cover the lock decision; this drives the real create-then-reapply path.
+func TestIntegration_User_ReapplyNoPasswordStaysStar(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
 	username := "pmtestreapplylock"
@@ -1062,15 +1056,14 @@ func TestIntegration_User_ReapplyNoPasswordStaysLocked(t *testing.T) {
 		NoPassword: true,
 		Comment:    "no_password reapply regression (#94)",
 	}
-	assertLocked := func(stage string) {
+	assertUnlocked := func(stage string) {
 		t.Helper()
-		out, err := sudoRun("passwd", "-S", username).Output()
+		info, err := userMgr.Get(context.Background(), username)
 		if err != nil {
-			t.Fatalf("%s: passwd -S %s failed: %v", stage, username, err)
+			t.Fatalf("%s: userMgr.Get(%s): %v", stage, username, err)
 		}
-		fields := strings.Fields(string(out))
-		if len(fields) < 2 || (fields[1] != "L" && fields[1] != "LK") {
-			t.Fatalf("%s: account must remain LOCKED (passwd -S field 2 = L/LK), got %q", stage, string(out))
+		if info.Locked {
+			t.Fatalf("%s: enabled no_password account must stay UNLOCKED across re-apply; got Locked=true", stage)
 		}
 	}
 	apply := func(stage string) *pb.ActionResult {
@@ -1090,10 +1083,40 @@ func TestIntegration_User_ReapplyNoPasswordStaysLocked(t *testing.T) {
 	if v, _ := userExists(context.Background(), username); !v {
 		t.Fatal("user not created")
 	}
-	assertLocked("after create")
+	assertUnlocked("after create")
 
 	apply("re-apply")
-	assertLocked("after re-apply") // the reconcile must not have unlocked it
+	assertUnlocked("after re-apply") // the reconcile must keep it unlocked, not flip/strip/lock it
+}
+
+// TestIntegration_User_DisabledNoPasswordIsLocked is the disabled-gate half of
+// the lock=disabled model: a no_password account created with Disabled=true must
+// come out LOCKED via the SDK Manager interface (Info.Locked=true), so the
+// terminal handler refuses it — even though the control already blocks a disabled
+// user at StartTerminal (defense in depth at both ends).
+func TestIntegration_User_DisabledNoPasswordIsLocked(t *testing.T) {
+	e := newTestExecutor()
+	ctx := context.Background()
+	username := "pmtestdisablednopass"
+	t.Cleanup(func() { cleanupTestUser(t, username) })
+
+	action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_PRESENT)
+	action.Params = &pb.Action_User{User: &pb.UserParams{
+		Username:   username,
+		Shell:      "/usr/sbin/nologin",
+		NoPassword: true,
+		Disabled:   true,
+		Comment:    "disabled no_password (lock=disabled gate)",
+	}}
+	assertSuccess(t, e.ExecuteEnvelope(ctx, actionToEnvelope(action)))
+
+	info, err := userMgr.Get(context.Background(), username)
+	if err != nil {
+		t.Fatalf("userMgr.Get(%s): %v", username, err)
+	}
+	if !info.Locked {
+		t.Error("disabled no_password account must be LOCKED (Info.Locked=true) so the terminal handler refuses it; got Locked=false")
+	}
 }
 
 // =============================================================================
