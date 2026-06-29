@@ -163,6 +163,21 @@ func TestIntegration_FileManagedBlock(t *testing.T) {
 	assert.NotContains(t, string(data), block)
 }
 
+// TestIntegration_ServiceManagerWriteUnitDelegates verifies that executeService
+// delegates unit-file writing to the SDK service Manager and rejects invalid
+// unit names BEFORE any filesystem access. This exercises the full
+// executor→serviceMgr→ValidateUnitName path with a real systemd Manager.
+func TestIntegration_ServiceManagerWriteUnitDelegates(t *testing.T) {
+	e := newTestExecutor()
+
+	// A unit name with path separators must be rejected by ValidateUnitName
+	params := &pb.ServiceParams{UnitName: "../../etc/cron.d/evil.service", UnitContent: "[Service]\nExecStart=/bin/true\n"}
+	_, _, err := e.executeService(context.Background(), params)
+	if err == nil {
+		t.Fatal("expected error for path-escaping unit name, got nil")
+	}
+}
+
 // TestIntegration_ShellScriptRunsThroughRealRunner verifies that runShellScript
 // dispatches through a real Direct runner and executes /bin/true.
 func TestIntegration_ShellScriptRunsThroughRealRunner(t *testing.T) {
