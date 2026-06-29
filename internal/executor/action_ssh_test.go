@@ -167,7 +167,7 @@ func TestShortGroupName_DifferentIDsProduceDifferentNames(t *testing.T) {
 // sshd_config content contains the expected Match Group directive.
 func TestGenerateSshGroupConfig_ContainsMatchGroup(t *testing.T) {
 	got := generateSshGroupConfig("pm-ssh-test1234", &pb.SshParams{
-		AllowPubkey:  true,
+		AllowPubkey:   true,
 		AllowPassword: false,
 	})
 	if !strings.Contains(got, "Match Group pm-ssh-test1234") {
@@ -188,7 +188,7 @@ func TestGenerateSshGroupConfig_ContainsMatchGroup(t *testing.T) {
 // password are allowed, both directives appear as "yes".
 func TestGenerateSshGroupConfig_BothAllowed(t *testing.T) {
 	got := generateSshGroupConfig("pm-ssh-test1234", &pb.SshParams{
-		AllowPubkey:  true,
+		AllowPubkey:   true,
 		AllowPassword: true,
 	})
 	if !strings.Contains(got, "PubkeyAuthentication yes") {
