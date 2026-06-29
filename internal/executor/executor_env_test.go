@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // runShellScript builds the child environment from a curated baseline plus
@@ -20,6 +19,9 @@ import (
 // interpreter is used so that if the guard ever regressed to run *after*
 // exec, the failure would surface as an interpreter error rather than the
 // allow-list message — and this test would catch it.
+//
+// The env validation runs BEFORE the command dispatches, so a nil executor
+// (no runner) exercises it without needing a real subprocess.
 func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
 	e := NewExecutor(nil, nil)
 	ctx := context.Background()
@@ -63,30 +65,9 @@ func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
 	})
 }
 
-// TestRunShellScript_DoesNotInjectReservedLocaleVar pins that the shell executor
-// does NOT place a reserved locale variable (LANG/LC_*/LANGUAGE/NO_COLOR) in the
-// child env. The reworked SDK Runner forces LC_ALL=C/LANG=C/NO_COLOR=1 on every
-// command and REJECTS any attempt to set them via Command.Env. The executor used
-// to inject `LANG=<host LANG>`, which made EVERY shell action fail with
-// ErrReservedEnvVar once the agent moved onto the reworked Runner — the
-// integration suite caught it. Running a no-op `true` through a real Direct
-// runner makes a regression resurface as that reserved-env-var error here, with
-// no container needed.
+// TestRunShellScript_DoesNotInjectReservedLocaleVar is an integration-level
+// test that runs a real /bin/true through a real Direct runner. Moved to
+// container_test.go (TestIntegration_ShellScriptRunsThroughRealRunner).
 func TestRunShellScript_DoesNotInjectReservedLocaleVar(t *testing.T) {
-	r, err := sysexec.NewRunner(sysexec.Direct)
-	if err != nil {
-		t.Fatalf("build direct runner: %v", err)
-	}
-	orig := executorRunner
-	executorRunner = r
-	t.Cleanup(func() { executorRunner = orig })
-
-	e := &Executor{}
-	out, err := e.runShellScript(context.Background(), &pb.ShellParams{RunAsRoot: true}, "true", nil)
-	if err != nil {
-		t.Fatalf("shell action failed — reserved-env-var regression? %v", err)
-	}
-	if out == nil || out.ExitCode != 0 {
-		t.Fatalf("expected a clean exit, got %+v", out)
-	}
+	t.Skip("moved to container_test.go — TestIntegration_ShellScriptRunsThroughRealRunner exercises the real runner path")
 }

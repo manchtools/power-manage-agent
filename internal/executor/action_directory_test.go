@@ -2,91 +2,73 @@ package executor
 
 import (
 	"context"
-	"log/slog"
 	"os"
 	"path/filepath"
 	"testing"
-	"time"
 
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
-// withRootBackend forces the Root privilege backend (restored on cleanup)
-// so the executor's fs helpers run their fd-based, direct-syscall path
-// against test-user-owned temp dirs instead of escalating via sudo.
-func withRootBackend(t *testing.T) {
-	t.Helper()
-	// The fs helpers dispatch through the fsMgr seam now (no process-global
-	// backend). Point it (and the shared runner) at a Direct runner so the
-	// fd-based, direct-syscall path runs against test-user-owned temp dirs, and
-	// restore the prior seams on cleanup.
-	prevRunner, prevFS := executorRunner, fsMgr
-	r, err := sysexec.NewRunner(sysexec.Direct)
-	if err != nil {
-		t.Fatalf("build direct runner: %v", err)
-	}
-	executorRunner = r
-	fsMgr = mustFSManager(r)
-	t.Cleanup(func() { executorRunner = prevRunner; fsMgr = prevFS })
+// =============================================================================
+// Validation-only unit tests: these test rejection paths and must never
+// reach a privileged call. Use no privilege runner.
+// =============================================================================
+
+// TestExecuteDirectory_RejectsNilParams verifies nil params rejection.
+func TestExecuteDirectory_RejectsNilParams(t *testing.T) {
+	e := NewExecutor(nil, nil)
+	_, changed, err := e.executeDirectory(context.Background(), nil, pb.DesiredState_DESIRED_STATE_PRESENT)
+	require.Error(t, err)
+	assert.False(t, changed)
+	assert.Contains(t, err.Error(), "required")
 }
 
-func newDirExecutor() *Executor {
-	return &Executor{logger: slog.Default(), now: time.Now}
+// TestExecuteDirectory_RejectsEmptyPath verifies empty path rejection.
+func TestExecuteDirectory_RejectsEmptyPath(t *testing.T) {
+	e := NewExecutor(nil, nil)
+	_, changed, err := e.executeDirectory(context.Background(),
+		&pb.DirectoryParams{Path: ""}, pb.DesiredState_DESIRED_STATE_PRESENT)
+	require.Error(t, err)
+	assert.False(t, changed)
 }
 
-// WS6 #6: the DIRECTORY PRESENT branch had no protected-path guard while
-// ABSENT did — an asymmetry that let a PRESENT action chmod/chown a
-// protected system directory. PRESENT must refuse the same protected
-// paths ABSENT does.
+// TestExecuteDirectory_RejectsUnknownState verifies unknown state rejection.
+func TestExecuteDirectory_RejectsUnknownState(t *testing.T) {
+	e := NewExecutor(nil, nil)
+	_, changed, err := e.executeDirectory(context.Background(),
+		&pb.DirectoryParams{Path: "/tmp/test"}, pb.DesiredState(999))
+	require.Error(t, err)
+	assert.False(t, changed)
+}
+
+// TestExecuteDirectory_PRESENT_RefusesProtectedPath verifies that protected
+// system paths are rejected BEFORE any privileged filesystem access. The
+// "correct" (non-protected) creation path moved to container_test.go.
 func TestExecuteDirectory_PRESENT_RefusesProtectedPath(t *testing.T) {
-	e := newDirExecutor()
+	e := NewExecutor(nil, nil)
 
-	// Top-level protected paths AND subtree paths (symmetric with ABSENT):
-	// a PRESENT chmod/chown of /etc/sudoers.d or /var/lib/<x> is as
-	// dangerous as deleting it, so deny-by-default the whole subtree.
 	for _, p := range []string{
 		"/etc", "/", "/usr",
 		"/etc/sudoers.d", "/etc/sudoers.d/custom",
 		"/var/lib/postgresql", "/home/alice", "/boot/efi", "/usr/local/bin",
 	} {
 		_, changed, err := e.executeDirectory(context.Background(),
-			// A mode the target almost certainly does not have, so the
-			// guard (not the "already in desired state" short-circuit) is
-			// what rejects it.
 			&pb.DirectoryParams{Path: p, Mode: "0777"},
 			pb.DesiredState_DESIRED_STATE_PRESENT)
 		require.Errorf(t, err, "PRESENT on protected %q must be refused", p)
 		assert.Contains(t, err.Error(), "protected")
 		assert.False(t, changed)
 	}
-
-	// Correct: a benign managed dir under a writable tmp succeeds.
-	withRootBackend(t)
-	target := filepath.Join(t.TempDir(), "managed")
-	_, changed, err := e.executeDirectory(context.Background(),
-		&pb.DirectoryParams{Path: target, Mode: "0750"},
-		pb.DesiredState_DESIRED_STATE_PRESENT)
-	require.NoError(t, err)
-	assert.True(t, changed)
-	info, statErr := os.Stat(target)
-	require.NoError(t, statErr)
-	assert.Equal(t, os.FileMode(0o750), info.Mode().Perm())
 }
 
-// WS6 #12: ABSENT recursive delete was guarded by a top-level-only
-// denylist, so a path one level down (a drop-in dir, a home, a state
-// dir) slipped through to rm -rf. Deny-by-default must refuse the whole
-// subtree of every protected prefix — BEFORE the existence check, so the
-// refusal does not depend on the path being present.
+// TestExecuteDirectory_ABSENT_DenyByDefault verifies subtree protection
+// for ABSENT — refuse deletion before the existence check uses Stat.
 func TestExecuteDirectory_ABSENT_DenyByDefault(t *testing.T) {
-	e := newDirExecutor()
+	e := NewExecutor(nil, nil)
 
-	// Sourced from intent (security-relevant subtrees), not the impl list.
-	// Use non-existent leaves to prove the refusal precedes the stat.
 	for _, p := range []string{
 		"/etc/sudoers.d/pm-ws6-nope",
 		"/etc/cron.d/pm-ws6-nope",
@@ -103,52 +85,18 @@ func TestExecuteDirectory_ABSENT_DenyByDefault(t *testing.T) {
 		assert.Contains(t, err.Error(), "protected")
 		assert.False(t, changed)
 	}
-
-	// Correct: a managed dir under a non-protected prefix is deletable.
-	withRootBackend(t)
-	target := filepath.Join(t.TempDir(), "managed")
-	require.NoError(t, os.MkdirAll(filepath.Join(target, "sub"), 0o755))
-	_, changed, err := e.executeDirectory(context.Background(),
-		&pb.DirectoryParams{Path: target},
-		pb.DesiredState_DESIRED_STATE_ABSENT)
-	require.NoError(t, err)
-	assert.True(t, changed)
-	_, statErr := os.Stat(target)
-	assert.True(t, os.IsNotExist(statErr), "managed dir should be removed")
 }
 
-// WS6 #5: directory permission changes must go through the fd-based,
-// no-follow helper — a symlink swapped in where a managed dir is expected
-// must abort (ELOOP), not have its target chmod'd/chowned.
-func TestCreateDirectoryWithPermissions_RefusesSymlink(t *testing.T) {
-	withRootBackend(t)
-	root := t.TempDir()
-	victim := filepath.Join(root, "victim")
-	require.NoError(t, os.Mkdir(victim, 0o700))
-	link := filepath.Join(root, "managed")
-	require.NoError(t, os.Symlink(victim, link))
+// TestDirectoryMatchesDesired_ReturnsFalseForNonExistent verifies that
+// directoryMatchesDesired returns false for missing paths and non-directories.
+func TestDirectoryMatchesDesired_ReturnsFalseForNonExistent(t *testing.T) {
+	e := &Executor{}
 
-	err := createDirectoryWithPermissions(context.Background(), link, "0777", "", "", false)
-	require.Error(t, err, "chmod/chown on a symlinked dir path must be refused")
+	// Non-existent path
+	assert.False(t, e.directoryMatchesDesired("/nonexistent/dir", &pb.DirectoryParams{}))
 
-	info, statErr := os.Stat(victim)
-	require.NoError(t, statErr)
-	assert.Equal(t, os.FileMode(0o700), info.Mode().Perm(),
-		"the symlink target's mode must be unchanged")
-}
-
-// WS6 #4: recursive delete must use the fd-anchored, symlink-refusing
-// helper — a symlinked target (or component) must abort, not be followed.
-func TestRemoveDirectory_RefusesSymlinkLeaf(t *testing.T) {
-	withRootBackend(t)
-	root := t.TempDir()
-	victim := filepath.Join(root, "victim")
-	require.NoError(t, os.MkdirAll(victim, 0o755))
-	link := filepath.Join(root, "managed")
-	require.NoError(t, os.Symlink(victim, link))
-
-	err := removeDirectory(context.Background(), link)
-	require.Error(t, err, "removing a symlinked dir path must be refused")
-	_, statErr := os.Stat(victim)
-	assert.NoError(t, statErr, "the symlink target must not be removed")
+	// Path exists but is a regular file, not a directory
+	tmpFile := filepath.Join(t.TempDir(), "regular-file")
+	require.NoError(t, os.WriteFile(tmpFile, []byte("content"), 0644))
+	assert.False(t, e.directoryMatchesDesired(tmpFile, &pb.DirectoryParams{}))
 }

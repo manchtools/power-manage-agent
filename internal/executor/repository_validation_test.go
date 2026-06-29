@@ -11,9 +11,19 @@ import (
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
-	"github.com/manchtools/power-manage-sdk/sys/exec/exectest"
 	"github.com/manchtools/power-manage-sdk/sys/repo"
 )
+
+// testRunnerForValidation builds a Direct runner for repo.Validate tests.
+// Validate runs no commands — it only validates field shapes — so a real
+// Direct runner is identical to FakeRunner here but avoids the test-only
+// dependency on exectest.
+func testRunnerForValidation(t *testing.T) sysexec.Runner {
+	t.Helper()
+	r, err := sysexec.NewRunner(sysexec.Direct)
+	require.NoError(t, err)
+	return r
+}
 
 // Repository field validation is now owned by the SDK's repo.Manager.Validate;
 // executeRepository runs it (on the agent's repositoryFields mapping) as its
@@ -40,7 +50,7 @@ func validateRepoViaSDK(t *testing.T, p *pb.RepositoryParams) error {
 	default:
 		t.Fatal("test params configure no backend")
 	}
-	mgr, err := repo.New(backend, exectest.New(sysexec.Direct))
+	mgr, err := repo.New(backend, testRunnerForValidation(t))
 	require.NoError(t, err)
 	e := &Executor{pkgBackend: backend}
 	return mgr.Validate(e.repositoryFields(p))
