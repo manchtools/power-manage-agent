@@ -250,6 +250,16 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 // notification is gated on success so users are never told "your system will
 // reboot" when it won't. Returns nil when the reboot was scheduled.
 func (e *Executor) scheduleRebootAfterUpdate(ctx context.Context, output *strings.Builder) error {
+	// Fail closed without a privilege runner, exactly as executeReboot does: a
+	// reboot must NEVER fall through to the process-global Direct runner, which
+	// systemd-logind honors via polkit with no sudo. sysreboot.New already
+	// rejects a nil runner, but guarding here keeps both reboot entry points
+	// identical and defends against a future New that defaults the runner. See
+	// action_reboot.go for the original workstation-reboot incident.
+	if e.runner == nil {
+		output.WriteString("FAILED to schedule reboot: no privilege runner configured\n")
+		return fmt.Errorf("schedule reboot: no privilege runner configured")
+	}
 	rb, err := sysreboot.New(e.runner)
 	if err == nil {
 		err = rb.Schedule(ctx, sysreboot.ScheduleOptions{Delay: "+1", Message: "System update requires reboot"})
