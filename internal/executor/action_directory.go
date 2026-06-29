@@ -4,7 +4,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"os"
 	"path/filepath"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
@@ -44,7 +43,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Check if directory already exists with correct mode and ownership
-		if e.directoryMatchesDesired(cleanPath, params) {
+		if e.directoryMatchesDesired(ctx, cleanPath, params) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("directory %s is already in desired state", cleanPath),
@@ -83,7 +82,7 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 		}
 
 		// Check if directory already doesn't exist
-		if _, err := os.Stat(cleanPath); os.IsNotExist(err) {
+		if !fileExistsWithSudo(ctx, cleanPath) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("directory %s does not exist, nothing to remove", cleanPath),
@@ -109,15 +108,17 @@ func (e *Executor) executeDirectory(ctx context.Context, params *pb.DirectoryPar
 }
 
 // directoryMatchesDesired checks if a directory already has the desired mode and ownership.
-func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryParams) bool {
-	// Check if directory exists
-	info, err := os.Stat(path)
+func (e *Executor) directoryMatchesDesired(ctx context.Context, path string, params *pb.DirectoryParams) bool {
+	// Check existence + type through the metadata chokepoint; a stat error
+	// reads as "does not match" so the caller falls through to the
+	// privilege-routed mkdir/perms path.
+	mode, err := statFile(ctx, path)
 	if err != nil {
 		return false
 	}
 
 	// Check if it's a directory
-	if !info.IsDir() {
+	if !mode.IsDir() {
 		return false
 	}
 
@@ -125,7 +126,7 @@ func (e *Executor) directoryMatchesDesired(path string, params *pb.DirectoryPara
 	if params.Mode != "" {
 		var desiredMode uint64
 		if _, err := fmt.Sscanf(params.Mode, "%o", &desiredMode); err == nil {
-			currentMode := info.Mode().Perm()
+			currentMode := mode.Perm()
 			if uint32(currentMode) != uint32(desiredMode) {
 				return false
 			}

@@ -2,18 +2,31 @@ package executor
 
 import (
 	"context"
-	"os/exec"
+	"slices"
 	"strings"
 	"testing"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
 )
+
+// These skip-gates mirror the production detection exactly: the executors now
+// decide "is this a deb/rpm/flatpak-capable host?" via the SDK's pkg.Detect
+// (Apt / Dnf|Zypper / Flatpak), not a raw LookPath of dpkg/rpm/flatpak. Gating
+// the tests on the same predicate keeps them honest on any host — e.g. a dnf
+// box with a stray dpkg binary is NOT deb-capable and the DEB action skips.
+func debCapable() bool { return slices.Contains(pkg.Detect(context.Background()), pkg.Apt) }
+func rpmCapable() bool {
+	d := pkg.Detect(context.Background())
+	return slices.Contains(d, pkg.Dnf) || slices.Contains(d, pkg.Zypper)
+}
+func flatpakCapable() bool { return slices.Contains(pkg.Detect(context.Background()), pkg.Flatpak) }
 
 // TestExecuteDeb_SkipsWhenDpkgMissing verifies that the DEB executor
 // returns a skip message when dpkg is not available.
 func TestExecuteDeb_SkipsWhenDpkgMissing(t *testing.T) {
-	if _, err := exec.LookPath("dpkg"); err == nil {
-		t.Skip("dpkg is available on this system — test requires a system without dpkg")
+	if debCapable() {
+		t.Skip("apt (deb backend) detected — test requires a non-deb host")
 	}
 
 	e := NewExecutor(nil, nil)
@@ -40,8 +53,8 @@ func TestExecuteDeb_SkipsWhenDpkgMissing(t *testing.T) {
 // TestExecuteRpm_SkipsWhenRpmMissing verifies that the RPM executor
 // returns a skip message when rpm is not available.
 func TestExecuteRpm_SkipsWhenRpmMissing(t *testing.T) {
-	if _, err := exec.LookPath("rpm"); err == nil {
-		t.Skip("rpm is available on this system — test requires a system without rpm")
+	if rpmCapable() {
+		t.Skip("dnf/zypper (rpm backend) detected — test requires a non-rpm host")
 	}
 
 	e := NewExecutor(nil, nil)
@@ -66,8 +79,8 @@ func TestExecuteRpm_SkipsWhenRpmMissing(t *testing.T) {
 // TestExecuteFlatpak_SkipsWhenFlatpakMissing verifies that the Flatpak executor
 // returns a skip message when flatpak is not available.
 func TestExecuteFlatpak_SkipsWhenFlatpakMissing(t *testing.T) {
-	if _, err := exec.LookPath("flatpak"); err == nil {
-		t.Skip("flatpak is available on this system — test requires a system without flatpak")
+	if flatpakCapable() {
+		t.Skip("flatpak detected — test requires a host without flatpak")
 	}
 
 	e := NewExecutor(nil, nil)
@@ -89,8 +102,8 @@ func TestExecuteFlatpak_SkipsWhenFlatpakMissing(t *testing.T) {
 // TestExecuteDeb_DoesNotSkipWhenDpkgPresent verifies that the DEB executor
 // proceeds (doesn't skip) when dpkg is available.
 func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
-	if _, err := exec.LookPath("dpkg"); err != nil {
-		t.Skip("dpkg is not available on this system")
+	if !debCapable() {
+		t.Skip("apt (deb backend) not detected on this host")
 	}
 
 	e := NewExecutor(nil, nil)
@@ -119,8 +132,8 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 // TestExecuteRpm_DoesNotSkipWhenRpmPresent verifies that the RPM executor
 // proceeds (doesn't skip) when rpm is available.
 func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
-	if _, err := exec.LookPath("rpm"); err != nil {
-		t.Skip("rpm is not available on this system")
+	if !rpmCapable() {
+		t.Skip("dnf/zypper (rpm backend) not detected on this host")
 	}
 
 	e := NewExecutor(nil, nil)
@@ -148,8 +161,8 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 // TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent verifies that the Flatpak executor
 // proceeds (doesn't skip) when flatpak is available.
 func TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent(t *testing.T) {
-	if _, err := exec.LookPath("flatpak"); err != nil {
-		t.Skip("flatpak is not available on this system")
+	if !flatpakCapable() {
+		t.Skip("flatpak not detected on this host")
 	}
 
 	e := NewExecutor(nil, nil)

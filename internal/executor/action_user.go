@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"os"
 	"os/user"
 	"path/filepath"
 	"strconv"
@@ -505,7 +504,7 @@ const accountsServiceHiddenContent = "[User]\nSystemAccount=true\n"
 // state); and, on unhide, only remove an override that matches what the SDK
 // writes (don't delete a foreign override). Returns whether a change was made.
 func setUserHidden(ctx context.Context, username string, hidden bool, output *strings.Builder) bool {
-	if _, err := os.Stat(accountsServiceDir); os.IsNotExist(err) {
+	if !fileExistsWithSudo(ctx, accountsServiceDir) {
 		return false // AccountsService not installed (headless), skip silently
 	}
 

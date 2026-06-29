@@ -93,10 +93,10 @@ func TestDirectoryMatchesDesired_ReturnsFalseForNonExistent(t *testing.T) {
 	e := &Executor{}
 
 	// Non-existent path
-	assert.False(t, e.directoryMatchesDesired("/nonexistent/dir", &pb.DirectoryParams{}))
+	assert.False(t, e.directoryMatchesDesired(context.Background(), "/nonexistent/dir", &pb.DirectoryParams{}))
 
 	// Path exists but is a regular file, not a directory
 	tmpFile := filepath.Join(t.TempDir(), "regular-file")
 	require.NoError(t, os.WriteFile(tmpFile, []byte("content"), 0644))
-	assert.False(t, e.directoryMatchesDesired(tmpFile, &pb.DirectoryParams{}))
+	assert.False(t, e.directoryMatchesDesired(context.Background(), tmpFile, &pb.DirectoryParams{}))
 }

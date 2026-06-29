@@ -70,7 +70,7 @@ func TestExecuteFile_RejectsUnknownDesiredState(t *testing.T) {
 // fileMatchesDesired returns false when the file does not exist.
 func TestFileMatchesDesired_ReturnsFalseForMissingFile(t *testing.T) {
 	e := NewExecutor(nil, nil)
-	if e.fileMatchesDesired("/nonexistent/path/that/does/not/exist.txt", &pb.FileParams{
+	if e.fileMatchesDesired(context.Background(), "/nonexistent/path/that/does/not/exist.txt", &pb.FileParams{
 		Content: "hello",
 	}) {
 		t.Error("fileMatchesDesired must return false for a non-existent file")
@@ -81,7 +81,7 @@ func TestFileMatchesDesired_ReturnsFalseForMissingFile(t *testing.T) {
 // directory (not a regular file) is not considered a match.
 func TestFileMatchesDesired_ReturnsFalseWhenPathIsDirectory(t *testing.T) {
 	e := NewExecutor(nil, nil)
-	if e.fileMatchesDesired("/tmp", &pb.FileParams{Content: "hello"}) {
+	if e.fileMatchesDesired(context.Background(), "/tmp", &pb.FileParams{Content: "hello"}) {
 		t.Error("fileMatchesDesired must return false for a directory")
 	}
 }
@@ -100,13 +100,13 @@ func TestFileMatchesDesired_OwnerOnlyCheck(t *testing.T) {
 	// panicking on the empty-string comparison.
 	e := NewExecutor(nil, nil)
 	// Non-existent file: Stat fails → returns false (safe, no nil deref)
-	if e.fileMatchesDesired("/nonexistent/test.txt", &pb.FileParams{
+	if e.fileMatchesDesired(context.Background(), "/nonexistent/test.txt", &pb.FileParams{
 		Owner: "root",
 	}) {
 		t.Error("must return false for non-existent file")
 	}
 	// Only Group specified, no Owner:
-	if e.fileMatchesDesired("/nonexistent/test.txt", &pb.FileParams{
+	if e.fileMatchesDesired(context.Background(), "/nonexistent/test.txt", &pb.FileParams{
 		Group: "wheel",
 	}) {
 		t.Error("must return false for non-existent file")
@@ -117,7 +117,7 @@ func TestFileMatchesDesired_OwnerOnlyCheck(t *testing.T) {
 // for the directory variant (same bug class was fixed there too).
 func TestDirectoryMatchesDesired_ReturnsFalseForMissingDir(t *testing.T) {
 	e := NewExecutor(nil, nil)
-	if e.directoryMatchesDesired("/nonexistent/dir", &pb.DirectoryParams{}) {
+	if e.directoryMatchesDesired(context.Background(), "/nonexistent/dir", &pb.DirectoryParams{}) {
 		t.Error("directoryMatchesDesired must return false for a non-existent directory")
 	}
 }
@@ -127,7 +127,7 @@ func TestDirectoryMatchesDesired_ReturnsFalseForMissingDir(t *testing.T) {
 func TestDirectoryMatchesDesired_ReturnsFalseForRegularFile(t *testing.T) {
 	e := NewExecutor(nil, nil)
 	// /etc/hostname is a regular file on most systems
-	if e.directoryMatchesDesired("/etc/hostname", &pb.DirectoryParams{}) {
+	if e.directoryMatchesDesired(context.Background(), "/etc/hostname", &pb.DirectoryParams{}) {
 		t.Error("directoryMatchesDesired must return false for a regular file")
 	}
 }

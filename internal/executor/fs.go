@@ -45,6 +45,32 @@ func fileExistsWithSudo(ctx context.Context, path string) bool {
 	return ok
 }
 
+// statFile returns a path's FileMode. The SDK fs Manager exposes Exists (bool)
+// and ReadFile (bytes) but no metadata stat, so this is the single sanctioned
+// raw-stat chokepoint, used only by the executor's idempotency checks
+// (file/directory "already matches the desired mode/type?"). It deliberately
+// does NOT escalate: if a non-root agent cannot stat a privileged path, the
+// caller reads the error as "does not match" and falls through to the
+// privilege-routed write — the safe direction. Existence is reported through
+// the error (os.IsNotExist). The ctx is threaded so this can move onto the fs
+// Manager once it grows a metadata stat, without touching call sites.
+//
+// It uses Lstat and fails closed on a symlink: following one could report a
+// symlinked privileged path as an already-matching regular file/dir, so the
+// idempotency check would skip the guarded write and leave the link in place.
+// Returning an error makes the caller treat it as "does not match" and route
+// through the symlink-refusing write path instead.
+func statFile(ctx context.Context, path string) (os.FileMode, error) {
+	info, err := os.Lstat(path)
+	if err != nil {
+		return 0, err
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		return 0, fmt.Errorf("statFile: refusing to follow symlink: %s", path)
+	}
+	return info.Mode(), nil
+}
+
 // removeFileStrict removes a file and returns any error.
 func removeFileStrict(ctx context.Context, path string) error {
 	return fsMgr.Remove(ctx, path)
