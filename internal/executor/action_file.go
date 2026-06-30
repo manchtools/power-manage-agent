@@ -31,7 +31,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
 		// Check if file already exists with correct content, mode, and ownership
-		if e.fileMatchesDesired(resolvedPath, params) {
+		if e.fileMatchesDesired(ctx, resolvedPath, params) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("file %s is already in desired state", resolvedPath),
@@ -100,7 +100,7 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		// Check if file already doesn't exist
-		if _, err := os.Stat(resolvedPath); os.IsNotExist(err) {
+		if !fileExistsWithSudo(ctx, resolvedPath) {
 			return &pb.CommandOutput{
 				ExitCode: 0,
 				Stdout:   fmt.Sprintf("file %s does not exist, nothing to remove", resolvedPath),
@@ -174,32 +174,34 @@ func (e *Executor) executeFile(ctx context.Context, params *pb.FileParams, state
 }
 
 // fileMatchesDesired checks if a file already has the desired content, mode, and ownership.
-func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
-	// Check if file exists
-	info, err := os.Stat(path)
+func (e *Executor) fileMatchesDesired(ctx context.Context, path string, params *pb.FileParams) bool {
+	// Check existence + type through the metadata chokepoint; a stat error
+	// (absent, or unreadable as this agent) reads as "does not match" so the
+	// caller falls through to the privilege-routed write.
+	mode, err := statFile(ctx, path)
 	if err != nil {
 		return false
 	}
 
 	// Check if it's a regular file
-	if !info.Mode().IsRegular() {
+	if !mode.IsRegular() {
 		return false
 	}
 
 	// Check content
-	content, err := os.ReadFile(path)
+	content, err := readFileWithSudo(ctx, path)
 	if err != nil {
 		return false
 	}
 
 	if params.ManagedBlock {
 		// For managed block mode, check if content block is already present in file
-		if !strings.Contains(string(content), params.Content) {
+		if !strings.Contains(content, params.Content) {
 			return false
 		}
 	} else {
 		// For regular mode, check exact content match via hash
-		currentHash := sha256.Sum256(content)
+		currentHash := sha256.Sum256([]byte(content))
 		desiredHash := sha256.Sum256([]byte(params.Content))
 		if currentHash != desiredHash {
 			return false
@@ -211,7 +213,7 @@ func (e *Executor) fileMatchesDesired(path string, params *pb.FileParams) bool {
 		// Parse desired mode
 		var desiredMode uint64
 		if _, err := fmt.Sscanf(params.Mode, "%o", &desiredMode); err == nil {
-			currentMode := info.Mode().Perm()
+			currentMode := mode.Perm()
 			if uint32(currentMode) != uint32(desiredMode) {
 				return false
 			}

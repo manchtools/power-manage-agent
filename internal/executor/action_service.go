@@ -5,7 +5,6 @@ import (
 	"context"
 	"crypto/sha256"
 	"fmt"
-	"os"
 	"path/filepath"
 	"strings"
 
@@ -45,13 +44,17 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 	if params.UnitContent != "" {
 		// Skip-if-unchanged — hashes are cheap and saves the atomic
 		// write + daemon-reload cycle on every assign-on-connect run.
-		// The systemd unit path is an implementation detail of the
-		// backend, but reading it directly is fine here because a
-		// mismatch / missing file just falls through to the write path.
+		// Read through the fs Manager so a non-root agent reads the
+		// root-owned unit via the privilege backend. The systemd unit path
+		// is hard-coded (an implementation detail the backend owns via
+		// WriteUnit), but reading it directly is fine: on a non-systemd
+		// backend or a read error (absent/unreadable), the hash simply
+		// mismatches and we fall through to the write path — never a wrong
+		// skip, only a redundant write at worst.
 		unitPath := filepath.Join("/etc/systemd/system", params.UnitName)
 		needsUpdate := true
-		if existingContent, err := os.ReadFile(unitPath); err == nil {
-			existingHash := sha256.Sum256(existingContent)
+		if existingContent, err := readFileWithSudo(ctx, unitPath); err == nil {
+			existingHash := sha256.Sum256([]byte(existingContent))
 			desiredHash := sha256.Sum256([]byte(params.UnitContent))
 			if existingHash == desiredHash {
 				needsUpdate = false

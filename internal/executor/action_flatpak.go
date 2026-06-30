@@ -3,10 +3,9 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"log/slog"
-	"os/exec"
+	"slices"
 	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
@@ -41,12 +40,11 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		return nil, false, fmt.Errorf("invalid flatpak remote: %w", err)
 	}
 
-	// Skip on systems without flatpak
-	if _, err := exec.LookPath("flatpak"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
-		}
-		return nil, false, fmt.Errorf("flatpak lookup: %w", err)
+	// Skip on systems without flatpak. flatpak is a first-class pkg.Backend
+	// that the SDK's pkg.Detect enumerates, so this honors the SDK's PATH
+	// resolution instead of hard-coding the "flatpak" binary name.
+	if !slices.Contains(pkg.Detect(ctx), pkg.Flatpak) {
+		return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
 	}
 
 	if params.SystemWide {

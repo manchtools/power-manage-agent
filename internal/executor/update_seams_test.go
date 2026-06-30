@@ -10,27 +10,39 @@ import (
 	"github.com/manchtools/power-manage-sdk/sys/exec/exectest"
 )
 
-// scheduleRebootAfterUpdate schedules the reboot through the SDK reboot Manager
-// (over the executor's runner). It must treat a failed schedule as a real action
-// error (the operator asked for the reboot) and must NOT notify users that their
-// system will reboot when it won't; on success it notifies exactly once.
+// TestScheduleRebootAfterUpdate exercises scheduleRebootAfterUpdate's failure
+// path: a reboot that could not be scheduled must return an error, suppress the
+// "your system will reboot" notification, and stay visible when joined with a
+// prior upgrade error.
 //
-// The interpret-update-check and apt security-only fail-closed logic that used
-// to live here moved into the SDK (pkg.HasUpdates and apt securityUpgrade) and
-// is tested there — the agent now delegates rather than reimplementing them.
+// It MUST use a FakeRunner, never a real one. An earlier version of this test
+// built a real Direct runner and let sysreboot.Schedule run; systemd-logind
+// grants an active desktop session the right to reboot via polkit with no sudo,
+// so `shutdown -r +1` fired for real and rebooted a developer's workstation.
+// The SDK draws the same line: its live `shutdown` round-trip is gated behind
+// //go:build container (sys/reboot/reboot_container_test.go); the scheduling
+// LOGIC is unit-tested with a FakeRunner. We test logic here too — the failure
+// path needs Schedule to fail, which the FakeRunner scripts deterministically on
+// any host. See also action_reboot_test.go for the original incident.
 func TestScheduleRebootAfterUpdate(t *testing.T) {
 	origNotify := notifyAll
 	t.Cleanup(func() { notifyAll = origNotify })
 
+	// newFailingExecutor returns an Executor whose reboot scheduling fails
+	// without touching the host: the FakeRunner returns an exec error for the
+	// shutdown command, so sysreboot.Schedule reports failure.
+	newFailingExecutor := func() *Executor {
+		r := exectest.New(sysexec.Direct)
+		r.Push(sysexec.Result{}, errors.New("shutdown unavailable"))
+		return &Executor{runner: r}
+	}
+
 	t.Run("schedule failure returns an error and suppresses notify", func(t *testing.T) {
-		fake := exectest.New(sysexec.Sudo)
-		fake.Push(sysexec.Result{ExitCode: 1, Stderr: "Failed to set wall message"}, nil)
-		e := &Executor{runner: fake}
 		notified := 0
 		notifyAll = func(ctx context.Context, title, body string) { notified++ }
 
 		var out strings.Builder
-		err := e.scheduleRebootAfterUpdate(context.Background(), &out)
+		err := newFailingExecutor().scheduleRebootAfterUpdate(context.Background(), &out)
 		if err == nil {
 			t.Fatal("a failed reboot schedule must return an error, not a clean success")
 		}
@@ -45,34 +57,27 @@ func TestScheduleRebootAfterUpdate(t *testing.T) {
 		}
 	})
 
-	t.Run("success notifies exactly once", func(t *testing.T) {
-		fake := exectest.New(sysexec.Sudo) // empty queue → clean success
-		e := &Executor{runner: fake}
+	t.Run("fails closed without a privilege runner", func(t *testing.T) {
 		notified := 0
 		notifyAll = func(ctx context.Context, title, body string) { notified++ }
 
 		var out strings.Builder
-		if err := e.scheduleRebootAfterUpdate(context.Background(), &out); err != nil {
-			t.Fatalf("successful reboot scheduling returned error: %v", err)
+		e := &Executor{} // runner is nil — the NewExecutor(_, nil) unit-test convention
+		err := e.scheduleRebootAfterUpdate(context.Background(), &out)
+		if err == nil {
+			t.Fatal("a reboot with no privilege runner must fail closed, not fall through to the global Direct runner")
 		}
-		if notified != 1 {
-			t.Errorf("want exactly one notification on success, got %d", notified)
-		}
-		if !strings.Contains(out.String(), "Scheduled reboot") {
-			t.Errorf("output = %q, want the scheduled-reboot line", out.String())
+		if notified != 0 {
+			t.Errorf("users must NOT be notified when no reboot can be scheduled, got %d notifications", notified)
 		}
 	})
 
 	t.Run("reboot failure joins with a prior error rather than demoting it", func(t *testing.T) {
-		fake := exectest.New(sysexec.Sudo)
-		fake.Push(sysexec.Result{}, errors.New("escalation unavailable"))
-		e := &Executor{runner: fake}
 		notifyAll = func(ctx context.Context, title, body string) {}
 
 		var out strings.Builder
-		// Mirror executeUpdate's call site: lastErr = errors.Join(lastErr, ...).
 		prior := errors.New("apt upgrade failed")
-		joined := errors.Join(prior, e.scheduleRebootAfterUpdate(context.Background(), &out))
+		joined := errors.Join(prior, newFailingExecutor().scheduleRebootAfterUpdate(context.Background(), &out))
 		if !errors.Is(joined, prior) {
 			t.Error("a prior upgrade error must stay visible alongside the reboot failure")
 		}

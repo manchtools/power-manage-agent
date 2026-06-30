@@ -3,10 +3,9 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
-	"os/exec"
+	"slices"
 	"strings"
 
 	sdk "github.com/manchtools/power-manage-sdk"
@@ -28,12 +27,11 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, false, err
 	}
 
-	// Skip on non-rpm systems
-	if _, err := exec.LookPath("rpm"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return &pb.CommandOutput{Stdout: "skipped: rpm not available on this system"}, false, nil
-		}
-		return nil, false, fmt.Errorf("rpm lookup: %w", err)
+	// Skip on non-rpm systems. dnf and zypper are the rpm-format backends
+	// the SDK's pkg.Detect enumerates; detecting either means rpm is usable,
+	// honoring SDK PATH resolution instead of hard-coding "rpm".
+	if detected := pkg.Detect(ctx); !slices.Contains(detected, pkg.Dnf) && !slices.Contains(detected, pkg.Zypper) {
+		return &pb.CommandOutput{Stdout: "skipped: no supported .rpm package manager available on this system"}, false, nil
 	}
 
 	mgr := e.pkgManagerForCtx(ctx)

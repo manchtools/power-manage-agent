@@ -3,13 +3,12 @@ package executor
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"net/url"
 	"os"
-	"os/exec"
 	"path"
 	"regexp"
+	"slices"
 	"strings"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
@@ -46,12 +45,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 	}
 
-	// Skip on non-deb systems
-	if _, err := exec.LookPath("dpkg"); err != nil {
-		if errors.Is(err, exec.ErrNotFound) {
-			return &pb.CommandOutput{Stdout: "skipped: dpkg not available on this system"}, false, nil
-		}
-		return nil, false, fmt.Errorf("dpkg lookup: %w", err)
+	// Skip on non-deb systems. Apt is the deb-format backend the SDK's
+	// pkg.Detect enumerates (it probes apt-get, which dpkg underpins), so
+	// this honors the SDK's PATH resolution instead of hard-coding "dpkg".
+	if !slices.Contains(pkg.Detect(ctx), pkg.Apt) {
+		return &pb.CommandOutput{Stdout: "skipped: no supported .deb package manager available on this system"}, false, nil
 	}
 
 	mgr := e.pkgManagerForCtx(ctx)

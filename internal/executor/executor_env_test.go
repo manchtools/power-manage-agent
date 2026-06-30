@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -20,6 +21,9 @@ import (
 // interpreter is used so that if the guard ever regressed to run *after*
 // exec, the failure would surface as an interpreter error rather than the
 // allow-list message — and this test would catch it.
+//
+// The env validation runs BEFORE the command dispatches, so a nil executor
+// (no runner) exercises it without needing a real subprocess.
 func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
 	e := NewExecutor(nil, nil)
 	ctx := context.Background()
@@ -63,30 +67,50 @@ func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
 	})
 }
 
-// TestRunShellScript_DoesNotInjectReservedLocaleVar pins that the shell executor
-// does NOT place a reserved locale variable (LANG/LC_*/LANGUAGE/NO_COLOR) in the
-// child env. The reworked SDK Runner forces LC_ALL=C/LANG=C/NO_COLOR=1 on every
-// command and REJECTS any attempt to set them via Command.Env. The executor used
-// to inject `LANG=<host LANG>`, which made EVERY shell action fail with
-// ErrReservedEnvVar once the agent moved onto the reworked Runner — the
-// integration suite caught it. Running a no-op `true` through a real Direct
-// runner makes a regression resurface as that reserved-env-var error here, with
-// no container needed.
+// TestRunShellScript_DoesNotInjectReservedLocaleVar verifies that a SHELL
+// action cannot smuggle a locale variable the Runner reserves for deterministic
+// output (LC_ALL=C / LANG=C / NO_COLOR=1). Such a var passes the agent's own
+// IsAllowedEnvVar gate (it is not hijack-prone) but is refused at the Runner
+// boundary with ErrReservedEnvVar BEFORE any process is spawned — so a
+// reintroduced reserved-locale injection is caught here without a real subprocess.
+//
+// The forced-LC_ALL=C child-environment assertion (the runner actually injecting
+// it) is exercised against a real runner in container_test.go
+// (TestIntegration_ShellScriptRunsThroughRealRunner).
 func TestRunShellScript_DoesNotInjectReservedLocaleVar(t *testing.T) {
-	r, err := sysexec.NewRunner(sysexec.Direct)
-	if err != nil {
-		t.Fatalf("build direct runner: %v", err)
-	}
-	orig := executorRunner
-	executorRunner = r
-	t.Cleanup(func() { executorRunner = orig })
+	e := NewExecutor(nil, nil)
+	ctx := context.Background()
 
-	e := &Executor{}
-	out, err := e.runShellScript(context.Background(), &pb.ShellParams{RunAsRoot: true}, "true", nil)
-	if err != nil {
-		t.Fatalf("shell action failed — reserved-env-var regression? %v", err)
+	const bogusInterp = "/nonexistent/pm-reserved-locale-interp"
+
+	for _, name := range []string{"LC_ALL", "LANG", "NO_COLOR"} {
+		t.Run("rejects "+name, func(t *testing.T) {
+			params := &pb.ShellParams{
+				Interpreter: bogusInterp,
+				RunAsRoot:   true,
+				Environment: map[string]string{name: "C.UTF-8"},
+			}
+			_, err := e.runShellScript(ctx, params, "echo hi", nil)
+			if err == nil {
+				t.Fatalf("runShellScript setting reserved %s = nil error, want rejection before exec", name)
+			}
+			if !errors.Is(err, sysexec.ErrReservedEnvVar) {
+				t.Errorf("error = %v, want ErrReservedEnvVar (the Runner forces LC_ALL=C/LANG=C/NO_COLOR=1)", err)
+			}
+		})
 	}
-	if out == nil || out.ExitCode != 0 {
-		t.Fatalf("expected a clean exit, got %+v", out)
-	}
+
+	// Correct/allowed control: a non-reserved application variable does NOT trip
+	// the reserved-var gate (it fails later on the bogus interpreter instead).
+	t.Run("allows MYAPP_FLAG past the reserved gate", func(t *testing.T) {
+		params := &pb.ShellParams{
+			Interpreter: bogusInterp,
+			RunAsRoot:   true,
+			Environment: map[string]string{"MYAPP_FLAG": "1"},
+		}
+		_, err := e.runShellScript(ctx, params, "echo hi", nil)
+		if errors.Is(err, sysexec.ErrReservedEnvVar) {
+			t.Errorf("MYAPP_FLAG must not be treated as a reserved var, got %v", err)
+		}
+	})
 }
