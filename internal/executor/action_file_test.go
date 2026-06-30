@@ -2,10 +2,13 @@ package executor
 
 import (
 	"context"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // TestExecuteFile_RejectsNilParams verifies that nil FileParams is rejected.
@@ -92,24 +95,43 @@ func TestFileMatchesDesired_ReturnsFalseWhenPathIsDirectory(t *testing.T) {
 // used to compare currentOwner against empty, making fileMatchesDesired never
 // return true.
 func TestFileMatchesDesired_OwnerOnlyCheck(t *testing.T) {
-	// This is a structural test that documents the contract. The actual
-	// filesystem check requires a real file, which depends on host state.
-	// The key assertion is that the code structure handles owner-only,
-	// group-only, and both correctly — verified by reading the source.
-	// We test the sentinel path: a non-existent file returns false without
-	// panicking on the empty-string comparison.
 	e := NewExecutor(nil, nil)
-	// Non-existent file: Stat fails → returns false (safe, no nil deref)
-	if e.fileMatchesDesired(context.Background(), "/nonexistent/test.txt", &pb.FileParams{
-		Owner: "root",
-	}) {
-		t.Error("must return false for non-existent file")
+	ctx := context.Background()
+
+	// Real file owned by the test user, with known content. fileMatchesDesired
+	// compares content first, then owner/group only for the fields that were
+	// requested — the bug was a group-only request comparing the (empty) Owner
+	// and so never matching. Exercise that real comparison path.
+	dir := t.TempDir()
+	path := filepath.Join(dir, "f")
+	const content = "hello world"
+	if err := os.WriteFile(path, []byte(content), 0o644); err != nil {
+		t.Fatalf("write file: %v", err)
 	}
-	// Only Group specified, no Owner:
-	if e.fileMatchesDesired(context.Background(), "/nonexistent/test.txt", &pb.FileParams{
-		Group: "wheel",
-	}) {
-		t.Error("must return false for non-existent file")
+	owner, group := getFileOwnership(path)
+	if owner == "" || group == "" {
+		t.Skip("ownership lookup unavailable on this platform")
+	}
+
+	// group-only request (matching content + group) must MATCH — the regression:
+	// a group-only request used to compare the empty Owner and never match.
+	if !e.fileMatchesDesired(ctx, path, &pb.FileParams{Content: content, Group: group}) {
+		t.Error("group-only request with the file's own group must match (empty-Owner regression)")
+	}
+	// owner-only request (matching content + owner) must MATCH.
+	if !e.fileMatchesDesired(ctx, path, &pb.FileParams{Content: content, Owner: owner}) {
+		t.Error("owner-only request with the file's own owner must match")
+	}
+	// owner-only request with a WRONG owner must NOT match — proves the owner is
+	// actually compared, not ignored.
+	if e.fileMatchesDesired(ctx, path, &pb.FileParams{Content: content, Owner: owner + "-nope"}) {
+		t.Error("owner-only request with a non-matching owner must not match")
+	}
+
+	// Sentinel: a non-existent file returns false without panicking on the
+	// empty-string ownership comparison.
+	if e.fileMatchesDesired(ctx, "/nonexistent/test.txt", &pb.FileParams{Group: "wheel"}) {
+		t.Error("must return false for a non-existent file")
 	}
 }
 
@@ -174,17 +196,13 @@ func TestIsProtectedPath_DeniesEtcSubdirs(t *testing.T) {
 	}
 	for _, path := range protectedSubdirs {
 		t.Run(path, func(t *testing.T) {
-			// sysfs.IsProtectedPath returns true for /etc itself, but does it
-			// also cover /etc subdirectories? The agent's isProtectedPath
-			// delegates to sysfs.IsProtectedPath AND adds its own critical
-			// file + top-level-child checks. For subdirectories that aren't
-			// individually critical files, check that at minimum the SDK
-			// IsProtectedPath covers them.
-			//
-			// If IsProtectedPath returns false for a known-protected subdir,
-			// the agent's own isUnderProtectedPrefix (checked in the action
-			// handlers) must catch it.
-			_ = path // this is a structural documentation test
+			// Mirror the exact guard the directory/file ABSENT handlers apply: a
+			// path is refused if it is in the agent's own denylist OR under a
+			// protected prefix. A regression in either branch (a new /etc subtree
+			// slipping through) fails here.
+			if !isProtectedPath(path) && !sysfs.IsUnderProtectedPrefix(path) {
+				t.Errorf("%s must be refused by the protection guard (isProtectedPath || IsUnderProtectedPrefix)", path)
+			}
 		})
 	}
 }

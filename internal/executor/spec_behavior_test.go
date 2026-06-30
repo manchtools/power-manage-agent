@@ -14,12 +14,17 @@ import (
 // SPEC: 11-sdk-spec.md — Invariant 7: ULIDs for all identifiers
 // =============================================================================
 
-func TestSpecSDK_ULIDNotUUID(t *testing.T) {
-	const ulidLen = 26
-	const uuidLen = 36
-	if ulidLen == uuidLen {
-		t.Error("ULID and UUID have different formats — tests must distinguish them")
-	}
+func TestSpecSDK_ULIDNotUUID_Documented(t *testing.T) {
+	// The agent executor neither generates nor parses identifiers — it echoes
+	// the server-emitted ActionId (a ULID) from the verified envelope, proven by
+	// TestExecutor_ExecutesVerifiedEnvelopeParams. The "ULIDs for all
+	// identifiers" invariant is enforced where IDs are actually produced/checked:
+	//   - SDK ULID generation (ulidx) — tested in the sdk module.
+	//   - Agent terminal session-id: handler/terminal.go ulid.Parse rejects any
+	//     non-ULID session id (proto validate:"required,ulid") — tested in the
+	//     handler package.
+	// A tautological 26-vs-36 length check here asserted nothing about either,
+	// so this is an honest documentation pointer rather than a fake assertion.
 }
 
 // =============================================================================
@@ -27,10 +32,32 @@ func TestSpecSDK_ULIDNotUUID(t *testing.T) {
 // =============================================================================
 
 func TestSpecAgent_NeverExecuteUnsigned_VerifyRejectsTampered(t *testing.T) {
-	e := NewExecutor(nil, nil)
-	_, err := e.VerifyEnvelope([]byte("payload"), []byte("wrong-signature"))
-	if err == nil {
-		t.Fatal("SPEC VIOLATION: VerifyEnvelope accepted tampered signature")
+	// Build a REAL verifier + matching signer (fresh self-signed CA) so this
+	// exercises actual signature verification, not the nil-verifier shortcut.
+	exec, signer := testVerifierAndSigner(t)
+	env := &pb.SignedActionEnvelope{
+		ActionId:   &pb.ActionId{Value: "01HSPECTAMPER000000000000"},
+		ActionType: pb.ActionType_ACTION_TYPE_SHELL,
+		Params:     &pb.SignedActionEnvelope_Shell{Shell: &pb.ShellParams{Script: "echo hi", RunAsRoot: true}},
+	}
+	envBytes, sig := signEnv(t, signer, env)
+
+	// Positive control: a genuine signature must verify — proving we reach real
+	// verification (the old nil-verifier test could never accept a valid sig).
+	if _, err := exec.VerifyEnvelope(envBytes, sig); err != nil {
+		t.Fatalf("a genuine signature must verify, got %v", err)
+	}
+	// Tampered signature under a valid envelope → must be refused.
+	badSig := append([]byte(nil), sig...)
+	badSig[0] ^= 0xFF
+	if _, err := exec.VerifyEnvelope(envBytes, badSig); err == nil {
+		t.Fatal("SPEC VIOLATION: VerifyEnvelope accepted a tampered signature")
+	}
+	// Tampered envelope under a valid signature → must be refused.
+	badEnv := append([]byte(nil), envBytes...)
+	badEnv[len(badEnv)-1] ^= 0xFF
+	if _, err := exec.VerifyEnvelope(badEnv, sig); err == nil {
+		t.Fatal("SPEC VIOLATION: VerifyEnvelope accepted a tampered envelope")
 	}
 }
 
