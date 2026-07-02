@@ -117,8 +117,19 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Send any results stored while offline (before syncing new actions)
 		syncPendingResults(sessionCtx, sched, client, logger)
 
-		// Sync actions from server (unary RPC — stream is connecting in parallel)
-		newInterval := syncActionsFromServer(sessionCtx, client, sched, firstSync, logger)
+		// Sync actions from server (unary RPC — the stream is connecting in
+		// parallel). The FIRST sync of a connection is a full reconcile, and
+		// it MUST land: a single transient failure (most commonly the unary
+		// sync racing ahead of the stream's device→gateway binding publish, so
+		// control returns "device not live on any gateway") would otherwise
+		// drop the agent into incremental-only mode, skipping every unchanged
+		// action and leaving any drift — e.g. an account locked by an older
+		// agent — uncorrected until the next reconnect. Retry until one full
+		// reconcile succeeds; the binding appears within the stream handshake,
+		// so a retry lands almost immediately.
+		newInterval := syncUntilFullReconcile(sessionCtx, logger, func() time.Duration {
+			return syncActionsFromServer(sessionCtx, client, sched, firstSync, logger)
+		})
 		if newInterval > 0 {
 			syncInterval = newInterval
 			firstSync = false
@@ -256,9 +267,16 @@ func periodicSync(
 
 	logger.Info("periodic sync started", "interval", syncInterval.String())
 
-	doSync := func(reason string) {
-		logger.Info("syncing actions", "reason", reason)
-		newInterval := syncActionsFromServer(ctx, client, sched, false, logger)
+	// full=true re-runs the FULL desired-state reconcile (every action),
+	// not just new/changed ones. An operator-triggered SYNC action means
+	// "re-apply desired state now" — the lever for correcting drift such as
+	// an account left locked by an older agent — so it must be a full sync,
+	// matching what a fresh connection does. The periodic ticker stays
+	// incremental so it doesn't re-run every action (including SHELL
+	// scripts) every interval.
+	doSync := func(reason string, full bool) {
+		logger.Info("syncing actions", "reason", reason, "full", full)
+		newInterval := syncActionsFromServer(ctx, client, sched, full, logger)
 		if newInterval > 0 && newInterval != syncInterval {
 			syncInterval = newInterval
 			ticker.Reset(syncInterval)
@@ -280,9 +298,10 @@ func periodicSync(
 			logger.Debug("periodic sync stopped")
 			return
 		case <-ticker.C:
-			doSync("periodic")
+			doSync("periodic", false)
 		case <-syncTrigger:
-			doSync("instant action trigger")
+			// Operator-dispatched SYNC action: full desired-state reconcile.
+			doSync("instant action trigger", true)
 		case override := <-intervalUpdates:
 			if override > 0 && override != syncInterval {
 				syncInterval = override
@@ -357,6 +376,59 @@ func sendScheduledResults(ctx context.Context, client *sdk.Client, sched *schedu
 			}
 		}
 	}
+}
+
+// firstSyncMaxAttempts bounds the initial full-sync retry so a genuinely
+// persistent failure doesn't block the connection setup forever; the
+// operator's manual SYNC (also a full reconcile) and the next reconnect remain
+// the fallbacks.
+const firstSyncMaxAttempts = 6
+
+// firstSyncBaseBackoff / firstSyncMaxBackoff bound the exponential backoff
+// between initial full-sync attempts. The dominant failure — the sync racing
+// the device→gateway binding publish — clears within the stream handshake, so
+// the first retry (after ~1s) almost always lands. Package vars, not consts, so
+// tests can shrink them (the retry loop is otherwise dominated by real sleeps).
+var (
+	firstSyncBaseBackoff = 1 * time.Second
+	firstSyncMaxBackoff  = 8 * time.Second
+)
+
+// syncUntilFullReconcile runs syncOnce (a full first-sync) and retries it on
+// failure with bounded exponential backoff until one succeeds, aborting early
+// if ctx is cancelled (the stream ended). syncOnce returns the sync interval
+// (>0) on success or 0 on failure — the same contract as syncActionsFromServer.
+// Returns the interval from the first success, or 0 if every attempt failed or
+// the ctx ended. Ensuring one full reconcile lands per connection is what keeps
+// a transient first-sync failure from stranding the agent in incremental-only
+// mode (see the caller).
+func syncUntilFullReconcile(ctx context.Context, logger *slog.Logger, syncOnce func() time.Duration) time.Duration {
+	backoff := firstSyncBaseBackoff
+	for attempt := 1; attempt <= firstSyncMaxAttempts; attempt++ {
+		if iv := syncOnce(); iv > 0 {
+			if attempt > 1 {
+				logger.Info("initial full sync succeeded after retry", "attempt", attempt)
+			}
+			return iv
+		}
+		if attempt == firstSyncMaxAttempts {
+			break
+		}
+		logger.Warn("initial full sync failed; retrying",
+			"attempt", attempt, "max_attempts", firstSyncMaxAttempts, "backoff", backoff.String())
+		select {
+		case <-ctx.Done():
+			return 0
+		case <-time.After(backoff):
+		}
+		if backoff < firstSyncMaxBackoff {
+			backoff *= 2
+		}
+	}
+	logger.Error("initial full sync did not succeed after retries; continuing with periodic sync",
+		"attempts", firstSyncMaxAttempts,
+		"note", "a manual Sync action or the next reconnect will retry the full reconcile")
+	return 0
 }
 
 // syncActionsFromServer fetches all assigned actions from the server and updates local store.
