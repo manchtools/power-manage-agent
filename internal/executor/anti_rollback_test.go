@@ -19,6 +19,21 @@ func TestCompareAgentVersion_Table(t *testing.T) {
 		{"v2026.10.00", "v2026.09.99", 1},
 		{"v2027.01.00", "v2026.12.31", 1},
 		{"v2026.06.10", "v2026.06.09", 1},
+
+		// Real release-tag scheme: 2-component cores (vYYYY.MM) and
+		// -rcN pre-release suffixes must compare (they are the actual tags
+		// operators run — the strict 3-numeric parser refused them, which
+		// is what broke self-update between RCs).
+		{"2026.07.01-rc3", "2026.07.01-rc4", -1}, // the reported failure: rc3 → rc4 is an UPGRADE
+		{"2026.07.01-rc4", "2026.07.01-rc3", 1},
+		{"2026.07.01-rc4", "2026.07.01-rc4", 0},
+		{"2026.07.01-rc4", "2026.07.01", -1}, // a pre-release is older than its final release
+		{"2026.07.01", "2026.07.01-rc4", 1},
+		{"2026.07.01-rc10", "2026.07.01-rc9", 1}, // rc numbers order numerically, not lexically
+		{"v2026.06", "v2026.06.00", 0},           // 2-part core == 3-part with .00 patch
+		{"v2026.06", "v2026.07.01-rc1", -1},      // 2026.06 predates any 2026.07 pre-release
+		{"v2026.06-rc1", "v2026.06", -1},         // pre-release older than release, 2-part core
+		{"v2026.06-rc1", "v2026.06-rc2", -1},
 	}
 	for _, tc := range cases {
 		got, err := compareAgentVersion(tc.a, tc.b)
@@ -31,8 +46,11 @@ func TestCompareAgentVersion_Table(t *testing.T) {
 		}
 	}
 
-	// Malformed → error (never silently treated as comparable).
-	for _, bad := range []string{"", "garbage", "v2026.06", "v2026.06.01.02", "vYYYY.MM.PP", "2026-06-01"} {
+	// Malformed → error (never silently treated as comparable). v2026.06 is
+	// NO LONGER here — a 2-component core is a valid release tag. Genuine
+	// garbage, a 1-component core, a >3-component core, non-numeric parts, and
+	// an empty pre-release suffix all still fail closed.
+	for _, bad := range []string{"", "garbage", "v2026", "v2026.06.01.02", "vYYYY.MM.PP", "2026-06-01", "2026.07.01-"} {
 		if _, err := compareAgentVersion("v2026.06.01", bad); err == nil {
 			t.Errorf("compareAgentVersion with malformed %q must error", bad)
 		}

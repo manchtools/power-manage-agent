@@ -288,11 +288,27 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	return &pb.CommandOutput{Stdout: stdout}, true, nil
 }
 
-// compareAgentVersion compares two vYYYY.MM.PP version strings and returns
-// -1 if a < b, 0 if equal, +1 if a > b. The leading "v" is optional. A
-// version that does not parse to exactly three numeric components is an
-// error — callers MUST treat that as fail-closed (never "newer"), so a
-// malformed candidate cannot bypass anti-rollback (WS7 #7).
+// agentVersion is a parsed agent release version: a 2- or 3-component numeric
+// core (year.month[.patch], missing patch = 0) plus an optional pre-release
+// suffix (e.g. "-rc4"). This matches the ACTUAL release-tag scheme — both
+// vYYYY.MM (major/minor) and vYYYY.MM.PP-rcN (patch RCs) — which the earlier
+// strict "exactly three numeric components" parser rejected, silently breaking
+// self-update between every real version (the -rcN suffix failed Atoi; a
+// 2-component tag failed the length check).
+type agentVersion struct {
+	core   [3]int // year, month, patch
+	pre    bool   // has a pre-release suffix (…-rcN)
+	preNum int    // N in -rcN; 0 when the suffix is not rc<number>
+	preRaw string // raw suffix, for a lexical fallback when it is not rc<number>
+}
+
+// compareAgentVersion compares two release versions and returns -1 if a < b,
+// 0 if equal, +1 if a > b. The leading "v" is optional. Ordering: the numeric
+// core wins first; for an equal core a final release outranks any pre-release
+// of it (2026.07.01 > 2026.07.01-rc4), and two rc pre-releases order by their
+// number (rc4 > rc3, rc10 > rc9). A version that does not parse is an error —
+// callers MUST treat that as fail-closed (never "newer"), so a malformed
+// candidate cannot bypass anti-rollback (WS7 #7).
 func compareAgentVersion(a, b string) (int, error) {
 	pa, err := parseAgentVersion(a)
 	if err != nil {
@@ -302,34 +318,88 @@ func compareAgentVersion(a, b string) (int, error) {
 	if err != nil {
 		return 0, err
 	}
-	for i := 0; i < len(pa); i++ {
-		if pa[i] != pb[i] {
-			if pa[i] < pb[i] {
+	for i := 0; i < len(pa.core); i++ {
+		if pa.core[i] != pb.core[i] {
+			if pa.core[i] < pb.core[i] {
 				return -1, nil
 			}
 			return 1, nil
 		}
 	}
+	// Equal core. A release (no suffix) is newer than a pre-release of it.
+	if pa.pre != pb.pre {
+		if pa.pre {
+			return -1, nil // a is a pre-release, b is the final release
+		}
+		return 1, nil
+	}
+	if !pa.pre {
+		return 0, nil // both final releases with equal cores
+	}
+	// Both pre-releases: order by rc number, then lexically as a fallback.
+	if pa.preNum != pb.preNum {
+		if pa.preNum < pb.preNum {
+			return -1, nil
+		}
+		return 1, nil
+	}
+	if pa.preRaw < pb.preRaw {
+		return -1, nil
+	}
+	if pa.preRaw > pb.preRaw {
+		return 1, nil
+	}
 	return 0, nil
 }
 
-// parseAgentVersion parses "vYYYY.MM.PP" (leading v optional) into its
-// three numeric components.
-func parseAgentVersion(v string) ([3]int, error) {
-	var out [3]int
+// parseAgentVersion parses "vYYYY.MM[.PP][-<pre>]" (leading v optional). The
+// core must be 2 or 3 dot-separated numeric components; a present pre-release
+// suffix must be non-empty. Anything else is an error so a malformed version
+// fails CLOSED in the anti-rollback gate (never treated as newer).
+func parseAgentVersion(v string) (agentVersion, error) {
+	var out agentVersion
 	v = strings.TrimPrefix(strings.TrimSpace(v), "v")
-	parts := strings.Split(v, ".")
-	if len(parts) != 3 {
-		return out, fmt.Errorf("invalid version %q: want vYYYY.MM.PP", v)
+	if v == "" {
+		return out, fmt.Errorf("empty version")
+	}
+	core := v
+	if i := strings.IndexByte(v, '-'); i >= 0 {
+		core = v[:i]
+		suffix := v[i+1:]
+		if suffix == "" {
+			return out, fmt.Errorf("invalid version %q: empty pre-release suffix", v)
+		}
+		out.pre = true
+		out.preRaw = suffix
+		if n, ok := parseRCNumber(suffix); ok {
+			out.preNum = n
+		}
+	}
+	parts := strings.Split(core, ".")
+	if len(parts) < 2 || len(parts) > 3 {
+		return out, fmt.Errorf("invalid version %q: want vYYYY.MM[.PP][-rcN]", v)
 	}
 	for i, p := range parts {
 		n, err := strconv.Atoi(p)
 		if err != nil {
 			return out, fmt.Errorf("invalid version component %q in %q: %w", p, v, err)
 		}
-		out[i] = n
+		out.core[i] = n
 	}
 	return out, nil
+}
+
+// parseRCNumber extracts N from an "rcN" pre-release suffix, so rc numbers
+// order numerically (rc10 > rc9) rather than lexically.
+func parseRCNumber(suffix string) (int, bool) {
+	if !strings.HasPrefix(suffix, "rc") {
+		return 0, false
+	}
+	n, err := strconv.Atoi(suffix[2:])
+	if err != nil || n < 0 {
+		return 0, false
+	}
+	return n, true
 }
 
 // extractFilename returns the filename from a URL, stripping query parameters.
