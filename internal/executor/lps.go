@@ -3,6 +3,7 @@ package executor
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -10,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
@@ -17,11 +19,14 @@ import (
 )
 
 // lpsRotationEntry is the JSON structure reported in action result metadata.
+// SealedPassword is base64 of the password sealed to the control server's LPS
+// public key (crypto.SealLpsPassword): the gateway relays it opaquely and
+// cannot read it. The old cleartext `password` field is gone (spec 18).
 type lpsRotationEntry struct {
-	Username  string `json:"username"`
-	Password  string `json:"password"`
-	RotatedAt string `json:"rotated_at"`
-	Reason    string `json:"reason"`
+	Username       string `json:"username"`
+	SealedPassword string `json:"sealed_password"`
+	RotatedAt      string `json:"rotated_at"`
+	Reason         string `json:"reason"`
 }
 
 // executeLps manages local user password rotation (Local Password Solution).
@@ -54,6 +59,22 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	st := e.getStore()
 	if st == nil {
 		return nil, false, nil, fmt.Errorf("agent store not configured")
+	}
+
+	// Fail closed BEFORE touching any account: without the control LPS public
+	// key we cannot seal the rotated password, and rotating without being able
+	// to return it to the operator would strand the new credential. The key
+	// arrives (CA-verified) on sync; a device that has never synced, or a
+	// server with no keypair, simply doesn't rotate until it does.
+	lpsPub, err := e.lpsPublicKey()
+	if err != nil {
+		return nil, false, nil, fmt.Errorf("LPS rotation requires the control public key: %w", err)
+	}
+	// The seal AAD binds device|action|username; without this agent's own
+	// device ID we cannot build it, so fail closed rather than seal loosely.
+	deviceID := e.getDeviceID()
+	if deviceID == "" {
+		return nil, false, nil, fmt.Errorf("LPS rotation requires the agent device ID (not configured)")
 	}
 
 	var output strings.Builder
@@ -131,6 +152,21 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			continue
 		}
 
+		// Seal the new password to the control key BEFORE setting it locally.
+		// password is an exec.Secret; Reveal() is the sanctioned plaintext
+		// access. Sealing first means a seal failure leaves the account's
+		// password UNCHANGED — never rotate to a credential we cannot return
+		// to the operator (the whole point of LPS). AAD binds the sealed blob
+		// to this device/action/user so control unseals it into the right
+		// record and only that record.
+		plaintext := password.Reveal()
+		sealed, err := sdkcrypto.SealLpsPassword(lpsPub, plaintext, deviceID, actionID, username)
+		if err != nil {
+			anyError = fmt.Errorf("seal password for %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to seal password, not rotating: %v\n", username, err))
+			continue
+		}
+
 		// Set the password
 		if err := userMgr.SetPassword(ctx, username, password); err != nil {
 			anyError = fmt.Errorf("set password for %s: %w", username, err)
@@ -143,10 +179,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		now := e.now().UTC()
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
-		// Update per-user state in SQLite. password is an exec.Secret; Reveal()
-		// is the sanctioned plaintext access for the drift hash + the operator-
-		// facing rotation record below.
-		plaintext := password.Reveal()
+		// Update per-user state in SQLite. The drift hash is over the local
+		// plaintext (never leaves the device); the operator-facing record
+		// carries only the sealed blob.
 		hash := sha256.Sum256([]byte(plaintext))
 		hashStr := hex.EncodeToString(hash[:])
 		if err := st.SetLpsUserState(actionID, username, now, hashStr); err != nil {
@@ -160,10 +195,10 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}
 
 		rotations = append(rotations, lpsRotationEntry{
-			Username:  username,
-			Password:  plaintext,
-			RotatedAt: now.Format(time.RFC3339),
-			Reason:    reason,
+			Username:       username,
+			SealedPassword: base64.StdEncoding.EncodeToString(sealed),
+			RotatedAt:      now.Format(time.RFC3339),
+			Reason:         reason,
 		})
 	}
 

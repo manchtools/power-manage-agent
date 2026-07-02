@@ -3,14 +3,11 @@ package executor
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
-	"log/slog"
 	"os/user"
 	"path/filepath"
 	"strconv"
 	"strings"
-	"time"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
@@ -18,7 +15,7 @@ import (
 )
 
 // executeUser manages user accounts (create, update, disable, remove).
-func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state pb.DesiredState) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	if params == nil {
 		return nil, false, nil, fmt.Errorf("user params required")
 	}
@@ -49,7 +46,7 @@ func (e *Executor) executeUser(ctx context.Context, params *pb.UserParams, state
 
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:
-		return e.createOrUpdateUser(ctx, params)
+		return e.createOrUpdateUser(ctx, params, actionID)
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		output, changed, err := e.removeUser(ctx, params.Username)
 		return output, changed, nil, err
@@ -125,7 +122,7 @@ func (e *Executor) ensureHomeIfMissing(ctx context.Context, params *pb.UserParam
 	return true
 }
 
-func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	var output strings.Builder
 	exists, err := userExists(ctx, params.Username)
 	if err != nil {
@@ -139,12 +136,12 @@ func (e *Executor) createOrUpdateUser(ctx context.Context, params *pb.UserParams
 	}
 
 	// Create new user - always a change
-	cmdOutput, metadata, err := e.createUser(ctx, params, &output)
+	cmdOutput, metadata, err := e.createUser(ctx, params, actionID, &output)
 	return cmdOutput, true, metadata, err
 }
 
 // createUser creates a new user account.
-func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output *strings.Builder) (*pb.CommandOutput, map[string]string, error) {
+func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, actionID string, output *strings.Builder) (*pb.CommandOutput, map[string]string, error) {
 	// Shell (default to /bin/bash for normal users, /usr/sbin/nologin for disabled/system)
 	shell := params.Shell
 	if shell == "" {
@@ -216,19 +213,14 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, output
 				}
 				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
 
-				// Report password via lps.rotations metadata so it's stored in the
-				// LPS table for operator retrieval — the sanctioned plaintext sink.
-				rotations := []lpsRotationEntry{{
-					Username:  params.Username,
-					Password:  tempPassword.Reveal(),
-					RotatedAt: e.now().UTC().Format(time.RFC3339),
-					Reason:    "user_created",
-				}}
-				rotationsJSON, err := json.Marshal(rotations)
-				if err != nil {
-					slog.Warn("failed to marshal user creation rotations", "error", err)
-				} else {
-					metadata = map[string]string{"lps.rotations": string(rotationsJSON)}
+				// Report the temp password via lps.rotations metadata for operator
+				// retrieval — SEALED to the control LPS public key, exactly like a
+				// rotation (spec 18), so the gateway never sees it in cleartext. If
+				// no verified key is available or sealing fails, the user is still
+				// created but the password is NOT reported (never leak cleartext);
+				// the operator resets it out of band.
+				if md := e.sealedUserCreateMetadata(params.Username, actionID, tempPassword.Reveal(), output); md != nil {
+					metadata = md
 				}
 			}
 		}

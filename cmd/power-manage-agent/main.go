@@ -254,6 +254,9 @@ func main() {
 	// Initialize the scheduler for autonomous action execution
 	exec := executor.NewExecutor(actionVerifier, runner)
 	exec.SetStore(actionStore)
+	// The agent's own device ID is part of the LPS seal context so control
+	// unseals each rotated password into the right (device, action, user) record.
+	exec.SetDeviceID(creds.DeviceID)
 	sched := scheduler.New(actionStore, exec, logger)
 	exec.SetActionStore(sched)
 

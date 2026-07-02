@@ -75,6 +75,8 @@ type mockExecutor struct {
 	// block, if non-nil for an action id, is received-from before ExecuteEnvelope
 	// returns — lets a test hold an execution in-flight (WS14 #9).
 	block map[string]chan struct{}
+	// lastLpsPublicKey records the most recent ApplyLpsPublicKey argument.
+	lastLpsPublicKey *pb.LpsPublicKey
 }
 
 // VerifyEnvelope mirrors the real executor: verify the CA signature over the
@@ -140,6 +142,15 @@ func (m *mockExecutor) ResetUpdateCycle() {
 	m.mu.Lock()
 	m.resets++
 	m.mu.Unlock()
+}
+
+// ApplyLpsPublicKey records the last key applied so scheduler-passthrough
+// tests can assert delegation; the real verify/persist lives in the executor.
+func (m *mockExecutor) ApplyLpsPublicKey(signed *pb.LpsPublicKey) error {
+	m.mu.Lock()
+	m.lastLpsPublicKey = signed
+	m.mu.Unlock()
+	return nil
 }
 
 func (m *mockExecutor) getCalls() []*pb.SignedActionEnvelope {
