@@ -45,6 +45,11 @@ type ActionExecutor interface {
 	// flag on the executor instance so a new sync cycle can run an
 	// update again (audit F042 + F048).
 	ResetUpdateCycle()
+	// ApplyLpsPublicKey verifies the control server's CA-signed LPS sealing
+	// key against the agent's enrollment CA and, on success, persists it for
+	// the LPS seal path. Fail-closed: a bad signature or missing verifier
+	// leaves any prior key untouched and returns an error (spec 18).
+	ApplyLpsPublicKey(signed *pb.LpsPublicKey) error
 }
 
 // maintenanceWindowSettingKey is the agent-store settings key under
@@ -158,6 +163,14 @@ func (s *Scheduler) SetMaintenanceWindow(w *pb.MaintenanceWindow) {
 	if err := storeMaintenanceWindow(s.store, normalized); err != nil {
 		s.logger.Warn("failed to persist maintenance window; in-memory only", "error", err)
 	}
+}
+
+// ApplyLpsPublicKey delegates to the executor, which owns the LPS verifier
+// and the seal path. Mirrors SetMaintenanceWindow's role as the sync-response
+// applier; verification + persistence + fail-closed policy live in the
+// executor (spec 18).
+func (s *Scheduler) ApplyLpsPublicKey(signed *pb.LpsPublicKey) error {
+	return s.executor.ApplyLpsPublicKey(signed)
 }
 
 // activeWindow returns a snapshot of the current window for read

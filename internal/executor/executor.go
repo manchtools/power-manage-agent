@@ -75,11 +75,16 @@ type Executor struct {
 	runner       sysexec.Runner
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
-	mu           sync.RWMutex // protects luksKeyStore, store, actionStore
+	mu           sync.RWMutex // protects luksKeyStore, store, actionStore, deviceID
 	luksKeyStore LuksKeyStore
 	store        *store.Store
 	actionStore  ActionStore
 	updateCfg    *AgentUpdateConfig
+	// deviceID is this agent's own device ULID, used as part of the LPS
+	// seal context (device|action|username) so the sealed password binds to
+	// the exact record the control server unseals it into. Set from
+	// credentials in main.go.
+	deviceID string
 
 	// Per-cycle AGENT_UPDATE dedup. Audit F042 + F048: previously
 	// package-level globals which made parallel tests serialise on
@@ -191,6 +196,20 @@ func (e *Executor) SetStore(s *store.Store) {
 	e.mu.Lock()
 	e.store = s
 	e.mu.Unlock()
+}
+
+// SetDeviceID sets this agent's own device ULID, used in the LPS seal context.
+func (e *Executor) SetDeviceID(id string) {
+	e.mu.Lock()
+	e.deviceID = id
+	e.mu.Unlock()
+}
+
+// getDeviceID returns the configured device ULID under the read lock.
+func (e *Executor) getDeviceID() string {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.deviceID
 }
 
 // SetUpdateConfig configures the agent self-update executor.
@@ -352,7 +371,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	case pb.ActionType_ACTION_TYPE_USER:
 		var changed bool
 		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeUser(ctx, env.GetUser(), env.DesiredState)
+		output, changed, metadata, execErr = e.executeUser(ctx, env.GetUser(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 		if len(metadata) > 0 {
 			result.Metadata = metadata

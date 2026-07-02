@@ -385,6 +385,14 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 	// blasting through queued work. See manchtools/power-manage-server#58.
 	sched.SetMaintenanceWindow(result.MaintenanceWindow)
 
+	// Apply the control server's LPS sealing key from the same sync. Verified
+	// (CA signature) and persisted by the executor; a failure keeps the last
+	// good key and is non-fatal to the sync — LPS rotation fails closed on its
+	// own if no key is ever stored. See spec 18 / manchtools/power-manage-agent#62.
+	if err := sched.ApplyLpsPublicKey(result.LpsPublicKey); err != nil {
+		logger.Error("failed to apply control LPS public key; keeping previous key", "error", err)
+	}
+
 	// Convert sync interval from minutes to duration
 	var syncInterval time.Duration
 	if result.SyncIntervalMinutes > 0 {
