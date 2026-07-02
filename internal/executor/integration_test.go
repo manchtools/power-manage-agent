@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 
@@ -74,6 +75,19 @@ func newTestExecutor() *Executor {
 		panic("failed to create test store: " + err.Error())
 	}
 	e.SetStore(s)
+	// Seed a control LPS public key + device ID so LPS rotations can seal
+	// (spec 18). Integration tests exercise the real rotation side effects
+	// (chpasswd, state persistence); they don't unseal, so a throwaway key
+	// whose private half we discard is enough to satisfy the fail-closed
+	// seal precondition.
+	priv, err := sdkcrypto.GenerateX25519()
+	if err != nil {
+		panic("failed to generate test LPS key: " + err.Error())
+	}
+	if err := s.SetSetting(lpsPublicKeySettingKey, string(priv.PublicKey().Bytes())); err != nil {
+		panic("failed to seed test LPS key: " + err.Error())
+	}
+	e.SetDeviceID("01HKINTEGRATIONDEVICE00000")
 	return e
 }
 
