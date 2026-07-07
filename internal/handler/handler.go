@@ -551,9 +551,10 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 
 // OnRequestInventory handles a SERVER-originated inventory collection request.
 // Implements sdk.InventoryHandler. The request is verified fail-closed before
-// any osquery runs (WS4) — a compromised gateway cannot forge it. The
-// agent-initiated periodic path calls CollectInventory directly and needs no
-// signature.
+// any osquery runs (WS4) — a compromised gateway cannot forge it. All
+// inventory collection is server-initiated over this path (manual refresh and
+// the spec-22 server-side scheduler); the agent has no periodic collector of
+// its own.
 func (h *Handler) OnRequestInventory(ctx context.Context, req *pb.RequestInventory) *pb.DeviceInventory {
 	// WS4: a server-originated request runs osquery as root — verify the CA
 	// signature before collecting. Fail-closed (incl. nil verifier): a forged
