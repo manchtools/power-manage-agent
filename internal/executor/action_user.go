@@ -395,15 +395,18 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	desiredLocked := desiredAccountLocked(params)
 	if desiredLocked != currentInfo.Locked {
 		if desiredLocked {
-			if params.Username == "root" {
-				// Deliberate operator choice (#169) — loud in the journal:
-				// password login to root stops working; sudo and key-based
-				// SSH are unaffected (lock-only, shell preserved).
-				e.logger.Warn("locking the root account per USER action (password login disabled; sudo/key-SSH unaffected)")
-			}
 			if err := userMgr.Lock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
 			} else {
+				if params.Username == "root" {
+					// Deliberate operator choice (#169) — loud in the
+					// journal, AFTER the lock succeeded (CR catch: warning
+					// on the attempt would falsely assert the state change
+					// when Lock fails): password login to root stops
+					// working; sudo and key-based SSH are unaffected
+					// (lock-only, shell preserved).
+					e.logger.Warn("locked the root account per USER action (password login disabled; sudo/key-SSH unaffected)")
+				}
 				output.WriteString("account locked (disabled)\n")
 				changed = true
 			}
