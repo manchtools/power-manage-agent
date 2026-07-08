@@ -239,22 +239,10 @@ func (h *Handler) OnActionWithStreaming(ctx context.Context, envelope []byte, si
 		}
 	}
 
-	// Create output callback if sendChunk is provided
-	var outputCallback executor.OutputCallback
-	if sendChunk != nil {
-		executionID := actionID
-		outputCallback = func(streamType sysexec.StreamType, line string, seq int64) {
-			chunk := &pb.OutputChunk{
-				ExecutionId: executionID,
-				Stream:      pb.OutputStreamType(streamType),
-				Data:        []byte(line),
-				Sequence:    seq,
-			}
-			if err := sendChunk(chunk); err != nil {
-				h.logger.Warn("failed to send output chunk", "error", err)
-			}
-		}
-	}
+	// Streaming relay, wrapped in the per-execution budget (audit A-02,
+	// #170): one marker chunk on exhaustion, then silence — the action
+	// itself runs to completion regardless.
+	outputCallback := budgetedChunkCallback(actionID, sendChunk, h.logger)
 
 	// Execute the VERIFIED envelope with streaming support.
 	result := h.executor.ExecuteWithStreaming(ctx, env, outputCallback)
