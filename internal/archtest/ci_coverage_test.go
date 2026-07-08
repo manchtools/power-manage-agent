@@ -53,8 +53,8 @@ func TestCIRunsEveryIntegrationTest(t *testing.T) {
 	// Stale-list direction: a workflow package argument whose directory no
 	// longer exists is the same rot in reverse.
 	for _, p := range pkgs {
-		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(p))); err != nil {
-			t.Errorf("integration-test.yml references ./agent/%s/ but that directory does not exist (stale lane entry)", p)
+		if _, err := os.Stat(filepath.Join(root, filepath.FromSlash(p.dir))); err != nil {
+			t.Errorf("integration-test.yml references ./agent/%s/ but that directory does not exist (stale lane entry)", p.dir)
 		}
 	}
 
@@ -146,16 +146,27 @@ func buildTagHasIntegration(line string) bool {
 	return false
 }
 
-// workflowPkgPattern matches the `./agent/internal/executor/` style package
-// arguments the workflow passes to `go test` (the repo is checked out into
-// the `agent/` sub-directory).
-var workflowPkgPattern = regexp.MustCompile(`\./agent/([A-Za-z0-9_/-]+?)/?(\s|\\|$|\.\.\.)`)
+// workflowPkg is one `./agent/<dir>/` package argument from the workflow.
+// Recursive records whether it carried the `/...` suffix — a non-recursive
+// argument tests ONLY that directory, so it must not count as covering
+// subpackages (CR catch: prefix-matching a non-recursive entry would
+// reintroduce the exact silent-gap this guard exists to close).
+type workflowPkg struct {
+	dir       string
+	recursive bool
+}
 
-func extractWorkflowPackages(workflow string) []string {
-	seen := map[string]bool{}
-	var out []string
+// workflowPkgPattern matches the `./agent/internal/executor/` and
+// `./agent/internal/executor/...` style package arguments the workflow
+// passes to `go test` (the repo is checked out into the `agent/`
+// sub-directory).
+var workflowPkgPattern = regexp.MustCompile(`\./agent/([A-Za-z0-9_/-]+?)/?(\.\.\.)?(\s|\\|$)`)
+
+func extractWorkflowPackages(workflow string) []workflowPkg {
+	seen := map[workflowPkg]bool{}
+	var out []workflowPkg
 	for _, m := range workflowPkgPattern.FindAllStringSubmatch(workflow, -1) {
-		p := strings.TrimSuffix(m[1], "/")
+		p := workflowPkg{dir: strings.TrimSuffix(m[1], "/"), recursive: m[2] == "..."}
 		if !seen[p] {
 			seen[p] = true
 			out = append(out, p)
@@ -182,9 +193,12 @@ func extractRunSelectors(workflow string) []string {
 	return out
 }
 
-func workflowCovers(pkg string, pkgs []string) bool {
+func workflowCovers(pkg string, pkgs []workflowPkg) bool {
 	for _, p := range pkgs {
-		if pkg == p || strings.HasPrefix(pkg, p+"/") {
+		if pkg == p.dir {
+			return true
+		}
+		if p.recursive && strings.HasPrefix(pkg, p.dir+"/") {
 			return true
 		}
 	}
