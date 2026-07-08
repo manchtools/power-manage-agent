@@ -74,6 +74,11 @@ func TestScheduler_StopIdempotentAndPreStartSafe(t *testing.T) {
 func TestScheduler_StartJoinsDrainingPredecessor(t *testing.T) {
 	s, _ := newTestScheduler(t)
 
+	// UNBUFFERED and never closed: the send below can only complete
+	// while Start's `<-prev` join is actively receiving — a
+	// deterministic proof the goroutine reached the join instead of
+	// running a second loop (CR catch: a timing window could
+	// false-pass if the goroutine simply wasn't scheduled).
 	draining := make(chan struct{})
 	s.mu.Lock()
 	s.running = false
@@ -88,11 +93,14 @@ func TestScheduler_StartJoinsDrainingPredecessor(t *testing.T) {
 		return s.running
 	}
 
-	// While the predecessor drains, the new loop must NOT start.
-	require.Never(t, isRunning, 150*time.Millisecond, 10*time.Millisecond,
-		"Start must wait for the draining predecessor before running a new loop")
+	select {
+	case draining <- struct{}{}:
+		// Start is parked in the predecessor join — and therefore has
+		// NOT started a new loop.
+	case <-time.After(2 * time.Second):
+		t.Fatal("Start never reached the predecessor join — a racing Start would run a second loop while the old one drains")
+	}
 
-	close(draining)
 	require.Eventually(t, isRunning, 2*time.Second, time.Millisecond,
 		"Start should run once the predecessor has fully exited")
 	s.Stop()
