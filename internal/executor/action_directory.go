@@ -122,14 +122,19 @@ func (e *Executor) directoryMatchesDesired(ctx context.Context, path string, par
 		return false
 	}
 
-	// Check mode if specified
+	// Check mode if specified. An UNPARSEABLE mode reads as "does not
+	// match" (#174): the old silent err == nil skip treated a
+	// misconfigured octal string as "mode doesn't matter", so the
+	// action reported converged without ever applying anything; falling
+	// through to the apply path surfaces the bad mode as a loud error
+	// there instead.
 	if params.Mode != "" {
 		var desiredMode uint64
-		if _, err := fmt.Sscanf(params.Mode, "%o", &desiredMode); err == nil {
-			currentMode := mode.Perm()
-			if uint32(currentMode) != uint32(desiredMode) {
-				return false
-			}
+		if _, err := fmt.Sscanf(params.Mode, "%o", &desiredMode); err != nil {
+			return false
+		}
+		if uint32(mode.Perm()) != uint32(desiredMode) {
+			return false
 		}
 	}
 

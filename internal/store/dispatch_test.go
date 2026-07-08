@@ -40,6 +40,9 @@ func TestStore_BinaryDecodePreservesUnknownFields(t *testing.T) {
 		Schedule: &pb.ActionSchedule{IntervalHours: 1},
 	})
 	require.NoError(t, err)
+	// 50000 sits in the free range well above any real pm.v1 field and
+	// below the 536870911 proto max; if the SDK ever allocates it, this
+	// test fails loudly at unmarshal — acceptable tripwire (#174).
 	b = protowire.AppendTag(b, 50000, protowire.VarintType)
 	b = protowire.AppendVarint(b, 1)
 	blob := append([]byte{binaryProtoPrefix}, b...)

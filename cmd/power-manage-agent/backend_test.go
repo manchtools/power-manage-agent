@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"io"
 	"log/slog"
 	"os"
@@ -36,21 +37,26 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 	fakeBin := fakePathWith(t, "sudo", "doas", "systemctl", "cryptsetup")
 
 	cases := []struct {
-		name    string
-		cfg     *Config
-		wantErr bool
-		want    sysexec.PrivilegeBackend
+		name     string
+		cfg      *Config
+		wantErr  bool
+		want     sysexec.PrivilegeBackend
+		wantWarn bool
 	}{
 		{name: "empty defaults to sudo", cfg: &Config{}, want: sysexec.Sudo},
 		{name: "explicit sudo", cfg: &Config{PrivilegeBackend: "sudo"}, want: sysexec.Sudo},
 		{name: "explicit doas", cfg: &Config{PrivilegeBackend: "doas"}, want: sysexec.Doas},
-		{name: "unknown value warns and falls back to sudo", cfg: &Config{PrivilegeBackend: "typo"}, want: sysexec.Sudo},
+		{name: "unknown value warns and falls back to sudo", cfg: &Config{PrivilegeBackend: "typo"}, want: sysexec.Sudo, wantWarn: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PATH", fakeBin)
-			got, err := applyBackendOverrides(tc.cfg, discardLogger())
+			// Capture logs so the "warns" half of the case name is
+			// actually asserted (#174).
+			var logBuf bytes.Buffer
+			logger := slog.New(slog.NewTextHandler(&logBuf, nil))
+			got, err := applyBackendOverrides(tc.cfg, logger)
 			if err != nil {
 				if !tc.wantErr {
 					t.Fatalf("applyBackendOverrides: %v", err)
@@ -62,6 +68,9 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("privilege backend = %v, want %v", got, tc.want)
+			}
+			if tc.wantWarn && !strings.Contains(logBuf.String(), "level=WARN") {
+				t.Errorf("expected a WARN log for an unknown backend value, got: %s", logBuf.String())
 			}
 		})
 	}

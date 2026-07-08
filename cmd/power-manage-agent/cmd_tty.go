@@ -32,9 +32,8 @@ func runTTY(args []string) int {
 	}
 
 	sub := args[0]
-	if err := fs.Parse(args[1:]); err != nil {
-		return 1
-	}
+	// flag.ExitOnError exits(2) on a parse failure; no error path here (#174).
+	_ = fs.Parse(args[1:])
 
 	switch sub {
 	case "-h", "--help", "help":

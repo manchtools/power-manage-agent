@@ -124,8 +124,11 @@ func (r recordingRunner) Run(_ context.Context, c sysexec.Command) (sysexec.Resu
 	return sysexec.Result{ExitCode: 0, Stdout: "logline\n"}, nil
 }
 
-func (r recordingRunner) Stream(_ context.Context, c sysexec.Command, _ sysexec.OutputCallback) (sysexec.Result, error) {
-	return r.Run(context.Background(), c)
+func (r recordingRunner) Stream(ctx context.Context, c sysexec.Command, _ sysexec.OutputCallback) (sysexec.Result, error) {
+	// Propagate the caller's ctx (#174): swallowing it here meant a test
+	// could never catch a production bug that drops cancellation on the
+	// streaming path.
+	return r.Run(ctx, c)
 }
 
 func (r recordingRunner) Backend() sysexec.PrivilegeBackend { return sysexec.Direct }

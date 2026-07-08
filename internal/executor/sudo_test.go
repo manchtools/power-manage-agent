@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/assert"
 
@@ -304,8 +305,17 @@ func requireVisudoAccepts(t *testing.T, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o440); err != nil {
 		t.Fatalf("write tempfile: %v", err)
 	}
-	out, err := exec.CommandContext(context.Background(), "visudo", "-c", "-f", path).CombinedOutput()
+	out, err := exec.CommandContext(visudoCtx(t), "visudo", "-c", "-f", path).CombinedOutput()
 	if err != nil {
 		t.Fatalf("visudo -c -f rejected the generated content:\n%s\n---\n%s", err, out)
 	}
+}
+
+// visudoCtx bounds a visudo invocation (#174): a hung visudo previously
+// blocked the test binary forever (no deadline on either call site).
+func visudoCtx(t *testing.T) context.Context {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	t.Cleanup(cancel)
+	return ctx
 }

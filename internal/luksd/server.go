@@ -259,6 +259,11 @@ func (d *Daemon) handleRequest(ctx context.Context, req Request) Response {
 		d.logger.Error("LUKS daemon: failed to read local state", "action_id", result.ActionID, "error", err)
 		return errResponse(CodeInternal, "failed to read local LUKS state")
 	}
+	// The revoke MUST precede the enroll (the new passphrase re-uses the
+	// same slot), and the managed key stays valid throughout — so a
+	// failure between the two never locks the volume out, it only leaves
+	// the user-passphrase slot empty until a retry.
+	revoked := false
 	if localState != nil && localState.DeviceKeyType != "none" && localState.DeviceKeyType != "" {
 		switch localState.DeviceKeyType {
 		case "tpm":
@@ -266,11 +271,13 @@ func (d *Daemon) handleRequest(ctx context.Context, req Request) Response {
 				d.logger.Error("luksd: remove existing TPM key failed", "device", result.DevicePath, "error", err)
 				return errResponse(CodeInternal, "failed to remove existing TPM key")
 			}
+			revoked = true
 		case "user_passphrase":
 			if err := d.enroller.KillSlot(ctx, result.DevicePath, userPassphraseSlot, managedKey); err != nil {
 				d.logger.Error("luksd: remove existing passphrase failed", "device", result.DevicePath, "error", err)
 				return errResponse(CodeInternal, "failed to remove existing passphrase")
 			}
+			revoked = true
 		}
 	}
 
@@ -280,6 +287,15 @@ func (d *Daemon) handleRequest(ctx context.Context, req Request) Response {
 		// name slots, devices, and failure modes an attacker probing the
 		// socket has no business learning.
 		d.logger.Error("luksd: set passphrase failed", "device", result.DevicePath, "error", err)
+		if revoked {
+			// The old key is gone but the new one didn't land (#174):
+			// without this the store would keep claiming a device key
+			// exists, diverging state from the volume. Best-effort — the
+			// managed key still unlocks either way.
+			if serr := d.store.SetLuksDeviceKeyType(result.ActionID, "none"); serr != nil {
+				d.logger.Error("luksd: failed to record emptied key slot after failed enroll", "action_id", result.ActionID, "error", serr)
+			}
+		}
 		return errResponse(CodeInternal, "failed to set passphrase")
 	}
 

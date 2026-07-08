@@ -94,6 +94,7 @@ func TestCloseAllTerminals_AlreadyStopping_NotDoubleReverted(t *testing.T) {
 		ttyUser:  "pm-tty-stop",
 		state:    sessionStateStopping, // already being torn down elsewhere
 		tempHome: tempHome,
+		cancel:   func() {}, // real func: a regression calling it must not nil-panic (#174)
 		now:      time.Now,
 	}
 	h.mu.Lock()

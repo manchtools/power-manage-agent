@@ -93,7 +93,7 @@ func TestCalculateNextExecute_ForwardClockJump_ClampedToOneInterval(t *testing.T
 		}
 		last := now.Add(240 * time.Hour)
 		got := st.calculateNextExecute(action, &last, false)
-		ceiling := now.Add(8 * time.Hour)
+		ceiling := now.Add(nilScheduleDrift)
 		if got.After(ceiling) {
 			t.Fatalf("nil-schedule future-dated cursor = %v exceeds 8h ceiling %v", got, ceiling)
 		}

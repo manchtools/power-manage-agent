@@ -108,6 +108,8 @@ func (h *updateHarness) shutdownCalled() bool {
 	case <-h.shutdownCh:
 		return true
 	case <-time.After(4 * time.Second):
+		// NOT tightened (#174 proposed 500ms): the update path sleeps
+		// deliberately before shutdown, so a short timeout false-fails.
 		return false
 	}
 }

@@ -6,10 +6,19 @@ import (
 	"context"
 	"fmt"
 	"os"
+	"sync"
 	"testing"
 	"time"
 
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
+)
+
+// testExecutorTmpDirs collects the per-executor temp dirs newTestExecutor
+// creates (it has no *testing.T, so t.Cleanup is unavailable); TestMain
+// removes them after the run (#174 — they previously leaked on disk).
+var (
+	testExecutorTmpDirsMu sync.Mutex
+	testExecutorTmpDirs   []string
 )
 
 // TestMain fail-closes the whole integration suite: these tests mutate real host
@@ -28,7 +37,13 @@ func TestMain(m *testing.M) {
 				"PM_ALLOW_DESTRUCTIVE_TESTS=1 to force them on this host.")
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	code := m.Run()
+	testExecutorTmpDirsMu.Lock()
+	for _, d := range testExecutorTmpDirs {
+		_ = os.RemoveAll(d)
+	}
+	testExecutorTmpDirsMu.Unlock()
+	os.Exit(code)
 }
 
 // disposableHost reports whether destructive integration tests are safe to run

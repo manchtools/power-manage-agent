@@ -140,7 +140,10 @@ func TestScheduler_StopWaitsForInFlightExecution(t *testing.T) {
 // it. Proves the stale-closed-channel invariant.
 func TestScheduler_RestartAfterStopRunsAgain(t *testing.T) {
 	sched, _ := newTestScheduler(t)
-	ctx := context.Background()
+	// Cancellable: a panic between the Starts must not leak the loop
+	// goroutine past the test (#174).
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
 	running := func() bool {
 		sched.mu.RLock()
 		defer sched.mu.RUnlock()

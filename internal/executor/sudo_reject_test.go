@@ -56,7 +56,7 @@ func TestSudoConfigForParams_CustomRequiresConfig(t *testing.T) {
 			_, err = f.WriteString(content)
 			require.NoError(t, err)
 			require.NoError(t, f.Close())
-			out, runErr := exec.Command(path, "-c", "-f", f.Name()).CombinedOutput()
+			out, runErr := exec.CommandContext(visudoCtx(t), path, "-c", "-f", f.Name()).CombinedOutput()
 			assert.NoErrorf(t, runErr, "visudo -c on generated CUSTOM fragment: %s", string(out))
 		}
 	})

@@ -70,6 +70,12 @@ func newTestExecutor() *Executor {
 	if err != nil {
 		panic("failed to create temp dir: " + err.Error())
 	}
+	// Registered for TestMain teardown (#174): newTestExecutor has no
+	// *testing.T, so t.Cleanup isn't available and each call previously
+	// leaked its directory on disk.
+	testExecutorTmpDirsMu.Lock()
+	testExecutorTmpDirs = append(testExecutorTmpDirs, tmpDir)
+	testExecutorTmpDirsMu.Unlock()
 	s, err := store.New(tmpDir)
 	if err != nil {
 		panic("failed to create test store: " + err.Error())
@@ -341,7 +347,14 @@ Description: Test package for integration tests
 // ensureTestUser creates a test user if it doesn't exist.
 func ensureTestUser(t *testing.T, username string) {
 	t.Helper()
-	if v, _ := userExists(context.Background(), username); v {
+	v, err := userExists(context.Background(), username)
+	if err != nil {
+		// A failed existence probe must not read as "absent" (#174):
+		// useradd on an EXISTING user would then fail the test with a
+		// misleading error instead of this honest one.
+		t.Fatalf("userExists(%s): %v", username, err)
+	}
+	if v {
 		return
 	}
 	cmd := sudoRun("useradd", "--no-create-home", "--shell", "/bin/bash", username)
@@ -378,19 +391,21 @@ func sudoRun(name string, args ...string) *exec.Cmd {
 	return exec.Command("sudo", sudoArgs...)
 }
 
-// sudoRemove removes a file using sudo rm -f.
+// sudoRemove removes a file. Routed through sudoRun (#174) so the
+// root-skips-sudo consistency holds on distros whose sudoers excludes
+// root (the same reason sudoRun exists).
 func sudoRemove(path string) {
-	exec.Command("sudo", "-n", "rm", "-f", path).Run()
+	sudoRun("rm", "-f", path).Run()
 }
 
-// sudoRemoveAll removes a file or directory recursively using sudo rm -rf.
+// sudoRemoveAll removes a file or directory recursively.
 func sudoRemoveAll(path string) {
-	exec.Command("sudo", "-n", "rm", "-rf", path).Run()
+	sudoRun("rm", "-rf", path).Run()
 }
 
-// sudoWriteFile writes content to a file using sudo tee.
+// sudoWriteFile writes content to a file via tee.
 func sudoWriteFile(path string, content []byte) error {
-	cmd := exec.Command("sudo", "-n", "tee", path)
+	cmd := sudoRun("tee", path)
 	cmd.Stdin = bytes.NewReader(content)
 	cmd.Stdout = io.Discard
 	return cmd.Run()

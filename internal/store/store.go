@@ -14,6 +14,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"time"
 
@@ -86,6 +87,11 @@ type StoredResult struct {
 // New creates a new store with the given data directory.
 // New opens the agent store (creating the data dir/database if needed) and runs
 // any pending migrations. Used by the agent service, which OWNS the schema.
+// nilScheduleDrift is the fallback cadence for an action with no
+// schedule: re-check every 8 hours. Named once so the clamp tests and
+// both production sites cannot drift apart (#174).
+const nilScheduleDrift = 8 * time.Hour
+
 func New(dataDir string) (*Store, error) { return open(dataDir, true) }
 
 // OpenExisting opens an already-initialised agent store WITHOUT running
@@ -121,6 +127,14 @@ func open(dataDir string, migrate bool) (*Store, error) {
 	// lets the CLI subcommands (tty/luks) wait for the daemon's writer
 	// instead of failing immediately with SQLITE_BUSY. journal_mode=WAL
 	// is a persistent file setting but is harmless to repeat per conn.
+	// The DSN is built by concatenation; a '?' or '#' inside the db path
+	// would be parsed as the query/fragment boundary and silently
+	// swallow the pragmas below (#174). No legitimate data-dir contains
+	// them — refuse loudly instead of opening a store with foreign-key
+	// enforcement nondeterministically off.
+	if strings.ContainsAny(dbPath, "?#") {
+		return nil, fmt.Errorf("store: data dir path %q contains '?' or '#', which would corrupt the SQLite DSN pragmas", dbPath)
+	}
 	dsn := dbPath + "?_pragma=foreign_keys(1)&_pragma=busy_timeout(5000)&_pragma=journal_mode(WAL)"
 	db, err := sql.Open("sqlite", dsn)
 	if err != nil {
@@ -1340,7 +1354,7 @@ func calculateNextExecuteFromSchedule(schedule *pb.ActionSchedule, lastExecuted 
 		if lastExecuted == nil {
 			return now
 		}
-		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(nilScheduleDrift), now, nilScheduleDrift)
 	}
 	if schedule.RunOnAssign && lastExecuted == nil {
 		return now
@@ -1417,7 +1431,7 @@ func (s *Store) calculateNextExecute(action *pb.Action, lastExecuted *time.Time,
 		if lastExecuted == nil {
 			return now
 		}
-		return clampInterval(lastExecuted.UTC().Add(8*time.Hour), now, 8*time.Hour)
+		return clampInterval(lastExecuted.UTC().Add(nilScheduleDrift), now, nilScheduleDrift)
 	}
 
 	// Check for run_on_assign

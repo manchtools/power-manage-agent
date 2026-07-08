@@ -15,6 +15,8 @@ func TestOpenExisting_RequiresInitialisedDB(t *testing.T) {
 	dir := t.TempDir()
 	_, err := OpenExisting(dir)
 	require.Error(t, err, "OpenExisting on a non-existent DB must error, not create an empty one")
+	assert.Contains(t, err.Error(), "does not exist",
+		"the error must be the missing-DB rejection, not an incidental failure (#174)")
 	assert.NoFileExists(t, filepath.Join(dir, "agent.db"), "OpenExisting must not create the database")
 }
 

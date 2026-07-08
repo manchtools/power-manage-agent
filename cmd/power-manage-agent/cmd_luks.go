@@ -50,7 +50,16 @@ func runLuks(args []string) {
 
 // runLuksURI handles power-manage://luks/set-passphrase?token=XXX URIs.
 func runLuksURI(rawURI string) {
-	normalizedURI := strings.Replace(rawURI, "power-manage://", "https://", 1)
+	// Strict PREFIX rewrite (#174): strings.Replace on the first
+	// occurrence anywhere would let a crafted URI like
+	// power-manage://power-manage://evil/... shift the scheme swap into
+	// the middle of the string; a URI that doesn't START with our scheme
+	// is rejected outright.
+	if !strings.HasPrefix(rawURI, "power-manage://") {
+		fmt.Fprintf(os.Stderr, "error: not a power-manage:// URI\n")
+		os.Exit(1)
+	}
+	normalizedURI := "https://" + strings.TrimPrefix(rawURI, "power-manage://")
 	parsed, err := url.Parse(normalizedURI)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: invalid URI: %v\n", err)

@@ -98,7 +98,10 @@ func TestApplyLpsPublicKey_RejectsBadSignatureKeepsPrior(t *testing.T) {
 // A nil verifier must fail closed rather than trust an unverifiable key.
 func TestApplyLpsPublicKey_NilVerifierFailsClosed(t *testing.T) {
 	e := NewExecutor(nil, nil)
-	s, _ := store.New(t.TempDir())
+	s, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
 	e.SetStore(s)
 	if err := e.ApplyLpsPublicKey(&pb.LpsPublicKey{PublicKey: make([]byte, 32), Signature: []byte("x")}); err == nil {
 		t.Fatal("nil verifier accepted a key")
@@ -125,11 +128,16 @@ func (f *fakeLpsUser) SetPassword(_ context.Context, _ string, pw sysexec.Secret
 func (f *fakeLpsUser) KillSessions(context.Context, string) error { return nil }
 
 // Criterion 15 + 17 (ordering): with no stored key the LPS action fails BEFORE
-// any SetPassword — sealing is a precondition to rotating. The fake panics if
-// SetPassword is ever reached, proving no account is touched.
+// any SetPassword — sealing is a precondition to rotating. The fake RECORDS
+// SetPassword calls (the panic guard is the embedded nil sysuser.Manager,
+// which catches any UNLISTED method) — the assertion below on zero recorded
+// calls is what proves no account is touched (#174 comment fix).
 func TestExecuteLps_NoKeyFailsClosedBeforeRotation(t *testing.T) {
 	e := NewExecutor(nil, nil)
-	s, _ := store.New(t.TempDir())
+	s, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatalf("store: %v", err)
+	}
 	e.SetStore(s)
 	e.SetDeviceID("01HKDEVICE0000000000000000")
 
@@ -137,7 +145,7 @@ func TestExecuteLps_NoKeyFailsClosedBeforeRotation(t *testing.T) {
 	t.Cleanup(func() { userMgr = prev })
 	userMgr = &fakeLpsUser{} // its SetPassword records; must never be called here
 
-	_, _, _, err := e.executeLps(context.Background(), &pb.LpsParams{
+	_, _, _, err = e.executeLps(context.Background(), &pb.LpsParams{
 		Usernames:            []string{"alice"},
 		PasswordLength:       20,
 		RotationIntervalDays: 30,
