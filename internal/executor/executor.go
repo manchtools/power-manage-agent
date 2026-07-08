@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -131,6 +132,10 @@ func (e *Executor) pkgManagerForCtx(ctx context.Context) pkg.Manager {
 // runner the package manager dispatches through; a nil runner leaves the package
 // manager unset (package actions fail) — used by unit tests that inject their
 // own pkg.Manager into e.pkgManager.
+// executorGlobalsAdopted latches the first runner-bearing construction
+// so re-adoption of the package-global managers is logged (#173).
+var executorGlobalsAdopted atomic.Bool
+
 func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Executor {
 	logger := slog.Default()
 	var (
@@ -140,7 +145,17 @@ func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Execut
 	// Adopt the configured runner process-wide so the cmd.go helpers (notably
 	// the escalating runSudoCmd) and the desktop fan-out dispatch through it. A
 	// nil runner (unit tests) leaves the Direct defaults in place.
+	//
+	// ONE executor per process is the supported shape (#173 review
+	// finding): these are package globals, so a second runner-bearing
+	// NewExecutor re-points every previously constructed Executor's
+	// free-function dispatch at the NEW runner. That re-adoption is now
+	// loud instead of silent; the full de-globalization is tracked with
+	// the #150 SDK-delegation refactor.
 	if runner != nil {
+		if !executorGlobalsAdopted.CompareAndSwap(false, true) {
+			logger.Warn("NewExecutor called again with a privilege runner; re-pointing the process-global managers — all executors in this process now dispatch through the newest runner (one runner-bearing executor per process is the supported shape)")
+		}
 		executorRunner = runner
 		desktopMgr = mustDesktopManager(runner)
 		serviceMgr = mustServiceManager(runner)

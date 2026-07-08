@@ -30,7 +30,10 @@ var remoteHTTPClient *http.Client
 // URLs that are CDN-redirected resolve (e.g. GitHub releases bounce github.com ->
 // release-assets.githubusercontent.com); the sha256 pin keeps the bytes honest
 // across the hop, and an https->http downgrade stays refused by the SDK.
-func fetchArtifact(ctx context.Context, url, dest, checksum, mode string, redirect remote.RedirectPolicy) error {
+// Package-var seam so tests can pin WHETHER a fetch happens (the deb
+// ABSENT path must never fetch without a verifiable checksum) without
+// standing up an HTTP origin.
+var fetchArtifact = func(ctx context.Context, url, dest, checksum, mode string, redirect remote.RedirectPolicy) error {
 	// No pre-trim: remote.NewHTTP trims the URL internally, matching
 	// sdk.ValidateHTTPSURL (used by requireVerifiedArtifact), so a whitespace-padded
 	// URL that passes validation still fetches rather than failing as "not absolute".

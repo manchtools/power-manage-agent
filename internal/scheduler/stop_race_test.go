@@ -64,3 +64,36 @@ func TestScheduler_StopIdempotentAndPreStartSafe(t *testing.T) {
 	require.NotPanics(t, s.Stop, "first Stop must not panic")
 	require.NotPanics(t, s.Stop, "second Stop must not panic (idempotent)")
 }
+
+// #173 review finding: Stop() sets running=false and releases the lock
+// BEFORE joining <-done, so a Start() racing the drain could allocate
+// new channels and run a second loop while the old goroutine was still
+// draining. Start must join the previous loop's done channel first.
+// Simulated deterministically: an open done channel stands in for a
+// still-draining loop; Start must not flip running until it closes.
+func TestScheduler_StartJoinsDrainingPredecessor(t *testing.T) {
+	s, _ := newTestScheduler(t)
+
+	draining := make(chan struct{})
+	s.mu.Lock()
+	s.running = false
+	s.done = draining
+	s.mu.Unlock()
+
+	go s.Start(context.Background())
+
+	isRunning := func() bool {
+		s.mu.RLock()
+		defer s.mu.RUnlock()
+		return s.running
+	}
+
+	// While the predecessor drains, the new loop must NOT start.
+	require.Never(t, isRunning, 150*time.Millisecond, 10*time.Millisecond,
+		"Start must wait for the draining predecessor before running a new loop")
+
+	close(draining)
+	require.Eventually(t, isRunning, 2*time.Second, time.Millisecond,
+		"Start should run once the predecessor has fully exited")
+	s.Stop()
+}

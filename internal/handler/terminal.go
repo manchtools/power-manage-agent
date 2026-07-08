@@ -846,8 +846,17 @@ func (h *Handler) lookupTerminal(sessionID string) *terminalSession {
 
 func (h *Handler) removeTerminal(sessionID string) {
 	h.mu.Lock()
+	ts := h.terminals[sessionID]
 	delete(h.terminals, sessionID)
 	h.mu.Unlock()
+	// Cancel the session context too (#173 review finding): the
+	// abortFail/abortStopped cleanup path reached only this function,
+	// so a session torn down after registration leaked its sessionCtx.
+	// CancelFuncs are idempotent, so the closeTerminal path calling
+	// cancel first is fine.
+	if ts != nil && ts.cancel != nil {
+		ts.cancel()
+	}
 }
 
 // terminalSweepLoop closes any session that has been idle longer than

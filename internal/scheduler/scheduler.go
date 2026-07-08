@@ -249,6 +249,22 @@ func (s *Scheduler) Start(ctx context.Context) {
 		s.mu.Unlock()
 		return
 	}
+	// Join a previous loop that Stop() has signalled but which has not
+	// exited yet (#173 review finding): Stop flips running=false before
+	// <-done, so without this join a Start racing the drain would
+	// allocate fresh channels and run a SECOND loop concurrently with
+	// the old one — double-executing due actions. Join outside the
+	// lock (the same rule Stop follows), then re-check running: another
+	// Start may have won the race while we waited.
+	if prev := s.done; prev != nil {
+		s.mu.Unlock()
+		<-prev
+		s.mu.Lock()
+		if s.running {
+			s.mu.Unlock()
+			return
+		}
+	}
 	s.running = true
 	s.stopCh = make(chan struct{})
 	s.done = make(chan struct{})

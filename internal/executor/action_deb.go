@@ -34,10 +34,11 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 	// INSTALL path: the artifact URL must be https and carry a checksum.
 	// downloadFile enforces https but SKIPS checksum verification when the
 	// checksum is empty, so this executor-boundary guard refuses an unverified
-	// .deb rather than relying on the proto/server alone (WS16 #2). Only the
-	// PRESENT path downloads — ABSENT removes by package name and never fetches
-	// the artifact, so it needs no verification (mirrors the AppImage remove
-	// path). Runs before the dpkg lookup so a malformed install is rejected
+	// .deb rather than relying on the proto/server alone (WS16 #2). The ABSENT
+	// path resolves the package name via a VERIFIED fetch when it can and
+	// falls back to the signed URL's filename otherwise (see
+	// debAbsentPackageName), so it enforces its own guard rather than this
+	// one. Runs before the dpkg lookup so a malformed install is rejected
 	// even on non-deb hosts.
 	if state == pb.DesiredState_DESIRED_STATE_PRESENT {
 		if err := requireVerifiedArtifact(params.Url, params.ChecksumSha256); err != nil {
@@ -153,6 +154,18 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 // install" case — it falls back to the URL-filename heuristic so the
 // action can still report "already absent" rather than erroring.
 func (e *Executor) debAbsentPackageName(ctx context.Context, mgr pkg.Manager, params *pb.AppInstallParams) (string, error) {
+	// SECURITY (#173 review finding): the fetched artifact's control file
+	// may only choose the REMOVAL TARGET when the fetch is verified —
+	// https plus the sha256 that travels inside the CA-signed action.
+	// fetchArtifact skips checksum verification when the checksum is
+	// empty, so an unverified fetch would let the origin (or a redirect
+	// target) serve a .deb whose Package field names ANY package and have
+	// the agent remove it. With no verifiable checksum, derive the name
+	// from the signed URL instead — never from origin-controlled bytes.
+	if requireVerifiedArtifact(params.Url, params.ChecksumSha256) != nil {
+		return debPackageNameFromURL(params.Url)
+	}
+
 	tmpFile, err := os.CreateTemp("", "*.deb")
 	if err != nil {
 		return "", fmt.Errorf("create temp file: %w", err)
