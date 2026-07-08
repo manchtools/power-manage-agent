@@ -17,10 +17,17 @@ import (
 // run instead of depending on the runner's real uid.
 var geteuidFn = os.Geteuid
 
-// randomBackoff returns a random duration between minInitialBackoff and maxInitialBackoff.
+// randomBackoff returns a random duration between minInitialBackoff and
+// maxInitialBackoff. Guarded against a degenerate span (#174):
+// rand.Int64N panics on n <= 0, so a future constants edit that makes
+// min >= max would crash the reconnect path instead of just losing the
+// jitter.
 func randomBackoff() time.Duration {
-	jitter := rand.Int64N(int64(maxInitialBackoff - minInitialBackoff))
-	return minInitialBackoff + time.Duration(jitter)
+	span := int64(maxInitialBackoff - minInitialBackoff)
+	if span <= 0 {
+		return minInitialBackoff
+	}
+	return minInitialBackoff + time.Duration(rand.Int64N(span))
 }
 
 // applyBackendOverrides maps the backend strings resolved by

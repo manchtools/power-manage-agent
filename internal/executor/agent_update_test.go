@@ -192,11 +192,15 @@ func TestSelfTestScript_ExitCode(t *testing.T) {
 
 	// Create a "binary" that exits 0
 	successScript := filepath.Join(dir, "success")
-	os.WriteFile(successScript, []byte("#!/bin/sh\nexit 0\n"), 0755)
+	if err := os.WriteFile(successScript, []byte("#!/bin/sh\nexit 0\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	// Create a "binary" that exits 1
 	failScript := filepath.Join(dir, "fail")
-	os.WriteFile(failScript, []byte("#!/bin/sh\necho 'connection failed' >&2\nexit 1\n"), 0755)
+	if err := os.WriteFile(failScript, []byte("#!/bin/sh\necho 'connection failed' >&2\nexit 1\n"), 0755); err != nil {
+		t.Fatal(err)
+	}
 
 	ctx := context.Background()
 

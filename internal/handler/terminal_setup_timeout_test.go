@@ -2,6 +2,7 @@ package handler
 
 import (
 	"context"
+	"sync"
 	"testing"
 	"time"
 
@@ -31,8 +32,9 @@ func TestOnTerminalStart_BoundedSetupContext(t *testing.T) {
 	// Modify hangs, respecting ctx — it returns only when the bounded setup ctx
 	// fires. This is the "hung sudo" the bound defends against.
 	modifyEntered := make(chan struct{})
+	var modifyOnce sync.Once // a retry / second user must not re-close (#174)
 	sysuserModify = func(ctx context.Context, _ string, _ sysuser.ModifyOptions) error {
-		close(modifyEntered)
+		modifyOnce.Do(func() { close(modifyEntered) })
 		<-ctx.Done()
 		return ctx.Err()
 	}

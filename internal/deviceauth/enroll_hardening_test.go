@@ -129,14 +129,23 @@ func TestEnroll_ConcurrentSerializesToOneRegistration(t *testing.T) {
 
 	const n = 5 // within the 5/min budget, so all reach the serialized body
 	var wg sync.WaitGroup
+	errCh := make(chan error, n)
 	for i := 0; i < n; i++ {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			_, _ = h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+			if _, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"})); err != nil {
+				errCh <- err
+			}
 		}()
 	}
 	wg.Wait()
+	close(errCh)
+	// Surface enroll errors (#174): a handler failure previously produced
+	// a confusing registerCalls-count mismatch instead of the real cause.
+	for err := range errCh {
+		t.Errorf("Enroll: %v", err)
+	}
 
 	assert.EqualValues(t, 1, atomic.LoadInt32(&registerCalls),
 		"enrollMu must serialize concurrent enrollments so exactly one device registers; the rest short-circuit on Exists()")

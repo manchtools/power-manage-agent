@@ -4,7 +4,9 @@ package executor
 import (
 	"context"
 	"fmt"
+	"os"
 	"path/filepath"
+	"strconv"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
@@ -122,14 +124,24 @@ func (e *Executor) directoryMatchesDesired(ctx context.Context, path string, par
 		return false
 	}
 
-	// Check mode if specified
+	// Check mode if specified. An UNPARSEABLE mode reads as "does not
+	// match" (#174): the old silent err == nil skip treated a
+	// misconfigured octal string as "mode doesn't matter", so the
+	// action reported converged without ever applying anything; falling
+	// through to the apply path surfaces the bad mode as a loud error
+	// there instead. strconv.ParseUint(_, 8, 32) mirrors the APPLY path
+	// (createDirectoryWithPermissions) exactly — fmt.Sscanf accepted
+	// partial strings like "0777junk" (CR catch). The comparison masks
+	// to the permission bits both sides: mode.Perm() drops
+	// setuid/setgid/sticky, so an unmasked desired like "2755" could
+	// never converge and re-applied on every run.
 	if params.Mode != "" {
-		var desiredMode uint64
-		if _, err := fmt.Sscanf(params.Mode, "%o", &desiredMode); err == nil {
-			currentMode := mode.Perm()
-			if uint32(currentMode) != uint32(desiredMode) {
-				return false
-			}
+		desiredMode, err := strconv.ParseUint(params.Mode, 8, 32)
+		if err != nil {
+			return false
+		}
+		if mode.Perm() != os.FileMode(desiredMode).Perm() {
+			return false
 		}
 	}
 

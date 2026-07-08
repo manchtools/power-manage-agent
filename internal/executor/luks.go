@@ -241,6 +241,17 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 		} else if rotated {
 			output.WriteString("LUKS: managed passphrase rotated\n")
 			changed = true
+			// Rotation persisted store state (at minimum LastRotatedAt);
+			// re-sync the in-memory snapshot so downstream consumers
+			// (reconcileDeviceKey, metadata) never act on a stale view
+			// (#174). Best-effort: the pre-rotation snapshot is still a
+			// valid fallback.
+			if reloaded, rerr := st.GetLuksState(actionID); rerr == nil && reloaded != nil {
+				localState = reloaded
+			} else if rerr != nil {
+				e.logger.Warn("LUKS: state reload after rotation failed; continuing with pre-rotation snapshot",
+					"action_id", actionID, "error", rerr)
+			}
 		}
 	}
 
@@ -292,6 +303,11 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 		ok, testErr := encMgr.VerifyPassphrase(ctx, devicePath, luksSecret(existingKey))
 		e.logger.Info("LUKS: test-passphrase result", "ok", ok, "error", testErr)
 		if testErr == nil && ok {
+			// No verifyKeyRoundTrip here — deliberately (#174): the
+			// round-trip proves the server durably stored a key the agent
+			// just GENERATED; this key came FROM the server (GetKey) and
+			// was verified against the volume above, so both ends are
+			// already proven.
 			e.logger.Info("LUKS: recovered ownership from server-stored key", "action_id", actionID)
 			return st.SetLuksOwnershipTaken(actionID, devicePath)
 		}
