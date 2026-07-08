@@ -111,6 +111,10 @@ func TestBudgetedChunkCallback_ConcurrentStreamsSafe(t *testing.T) {
 		}
 	}
 	assert.Equal(t, 1, markers, "exactly one truncation marker under concurrency")
+	require.NotEmpty(t, *chunks)
+	last := (*chunks)[len(*chunks)-1]
+	assert.Contains(t, string(last.Data), "truncated by agent",
+		"the marker must be the LAST chunk — no admitted chunk may land after it")
 }
 
 func TestBudgetedChunkCallback_NilSendChunkReturnsNil(t *testing.T) {

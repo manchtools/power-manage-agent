@@ -32,8 +32,14 @@ const truncationMarker = "[output truncated by agent: per-execution streaming bu
 
 // budgetedChunkCallback wraps sendChunk in the per-execution budget.
 // Returns nil when sendChunk is nil (no streaming sink — matches the
-// prior wiring). Safe for concurrent use: the SDK executor pumps
-// stdout and stderr from separate goroutines.
+// prior wiring).
+//
+// The mutex is held across the send itself: the SDK executor currently
+// pumps stdout and stderr from ONE goroutine, but the OutputCallback
+// contract doesn't promise that, and the underlying stream sender is
+// not documented safe for concurrent writers — serializing here makes
+// both the send safety and the "marker is the LAST chunk" guarantee
+// unconditional (CR catch on the lock scope).
 func budgetedChunkCallback(executionID string, sendChunk func(*pb.OutputChunk) error, logger *slog.Logger) executor.OutputCallback {
 	if sendChunk == nil {
 		return nil
@@ -46,13 +52,12 @@ func budgetedChunkCallback(executionID string, sendChunk func(*pb.OutputChunk) e
 	)
 	return func(streamType sysexec.StreamType, line string, seq int64) {
 		mu.Lock()
+		defer mu.Unlock()
 		if truncated {
-			mu.Unlock()
 			return
 		}
 		if bytesSent+len(line) > maxStreamBytesPerExecution || chunks+1 > maxStreamChunksPerExecution {
 			truncated = true
-			mu.Unlock()
 			logger.Info("output streaming budget exceeded; truncating relay (action continues)",
 				"execution_id", executionID, "bytes", bytesSent, "chunks", chunks)
 			if err := sendChunk(&pb.OutputChunk{
@@ -67,7 +72,6 @@ func budgetedChunkCallback(executionID string, sendChunk func(*pb.OutputChunk) e
 		}
 		bytesSent += len(line)
 		chunks++
-		mu.Unlock()
 
 		if err := sendChunk(&pb.OutputChunk{
 			ExecutionId: executionID,
