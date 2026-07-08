@@ -322,7 +322,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 
 	// Apply a per-action timeout. Long-running classes (scripts, and — WS16 #3
 	// — package/update operations) get a default ceiling when none is set so
-	// they cannot run unbounded.
+	// they cannot run unbounded. parentCtx is kept so the result
+	// classification below can tell "the parent deadline fired" apart
+	// from "the per-action timeout fired" (CR catch on #179).
+	parentCtx := ctx
 	timeout := defaultTimeoutForAction(env.ActionType, env.GetTimeoutSeconds())
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -438,19 +441,22 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	}
 
 	result.Output = output
-	result.CompletedAt = timestamppb.New(e.now())
-	result.DurationMs = e.now().Sub(start).Milliseconds()
+	completed := e.now()
+	result.CompletedAt = timestamppb.New(completed)
+	result.DurationMs = completed.Sub(start).Milliseconds()
 
 	// Check context errors first - distinguish between timeout and cancellation
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
-		// A parent-context deadline can fire when the action itself set no
-		// timeout — "timed out after 0 seconds" was a lie (#173).
-		if timeout > 0 {
-			result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
-		} else {
+		// Distinguish the PARENT deadline from the per-action timeout —
+		// "timed out after N seconds" when the parent cancelled first
+		// (or when no action timeout existed at all) was a lie (#173 +
+		// CR catch on #179).
+		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
 			result.Error = "action deadline exceeded (parent context)"
+		} else {
+			result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
 		}
 	case errors.Is(ctx.Err(), context.Canceled):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
