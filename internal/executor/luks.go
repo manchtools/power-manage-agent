@@ -368,15 +368,17 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		// No previous rotation recorded — set the timestamp and skip.
 		if localState.LastRotatedAt.IsZero() {
 			if err := st.SetLuksLastRotatedAt(actionID, e.now().UTC()); err != nil {
-				// First-rotation timestamp persistence failed.
-				// Subsequent ticks re-enter this branch and re-skip
-				// rotation, so rotation never starts. Track
-				// consecutive failures so the buried-Warn case
-				// escalates to Error after the threshold (#80).
+				// First-rotation timestamp persistence failed. Subsequent
+				// ticks re-enter this branch, so rotation would never
+				// start. #80 escalated the buried Warn to Error after a
+				// threshold; #173 goes further: fail the action LOUDLY so
+				// the server sees a failing execution instead of a green
+				// action whose rotation is silently parked forever. The
+				// escalation counter stays for log-side telemetry.
 				e.recordLuksTimestampFailure(actionID, "initial", err)
-			} else {
-				e.clearLuksTimestampFailures(actionID)
+				return false, fmt.Errorf("persist initial LUKS rotation timestamp (rotation cannot start until this succeeds): %w", err)
 			}
+			e.clearLuksTimestampFailures(actionID)
 			return false, nil
 		}
 		intervalDuration := time.Duration(params.RotationIntervalDays) * 24 * time.Hour

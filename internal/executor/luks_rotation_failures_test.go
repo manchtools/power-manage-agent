@@ -2,11 +2,15 @@ package executor
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"log/slog"
 	"strings"
 	"testing"
 	"time"
+
+	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
 // TestRecordLuksTimestampFailure_EscalatesAtThreshold pins the
@@ -128,4 +132,36 @@ func itoa(n int) string {
 		n /= 10
 	}
 	return string(b[i:])
+}
+
+// #173 review finding: when the FIRST rotation timestamp cannot be
+// persisted, checkAndRotate returned (false, nil) — every subsequent
+// tick re-entered the zero branch and rotation never started, invisibly
+// (the #80 escalation only raised the LOG level). It must fail the
+// action loudly instead. Driven via a CLOSED store so
+// SetLuksLastRotatedAt returns a real error.
+func TestCheckAndRotate_InitialTimestampPersistFailure_FailsLoud(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := st.Close(); err != nil { // subsequent writes error
+		t.Fatal(err)
+	}
+
+	e := &Executor{logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), now: time.Now}
+	e.SetStore(st)
+	e.SetLuksKeyStore(&fakeLuksKeyStore{})
+
+	params := &pb.EncryptionParams{RotationIntervalDays: 30}
+	changed, err := e.checkAndRotate(context.Background(), params, &store.LuksState{}, "01HXROTATEFAIL000000000000", "/dev/sda2")
+	if err == nil {
+		t.Fatal("checkAndRotate must fail loudly when the initial rotation timestamp cannot be persisted — (false, nil) parks rotation forever")
+	}
+	if changed {
+		t.Fatal("no rotation may be reported on the failure path")
+	}
+	if !strings.Contains(err.Error(), "rotation cannot start") {
+		t.Fatalf("error must name the stuck-rotation consequence, got: %v", err)
+	}
 }

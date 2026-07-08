@@ -303,6 +303,14 @@ func (s *Store) SaveAction(action *pb.Action) error {
 	now := s.now().UTC()
 	nextExecute := s.calculateNextExecute(action, &now, false)
 
+	// DELIBERATE TRADEOFF (#173): on conflict, an already-executed
+	// action keeps its EXISTING cursor even when the re-dispatched
+	// action carries a CHANGED schedule — the new cadence takes effect
+	// only after the old next_execute_at elapses (one stale interval,
+	// worst case). The alternative — adopting the new cursor — reopens
+	// the double-execution hole this CASE exists to close, because the
+	// dispatch caller has just executed the action inline. Do not
+	// "fix" this without solving that ordering first.
 	_, err = s.db.Exec(`
 		INSERT INTO actions (id, action_json, assigned_at, next_execute_at)
 		VALUES (?, ?, CURRENT_TIMESTAMP, ?)

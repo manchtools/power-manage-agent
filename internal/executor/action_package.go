@@ -278,8 +278,15 @@ func (e *Executor) unpinPackage(ctx context.Context, mgr pkg.Manager, pkgName st
 // ensurePackagePinned ensures a package is pinned. Returns true if a change was made.
 // This is a convenience method that handles filesystem repair before pinning.
 func (e *Executor) ensurePackagePinned(ctx context.Context, mgr pkg.Manager, pkgName string) (bool, error) {
-	// Check if already pinned first (no filesystem write needed)
-	isPinned, _ := e.isPackagePinned(ctx, mgr, pkgName)
+	// Check if already pinned first (no filesystem write needed). A
+	// probe ERROR is surfaced, not coerced to "not pinned" (#173): the
+	// old blank-identifier discard turned a transient probe failure into
+	// a needless repairFilesystem + re-pin round while hiding the root
+	// cause from the execution result.
+	isPinned, err := e.isPackagePinned(ctx, mgr, pkgName)
+	if err != nil {
+		return false, fmt.Errorf("check pin state for %s: %w", pkgName, err)
+	}
 	if isPinned {
 		return false, nil
 	}

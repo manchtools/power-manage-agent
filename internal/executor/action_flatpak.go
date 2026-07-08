@@ -4,7 +4,6 @@ package executor
 import (
 	"context"
 	"fmt"
-	"log/slog"
 	"slices"
 	"strings"
 
@@ -363,13 +362,13 @@ func ensureFlatpakPinned(ctx context.Context, mgr pkg.Manager, appID string) (bo
 func (e *Executor) repairFlatpak(ctx context.Context) {
 	mgr, err := pkg.New(pkg.Flatpak, executorRunner)
 	if err != nil {
-		slog.Warn("repairFlatpak: build flatpak manager failed", "error", err)
+		e.logger.Warn("repairFlatpak: build flatpak manager failed", "error", err)
 		return
 	}
 	if _, err := mgr.Repair(ctx); err != nil {
-		slog.Warn("repairFlatpak: repair failed", "error", err)
+		e.logger.Warn("repairFlatpak: repair failed", "error", err)
 	}
 	if _, err := mgr.Update(ctx); err != nil {
-		slog.Warn("repairFlatpak: appstream update failed", "error", err)
+		e.logger.Warn("repairFlatpak: appstream update failed", "error", err)
 	}
 }

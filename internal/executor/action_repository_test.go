@@ -8,27 +8,48 @@ import (
 	"time"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // TestExecuteRepository_RejectsBeforePrivilegedRemount pins finding 5:
 // a malformed repository action (bad name, oversized name, non-https
 // base URL) is rejected BEFORE any privileged filesystem
 // remount/repair. The repairFS seam records zero invocations.
+//
+// #173 review finding: the old fixture built the Executor with a ZERO
+// pkgBackend, so every case returned from the backend-dispatch default
+// branch and repo.Validate never ran — the test passed for the wrong
+// reason. The Executor now carries a real backend + runner (Validate
+// runs no commands), every param carries config for that backend so it
+// clears the skip switch, and the error is asserted to NOT be the
+// backend-dispatch error, proving rejection happened in validation.
 func TestExecuteRepository_RejectsBeforePrivilegedRemount(t *testing.T) {
+	runner, err := sysexec.NewRunner(sysexec.Direct)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var remountCalls int
-	e := &Executor{logger: slog.Default(), now: time.Now, repairFS: func(context.Context) bool {
+	e := &Executor{logger: slog.Default(), now: time.Now, pkgBackend: pkg.Dnf, runner: runner, repairFS: func(context.Context) bool {
 		remountCalls++
 		return true
 	}}
+	dnf := func(baseurl string) *pb.DnfRepository {
+		return &pb.DnfRepository{Baseurl: baseurl, Gpgcheck: true}
+	}
 	bad := []*pb.RepositoryParams{
-		{Name: "r", Dnf: &pb.DnfRepository{Baseurl: "http://evil", Gpgcheck: true}}, // non-https base URL
-		{Name: "../etc"},                 // path-traversing name
-		{Name: strings.Repeat("a", 200)}, // oversized name
+		{Name: "r", Dnf: dnf("http://evil")},                                      // non-https base URL
+		{Name: "../etc", Dnf: dnf("https://mirror.example/repo")},                 // path-traversing name
+		{Name: strings.Repeat("a", 200), Dnf: dnf("https://mirror.example/repo")}, // oversized name
 	}
 	for i, p := range bad {
 		out, changed, err := e.executeRepository(context.Background(), p, pb.DesiredState_DESIRED_STATE_PRESENT)
 		if err == nil {
 			t.Errorf("case %d: malformed repo action accepted: out=%v changed=%v", i, out, changed)
+			continue
+		}
+		if strings.Contains(err.Error(), "no supported package manager") {
+			t.Errorf("case %d: rejected by backend dispatch, not validation: %v", i, err)
 		}
 	}
 	if remountCalls != 0 {

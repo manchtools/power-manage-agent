@@ -10,6 +10,7 @@ import (
 	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"google.golang.org/protobuf/proto"
@@ -131,6 +132,10 @@ func (e *Executor) pkgManagerForCtx(ctx context.Context) pkg.Manager {
 // runner the package manager dispatches through; a nil runner leaves the package
 // manager unset (package actions fail) — used by unit tests that inject their
 // own pkg.Manager into e.pkgManager.
+// executorGlobalsAdopted latches the first runner-bearing construction
+// so re-adoption of the package-global managers is logged (#173).
+var executorGlobalsAdopted atomic.Bool
+
 func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Executor {
 	logger := slog.Default()
 	var (
@@ -140,7 +145,17 @@ func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Execut
 	// Adopt the configured runner process-wide so the cmd.go helpers (notably
 	// the escalating runSudoCmd) and the desktop fan-out dispatch through it. A
 	// nil runner (unit tests) leaves the Direct defaults in place.
+	//
+	// ONE executor per process is the supported shape (#173 review
+	// finding): these are package globals, so a second runner-bearing
+	// NewExecutor re-points every previously constructed Executor's
+	// free-function dispatch at the NEW runner. That re-adoption is now
+	// loud instead of silent; the full de-globalization is tracked with
+	// the #150 SDK-delegation refactor.
 	if runner != nil {
+		if !executorGlobalsAdopted.CompareAndSwap(false, true) {
+			logger.Warn("NewExecutor called again with a privilege runner; re-pointing the process-global managers — all executors in this process now dispatch through the newest runner (one runner-bearing executor per process is the supported shape)")
+		}
 		executorRunner = runner
 		desktopMgr = mustDesktopManager(runner)
 		serviceMgr = mustServiceManager(runner)
@@ -307,7 +322,10 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 
 	// Apply a per-action timeout. Long-running classes (scripts, and — WS16 #3
 	// — package/update operations) get a default ceiling when none is set so
-	// they cannot run unbounded.
+	// they cannot run unbounded. parentCtx is kept so the result
+	// classification below can tell "the parent deadline fired" apart
+	// from "the per-action timeout fired" (CR catch on #179).
+	parentCtx := ctx
 	timeout := defaultTimeoutForAction(env.ActionType, env.GetTimeoutSeconds())
 	if timeout > 0 {
 		var cancel context.CancelFunc
@@ -423,14 +441,23 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	}
 
 	result.Output = output
-	result.CompletedAt = timestamppb.Now()
-	result.DurationMs = e.now().Sub(start).Milliseconds()
+	completed := e.now()
+	result.CompletedAt = timestamppb.New(completed)
+	result.DurationMs = completed.Sub(start).Milliseconds()
 
 	// Check context errors first - distinguish between timeout and cancellation
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
-		result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
+		// Distinguish the PARENT deadline from the per-action timeout —
+		// "timed out after N seconds" when the parent cancelled first
+		// (or when no action timeout existed at all) was a lie (#173 +
+		// CR catch on #179).
+		if errors.Is(parentCtx.Err(), context.DeadlineExceeded) {
+			result.Error = "action deadline exceeded (parent context)"
+		} else {
+			result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
+		}
 	case errors.Is(ctx.Err(), context.Canceled):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"

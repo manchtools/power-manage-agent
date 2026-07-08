@@ -24,6 +24,10 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
+// heartbeatQueryTimeout bounds each BuildHeartbeat osquery round-trip;
+// heartbeats are advisory metrics, never worth wedging the stream for.
+const heartbeatQueryTimeout = 10 * time.Second
+
 // streamValidator validates incoming stream-RPC messages at the agent boundary
 // (validate → verify-signature → execute). The control server already validates
 // before dispatch; this is defense-in-depth so a malformed message is rejected
@@ -96,20 +100,29 @@ func NewHandler(logger *slog.Logger, exec *executor.Executor, sched *scheduler.S
 // after the agent started is detected without requiring a restart.
 func (h *Handler) getOsquery() osqueryRunner {
 	h.mu.Lock()
-	defer h.mu.Unlock()
-
 	if h.osquery != nil {
-		return h.osquery
+		r := h.osquery
+		h.mu.Unlock()
+		return r
 	}
+	h.mu.Unlock()
 
+	// Construct OUTSIDE the lock (#173): osquery.New probes the host;
+	// holding h.mu across it blocked every other handler operation
+	// (welcome/terminal/session bookkeeping) behind a slow probe. Two
+	// concurrent probes are benign — the loser's registry is dropped.
 	registry, err := osquery.New(handlerRunner)
 	if err != nil {
 		return nil
 	}
 
-	h.osquery = registry
-	h.logger.Info("osquery detected and initialized")
-	return registry
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.osquery == nil {
+		h.osquery = registry
+		h.logger.Info("osquery detected and initialized")
+	}
+	return h.osquery
 }
 
 // setOsqueryForTest injects a fake osquery runner so tests can assert whether a
@@ -418,15 +431,22 @@ func (h *Handler) BuildHeartbeat() *pb.Heartbeat {
 		return hb
 	}
 
+	// Bound the osquery round-trips (#173): BuildHeartbeat has no caller
+	// context (SDK heartbeat-callback shape), and an unbounded
+	// context.Background() let a hung osquery wedge heartbeat
+	// construction indefinitely.
+	ctx, cancel := context.WithTimeout(context.Background(), heartbeatQueryTimeout)
+	defer cancel()
+
 	// Get uptime
-	if result, _ := oq.Query(context.Background(), &pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(ctx, &pb.OSQuery{QueryId: "hb", Table: "uptime"}); result != nil && result.Success && len(result.Rows) > 0 {
 		if sec, err := strconv.ParseInt(result.Rows[0].Data["total_seconds"], 10, 64); err == nil {
 			hb.Uptime = durationpb.New(time.Duration(sec) * time.Second)
 		}
 	}
 
 	// Get memory usage
-	if result, _ := oq.Query(context.Background(), &pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
+	if result, _ := oq.Query(ctx, &pb.OSQuery{QueryId: "hb", Table: "memory_info"}); result != nil && result.Success && len(result.Rows) > 0 {
 		data := result.Rows[0].Data
 		total, totalErr := strconv.ParseInt(data["memory_total"], 10, 64)
 		free, freeErr := strconv.ParseInt(data["memory_free"], 10, 64)

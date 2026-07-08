@@ -198,9 +198,19 @@ func main() {
 		})
 		enrollServer := deviceauth.NewEnrollServer(enrollHandler, deviceauth.EnrollSocketPath, logger)
 
+		// Start returns nil on graceful shutdown (http.ErrServerClosed is
+		// filtered), so anything on this channel is a REAL failure — a
+		// dead socket path, a permission error, a bind conflict. Without
+		// the error case below, main() blocked on this select until
+		// SIGTERM while enrollment could never arrive: under systemd the
+		// unit looked "running" with a broken enrollment socket (#173
+		// review finding). Exit non-zero instead so systemd restarts it
+		// and the failure is visible.
+		enrollErrCh := make(chan error, 1)
 		go func() {
 			if err := enrollServer.Start(ctx); err != nil {
 				logger.Error("enrollment server failed", "error", err)
+				enrollErrCh <- err
 			}
 		}()
 
@@ -208,6 +218,9 @@ func main() {
 		case creds = <-enrollCh:
 			logger.Info("enrollment complete", "device_id", creds.DeviceID)
 			enrollServer.Shutdown()
+		case err := <-enrollErrCh:
+			logger.Error("cannot accept enrollments; exiting", "error", err)
+			os.Exit(1)
 		case <-ctx.Done():
 			logger.Info("agent stopped while waiting for enrollment")
 			return

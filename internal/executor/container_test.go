@@ -196,6 +196,3 @@ func TestIntegration_ShellScriptRunsThroughRealRunner(t *testing.T) {
 	require.NotNil(t, out)
 	assert.Equal(t, int32(42), out.ExitCode)
 }
-
-// TestIntegration_SSHKeysCreatedViaRealFSManager verifies that setupSSHKeys
-// creates .ssh directory and authorized_keys through the real fs Manager.
