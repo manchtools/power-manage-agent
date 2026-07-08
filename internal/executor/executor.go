@@ -438,14 +438,20 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	}
 
 	result.Output = output
-	result.CompletedAt = timestamppb.Now()
+	result.CompletedAt = timestamppb.New(e.now())
 	result.DurationMs = e.now().Sub(start).Milliseconds()
 
 	// Check context errors first - distinguish between timeout and cancellation
 	switch {
 	case errors.Is(ctx.Err(), context.DeadlineExceeded):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_TIMEOUT
-		result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
+		// A parent-context deadline can fire when the action itself set no
+		// timeout — "timed out after 0 seconds" was a lie (#173).
+		if timeout > 0 {
+			result.Error = fmt.Sprintf("action timed out after %d seconds", timeout)
+		} else {
+			result.Error = "action deadline exceeded (parent context)"
+		}
 	case errors.Is(ctx.Err(), context.Canceled):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"

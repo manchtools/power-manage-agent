@@ -69,6 +69,10 @@ func newTestHandlerWithTTY(t *testing.T, ttyEnabled bool) (*Handler, *fakeSender
 	}
 	sender := &fakeSender{}
 	h.SetTerminalSender(sender)
+	// SetTerminalSender lazily starts the sweep loop; without this the
+	// goroutine outlives the test (#173 — the F004 comment in the
+	// production code warns about exactly this).
+	t.Cleanup(h.StopTerminalSweeper)
 	return h, sender
 }
 
@@ -460,8 +464,8 @@ func TestTerminal_AnySessionForUserExcept(t *testing.T) {
 	if !h.anySessionForUserExcept("pm-tty-alice", "a") {
 		t.Error("session b for alice should be visible when excluding a")
 	}
-	if h.anySessionForUserExcept("pm-tty-alice", "a") && !h.anySessionForUserExcept("pm-tty-alice", "b") {
-		// trivially true; here for symmetry
+	if !h.anySessionForUserExcept("pm-tty-alice", "b") {
+		t.Error("session a for alice should be visible when excluding b")
 	}
 	if h.anySessionForUserExcept("pm-tty-bob", "c") {
 		t.Error("excluding the only bob session should return false")

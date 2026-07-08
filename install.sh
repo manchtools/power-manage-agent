@@ -188,9 +188,13 @@ resolve_latest_prerelease() {
         exit 1
     fi
 
-    # Extract tag_name from the first release where prerelease is true
+    # Extract tag_name from the first release where prerelease is true.
+    # tr splits on commas first so the match works on BOTH pretty-printed
+    # (one key per line) and compact/minified JSON (#173 — the old
+    # /"prerelease": true/ line-match silently found nothing in a
+    # compact response and aborted with "No prerelease found").
     local tag
-    tag=$(echo "$response" | awk '/"tag_name"/{tag=$2} /"prerelease": true/{print tag; exit}' | tr -dc 'a-zA-Z0-9._-')
+    tag=$(echo "$response" | tr ',' '\n' | awk -F'"' '/"tag_name"/{tag=$4} /"prerelease": *true/{print tag; exit}' | tr -dc 'a-zA-Z0-9._-')
 
     if [[ -z "$tag" ]]; then
         log_error "No prerelease found on GitHub"

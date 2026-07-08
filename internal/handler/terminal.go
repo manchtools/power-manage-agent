@@ -760,13 +760,6 @@ func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
 	// Active session: pull from the registry, then revert side effects.
 	h.mu.Lock()
 	delete(h.terminals, sessionID)
-	stillActiveForUser := false
-	for _, other := range h.terminals {
-		if other != nil && other.ttyUser == ttyUser {
-			stillActiveForUser = true
-			break
-		}
-	}
 	h.mu.Unlock()
 
 	if sess != nil {
@@ -776,8 +769,23 @@ func (h *Handler) closeTerminal(ctx context.Context, sessionID, reason string) {
 	}
 
 	// Revert the TTY user shell only when no other session for the
-	// same user is still running. This handles the (rare but possible)
-	// case where the same TTY user has multiple concurrent sessions.
+	// same user is still running (the same user can have concurrent
+	// sessions). Decided as LATE as possible (#173 narrow TOCTOU): the
+	// old snapshot was taken before sess.Close(), widening the window
+	// in which a concurrently-starting session for the same user would
+	// get its shell deactivated underneath it. A usermod-wide residual
+	// window remains — eliminating it needs a per-user
+	// activate/deactivate mutex; accepted, since the racing start fails
+	// its first shell exec loudly and the operator's reconnect retries.
+	h.mu.Lock()
+	stillActiveForUser := false
+	for _, other := range h.terminals {
+		if other != nil && other.ttyUser == ttyUser {
+			stillActiveForUser = true
+			break
+		}
+	}
+	h.mu.Unlock()
 	if !stillActiveForUser {
 		h.deactivateShell(ctx, ttyUser)
 	}

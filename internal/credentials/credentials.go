@@ -288,6 +288,17 @@ func (s *Store) loadOrCreateSalt() ([]byte, error) {
 	if err == nil && len(salt) == saltLen {
 		return salt, nil
 	}
+	// A PRESENT salt file with the wrong length is corruption, not
+	// first-boot (#173): silently regenerating destroyed the forensic
+	// signal AND guaranteed the paired credentials.enc could never
+	// decrypt again — fail loudly so the operator sees the corruption
+	// and re-enrolls deliberately.
+	if err == nil {
+		return nil, fmt.Errorf("salt file %s is corrupt (%d bytes, want %d) — refusing to regenerate; delete it together with %s to re-enroll", saltPath, len(salt), saltLen, credentialsFile)
+	}
+	if !os.IsNotExist(err) {
+		return nil, fmt.Errorf("read salt: %w", err)
+	}
 
 	// Generate new salt
 	salt = make([]byte, saltLen)
@@ -322,6 +333,12 @@ func (s *Store) deriveKey(salt []byte) ([]byte, error) {
 // the cross-machine binding (credentials saved under one machine ID do
 // not decrypt under another).
 var getMachineID = func() ([]byte, error) {
+	// COMPAT PIN (#173): the RAW file bytes — including the trailing
+	// newline — are the Argon2id password. Trimming, normalizing, or
+	// re-encoding here would silently change the derived key and brick
+	// decryption of every credentials.enc in the fleet. Never "clean
+	// this up"; a format change requires a versioned migration
+	// (credentialsMagicV1 exists for exactly that).
 	// Try /etc/machine-id first (systemd)
 	id, err := os.ReadFile("/etc/machine-id")
 	if err == nil && len(id) > 0 {

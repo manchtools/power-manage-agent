@@ -3,7 +3,9 @@ package luksd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -130,9 +132,16 @@ func (d *Daemon) Start(ctx context.Context) error {
 	for {
 		conn, err := listener.Accept()
 		if err != nil {
-			// Listener closed on shutdown.
 			d.wg.Wait()
-			return nil
+			// Only a closed listener is the graceful-shutdown path; any
+			// other Accept error (EMFILE, ENOTSOCK, …) previously
+			// masqueraded as a clean shutdown and the daemon died
+			// silently (#173).
+			if errors.Is(err, net.ErrClosed) {
+				return nil
+			}
+			d.logger.Error("LUKS daemon accept failed; daemon stopping", "error", err)
+			return fmt.Errorf("luksd accept: %w", err)
 		}
 		d.wg.Add(1)
 		go func() {
@@ -160,12 +169,21 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 	_ = conn.SetDeadline(d.now().Add(30 * time.Second))
 
 	var req Request
-	dec := json.NewDecoder(conn)
+	// Cap the request size (#173): a passphrase request is tiny; without
+	// a limit a local user could stream an arbitrarily large payload
+	// into the decoder for the full deadline window (local-only DoS
+	// hardening on a root daemon).
+	dec := json.NewDecoder(io.LimitReader(conn, maxRequestBytes))
 	if err := dec.Decode(&req); err != nil {
 		d.writeResponse(conn, Response{OK: false, Code: CodeInternal, Error: "malformed request"})
 		return
 	}
 	resp := d.handleRequest(ctx, req)
+	// Fresh write window (#173): enrollment (cryptsetup key-slot work)
+	// runs before the response, so a single shared deadline could expire
+	// exactly when the passphrase was already set and the client most
+	// needs to hear about it.
+	_ = conn.SetWriteDeadline(d.now().Add(10 * time.Second))
 	d.writeResponse(conn, resp)
 }
 
@@ -174,6 +192,10 @@ func (d *Daemon) writeResponse(conn net.Conn, resp Response) {
 		d.logger.Warn("failed to write LUKS daemon response", "error", err)
 	}
 }
+
+// maxRequestBytes caps a single request read (#173). Requests carry a
+// token + passphrase + small metadata; 64 KiB is generous.
+const maxRequestBytes = 64 * 1024
 
 // errResponse builds a rejection.
 func errResponse(code, msg string) Response {
@@ -241,17 +263,24 @@ func (d *Daemon) handleRequest(ctx context.Context, req Request) Response {
 		switch localState.DeviceKeyType {
 		case "tpm":
 			if err := d.enroller.WipeTPM(ctx, result.DevicePath, managedKey); err != nil {
-				return errResponse(CodeInternal, fmt.Sprintf("failed to remove existing TPM key: %v", err))
+				d.logger.Error("luksd: remove existing TPM key failed", "device", result.DevicePath, "error", err)
+				return errResponse(CodeInternal, "failed to remove existing TPM key")
 			}
 		case "user_passphrase":
 			if err := d.enroller.KillSlot(ctx, result.DevicePath, userPassphraseSlot, managedKey); err != nil {
-				return errResponse(CodeInternal, fmt.Sprintf("failed to remove existing passphrase: %v", err))
+				d.logger.Error("luksd: remove existing passphrase failed", "device", result.DevicePath, "error", err)
+				return errResponse(CodeInternal, "failed to remove existing passphrase")
 			}
 		}
 	}
 
 	if err := d.enroller.AddKeyToSlot(ctx, result.DevicePath, userPassphraseSlot, managedKey, req.Passphrase); err != nil {
-		return errResponse(CodeInternal, fmt.Sprintf("failed to set passphrase: %v", err))
+		// Detail goes to the root-readable journal, not to the local
+		// unprivileged client (#173): enroller/cryptsetup internals can
+		// name slots, devices, and failure modes an attacker probing the
+		// socket has no business learning.
+		d.logger.Error("luksd: set passphrase failed", "device", result.DevicePath, "error", err)
+		return errResponse(CodeInternal, "failed to set passphrase")
 	}
 
 	// Persist state + history. Surface persistence errors: a missed
