@@ -1,0 +1,42 @@
+name: docref
+
+# Docs-anchored-to-code gate (audit A-05, issue #172). Fails when an
+# anchored snippet or claim in README.md / docs/ drifts from the code
+# symbol it points at. Runs on code changes too — moving or editing an
+# anchored symbol is exactly the drift this catches.
+
+on:
+  pull_request:
+    paths:
+      - '**.md'
+      - '**.go'
+      - 'docref.toml'
+      - 'docref.lock'
+      - '.github/workflows/docref.yml'
+  push:
+    branches: [main]
+    paths:
+      - '**.md'
+      - '**.go'
+      - 'docref.toml'
+      - 'docref.lock'
+      - '.github/workflows/docref.yml'
+
+concurrency:
+  group: docref-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  docref-check:
+    name: docref (docs anchored to code)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v5
+
+      # Purpose-built docref CI image (docref + git on Alpine); nothing to build.
+      - name: docref check (docs match the code they describe)
+        run: docker run --rm -v "${{ github.workspace }}:/repo" ghcr.io/manchtools/open-docref:v0.1.0 check

@@ -53,6 +53,7 @@ The agent supports two enrollment methods:
 6. The Control Server validates the token, signs the certificate, and returns credentials
 7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and connects to the gateway
 
+<!-- docref: begin src=internal/deviceauth/enroll_server.go#EnrollSocketPath:9838543e -->
 > **Trust boundary (deliberate self-service design).** The enrollment
 > socket is intentionally world-accessible (mode `0666`) so a **non-root
 > user can enroll their own corporate/BYOD device without sudo** — that
@@ -63,6 +64,7 @@ The agent supports two enrollment methods:
 > of 5 enrollment attempts per minute, so a local user can briefly
 > disrupt a legitimate enrollment by flooding bad tokens — acceptable for
 > a self-hosted MDM, not for adversarial multi-tenant hosts.
+<!-- docref: end -->
 >
 > **Hardening (WS9).** `server_url` must be **https** (cleartext/opaque
 > URLs are refused before any network call). Token delivery is via
@@ -633,12 +635,15 @@ The agent prevents actions from modifying its own infrastructure:
 
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
 - **mTLS**: After registration, the agent connects to the Gateway using mutual TLS with certificates signed by the Control Server CA
+<!-- docref: begin src=cmd/power-manage-agent/cert_rotation.go#renewAt:211ccaeb -->
 - **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
 - **Trust roots — control server vs gateway asymmetry**: Every gateway-bound RPC validates the gateway certificate against the **internal CA** that signed the agent's own certificate (i.e., `WithMTLSFromPEM`). The Control Server's `RenewCertificate` RPC is the one exception: it validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because the control server typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
+<!-- docref: end -->
 - **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id (plus a per-store random salt), written `0600` in a `0700` owner-only directory. The store fails closed if its directory is group/world-**writable** (a non-owner could otherwise forge the salt/ciphertext), and Save tightens an existing directory to `0700`. The machine-ID binding means the ciphertext will not decrypt if copied to another host, but it is **not** protection against offline theft of the disk or a backup (the machine ID lives on the same disk) — use **full-disk encryption** for that. A same-disk key file would add no real defense, so it is intentionally not used (WS10 accepted residual; see ADR 0014).
 
 ### Root Stream-RPC Verification (WS4)
 
+<!-- docref: begin src=internal/executor/executor.go#Executor.VerifyEnvelope:ea44180f,internal/handler/handler.go#Handler.OnRequestInventory:398d6189 -->
 The agent runs as root, and the Gateway/Valkey relay is **untrusted for
 origination**. So beyond signed actions, the four root stream-RPCs are verified
 fail-closed against the CA certificate **before any root work**:
@@ -654,8 +659,10 @@ Each verifies the Control Server's signature over the message's canonical bytes
 under that surface's disjoint domain. **Raw SQL is permitted only when signed**
 (an unsigned/tampered raw query never reaches osquery); the message is validated
 at the boundary first. A missing verifier fails closed (production always has
-one — the CA cert is required at startup). Agent-initiated periodic inventory
-collection is the agent's own decision and needs no signature.
+one — the CA cert is required at startup). All inventory collection is
+server-initiated over this signed path (manual refresh and the spec-22
+server-side scheduler); the agent has no periodic collector of its own.
+<!-- docref: end -->
 
 ### Package / Repository Argument Hardening (WS8)
 
