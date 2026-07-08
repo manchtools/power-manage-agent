@@ -1,0 +1,6 @@
+# docref keeps README.md and docs/ honest against the code they describe
+# (audit A-05, issue #172). `docref check` (run in CI) fails when an
+# anchored snippet or claim drifts from the symbol/region it points at.
+# Anchor liberally: an un-anchored statement about code is a latent bug.
+[scan]
+include = ["README.md", "docs/**/*.md"]
