@@ -26,10 +26,14 @@ concurrency:
   group: docref-${{ github.ref }}
   cancel-in-progress: true
 
+permissions:
+  contents: read
+
 jobs:
   docref-check:
     name: docref (docs anchored to code)
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - uses: actions/checkout@v5
 
