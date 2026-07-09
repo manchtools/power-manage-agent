@@ -306,16 +306,19 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 	// Determine desired shell
 	desiredShell := params.Shell
 	if desiredShell == "" {
-		// Disabling ROOT is lock-only (#169, operator decision 2026-07-08):
-		// the nologin default would break `sudo -i` and key-based root SSH
-		// (both run root's login shell), turning a reversible password lock
-		// into an emergency-access lockout. A password-locked root with an
-		// intact shell is exactly Ubuntu's default posture and has no
-		// effect on the agent (systemd services don't authenticate or use
-		// the login shell). Regular users keep the nologin-on-disable
-		// offboarding default; an operator may still set the shell
-		// explicitly for root.
-		if params.Disabled && params.Username != "root" {
+		// Disabling the SUPERUSER is lock-only (#169, operator decision
+		// 2026-07-08): the nologin default would break `sudo -i` and
+		// key-based root SSH (both run the login shell), turning a
+		// reversible password lock into an emergency-access lockout. A
+		// password-locked superuser with an intact shell is exactly
+		// Ubuntu's default posture and has no effect on the agent
+		// (systemd services don't authenticate or use the login shell).
+		// Keyed on UID 0 — the self-discovering superuser identity — not
+		// on the name "root", so a renamed superuser account is covered
+		// without a name list to maintain. Regular users keep the
+		// nologin-on-disable offboarding default; an operator may still
+		// set the shell explicitly.
+		if params.Disabled && currentInfo.UID != 0 {
 			desiredShell = "/usr/sbin/nologin"
 		}
 		// If not disabled and no shell specified, don't change the existing shell
@@ -398,14 +401,15 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 			if err := userMgr.Lock(ctx, params.Username); err != nil {
 				output.WriteString(fmt.Sprintf("warning: failed to lock user: %v\n", err))
 			} else {
-				if params.Username == "root" {
+				if currentInfo.UID == 0 {
 					// Deliberate operator choice (#169) — loud in the
 					// journal, AFTER the lock succeeded (CR catch: warning
 					// on the attempt would falsely assert the state change
-					// when Lock fails): password login to root stops
-					// working; sudo and key-based SSH are unaffected
-					// (lock-only, shell preserved).
-					e.logger.Warn("locked the root account per USER action (password login disabled; sudo/key-SSH unaffected)")
+					// when Lock fails): password login to the superuser
+					// stops working; sudo and key-based SSH are unaffected
+					// (lock-only, shell preserved). UID-keyed, like the
+					// shell exemption above.
+					e.logger.Warn("locked the superuser account per USER action (password login disabled; sudo/key-SSH unaffected)", "username", params.Username)
 				}
 				output.WriteString("account locked (disabled)\n")
 				changed = true

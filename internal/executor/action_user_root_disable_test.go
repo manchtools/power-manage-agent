@@ -46,7 +46,7 @@ func swapUserMgr(t *testing.T, m sysuser.Manager) {
 // root SSH keep working (Ubuntu's default posture). The lock is loud
 // in the journal.
 func TestUpdateUser_DisableRoot_LockOnlyKeepsShell(t *testing.T) {
-	fake := &fakeRootDisableUser{info: sysuser.Info{Shell: "/bin/bash", Locked: false}}
+	fake := &fakeRootDisableUser{info: sysuser.Info{UID: 0, Shell: "/bin/bash", Locked: false}}
 	swapUserMgr(t, fake)
 
 	var logBuf bytes.Buffer
@@ -79,7 +79,7 @@ func TestUpdateUser_DisableRoot_LockOnlyKeepsShell(t *testing.T) {
 // Regression pin for the existing offboarding semantics: a REGULAR
 // user disabled without an explicit shell still defaults to nologin.
 func TestUpdateUser_DisableRegularUser_StillDefaultsNologin(t *testing.T) {
-	fake := &fakeRootDisableUser{info: sysuser.Info{Shell: "/bin/bash", Locked: false}}
+	fake := &fakeRootDisableUser{info: sysuser.Info{UID: 1000, Shell: "/bin/bash", Locked: false}}
 	swapUserMgr(t, fake)
 
 	e := &Executor{logger: slog.Default(), now: time.Now}
@@ -108,7 +108,7 @@ func TestUpdateUser_DisableRegularUser_StillDefaultsNologin(t *testing.T) {
 // An explicit shell on a root-disable is still honored — the exemption
 // only removes the DEFAULT, not the operator's stated intent.
 func TestUpdateUser_DisableRoot_ExplicitShellHonored(t *testing.T) {
-	fake := &fakeRootDisableUser{info: sysuser.Info{Shell: "/bin/bash", Locked: false}}
+	fake := &fakeRootDisableUser{info: sysuser.Info{UID: 0, Shell: "/bin/bash", Locked: false}}
 	swapUserMgr(t, fake)
 
 	e := &Executor{logger: slog.New(slog.NewTextHandler(&bytes.Buffer{}, nil)), now: time.Now}
@@ -129,5 +129,36 @@ func TestUpdateUser_DisableRoot_ExplicitShellHonored(t *testing.T) {
 	}
 	if !found {
 		t.Fatal("an explicitly requested shell must still be applied to root")
+	}
+}
+
+// The exemption is keyed on UID 0, not the name "root": a renamed
+// superuser account (hardening setups, "toor", etc.) must get the same
+// lock-only treatment — no name list to maintain.
+func TestUpdateUser_DisableRenamedSuperuser_LockOnlyKeepsShell(t *testing.T) {
+	fake := &fakeRootDisableUser{info: sysuser.Info{UID: 0, Shell: "/bin/bash", Locked: false}}
+	swapUserMgr(t, fake)
+
+	var logBuf bytes.Buffer
+	e := &Executor{logger: slog.New(slog.NewTextHandler(&logBuf, nil)), now: time.Now}
+
+	var out strings.Builder
+	_, changed, err := e.updateUser(context.Background(), &pb.UserParams{
+		Username: "sysadm",
+		Disabled: true,
+	}, &out)
+	if err != nil {
+		t.Fatalf("updateUser: %v", err)
+	}
+	if !changed {
+		t.Fatal("locking the superuser must report changed")
+	}
+	for _, m := range fake.modified {
+		if m.Shell != "" {
+			t.Fatalf("disabling a UID-0 account must not touch the shell (lock-only), got Modify(Shell=%q)", m.Shell)
+		}
+	}
+	if !strings.Contains(logBuf.String(), "level=WARN") || !strings.Contains(logBuf.String(), "sysadm") {
+		t.Fatalf("locking a UID-0 account must warn loudly in the journal, got: %s", logBuf.String())
 	}
 }
