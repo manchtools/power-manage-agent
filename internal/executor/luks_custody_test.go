@@ -17,7 +17,7 @@ import (
 // fakeLuksKeyStore is a recording LuksKeyStore for custody tests.
 type fakeLuksKeyStore struct {
 	getKeyFunc   func(ctx context.Context, actionID string) (string, error)
-	storeKeyFunc func(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error
+	storeKeyFunc func(ctx context.Context, actionID, devicePath string, sealedPassphrase []byte, reason pb.RotationReason) error
 
 	getKeyCalls   int
 	storeKeyCalls int
@@ -31,10 +31,10 @@ func (f *fakeLuksKeyStore) GetKey(ctx context.Context, actionID string) (string,
 	return "", nil
 }
 
-func (f *fakeLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error {
+func (f *fakeLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath string, sealedPassphrase []byte, reason pb.RotationReason) error {
 	f.storeKeyCalls++
 	if f.storeKeyFunc != nil {
-		return f.storeKeyFunc(ctx, actionID, devicePath, passphrase, reason)
+		return f.storeKeyFunc(ctx, actionID, devicePath, sealedPassphrase, reason)
 	}
 	return nil
 }
