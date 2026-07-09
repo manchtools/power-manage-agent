@@ -378,6 +378,15 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	}
 	passphrase := passSecret.Reveal()
 
+	// Seal BEFORE any LUKS mutation (CR catch): the seal is a pure
+	// computation, so failing here needs no rollback — a seal failure
+	// after AddKey would need one, and a failed rollback would orphan a
+	// slot.
+	sealed, err := e.sealLuksPassphrase(actionID, passphrase)
+	if err != nil {
+		return fmt.Errorf("seal key for server: %w", err)
+	}
+
 	// Add managed passphrase using PSK (both keys now valid)
 	e.logger.Info("LUKS: adding managed key using PSK",
 		"psk_len", len(params.PresharedKey),
@@ -386,17 +395,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 		return fmt.Errorf("add managed key: %w", err)
 	}
 
-	// Seal to the control key, then store on server — must succeed before
-	// removing the PSK. A seal failure takes the same rollback as a store
-	// failure: the slot we just added is removed again.
-	sealed, err := e.sealLuksPassphrase(actionID, passphrase)
-	if err != nil {
-		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(passphrase)); rmErr != nil {
-			e.logger.Error("LUKS: rollback failed — managed key remains in slot",
-				"action_id", actionID, "error", rmErr)
-		}
-		return fmt.Errorf("seal key for server: %w", err)
-	}
+	// Store on server — must succeed before removing the PSK.
 	if err := ks.StoreKey(ctx, actionID, devicePath, sealed, pb.RotationReason_ROTATION_REASON_INITIAL); err != nil {
 		// Rollback: remove the managed key we just added
 		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(passphrase)); rmErr != nil {
@@ -482,21 +481,19 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 	}
 	newPassphrase := newPassSecret.Reveal()
 
+	// Seal BEFORE the slot mutation (CR catch) — pure computation, no
+	// rollback needed on failure.
+	sealed, err := e.sealLuksPassphrase(actionID, newPassphrase)
+	if err != nil {
+		return false, fmt.Errorf("seal new key for server: %w", err)
+	}
+
 	// Add new key using old key (both valid)
 	if err := encMgr.AddKey(ctx, devicePath, luksSecret(currentKey), luksSecret(newPassphrase), sysenc.AddKeyOptions{}); err != nil {
 		return false, fmt.Errorf("add new key: %w", err)
 	}
 
-	// Seal, then store on server — must succeed before removing the old
-	// key. A seal failure takes the same rollback as a store failure.
-	sealed, err := e.sealLuksPassphrase(actionID, newPassphrase)
-	if err != nil {
-		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(newPassphrase)); rmErr != nil {
-			e.logger.Error("LUKS: rotation rollback failed — new key remains in slot",
-				"action_id", actionID, "error", rmErr)
-		}
-		return false, fmt.Errorf("seal new key for server: %w", err)
-	}
+	// Store on server — must succeed before removing the old key.
 	if err := ks.StoreKey(ctx, actionID, devicePath, sealed, pb.RotationReason_ROTATION_REASON_SCHEDULED); err != nil {
 		// Rollback: remove the new key we just added
 		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(newPassphrase)); rmErr != nil {
