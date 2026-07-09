@@ -10,7 +10,6 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
-	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysnotify "github.com/manchtools/power-manage-sdk/sys/notify"
 	sysreboot "github.com/manchtools/power-manage-sdk/sys/reboot"
 )
@@ -227,8 +226,12 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			// errors.Join keeps the reboot failure visible even when an
 			// earlier upgrade error already occupied lastErr — a
 			// first-error-wins guard would silently demote a reboot the
-			// operator explicitly asked for.
-			lastErr = errors.Join(lastErr, e.scheduleRebootAfterUpdate(ctx, &allOutput))
+			// operator explicitly asked for. Join only on a real failure so
+			// lastErr keeps its identity otherwise (the NA classification
+			// below relies on it).
+			if rebootErr := e.scheduleRebootAfterUpdate(ctx, &allOutput); rebootErr != nil {
+				lastErr = errors.Join(lastErr, rebootErr)
+			}
 		}
 	}
 
@@ -239,11 +242,11 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 	// Fail-closed is preserved — nothing was upgraded — only the
 	// classification changes. changed deliberately excludes
 	// updatesAvailable: it reflects what WOULD apply, not what did.
-	if securityOnly && (errors.Is(lastErr, pkg.ErrSecurityOnlyUnsupported) || errors.Is(lastErr, sysexec.ErrBackendUnavailable)) {
+	if securityOnlyNotApplicable(securityOnly, upgradeErr, lastErr) {
 		return &pb.CommandOutput{
 			ExitCode: 0,
 			Stdout:   allOutput.String(),
-		}, autoremoved || newRebootRequired, notApplicable("security-only upgrades unsupported on backend %q: %v", e.pkgBackend, lastErr)
+		}, autoremoved || newRebootRequired, notApplicable("security-only upgrades unsupported on backend %q: %v", e.pkgBackend, upgradeErr)
 	}
 
 	exitCode := int32(0)

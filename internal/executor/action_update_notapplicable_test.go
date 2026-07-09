@@ -149,6 +149,40 @@ func TestExecuteUpdate_SecurityOnlySupported_Proceeds(t *testing.T) {
 	}
 }
 
+// TestSecurityOnlyNotApplicable_Decision pins the NA-eligibility decision,
+// including the CodeRabbit catch on this change: a reboot-scheduling
+// failure joined onto lastErr after the sentinel upgrade error means the
+// run had a REAL failure — it must stay FAILED, not be demoted to
+// NOT_APPLICABLE.
+func TestSecurityOnlyNotApplicable_Decision(t *testing.T) {
+	sentinel := pkg.ErrSecurityOnlyUnsupported
+	wrapped := fmt.Errorf("apt security upgrade: %w", sysexec.ErrBackendUnavailable)
+	rebootFail := errors.New("schedule reboot: shutdown refused")
+
+	cases := []struct {
+		name         string
+		securityOnly bool
+		upgradeErr   error
+		lastErr      error
+		want         bool
+	}{
+		{"sentinel alone → NA", true, sentinel, sentinel, true},
+		{"wrapped backend-unavailable alone → NA", true, wrapped, wrapped, true},
+		{"reboot failure joined after sentinel → stays FAILED", true, sentinel, errors.Join(sentinel, rebootFail), false},
+		{"not security-only → never NA", false, sentinel, sentinel, false},
+		{"no upgrade error → never NA", true, nil, nil, false},
+		{"unrelated upgrade error → stays FAILED", true, errors.New("dpkg exploded"), errors.New("dpkg exploded"), false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := securityOnlyNotApplicable(tc.securityOnly, tc.upgradeErr, tc.lastErr); got != tc.want {
+				t.Errorf("securityOnlyNotApplicable(%v, %v, %v) = %v, want %v",
+					tc.securityOnly, tc.upgradeErr, tc.lastErr, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestExecuteEnvelope_SecurityOnly_NotApplicableStatus pins the central
 // classification (spec 23 AC 2 end to end in the agent): the sentinel from
 // the update path surfaces as EXECUTION_STATUS_NOT_APPLICABLE on the

@@ -3,6 +3,9 @@ package executor
 import (
 	"errors"
 	"fmt"
+
+	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
 // errNotApplicable marks an action as structurally inapplicable to this
@@ -19,4 +22,19 @@ var errNotApplicable = errors.New("not applicable to this device")
 // returns from a structural-inapplicability path.
 func notApplicable(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", errNotApplicable, fmt.Sprintf(format, args...))
+}
+
+// securityOnlyNotApplicable decides whether an update run's outcome is
+// structural inapplicability (spec 23 AC 2): the request was security-only,
+// the upgrade failed with one of the two capability sentinels
+// (ErrSecurityOnlyUnsupported: pacman/flatpak can't scope;
+// ErrBackendUnavailable: apt's unattended-upgrade tooling absent), and
+// nothing ELSE went wrong afterwards — lastErr must still be exactly the
+// upgrade error. A reboot-scheduling failure joined onto lastErr means the
+// run had a real failure the operator asked to see, so it stays FAILED
+// (CodeRabbit catch on the spec 23 change).
+func securityOnlyNotApplicable(securityOnly bool, upgradeErr, lastErr error) bool {
+	return securityOnly && upgradeErr != nil && lastErr == upgradeErr &&
+		(errors.Is(upgradeErr, pkg.ErrSecurityOnlyUnsupported) ||
+			errors.Is(upgradeErr, sysexec.ErrBackendUnavailable))
 }
