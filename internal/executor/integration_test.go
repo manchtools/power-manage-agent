@@ -167,6 +167,23 @@ func assertSuccess(t *testing.T, result *pb.ActionResult) {
 	}
 }
 
+// assertNotApplicable pins the spec-23 contract for structural
+// inapplicability: NOT_APPLICABLE status, the reason in the result error,
+// and changed=false.
+func assertNotApplicable(t *testing.T, result *pb.ActionResult, wantReason string) {
+	t.Helper()
+	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE {
+		t.Errorf("expected NOT_APPLICABLE, got %s (error: %s, stdout: %s)",
+			result.Status, result.Error, truncate(safeStdout(result), 200))
+	}
+	if !strings.Contains(result.Error, wantReason) {
+		t.Errorf("expected reason %q in result error, got: %s", wantReason, result.Error)
+	}
+	if result.Changed {
+		t.Errorf("expected changed=false on a not-applicable result")
+	}
+}
+
 func assertFailed(t *testing.T, result *pb.ActionResult) {
 	t.Helper()
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_FAILED {
@@ -526,27 +543,21 @@ func TestIntegration_Package_GracefulSkip(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
-		if !strings.Contains(safeStdout(result), "skipped") {
-			t.Error("expected skip message in stdout")
-		}
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 }
 
@@ -1822,24 +1833,21 @@ func TestIntegration_Package_GracefulSkip_Dnf(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 }
 
@@ -2056,24 +2064,21 @@ func TestIntegration_Package_GracefulSkip_Pacman(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("DnfNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("ZypperNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{ZypperName: "some-zypper-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 }
 
@@ -2205,24 +2210,21 @@ func TestIntegration_Package_GracefulSkip_Zypper(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{AptName: "some-apt-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("DnfNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{DnfName: "some-dnf-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 
 	t.Run("PacmanNameOnly", func(t *testing.T) {
 		action := makeAction(t, pb.ActionType_ACTION_TYPE_PACKAGE, pb.DesiredState_DESIRED_STATE_PRESENT)
 		action.Params = &pb.Action_Package{Package: &pb.PackageParams{PacmanName: "some-pacman-pkg"}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
-		assertSuccess(t, result)
-		assertChanged(t, result, false)
+		assertNotApplicable(t, result, "no package name configured")
 	})
 }
 
