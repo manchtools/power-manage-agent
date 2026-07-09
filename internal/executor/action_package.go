@@ -23,10 +23,7 @@ func (e *Executor) executePackage(ctx context.Context, params *pb.PackageParams,
 	}
 	pkgName := e.getPackageNameForManager(params)
 	if pkgName == "" {
-		return &pb.CommandOutput{
-			ExitCode: 0,
-			Stdout:   "skipped: no package name configured for this package manager",
-		}, false, nil
+		return nil, false, notApplicable("no package name configured for this package manager")
 	}
 	switch state {
 	case pb.DesiredState_DESIRED_STATE_PRESENT:

@@ -66,7 +66,7 @@ stop:
 	ssh $(SSH_OPTS) $(SSH) 'sudo systemctl stop $(SERVICE)'
 
 CONTAINER_CMD := $(shell command -v podman 2>/dev/null || command -v docker 2>/dev/null)
-TEST_CMD := runuser -u power-manage -- /usr/local/go/bin/go test -v -tags=integration -count=1 -timeout=10m ./agent/internal/executor/ -run Integration
+TEST_CMD := /usr/local/go/bin/go test -v -tags=integration -count=1 -timeout=10m ./agent/internal/executor/ -run Integration
 
 test-integration-debian:
 	$(CONTAINER_CMD) build -f test/Dockerfile.integration -t pm-agent-test-debian ../

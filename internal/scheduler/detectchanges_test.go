@@ -59,6 +59,30 @@ func TestDetectChanges(t *testing.T) {
 		assert.False(t, got, "an ordinary unchanged success must not be reported")
 	})
 
+	t.Run("NOT_APPLICABLE unchanged does not report (spec 23 AC 6)", func(t *testing.T) {
+		stored := &store.StoredAction{Action: &pb.Action{
+			Id:     &pb.ActionId{Value: "na"},
+			Type:   pb.ActionType_ACTION_TYPE_UPDATE,
+			Params: &pb.Action_Update{Update: &pb.UpdateParams{SecurityOnly: true}},
+		}}
+		got := sched.detectChanges(stored, &pb.ActionResult{
+			Status: pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE, Changed: false,
+		})
+		assert.False(t, got, "a permanently inapplicable recurring action must follow the same skip-if-unchanged dedup as SUCCESS — no per-tick event spam")
+	})
+
+	t.Run("NOT_APPLICABLE with Changed=true reports", func(t *testing.T) {
+		stored := &store.StoredAction{Action: &pb.Action{
+			Id:     &pb.ActionId{Value: "na2"},
+			Type:   pb.ActionType_ACTION_TYPE_UPDATE,
+			Params: &pb.Action_Update{Update: &pb.UpdateParams{SecurityOnly: true}},
+		}}
+		got := sched.detectChanges(stored, &pb.ActionResult{
+			Status: pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE, Changed: true,
+		})
+		assert.True(t, got, "a not-applicable result that still changed the system (e.g. autoremove ran) must report")
+	})
+
 	t.Run("SkipIfUnchanged first run (empty hash) reports", func(t *testing.T) {
 		stored := &store.StoredAction{
 			Action:         shellAction("s0", &pb.ShellParams{Script: "x"}, &pb.ActionSchedule{SkipIfUnchanged: true}),

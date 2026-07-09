@@ -461,6 +461,11 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	case errors.Is(ctx.Err(), context.Canceled):
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = "action cancelled"
+	case errors.Is(execErr, errNotApplicable):
+		// Spec 23: structural inapplicability is a first-class terminal
+		// outcome, not a failure. The reason travels in the result error.
+		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE
+		result.Error = execErr.Error()
 	case execErr != nil:
 		result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 		result.Error = execErr.Error()

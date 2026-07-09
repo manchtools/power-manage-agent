@@ -226,9 +226,27 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			// errors.Join keeps the reboot failure visible even when an
 			// earlier upgrade error already occupied lastErr — a
 			// first-error-wins guard would silently demote a reboot the
-			// operator explicitly asked for.
-			lastErr = errors.Join(lastErr, e.scheduleRebootAfterUpdate(ctx, &allOutput))
+			// operator explicitly asked for. Join only on a real failure so
+			// lastErr keeps its identity otherwise (the NA classification
+			// below relies on it).
+			if rebootErr := e.scheduleRebootAfterUpdate(ctx, &allOutput); rebootErr != nil {
+				lastErr = errors.Join(lastErr, rebootErr)
+			}
 		}
+	}
+
+	// Spec 23 AC 2: a security-only request on a backend that cannot scope
+	// to security patches (pacman/flatpak → ErrSecurityOnlyUnsupported) or
+	// whose scoping tool is absent (apt without unattended-upgrades →
+	// ErrBackendUnavailable) is structural inapplicability, not a failure.
+	// Fail-closed is preserved — nothing was upgraded — only the
+	// classification changes. changed deliberately excludes
+	// updatesAvailable: it reflects what WOULD apply, not what did.
+	if securityOnlyNotApplicable(securityOnly, upgradeErr, lastErr) {
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   allOutput.String(),
+		}, autoremoved || newRebootRequired, notApplicable("security-only upgrades unsupported on backend %q: %v", e.pkgBackend, upgradeErr)
 	}
 
 	exitCode := int32(0)
