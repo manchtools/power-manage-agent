@@ -331,8 +331,8 @@ Create, modify, or remove system users.
 
 On creation, a temporary password is generated and returned in the `lps.rotations` metadata field. The `power-manage` system user is protected from deletion.
 
-<!-- docref: begin src=internal/executor/action_user.go#Executor.updateUser:318399bc -->
-`disabled: true` shadow-locks the account (`usermod -L`, a leading `!` on the password hash) and — for regular users — defaults the shell to `/usr/sbin/nologin` for offboarding. **Disabling `root` is deliberately lock-only**: the shell is left untouched, so `sudo -i` and key-based root SSH keep working while password login stops — the same posture as Ubuntu's locked-by-default root. This is an operator choice and has no effect on the agent itself (a running root service neither re-authenticates nor uses the login shell); the agent logs a warning when it locks root. An explicitly set `shell` is always honored, root included.
+<!-- docref: begin src=internal/executor/action_user.go#Executor.updateUser:50055ffa -->
+`disabled: true` shadow-locks the account (`usermod -L`, a leading `!` on the password hash) and — for regular users — defaults the shell to `/usr/sbin/nologin` for offboarding. **Disabling the superuser is deliberately lock-only**: for any UID-0 account (keyed on the UID, not the name `root`, so a renamed superuser is covered without a name list) the shell is left untouched, so `sudo -i` and key-based root SSH keep working while password login stops — the same posture as Ubuntu's locked-by-default root. This is an operator choice and has no effect on the agent itself (a running root service neither re-authenticates nor uses the login shell); the agent logs a warning when it locks a UID-0 account. An explicitly set `shell` is always honored, superuser included.
 <!-- docref: end -->
 
 **Desired State:**
