@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
@@ -20,9 +21,44 @@ import (
 func luksSecret(s string) sysexec.Secret { return sysexec.NewMultilineSecret(s) }
 
 // LuksKeyStore is the interface for LUKS key operations via the agent stream.
+// StoreKey carries the passphrase SEALED to the control public key
+// (crypto.SealLuksPassphrase, spec 25) — everything past the executor only
+// ever sees opaque bytes; the relaying gateway cannot read it.
 type LuksKeyStore interface {
 	GetKey(ctx context.Context, actionID string) (string, error)
-	StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error
+	StoreKey(ctx context.Context, actionID, devicePath string, sealedPassphrase []byte, reason pb.RotationReason) error
+}
+
+// sealLuksPassphrase seals a managed passphrase to the verified control
+// public key under the (device, action) context (spec 25). Fail-closed by
+// construction: no verified key or no device identity → error, and the
+// caller must not fall back to any cleartext path. The key is the same one
+// LPS sealing uses; domain separation (distinct HKDF info + AAD) lives in
+// the SDK's single construction site.
+func (e *Executor) sealLuksPassphrase(actionID, passphrase string) ([]byte, error) {
+	pub, err := e.lpsPublicKey()
+	if err != nil {
+		return nil, fmt.Errorf("no verified control public key (sync with the server first): %w", err)
+	}
+	deviceID := e.getDeviceID()
+	if deviceID == "" {
+		return nil, fmt.Errorf("device ID not available; cannot bind the seal context")
+	}
+	return sdkcrypto.SealLuksPassphrase(pub, passphrase, deviceID, actionID)
+}
+
+// requireLuksSealReady is the pre-mutation gate for the two store paths:
+// without a control key (or device identity) the new passphrase could never
+// be stored, so bail BEFORE any LUKS slot is touched — a failed store after
+// AddKey needs a rollback; a refused store before it needs nothing.
+func (e *Executor) requireLuksSealReady() error {
+	if _, err := e.lpsPublicKey(); err != nil {
+		return fmt.Errorf("cannot seal to control key (fail closed, no cleartext fallback): %w", err)
+	}
+	if e.getDeviceID() == "" {
+		return fmt.Errorf("cannot seal to control key: device ID not available")
+	}
+	return nil
 }
 
 // luksTimestampFailureThreshold is the consecutive-failure count after
@@ -320,14 +356,22 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 		return fmt.Errorf("server not reachable, cannot manage LUKS keys (retry when connected): %w", getKeyErr)
 	}
 
+	// Spec 25 pre-mutation gate: the new passphrase can only be stored
+	// SEALED; without a control key the store is doomed, so refuse before
+	// any slot is touched.
+	if err := e.requireLuksSealReady(); err != nil {
+		return fmt.Errorf("take ownership: %w", err)
+	}
+
 	minWords := int(params.MinWords)
 	if minWords < 3 {
 		minWords = 5
 	}
 
 	// Generate managed passphrase. The agent's key-store layer handles keys as
-	// strings (they must be serialized to the server), so Reveal once here and
-	// re-wrap as a Secret at each encryption-Manager boundary below.
+	// strings locally, so Reveal once here and re-wrap as a Secret at each
+	// encryption-Manager boundary below; the WIRE only ever carries the
+	// sealed form (spec 25).
 	passSecret, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return fmt.Errorf("generate passphrase: %w", err)
@@ -342,8 +386,18 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 		return fmt.Errorf("add managed key: %w", err)
 	}
 
-	// Store on server — must succeed before removing PSK
-	if err := ks.StoreKey(ctx, actionID, devicePath, passphrase, pb.RotationReason_ROTATION_REASON_INITIAL); err != nil {
+	// Seal to the control key, then store on server — must succeed before
+	// removing the PSK. A seal failure takes the same rollback as a store
+	// failure: the slot we just added is removed again.
+	sealed, err := e.sealLuksPassphrase(actionID, passphrase)
+	if err != nil {
+		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(passphrase)); rmErr != nil {
+			e.logger.Error("LUKS: rollback failed — managed key remains in slot",
+				"action_id", actionID, "error", rmErr)
+		}
+		return fmt.Errorf("seal key for server: %w", err)
+	}
+	if err := ks.StoreKey(ctx, actionID, devicePath, sealed, pb.RotationReason_ROTATION_REASON_INITIAL); err != nil {
 		// Rollback: remove the managed key we just added
 		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(passphrase)); rmErr != nil {
 			e.logger.Error("LUKS: rollback failed — managed key remains in slot",
@@ -403,6 +457,12 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		}
 	}
 
+	// Spec 25 pre-mutation gate: refuse a due rotation before touching any
+	// slot when the sealed store could never succeed.
+	if err := e.requireLuksSealReady(); err != nil {
+		return false, fmt.Errorf("rotate: %w", err)
+	}
+
 	// Get current key from server
 	currentKey, err := ks.GetKey(ctx, actionID)
 	if err != nil {
@@ -414,8 +474,8 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		minWords = 5
 	}
 
-	// Generate new passphrase (Reveal once for the string-based key store; re-wrap
-	// as a Secret at each encryption-Manager boundary below).
+	// Generate new passphrase (Reveal once for the string-based local key
+	// handling; the WIRE only carries the sealed form — spec 25).
 	newPassSecret, err := sysenc.GeneratePassphrase(minWords)
 	if err != nil {
 		return false, fmt.Errorf("generate passphrase: %w", err)
@@ -427,8 +487,17 @@ func (e *Executor) checkAndRotate(ctx context.Context, params *pb.EncryptionPara
 		return false, fmt.Errorf("add new key: %w", err)
 	}
 
-	// Store on server — must succeed before removing old key
-	if err := ks.StoreKey(ctx, actionID, devicePath, newPassphrase, pb.RotationReason_ROTATION_REASON_SCHEDULED); err != nil {
+	// Seal, then store on server — must succeed before removing the old
+	// key. A seal failure takes the same rollback as a store failure.
+	sealed, err := e.sealLuksPassphrase(actionID, newPassphrase)
+	if err != nil {
+		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(newPassphrase)); rmErr != nil {
+			e.logger.Error("LUKS: rotation rollback failed — new key remains in slot",
+				"action_id", actionID, "error", rmErr)
+		}
+		return false, fmt.Errorf("seal new key for server: %w", err)
+	}
+	if err := ks.StoreKey(ctx, actionID, devicePath, sealed, pb.RotationReason_ROTATION_REASON_SCHEDULED); err != nil {
 		// Rollback: remove the new key we just added
 		if rmErr := encMgr.RemoveKey(ctx, devicePath, luksSecret(newPassphrase)); rmErr != nil {
 			e.logger.Error("LUKS: rotation rollback failed — new key remains in slot",

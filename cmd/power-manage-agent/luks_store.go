@@ -21,9 +21,9 @@ func (s *clientLuksKeyStore) GetKey(ctx context.Context, actionID string) (strin
 	return s.client.GetLuksKey(ctx, actionID)
 }
 
-func (s *clientLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error {
+func (s *clientLuksKeyStore) StoreKey(ctx context.Context, actionID, devicePath string, sealedPassphrase []byte, reason pb.RotationReason) error {
 	if s.client == nil {
 		return fmt.Errorf("luks key store: no SDK client wired (programmer error)")
 	}
-	return s.client.StoreLuksKey(ctx, actionID, devicePath, passphrase, reason)
+	return s.client.StoreLuksKey(ctx, actionID, devicePath, sealedPassphrase, reason)
 }
