@@ -27,11 +27,12 @@ func (e *Executor) executeRpm(ctx context.Context, params *pb.AppInstallParams, 
 		return nil, false, err
 	}
 
-	// Skip on non-rpm systems. dnf and zypper are the rpm-format backends
-	// the SDK's pkg.Detect enumerates; detecting either means rpm is usable,
-	// honoring SDK PATH resolution instead of hard-coding "rpm".
+	// Not applicable on non-rpm systems (spec 23). dnf and zypper are the
+	// rpm-format backends the SDK's pkg.Detect enumerates; detecting either
+	// means rpm is usable, honoring SDK PATH resolution instead of
+	// hard-coding "rpm".
 	if detected := pkg.Detect(ctx); !slices.Contains(detected, pkg.Dnf) && !slices.Contains(detected, pkg.Zypper) {
-		return &pb.CommandOutput{Stdout: "skipped: no supported .rpm package manager available on this system"}, false, nil
+		return nil, false, notApplicable("no supported .rpm package manager available on this system")
 	}
 
 	mgr := e.pkgManagerForCtx(ctx)

@@ -610,8 +610,12 @@ func (s *Scheduler) executeAction(ctx context.Context, stored *store.StoredActio
 // the server. It uses the executor's Changed flag (set accurately by every
 // action type) and optionally compares output hashes for SkipIfUnchanged actions.
 func (s *Scheduler) detectChanges(stored *store.StoredAction, result *pb.ActionResult) bool {
-	// Always consider non-success statuses as changes
-	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
+	// Always consider non-success statuses as changes. NOT_APPLICABLE is the
+	// exception (spec 23 AC 6): a permanently inapplicable recurring action
+	// follows the same skip-if-unchanged dedup as SUCCESS so it doesn't
+	// re-report every tick.
+	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
+		result.Status != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE {
 		return true
 	}
 

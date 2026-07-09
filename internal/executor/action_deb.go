@@ -46,11 +46,12 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 		}
 	}
 
-	// Skip on non-deb systems. Apt is the deb-format backend the SDK's
-	// pkg.Detect enumerates (it probes apt-get, which dpkg underpins), so
-	// this honors the SDK's PATH resolution instead of hard-coding "dpkg".
+	// Not applicable on non-deb systems (spec 23). Apt is the deb-format
+	// backend the SDK's pkg.Detect enumerates (it probes apt-get, which dpkg
+	// underpins), so this honors the SDK's PATH resolution instead of
+	// hard-coding "dpkg".
 	if !slices.Contains(pkg.Detect(ctx), pkg.Apt) {
-		return &pb.CommandOutput{Stdout: "skipped: no supported .deb package manager available on this system"}, false, nil
+		return nil, false, notApplicable("no supported .deb package manager available on this system")
 	}
 
 	mgr := e.pkgManagerForCtx(ctx)

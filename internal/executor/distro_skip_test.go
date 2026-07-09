@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"slices"
 	"strings"
 	"testing"
@@ -22,9 +23,26 @@ func rpmCapable() bool {
 }
 func flatpakCapable() bool { return slices.Contains(pkg.Detect(context.Background()), pkg.Flatpak) }
 
-// TestExecuteDeb_SkipsWhenDpkgMissing verifies that the DEB executor
-// returns a skip message when dpkg is not available.
-func TestExecuteDeb_SkipsWhenDpkgMissing(t *testing.T) {
+// requireNotApplicable asserts the spec-23 contract for a structural
+// backend-missing path: an errNotApplicable-wrapped reason and
+// changed=false — never a silent success.
+func requireNotApplicable(t *testing.T, changed bool, err error, wantReason string) {
+	t.Helper()
+	if !errors.Is(err, errNotApplicable) {
+		t.Fatalf("expected errNotApplicable, got: %v", err)
+	}
+	if !strings.Contains(err.Error(), wantReason) {
+		t.Errorf("reason %q missing from error: %v", wantReason, err)
+	}
+	if changed {
+		t.Error("expected changed=false for a not-applicable action")
+	}
+}
+
+// TestExecuteDeb_NotApplicableWhenDpkgMissing verifies that the DEB executor
+// reports structural inapplicability (spec 23 AC 3) when no deb backend is
+// available — not a silent success.
+func TestExecuteDeb_NotApplicableWhenDpkgMissing(t *testing.T) {
 	if debCapable() {
 		t.Skip("apt (deb backend) detected — test requires a non-deb host")
 	}
@@ -32,71 +50,49 @@ func TestExecuteDeb_SkipsWhenDpkgMissing(t *testing.T) {
 	e := NewExecutor(nil, nil)
 	// A well-formed action (https + checksum): the executor-boundary
 	// requireVerifiedArtifact guard runs before the dpkg lookup, so a
-	// checksum-less action would be rejected rather than skipped on a non-deb
-	// host (WS16 #2). Use a valid action so this test exercises the skip path.
-	output, changed, err := e.executeDeb(context.Background(), &pb.AppInstallParams{
+	// checksum-less action would be rejected rather than reported
+	// not-applicable on a non-deb host (WS16 #2). Use a valid action so this
+	// test exercises the inapplicability path.
+	_, changed, err := e.executeDeb(context.Background(), &pb.AppInstallParams{
 		Url:            "https://example.com/test.deb",
 		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if changed {
-		t.Error("expected changed=false for skipped action")
-	}
-	if output == nil || !strings.Contains(output.Stdout, "skipped") {
-		t.Errorf("expected skip message, got: %v", output)
-	}
+	requireNotApplicable(t, changed, err, "no supported .deb package manager")
 }
 
-// TestExecuteRpm_SkipsWhenRpmMissing verifies that the RPM executor
-// returns a skip message when rpm is not available.
-func TestExecuteRpm_SkipsWhenRpmMissing(t *testing.T) {
+// TestExecuteRpm_NotApplicableWhenRpmMissing verifies that the RPM executor
+// reports structural inapplicability when no rpm backend is available.
+func TestExecuteRpm_NotApplicableWhenRpmMissing(t *testing.T) {
 	if rpmCapable() {
 		t.Skip("dnf/zypper (rpm backend) detected — test requires a non-rpm host")
 	}
 
 	e := NewExecutor(nil, nil)
 	// Well-formed action so requireVerifiedArtifact (which runs before the rpm
-	// lookup) passes and the test reaches the skip path on a non-rpm host.
-	output, changed, err := e.executeRpm(context.Background(), &pb.AppInstallParams{
+	// lookup) passes and the test reaches the inapplicability path.
+	_, changed, err := e.executeRpm(context.Background(), &pb.AppInstallParams{
 		Url:            "https://example.com/test.rpm",
 		ChecksumSha256: strings.Repeat("a", 64),
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if changed {
-		t.Error("expected changed=false for skipped action")
-	}
-	if output == nil || !strings.Contains(output.Stdout, "skipped") {
-		t.Errorf("expected skip message, got: %v", output)
-	}
+	requireNotApplicable(t, changed, err, "no supported .rpm package manager")
 }
 
-// TestExecuteFlatpak_SkipsWhenFlatpakMissing verifies that the Flatpak executor
-// returns a skip message when flatpak is not available.
-func TestExecuteFlatpak_SkipsWhenFlatpakMissing(t *testing.T) {
+// TestExecuteFlatpak_NotApplicableWhenFlatpakMissing verifies that the
+// Flatpak executor reports structural inapplicability when flatpak is not
+// installed on the host.
+func TestExecuteFlatpak_NotApplicableWhenFlatpakMissing(t *testing.T) {
 	if flatpakCapable() {
 		t.Skip("flatpak detected — test requires a host without flatpak")
 	}
 
 	e := NewExecutor(nil, nil)
-	output, changed, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
+	_, changed, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId: "org.example.Test",
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
 
-	if err != nil {
-		t.Fatalf("expected no error, got: %v", err)
-	}
-	if changed {
-		t.Error("expected changed=false for skipped action")
-	}
-	if output == nil || !strings.Contains(output.Stdout, "skipped") {
-		t.Errorf("expected skip message, got: %v", output)
-	}
+	requireNotApplicable(t, changed, err, "flatpak not available")
 }
 
 // TestExecuteDeb_DoesNotSkipWhenDpkgPresent verifies that the DEB executor
@@ -118,6 +114,9 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 	// Should NOT contain "skipped" — it should proceed and fail on download/install
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("DEB executor should not skip when dpkg is available")
+	}
+	if errors.Is(err, errNotApplicable) {
+		t.Errorf("DEB executor wrongly reported not-applicable on a deb-capable host: %v", err)
 	}
 	if err == nil {
 		t.Error("expected error from download/install of invalid URL, got nil")
@@ -148,6 +147,9 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("RPM executor should not skip when rpm is available")
 	}
+	if errors.Is(err, errNotApplicable) {
+		t.Errorf("RPM executor wrongly reported not-applicable on an rpm-capable host: %v", err)
+	}
 	if err == nil {
 		t.Error("expected error from download/install of invalid URL, got nil")
 	}
@@ -172,6 +174,9 @@ func TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent(t *testing.T) {
 
 	if output != nil && strings.Contains(output.Stdout, "skipped") {
 		t.Error("Flatpak executor should not skip when flatpak is available")
+	}
+	if errors.Is(err, errNotApplicable) {
+		t.Errorf("Flatpak executor wrongly reported not-applicable on a flatpak-capable host: %v", err)
 	}
 	if err == nil {
 		t.Error("expected error from install of nonexistent app, got nil")

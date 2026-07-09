@@ -10,6 +10,7 @@ import (
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	sysnotify "github.com/manchtools/power-manage-sdk/sys/notify"
 	sysreboot "github.com/manchtools/power-manage-sdk/sys/reboot"
 )
@@ -229,6 +230,20 @@ func (e *Executor) executeUpdate(ctx context.Context, params *pb.UpdateParams) (
 			// operator explicitly asked for.
 			lastErr = errors.Join(lastErr, e.scheduleRebootAfterUpdate(ctx, &allOutput))
 		}
+	}
+
+	// Spec 23 AC 2: a security-only request on a backend that cannot scope
+	// to security patches (pacman/flatpak → ErrSecurityOnlyUnsupported) or
+	// whose scoping tool is absent (apt without unattended-upgrades →
+	// ErrBackendUnavailable) is structural inapplicability, not a failure.
+	// Fail-closed is preserved — nothing was upgraded — only the
+	// classification changes. changed deliberately excludes
+	// updatesAvailable: it reflects what WOULD apply, not what did.
+	if securityOnly && (errors.Is(lastErr, pkg.ErrSecurityOnlyUnsupported) || errors.Is(lastErr, sysexec.ErrBackendUnavailable)) {
+		return &pb.CommandOutput{
+			ExitCode: 0,
+			Stdout:   allOutput.String(),
+		}, autoremoved || newRebootRequired, notApplicable("security-only upgrades unsupported on backend %q: %v", e.pkgBackend, lastErr)
 	}
 
 	exitCode := int32(0)

@@ -39,11 +39,12 @@ func (e *Executor) executeFlatpak(ctx context.Context, params *pb.FlatpakParams,
 		return nil, false, fmt.Errorf("invalid flatpak remote: %w", err)
 	}
 
-	// Skip on systems without flatpak. flatpak is a first-class pkg.Backend
-	// that the SDK's pkg.Detect enumerates, so this honors the SDK's PATH
-	// resolution instead of hard-coding the "flatpak" binary name.
+	// Not applicable on systems without flatpak (spec 23). flatpak is a
+	// first-class pkg.Backend that the SDK's pkg.Detect enumerates, so this
+	// honors the SDK's PATH resolution instead of hard-coding the "flatpak"
+	// binary name.
 	if !slices.Contains(pkg.Detect(ctx), pkg.Flatpak) {
-		return &pb.CommandOutput{Stdout: "skipped: flatpak not available on this system"}, false, nil
+		return nil, false, notApplicable("flatpak not available on this system")
 	}
 
 	if params.SystemWide {

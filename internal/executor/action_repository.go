@@ -32,26 +32,28 @@ func (e *Executor) executeRepository(ctx context.Context, params *pb.RepositoryP
 		return nil, false, fmt.Errorf("repository name required")
 	}
 
-	// Per-manager skip-check BEFORE any validation or remount: if the action
-	// carries no config for the host's package manager, it's a no-op and
-	// shouldn't trigger validation or a sudo-backed remount on a read-only root.
-	// The skip path returns changed=false; remount only fires when there is work.
+	// Per-manager applicability check BEFORE any validation or remount: if
+	// the action carries no config for the host's package manager, it is
+	// structurally inapplicable here (spec 23) and shouldn't trigger
+	// validation or a sudo-backed remount on a read-only root. The
+	// not-applicable path returns changed=false; remount only fires when
+	// there is work.
 	switch e.pkgBackend {
 	case pkg.Apt:
 		if params.Apt == nil || params.Apt.Disabled {
-			return &pb.CommandOutput{ExitCode: 0, Stdout: "skipped: no APT repository configuration provided"}, false, nil
+			return nil, false, notApplicable("no APT repository configuration provided")
 		}
 	case pkg.Dnf:
 		if params.Dnf == nil || params.Dnf.Disabled {
-			return &pb.CommandOutput{ExitCode: 0, Stdout: "skipped: no DNF repository configuration provided"}, false, nil
+			return nil, false, notApplicable("no DNF repository configuration provided")
 		}
 	case pkg.Pacman:
 		if params.Pacman == nil || params.Pacman.Disabled {
-			return &pb.CommandOutput{ExitCode: 0, Stdout: "skipped: no Pacman repository configuration provided"}, false, nil
+			return nil, false, notApplicable("no Pacman repository configuration provided")
 		}
 	case pkg.Zypper:
 		if params.Zypper == nil || params.Zypper.Disabled {
-			return &pb.CommandOutput{ExitCode: 0, Stdout: "skipped: no Zypper repository configuration provided"}, false, nil
+			return nil, false, notApplicable("no Zypper repository configuration provided")
 		}
 	default:
 		return nil, false, fmt.Errorf("no supported package manager found for repository configuration")
