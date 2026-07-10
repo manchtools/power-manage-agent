@@ -273,6 +273,25 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("swap binary at %s: %w", cfg.BinaryPath, err)
 	}
 
+	// Step 9.5 (spec 27): refresh the systemd unit from the NEW binary
+	// before signaling shutdown, so the respawn systemd performs picks up
+	// binary AND unit together — capability additions like #96 apply in
+	// the restart the update already causes, with no extra restart.
+	// Fail-open: a unit-install failure must never abort a completed
+	// binary swap; the new binary's startup reconcile retries after the
+	// respawn and the drift stays loud there.
+	unitCtx, unitCancel := context.WithTimeout(ctx, 30*time.Second)
+	unitRes, unitErr := executorRunner.Run(unitCtx, sysexec.Command{
+		Name: cfg.BinaryPath,
+		Args: []string{"install-unit", "--data-dir=" + cfg.DataDir},
+	})
+	unitCancel()
+	if unitErr != nil || unitRes.ExitCode != 0 {
+		e.logger.Error("install-unit on new binary failed; the startup reconcile will retry after respawn",
+			"error", unitErr, "exit_code", unitRes.ExitCode,
+			"stderr", strings.TrimSpace(unitRes.Stderr))
+	}
+
 	// Step 10: Signal graceful shutdown — systemd restarts with new binary
 	stdout := fmt.Sprintf("Updated from %s to %s. Restarting.", cfg.Version, newVersion)
 	e.logger.Info(stdout)

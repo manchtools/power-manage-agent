@@ -92,6 +92,8 @@ func main() {
 			os.Exit(runSelfTest(os.Args[2:]))
 		case "tty":
 			os.Exit(runTTY(os.Args[2:]))
+		case "install-unit":
+			os.Exit(runInstallUnit(os.Args[2:]))
 		}
 	}
 
@@ -141,6 +143,12 @@ func main() {
 		logger.Info("received signal, shutting down", "signal", sig)
 		cancel()
 	}()
+
+	// Spec 27: reconcile the on-disk systemd unit against the template
+	// embedded in THIS binary, so a binary update updates the unit and
+	// capability drift (agent#187) cannot recur. Fail-open, never
+	// restarts — a rewritten unit applies at the next restart/reboot.
+	reconcileUnitAtStartup(ctx, runner, logger, cfg.DataDir)
 
 	// Initialize credential store
 	credStore := credentials.NewStore(cfg.DataDir)
@@ -368,12 +376,13 @@ func parseFlags() *Config {
 		fmt.Fprintln(out, "  power-manage-agent [flags]           run the agent (default)")
 		fmt.Fprintln(out, "  power-manage-agent <command> [args]  run a subcommand")
 		fmt.Fprintln(out, "\nSubcommands:")
-		fmt.Fprintln(out, "  enroll      enroll this device with a control server (token or power-manage:// URI)")
-		fmt.Fprintln(out, "  tty         toggle the device-local remote-terminal gate (enable|disable|status)")
-		fmt.Fprintln(out, "  luks        LUKS passphrase operations")
-		fmt.Fprintln(out, "  query       run a local osquery query")
-		fmt.Fprintln(out, "  self-test   run agent self-diagnostics")
-		fmt.Fprintln(out, "  version     print the agent version")
+		fmt.Fprintln(out, "  enroll        enroll this device with a control server (token or power-manage:// URI)")
+		fmt.Fprintln(out, "  tty           toggle the device-local remote-terminal gate (enable|disable|status)")
+		fmt.Fprintln(out, "  luks          LUKS passphrase operations")
+		fmt.Fprintln(out, "  query         run a local osquery query")
+		fmt.Fprintln(out, "  self-test     run agent self-diagnostics")
+		fmt.Fprintln(out, "  install-unit  install/refresh the agent's systemd unit from this binary (root)")
+		fmt.Fprintln(out, "  version       print the agent version")
 		fmt.Fprintln(out, "\nFlags (default run mode):")
 		flag.PrintDefaults()
 	}
