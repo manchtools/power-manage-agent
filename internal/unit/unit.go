@@ -98,7 +98,10 @@ func validateUnitPath(field, value string) error {
 		switch {
 		case r <= 0x20 || r == 0x7f: // control chars incl. space/tab/newline
 			return fmt.Errorf("unit render: %s %q contains whitespace or a control character", field, value)
-		case r == '"' || r == '\'' || r == '\\' || r == '%':
+		case r == '"' || r == '\'' || r == '\\' || r == '%' || r == '$':
+			// '%' = specifier expansion; '$' = environment-variable
+			// expansion in ExecStart — both would silently rewrite the
+			// path at unit load time instead of failing at install time.
 			return fmt.Errorf("unit render: %s %q contains %q, which systemd unit syntax interprets", field, value, string(r))
 		}
 	}

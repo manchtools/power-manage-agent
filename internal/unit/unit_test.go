@@ -363,6 +363,8 @@ func TestRender_RejectsUnsafePaths(t *testing.T) {
 		"/path'quote",
 		"/path\\backslash",
 		"/path%specifier",
+		"/path$var",
+		"/path${brace}",
 		"/path\x07bell",
 		"",
 	}
