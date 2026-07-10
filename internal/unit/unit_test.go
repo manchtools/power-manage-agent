@@ -19,8 +19,9 @@ import (
 type fakeManager struct {
 	t *testing.T
 
-	version    int
-	versionErr error
+	version      int
+	versionErr   error
+	versionCalls int
 
 	readContent string
 	readErr     error
@@ -32,9 +33,16 @@ type fakeManager struct {
 
 	reloads   int
 	reloadErr error
+
+	needsReload      bool
+	needsReloadErr   error
+	needsReloadCalls int
 }
 
-func (f *fakeManager) Version(context.Context) (int, error) { return f.version, f.versionErr }
+func (f *fakeManager) Version(context.Context) (int, error) {
+	f.versionCalls++
+	return f.version, f.versionErr
+}
 func (f *fakeManager) ReadUnit(_ context.Context, unit string) (string, error) {
 	if f.readErr != nil {
 		return "", f.readErr
@@ -49,6 +57,11 @@ func (f *fakeManager) WriteUnit(_ context.Context, unit, content string) error {
 func (f *fakeManager) DaemonReload(context.Context) error {
 	f.reloads++
 	return f.reloadErr
+}
+
+func (f *fakeManager) NeedsReload(context.Context, string) (bool, error) {
+	f.needsReloadCalls++
+	return f.needsReload, f.needsReloadErr
 }
 
 func (f *fakeManager) fail(method string) {
@@ -190,6 +203,9 @@ func TestReconcile_AbsentUnitSkips(t *testing.T) {
 	if drifted || m.writeCalls != 0 || m.reloads != 0 {
 		t.Error("absent unit must be a complete no-op for the startup reconcile")
 	}
+	if m.versionCalls != 0 {
+		t.Error("absent unit must skip BEFORE the systemd version probe (container/dev runs must not invoke systemctl)")
+	}
 }
 
 // TestReconcile_VersionProbeFailureFailsSafe: probe error → render with
@@ -259,5 +275,106 @@ func TestRenderedUnitPassesSDKContentGate(t *testing.T) {
 		if err := service.ValidateUnitContent(out); err != nil {
 			t.Errorf("rendered unit (RestrictRealtime=%v) rejected by the SDK content gate: %v", rr, err)
 		}
+	}
+}
+
+// TestReconcile_PendingReloadRetried closes the reload-retry gap (local
+// CR on the spec-27 PR): a previous run wrote the unit but its
+// daemon-reload failed. The next reconcile sees identical bytes, and
+// must consult NeedDaemonReload and retry the reload — statelessly.
+func TestReconcile_PendingReloadRetried(t *testing.T) {
+	rendered, err := Render(Params{BinaryPath: testBin, DataDir: testData, RestrictRealtime: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &fakeManager{t: t, version: 257, readContent: rendered, needsReload: true}
+	drifted, err := Reconcile(context.Background(), m, testLogger(), Params{BinaryPath: testBin, DataDir: testData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drifted {
+		t.Error("identical bytes must not count as drift")
+	}
+	if m.writeCalls != 0 {
+		t.Error("identical bytes must not rewrite the unit")
+	}
+	if m.reloads != 1 {
+		t.Errorf("pending reload must be retried exactly once, got %d", m.reloads)
+	}
+}
+
+// TestReconcile_NoPendingReloadNoReload: the identical path stays a
+// no-op when systemd's loaded config is current.
+func TestReconcile_NoPendingReloadNoReload(t *testing.T) {
+	rendered, err := Render(Params{BinaryPath: testBin, DataDir: testData, RestrictRealtime: true})
+	if err != nil {
+		t.Fatal(err)
+	}
+	m := &fakeManager{t: t, version: 257, readContent: rendered, needsReload: false}
+	if _, err := Reconcile(context.Background(), m, testLogger(), Params{BinaryPath: testBin, DataDir: testData}); err != nil {
+		t.Fatal(err)
+	}
+	if m.needsReloadCalls != 1 || m.reloads != 0 {
+		t.Errorf("want one NeedsReload probe and zero reloads, got %d / %d", m.needsReloadCalls, m.reloads)
+	}
+}
+
+// TestReconcile_ReloadFailureThenRetrySucceeds is the CR-requested
+// regression pair end-to-end: run 1 drifts, writes, and fails the
+// reload (error surfaces); run 2 sees identical bytes + pending reload
+// and completes it.
+func TestReconcile_ReloadFailureThenRetrySucceeds(t *testing.T) {
+	// Run 1: drift + failing reload.
+	m1 := &fakeManager{t: t, version: 257, readContent: "stale\n", reloadErr: errors.New("dbus down")}
+	_, err := Reconcile(context.Background(), m1, testLogger(), Params{BinaryPath: testBin, DataDir: testData})
+	if err == nil {
+		t.Fatal("failing daemon-reload after a write must surface")
+	}
+	if m1.writeCalls != 1 {
+		t.Fatal("the unit must have been written before the reload failed")
+	}
+
+	// Run 2: disk now matches (m1 wrote it), systemd still stale.
+	m2 := &fakeManager{t: t, version: 257, readContent: m1.writeContent, needsReload: true}
+	drifted, err := Reconcile(context.Background(), m2, testLogger(), Params{BinaryPath: testBin, DataDir: testData})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if drifted || m2.writeCalls != 0 {
+		t.Error("run 2 must not rewrite")
+	}
+	if m2.reloads != 1 {
+		t.Errorf("run 2 must complete the pending reload, got %d reloads", m2.reloads)
+	}
+}
+
+// TestRender_RejectsUnsafePaths pins the render-input validation (local
+// CR): BinaryPath/DataDir land verbatim in ExecStart=/Environment=, so
+// whitespace, quotes, backslashes, %-specifiers, control characters,
+// or relative paths must be refused — a mangled root-owned unit is
+// worse than a loud install failure.
+func TestRender_RejectsUnsafePaths(t *testing.T) {
+	bad := []string{
+		"relative/path",
+		"/path with space",
+		"/path\twith-tab",
+		"/path\nwith-newline",
+		"/path\"quote",
+		"/path'quote",
+		"/path\\backslash",
+		"/path%specifier",
+		"/path\x07bell",
+		"",
+	}
+	for _, p := range bad {
+		if _, err := Render(Params{BinaryPath: p, DataDir: testData}); err == nil {
+			t.Errorf("BinaryPath %q must be rejected", p)
+		}
+		if _, err := Render(Params{BinaryPath: testBin, DataDir: p}); err == nil {
+			t.Errorf("DataDir %q must be rejected", p)
+		}
+	}
+	if _, err := Render(Params{BinaryPath: "/opt/pm/agent-v2", DataDir: "/srv/pm-data_1"}); err != nil {
+		t.Errorf("plain absolute paths must pass, got %v", err)
 	}
 }

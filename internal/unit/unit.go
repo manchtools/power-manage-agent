@@ -26,6 +26,7 @@ import (
 	"fmt"
 	"io/fs"
 	"log/slog"
+	"strings"
 	"text/template"
 )
 
@@ -53,6 +54,7 @@ type Manager interface {
 	ReadUnit(ctx context.Context, unit string) (string, error)
 	WriteUnit(ctx context.Context, unit, content string) error
 	DaemonReload(ctx context.Context) error
+	NeedsReload(ctx context.Context, unit string) (bool, error)
 }
 
 // Params are the render inputs. BinaryPath and DataDir come from the
@@ -68,14 +70,39 @@ type Params struct {
 
 // Render produces the unit-file content for p.
 func Render(p Params) (string, error) {
-	if p.BinaryPath == "" || p.DataDir == "" {
-		return "", fmt.Errorf("unit render: BinaryPath and DataDir are required")
+	if err := validateUnitPath("BinaryPath", p.BinaryPath); err != nil {
+		return "", err
+	}
+	if err := validateUnitPath("DataDir", p.DataDir); err != nil {
+		return "", err
 	}
 	var buf bytes.Buffer
 	if err := tmpl.Execute(&buf, p); err != nil {
 		return "", fmt.Errorf("unit render: %w", err)
 	}
 	return buf.String(), nil
+}
+
+// validateUnitPath rejects render inputs that would corrupt the unit:
+// the values land verbatim in ExecStart= (systemd word-splits on
+// whitespace and interprets quotes/backslashes) and Environment=
+// (systemd expands %-specifiers), so whitespace, quotes, backslashes,
+// '%', control characters, and relative paths are refused. These are
+// operator-supplied install flags, not attacker input — the point is a
+// loud install-time failure instead of a silently mangled root unit.
+func validateUnitPath(field, value string) error {
+	if !strings.HasPrefix(value, "/") {
+		return fmt.Errorf("unit render: %s %q must be an absolute path", field, value)
+	}
+	for _, r := range value {
+		switch {
+		case r <= 0x20 || r == 0x7f: // control chars incl. space/tab/newline
+			return fmt.Errorf("unit render: %s %q contains whitespace or a control character", field, value)
+		case r == '"' || r == '\'' || r == '\\' || r == '%':
+			return fmt.Errorf("unit render: %s %q contains %q, which systemd unit syntax interprets", field, value, string(r))
+		}
+	}
+	return nil
 }
 
 // Reconcile is the daemon-startup path: compare the on-disk unit with
@@ -97,6 +124,21 @@ func EnsureInstalled(ctx context.Context, mgr Manager, logger *slog.Logger, p Pa
 }
 
 func sync(ctx context.Context, mgr Manager, logger *slog.Logger, p Params, createIfMissing bool) (bool, error) {
+	// Read FIRST: an absent unit (container/dev run) must skip before
+	// anything touches systemctl — no version probe, no warnings.
+	absent := false
+	onDisk, err := mgr.ReadUnit(ctx, UnitName)
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		if !createIfMissing {
+			logger.Debug("no unit file on disk; skipping unit reconcile", "unit", UnitName)
+			return false, nil
+		}
+		absent = true
+	case err != nil:
+		return false, fmt.Errorf("read unit %s: %w", UnitName, err)
+	}
+
 	// Version probe failure fails SAFE, not closed: render with
 	// RestrictRealtime=false (the same precaution install.sh took) —
 	// a broken probe must not leave a stale bounding set in place.
@@ -112,20 +154,23 @@ func sync(ctx context.Context, mgr Manager, logger *slog.Logger, p Params, creat
 		return false, err
 	}
 
-	onDisk, err := mgr.ReadUnit(ctx, UnitName)
-	switch {
-	case errors.Is(err, fs.ErrNotExist):
-		if !createIfMissing {
-			logger.Debug("no unit file on disk; skipping unit reconcile", "unit", UnitName)
+	if !absent && onDisk == rendered {
+		// The file is current, but a PREVIOUS run may have written it
+		// and then failed its daemon-reload — in which case systemd is
+		// still running the stale loaded config and a byte compare
+		// alone would never retry. NeedDaemonReload is the stateless
+		// truth for that; complete the pending reload here.
+		pending, nrErr := mgr.NeedsReload(ctx, UnitName)
+		if nrErr != nil {
+			logger.Warn("could not check for a pending daemon-reload; continuing", "unit", UnitName, "error", nrErr)
 			return false, nil
 		}
-		onDisk = ""
-	case err != nil:
-		return false, fmt.Errorf("read unit %s: %w", UnitName, err)
-	}
-
-	if onDisk == rendered {
-		logger.Debug("unit file matches the embedded template", "unit", UnitName)
+		if pending {
+			logger.Warn("unit file is current but systemd's loaded config is stale (an earlier daemon-reload failed?); completing the reload", "unit", UnitName)
+			if err := mgr.DaemonReload(ctx); err != nil {
+				return false, fmt.Errorf("retry daemon-reload for %s: %w", UnitName, err)
+			}
+		}
 		return false, nil
 	}
 
