@@ -10,6 +10,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -18,16 +19,24 @@ import (
 )
 
 // agentScript builds a staged "agent binary" as a shell script that
-// answers `version` and `self-test`, so executeAgentUpdate can be driven
-// end-to-end without a real binary.
+// answers `version`, `self-test`, and `install-unit` (recording the
+// invocation argv to "$0.install-unit", spec 27), so executeAgentUpdate
+// can be driven end-to-end without a real binary.
 func agentScript(version string, selfTestExit int) []byte {
+	return agentScriptUnitExit(version, selfTestExit, 0)
+}
+
+// agentScriptUnitExit is agentScript with a controllable install-unit
+// exit code, for the fail-open test.
+func agentScriptUnitExit(version string, selfTestExit, installUnitExit int) []byte {
 	return []byte(fmt.Sprintf(`#!/bin/sh
 case "$1" in
   version) echo %q ;;
   self-test) exit %d ;;
+  install-unit) shift; echo "$@" > "$0.install-unit"; exit %d ;;
   *) exit 0 ;;
 esac
-`, version, selfTestExit))
+`, version, selfTestExit, installUnitExit))
 }
 
 func sha256hex(b []byte) string {
@@ -217,6 +226,54 @@ func TestExecuteAgentUpdate_HappyPathSwapsAndShutsDown(t *testing.T) {
 	}
 	if !h.shutdownCalled() {
 		t.Error("Shutdown must be invoked after a successful update")
+	}
+}
+
+// TestExecuteAgentUpdate_RefreshesUnitFromNewBinary pins spec 27 AC 4:
+// after the swap + self-test and BEFORE the shutdown signal, the
+// updater invokes the NEW binary's install-unit with the running data
+// dir — so the respawn systemd performs starts the new binary under
+// the new unit.
+func TestExecuteAgentUpdate_RefreshesUnitFromNewBinary(t *testing.T) {
+	staged := agentScript("v2026.06.05", 0)
+	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
+
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	if err != nil {
+		t.Fatalf("update failed: %v", err)
+	}
+	if !changed {
+		t.Error("changed must be true")
+	}
+	argv, err := os.ReadFile(h.binaryPath + ".install-unit")
+	if err != nil {
+		t.Fatalf("install-unit was not invoked on the new binary: %v", err)
+	}
+	if !strings.Contains(string(argv), "--data-dir="+h.e.updateCfg.DataDir) {
+		t.Errorf("install-unit argv = %q, want --data-dir=%s", string(argv), h.e.updateCfg.DataDir)
+	}
+	if !h.shutdownCalled() {
+		t.Error("Shutdown must still be invoked after the unit refresh")
+	}
+}
+
+// TestExecuteAgentUpdate_UnitInstallFailureIsFailOpen pins the second
+// half of AC 4: a failing install-unit never aborts a completed binary
+// swap — the update still succeeds and the shutdown fires (the new
+// binary's startup reconcile retries after the respawn).
+func TestExecuteAgentUpdate_UnitInstallFailureIsFailOpen(t *testing.T) {
+	staged := agentScriptUnitExit("v2026.06.05", 0, 1)
+	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
+
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	if err != nil {
+		t.Fatalf("update must succeed despite install-unit failure: %v", err)
+	}
+	if !changed {
+		t.Error("changed must be true")
+	}
+	if !h.shutdownCalled() {
+		t.Error("Shutdown must be invoked despite install-unit failure")
 	}
 }
 

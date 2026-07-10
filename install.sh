@@ -336,140 +336,18 @@ create_directories() {
 }
 
 install_systemd_service() {
-    local service_file="/etc/systemd/system/${SERVICE_NAME}.service"
-
     log_info "Installing systemd service..."
 
-    # Detect systemd version to conditionally enable RestrictRealtime.
-    # systemd <257 (Debian Bookworm 252) implements RestrictRealtime via a
-    # seccomp filter that sets no_new_privs, preventing the agent from using
-    # sudo. systemd 257+ (Trixie) does not have this issue.
-    local restrict_realtime="false"
-    local systemd_ver
-    systemd_ver=$(systemctl --version 2>/dev/null | head -1 | awk '{for(i=1;i<=NF;i++) if($i+0==$i){print $i; exit}}')
-    if [[ -z "$systemd_ver" ]]; then
-        log_warn "Could not detect systemd version, disabling RestrictRealtime as a precaution"
-    elif ! [[ "$systemd_ver" =~ ^[0-9]+$ ]]; then
-        log_warn "Unexpected systemd version format '$systemd_ver', disabling RestrictRealtime as a precaution"
-    elif [[ "$systemd_ver" -ge 257 ]]; then
-        restrict_realtime="true"
-    fi
-
-    cat > "$service_file" << EOF
-[Unit]
-Description=Power Manage Agent
-Documentation=https://github.com/manchtools/power-manage
-After=network-online.target
-Wants=network-online.target
-StartLimitIntervalSec=60
-StartLimitBurst=3
-
-[Service]
-Type=simple
-# Agent runs as root. The previous power-manage + sudoers escalation
-# model was retired (see agent/README.md "Runs as root"); every
-# privileged operation now runs in-process without a sudo round-trip.
-User=root
-Group=root
-
-# Environment
-Environment="POWER_MANAGE_DATA_DIR=$DATA_DIR"
-
-# Main process
-ExecStart=$BINARY_PATH -data-dir=$DATA_DIR -log-level=info
-
-# Restart configuration
-Restart=always
-RestartSec=10
-
-# Runtime directory (/run/pm-agent) for enrollment socket
-RuntimeDirectory=pm-agent
-RuntimeDirectoryMode=0755
-
-# Security hardening — most ProtectXxx knobs are intentionally
-# disabled: the agent's job is to mutate system state (install
-# packages, write unit files, reload systemd, set LUKS keys, …) and
-# the protection knobs would block exactly those operations.
-NoNewPrivileges=false
-ProtectSystem=false
-ProtectHome=false
-PrivateTmp=false
-ProtectKernelTunables=false
-ProtectKernelModules=false
-ProtectControlGroups=true
-RestrictRealtime=$restrict_realtime
-RestrictSUIDSGID=false
-
-# Capabilities.
-#
-# Running as root means the agent process inherits the full default
-# capability set, but we pin both the ambient set and the bounding
-# set so:
-#
-#   - Children launched from shell actions (which may shed caps via
-#     execve onto a binary without file caps) keep the caps the
-#     action needs. The bounding set is the hard ceiling that the
-#     execve cap-stripping rules reduce against, so any cap NOT
-#     listed below is unavailable to children regardless of how
-#     they're launched.
-#
-#   - Remote terminal sessions spawn /bin/bash under per-user
-#     pm-tty-* accounts via setresuid/setresgid. CAP_SETUID and
-#     CAP_SETGID are already in root's effective set, but listing
-#     them as ambient caps makes the privilege transition explicit
-#     and survives any future drop-priv refactor that runs the
-#     agent as a non-root user with the relevant caps file-set on
-#     the binary.
-#
-#   - CAP_AUDIT_WRITE in the bounding set keeps the kernel-audit
-#     channel open for any setuid-root child (sudo invocations
-#     from run_as_root shell actions still happen on hosts where
-#     the operator policy uses them). Without it, audit messages
-#     fail with "audit message cannot be sent: operation not
-#     permitted" — silent compliance gap on SOC2/PCI/CIS hosts.
-#
-# Bounding set caps and what they're for:
-#   CAP_SETUID / CAP_SETGID — drop priv to per-user pm-tty-* shells.
-#   CAP_AUDIT_WRITE — kernel audit log writes from setuid children.
-#   CAP_CHOWN / CAP_DAC_OVERRIDE / CAP_FOWNER — file ownership +
-#     permission overrides during package hooks and config writes.
-#   CAP_NET_BIND_SERVICE — daemons restarted by shell actions that
-#     bind privileged ports without setuid.
-#   CAP_NET_ADMIN — firewall control via ufw / firewall-cmd / nft.
-#   CAP_SYS_ADMIN — mount / umount during LUKS operations.
-#   CAP_KILL — signal other-uid (pm-tty-*) process groups when tearing
-#     down terminal sessions; without it the in-process root model's
-#     kill(-pgid, …) / pkill -u returns EPERM and the sweeper degrades
-#     to relying on pty-close SIGHUP, leaking detached/ignoring procs.
-#   CAP_SETFCAP — let dpkg/rpm set file capabilities during package
-#     installs (e.g. iputils, anything shipping +ep file caps).
-#   CAP_NET_RAW — file-cap binaries like ping (and raw-socket children)
-#     exec-fail with EPERM under a bounding set that excludes it.
-#
-# Since the agent runs as root (User=root), the in-process daemon's own
-# syscalls are also subject to this bounding set — not just its
-# children — so the three caps above are required for the in-process
-# model, not optional. The agent's only listener is the UNIX socket at
-# /run/pm-agent/enroll.sock — it never binds a TCP port itself.
-AmbientCapabilities=CAP_SETUID CAP_SETGID
-CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SETFCAP CAP_NET_RAW
-
-# Allow network access
-PrivateNetwork=false
-
-# Logging
-StandardOutput=journal
-StandardError=journal
-SyslogIdentifier=$SERVICE_NAME
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-    chmod 644 "$service_file"
-
-    log_info "Reloading systemd daemon..."
-    systemctl daemon-reload
+    # The unit file ships INSIDE the agent binary as the single source
+    # of truth (spec 27): the binary renders it (including the
+    # RestrictRealtime systemd-version conditional, which used to live
+    # here), validates it, writes it atomically to
+    # /etc/systemd/system/${SERVICE_NAME}.service, and reloads systemd.
+    # This script only triggers the first placement — systemd cannot
+    # start the service before a unit exists — and the running agent
+    # reconciles the unit against its embedded copy at every startup,
+    # so a binary update updates the unit.
+    "$BINARY_PATH" install-unit --data-dir="$DATA_DIR"
 }
 
 enroll_agent() {

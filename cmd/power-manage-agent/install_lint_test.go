@@ -60,8 +60,12 @@ func TestInstall_TokenDeliveredViaFileNotArgv(t *testing.T) {
 // WS7 #9: every capability in the systemd unit's CapabilityBoundingSet
 // must carry a justification comment. Self-discovering: a cap added
 // without a comment fails this test.
+// TestInstall_CapsDocumented walks the agent's embedded unit TEMPLATE
+// (the single source since spec 27 — install.sh no longer carries the
+// unit) and requires a justification comment for every capability in
+// the bounding set.
 func TestInstall_CapsDocumented(t *testing.T) {
-	sh := readRepoFile(t, "install.sh")
+	sh := readRepoFile(t, filepath.Join("internal", "unit", "power-manage-agent.service.tmpl"))
 
 	var capLine string
 	commentCaps := map[string]bool{}
@@ -82,7 +86,7 @@ func TestInstall_CapsDocumented(t *testing.T) {
 	}
 
 	if capLine == "" {
-		t.Fatal("no CapabilityBoundingSet= line found in install.sh")
+		t.Fatal("no CapabilityBoundingSet= line found in the unit template")
 	}
 	caps := strings.Fields(capLine)
 	if len(caps) == 0 {
@@ -92,6 +96,29 @@ func TestInstall_CapsDocumented(t *testing.T) {
 		if !commentCaps[c] {
 			t.Errorf("capability %s in CapabilityBoundingSet has no justification comment", c)
 		}
+	}
+}
+
+// TestInstall_SingleUnitSource is spec 27's grep guard: install.sh must
+// carry NO copy of the unit (no heredoc, no unit directives) — the
+// embedded template is the single source — and must invoke the
+// binary's install-unit instead. The invocation assertion is the
+// matches-zero guard: if the subcommand is ever renamed, this fails
+// loudly rather than the directive checks passing vacuously against a
+// script that installs no unit at all.
+func TestInstall_SingleUnitSource(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+
+	for _, directive := range []string{"CapabilityBoundingSet=", "AmbientCapabilities=", "ExecStart=", "RestrictRealtime=", "[Service]"} {
+		if strings.Contains(sh, directive) {
+			t.Errorf("install.sh contains unit directive %q — the unit's single source is the embedded template", directive)
+		}
+	}
+	if !strings.Contains(sh, `"$BINARY_PATH" install-unit --data-dir="$DATA_DIR"`) {
+		t.Error("install.sh must install the unit via the binary's install-unit subcommand")
+	}
+	if strings.Contains(sh, "systemctl --version") {
+		t.Error("the systemd-version probe moved into the binary; install.sh must not probe")
 	}
 }
 

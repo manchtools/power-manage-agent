@@ -92,6 +92,8 @@ func main() {
 			os.Exit(runSelfTest(os.Args[2:]))
 		case "tty":
 			os.Exit(runTTY(os.Args[2:]))
+		case "install-unit":
+			os.Exit(runInstallUnit(os.Args[2:]))
 		}
 	}
 
@@ -141,6 +143,12 @@ func main() {
 		logger.Info("received signal, shutting down", "signal", sig)
 		cancel()
 	}()
+
+	// Spec 27: reconcile the on-disk systemd unit against the template
+	// embedded in THIS binary, so a binary update updates the unit and
+	// capability drift (agent#187) cannot recur. Fail-open, never
+	// restarts — a rewritten unit applies at the next restart/reboot.
+	reconcileUnitAtStartup(ctx, runner, logger, cfg.DataDir)
 
 	// Initialize credential store
 	credStore := credentials.NewStore(cfg.DataDir)

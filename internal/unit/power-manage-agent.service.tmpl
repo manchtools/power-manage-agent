@@ -1,0 +1,108 @@
+[Unit]
+Description=Power Manage Agent
+Documentation=https://github.com/manchtools/power-manage
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=simple
+# Agent runs as root. The previous power-manage + sudoers escalation
+# model was retired (see agent/README.md "Runs as root"); every
+# privileged operation now runs in-process without a sudo round-trip.
+User=root
+Group=root
+
+# Environment
+Environment="POWER_MANAGE_DATA_DIR={{.DataDir}}"
+
+# Main process
+ExecStart={{.BinaryPath}} -data-dir={{.DataDir}} -log-level=info
+
+# Restart configuration
+Restart=always
+RestartSec=10
+
+# Runtime directory (/run/pm-agent) for enrollment socket
+RuntimeDirectory=pm-agent
+RuntimeDirectoryMode=0755
+
+# Security hardening — most ProtectXxx knobs are intentionally
+# disabled: the agent's job is to mutate system state (install
+# packages, write unit files, reload systemd, set LUKS keys, …) and
+# the protection knobs would block exactly those operations.
+NoNewPrivileges=false
+ProtectSystem=false
+ProtectHome=false
+PrivateTmp=false
+ProtectKernelTunables=false
+ProtectKernelModules=false
+ProtectControlGroups=true
+RestrictRealtime={{if .RestrictRealtime}}true{{else}}false{{end}}
+RestrictSUIDSGID=false
+
+# Capabilities.
+#
+# Running as root means the agent process inherits the full default
+# capability set, but we pin both the ambient set and the bounding
+# set so:
+#
+#   - Children launched from shell actions (which may shed caps via
+#     execve onto a binary without file caps) keep the caps the
+#     action needs. The bounding set is the hard ceiling that the
+#     execve cap-stripping rules reduce against, so any cap NOT
+#     listed below is unavailable to children regardless of how
+#     they're launched.
+#
+#   - Remote terminal sessions spawn /bin/bash under per-user
+#     pm-tty-* accounts via setresuid/setresgid. CAP_SETUID and
+#     CAP_SETGID are already in root's effective set, but listing
+#     them as ambient caps makes the privilege transition explicit
+#     and survives any future drop-priv refactor that runs the
+#     agent as a non-root user with the relevant caps file-set on
+#     the binary.
+#
+#   - CAP_AUDIT_WRITE in the bounding set keeps the kernel-audit
+#     channel open for any setuid-root child (sudo invocations
+#     from run_as_root shell actions still happen on hosts where
+#     the operator policy uses them). Without it, audit messages
+#     fail with "audit message cannot be sent: operation not
+#     permitted" — silent compliance gap on SOC2/PCI/CIS hosts.
+#
+# Bounding set caps and what they're for:
+#   CAP_SETUID / CAP_SETGID — drop priv to per-user pm-tty-* shells.
+#   CAP_AUDIT_WRITE — kernel audit log writes from setuid children.
+#   CAP_CHOWN / CAP_DAC_OVERRIDE / CAP_FOWNER — file ownership +
+#     permission overrides during package hooks and config writes.
+#   CAP_NET_BIND_SERVICE — daemons restarted by shell actions that
+#     bind privileged ports without setuid.
+#   CAP_NET_ADMIN — firewall control via ufw / firewall-cmd / nft.
+#   CAP_SYS_ADMIN — mount / umount during LUKS operations.
+#   CAP_KILL — signal other-uid (pm-tty-*) process groups when tearing
+#     down terminal sessions; without it the in-process root model's
+#     kill(-pgid, …) / pkill -u returns EPERM and the sweeper degrades
+#     to relying on pty-close SIGHUP, leaking detached/ignoring procs.
+#   CAP_SETFCAP — let dpkg/rpm set file capabilities during package
+#     installs (e.g. iputils, anything shipping +ep file caps).
+#   CAP_NET_RAW — file-cap binaries like ping (and raw-socket children)
+#     exec-fail with EPERM under a bounding set that excludes it.
+#
+# Since the agent runs as root (User=root), the in-process daemon's own
+# syscalls are also subject to this bounding set — not just its
+# children — so the three caps above are required for the in-process
+# model, not optional. The agent's only listener is the UNIX socket at
+# /run/pm-agent/enroll.sock — it never binds a TCP port itself.
+AmbientCapabilities=CAP_SETUID CAP_SETGID
+CapabilityBoundingSet=CAP_SETUID CAP_SETGID CAP_AUDIT_WRITE CAP_CHOWN CAP_DAC_OVERRIDE CAP_FOWNER CAP_NET_BIND_SERVICE CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_SETFCAP CAP_NET_RAW
+
+# Allow network access
+PrivateNetwork=false
+
+# Logging
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=power-manage-agent
+
+[Install]
+WantedBy=multi-user.target
