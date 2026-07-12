@@ -50,7 +50,9 @@ func verifierHandler(t *testing.T, caPEM []byte, oq osqueryRunner) *Handler {
 	t.Helper()
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
-	h := NewHandler(slog.Default(), executor.NewExecutor(verifier, nil), nil, nil, make(chan struct{}, 1))
+	exec := executor.NewExecutor(verifier, nil)
+	exec.SetDeviceID(testDeviceID)
+	h := NewHandler(slog.Default(), exec, nil, nil, make(chan struct{}, 1))
 	if oq != nil {
 		h.setOsqueryForTest(oq)
 	}
