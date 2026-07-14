@@ -80,8 +80,9 @@ func (c *Cache) Check(fingerprint string) error {
 }
 
 // Refresh fetches a new snapshot and atomically swaps it in. On fetch failure
-// the previous snapshot is retained (bounded-staleness fail-open until
-// not_after); the error is returned so callers can log it.
+// the previous snapshot is retained — still bounded by its not_after, after
+// which Check fails closed — so a brief control blip does not immediately sever
+// the data plane. The error is returned so callers can log it.
 func (c *Cache) Refresh(ctx context.Context) error {
 	if c.fetch == nil {
 		return errors.New("gateway CRL: nil fetch func")

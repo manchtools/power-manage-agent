@@ -69,7 +69,16 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 	// Best-effort initial load so the first connect can pass the gate; until a
 	// list loads, Check fails closed and the connection loop retries (AC 12).
 	crlCache := crl.New(func(fctx context.Context) (*sdk.GatewayCRL, error) {
-		cur := reloadCredsForReconnect(credStore, creds, logger)
+		// Load straight from the store each fetch. This presents the current
+		// (rotated) device cert to control AND avoids capturing runAgent's
+		// `creds` variable, which the reconnect loop reassigns concurrently —
+		// reading it from this refresh goroutine would be a data race. A load
+		// failure returns an error; the cache keeps its last-good snapshot
+		// until not_after, then Check fails closed.
+		cur, err := credStore.Load()
+		if err != nil {
+			return nil, fmt.Errorf("load credentials for CRL fetch: %w", err)
+		}
 		if strings.TrimSpace(cur.ControlAddr) == "" {
 			return nil, errors.New("no control address in credentials for CRL fetch")
 		}
