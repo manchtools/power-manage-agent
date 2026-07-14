@@ -3,6 +3,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -11,6 +13,7 @@ import (
 	sdk "github.com/manchtools/power-manage-sdk"
 	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
+	"github.com/manchtools/power-manage/agent/internal/crl"
 	"github.com/manchtools/power-manage/agent/internal/handler"
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
@@ -57,6 +60,30 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 	// certificate before building the mTLS client.
 	firstConnect := true
 
+	// Gateway CRL (spec 31 Part D): the revocation list is fetched from control
+	// and every gateway's server-cert fingerprint is checked against it during
+	// the mTLS handshake (WithMTLSFromPEMAndRevocationCheck below). The fetch
+	// reloads creds each time so it always presents the freshest (rotated)
+	// device cert, and reaches control directly — no gateway relay (AC 13), so
+	// a revoked gateway can be learned about even while still connected to it.
+	// Best-effort initial load so the first connect can pass the gate; until a
+	// list loads, Check fails closed and the connection loop retries (AC 12).
+	crlCache := crl.New(func(fctx context.Context) (*sdk.GatewayCRL, error) {
+		cur := reloadCredsForReconnect(credStore, creds, logger)
+		if strings.TrimSpace(cur.ControlAddr) == "" {
+			return nil, errors.New("no control address in credentials for CRL fetch")
+		}
+		mtls, err := sdk.WithMTLSFromPEMAndSystemRoots(cur.Certificate, cur.PrivateKey, cur.CACert)
+		if err != nil {
+			return nil, fmt.Errorf("configure control mTLS for CRL: %w", err)
+		}
+		return sdk.FetchGatewayCRL(fctx, cur.ControlAddr, mtls)
+	}, logger, crl.WithClock(now))
+	if err := crlCache.Refresh(ctx); err != nil {
+		logger.Warn("initial gateway CRL fetch failed; gateway connections refused until it loads", "error", err)
+	}
+	go crlCache.Run(ctx, crlRefreshInterval)
+
 	for {
 		if !firstConnect {
 			creds = reloadCredsForReconnect(credStore, creds, logger)
@@ -79,7 +106,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 				"gateway", creds.GatewayAddr, "error", err)
 			os.Exit(1)
 		}
-		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
+		mtlsOpt, err := sdk.WithMTLSFromPEMAndRevocationCheck(creds.Certificate, creds.PrivateKey, creds.CACert, crlCache.Check)
 		if err != nil {
 			logger.Error("failed to configure mTLS", "error", err)
 			os.Exit(1)
