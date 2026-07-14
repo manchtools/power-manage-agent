@@ -13,19 +13,34 @@ import (
 	"github.com/manchtools/power-manage-sdk/verify"
 )
 
+// testDeviceID is the device id the test executor is configured with, and the
+// default target every signed test envelope is bound to (see signEnv), so the
+// PMSEC-001 target check passes for a matching envelope. Cross-device tests set
+// a different TargetDeviceId explicitly.
+const testDeviceID = "01TESTDEVICE0000000000000A"
+
 // testVerifierAndSigner returns an Executor whose verifier is built from a
-// fresh self-signed CA, plus the matching ActionSigner. A signature minted
-// by this signer verifies; anything else (or nothing) is refused.
+// fresh self-signed CA and whose device id is testDeviceID, plus the matching
+// ActionSigner. A signature minted by this signer verifies; anything else (or
+// nothing) is refused.
 func testVerifierAndSigner(t *testing.T) (*Executor, *verify.ActionSigner) {
 	t.Helper()
 	caPEM, key, _ := cryptotest.GenCA(t, "test-ca")
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
-	return NewExecutor(verifier, nil), verify.NewActionSigner(key)
+	exec := NewExecutor(verifier, nil)
+	exec.SetDeviceID(testDeviceID)
+	return exec, verify.NewActionSigner(key)
 }
 
 func signEnv(t *testing.T, signer *verify.ActionSigner, env *pb.SignedActionEnvelope) (envelope []byte, signature []byte) {
 	t.Helper()
+	// Default the signed target to this test device so a plain envelope passes
+	// the PMSEC-001 target check; a test that wants a cross-device envelope sets
+	// TargetDeviceId itself before calling.
+	if env.GetTargetDeviceId() == "" {
+		env.TargetDeviceId = testDeviceID
+	}
 	b, err := verify.MarshalEnvelope(env)
 	require.NoError(t, err)
 	sig, err := signer.Sign(b)
@@ -137,6 +152,69 @@ func TestExecutor_VerifyEnvelopeFailClosed(t *testing.T) {
 		noVerifier := NewExecutor(nil, nil)
 		_, err := noVerifier.VerifyEnvelope(envBytes, sig)
 		assert.Error(t, err, "an executor with no verifier must refuse, not pass")
+	})
+}
+
+// TestExecutor_VerifyEnvelope_EnforcesTargetBinding is the PMSEC-001 regression:
+// verification is an AUTHORIZATION step, not just an authenticity check. A
+// compromised gateway/relay that captures device A's validly-signed (same-CA)
+// envelope and routes it to device B must be refused, even though the signature
+// is genuine — because the SIGNED target_device_id does not match B. Fail closed
+// on an empty target and on an agent that does not know its own device id.
+func TestExecutor_VerifyEnvelope_EnforcesTargetBinding(t *testing.T) {
+	exec, signer := testVerifierAndSigner(t) // exec device id == testDeviceID
+
+	shell := func(id, target string) *pb.SignedActionEnvelope {
+		return &pb.SignedActionEnvelope{
+			ActionId:       &pb.ActionId{Value: id},
+			ActionType:     pb.ActionType_ACTION_TYPE_SHELL,
+			TargetDeviceId: target,
+			Params:         &pb.SignedActionEnvelope_Shell{Shell: &pb.ShellParams{Script: "echo hi", RunAsRoot: true}},
+		}
+	}
+	signRaw := func(env *pb.SignedActionEnvelope) (b, sig []byte) {
+		var err error
+		b, err = verify.MarshalEnvelope(env) // no defaulting: sign exactly what's given
+		require.NoError(t, err)
+		sig, err = signer.Sign(b)
+		require.NoError(t, err)
+		return b, sig
+	}
+
+	t.Run("matching target verifies", func(t *testing.T) {
+		b, sig := signRaw(shell("01HMATCH", testDeviceID))
+		got, err := exec.VerifyEnvelope(b, sig)
+		require.NoError(t, err)
+		require.Equal(t, testDeviceID, got.GetTargetDeviceId())
+	})
+
+	t.Run("cross-device target is refused", func(t *testing.T) {
+		// Genuine signature (same CA), only the target differs — the exact
+		// compromised-relay cross-device replay PMSEC-001 describes.
+		b, sig := signRaw(shell("01HOTHERDEV", "01OTHERDEVICE0000000000B"))
+		_, err := exec.VerifyEnvelope(b, sig)
+		require.Error(t, err, "a validly-signed envelope for a DIFFERENT device must be refused")
+		require.Contains(t, err.Error(), "target device")
+	})
+
+	t.Run("empty signed target is refused (fail closed)", func(t *testing.T) {
+		b, sig := signRaw(shell("01HNOTARGET", ""))
+		_, err := exec.VerifyEnvelope(b, sig)
+		require.Error(t, err, "an envelope that binds no target device must be refused")
+	})
+
+	t.Run("agent without a configured device id fails closed", func(t *testing.T) {
+		caPEM, key, _ := cryptotest.GenCA(t, "test-ca-2")
+		verifier, err := verify.NewActionVerifier(caPEM)
+		require.NoError(t, err)
+		noID := NewExecutor(verifier, nil) // deliberately no SetDeviceID
+		s := verify.NewActionSigner(key)
+		b, err := verify.MarshalEnvelope(shell("01HNOID", testDeviceID))
+		require.NoError(t, err)
+		sig, err := s.Sign(b)
+		require.NoError(t, err)
+		_, verr := noID.VerifyEnvelope(b, sig)
+		require.Error(t, verr, "an agent that does not know its own device id must refuse to execute")
 	})
 }
 

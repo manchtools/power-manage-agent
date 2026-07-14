@@ -31,6 +31,12 @@ const (
 	defaultHeartbeatInterval = 30 * time.Second
 	defaultSyncInterval      = 30 * time.Minute
 
+	// crlRefreshInterval is how often the agent re-fetches the gateway CRL from
+	// control (spec 31 Part D). Well below control's not_after so the list
+	// renews before it can expire; a persistent fetch failure lets the snapshot
+	// age past not_after and the revocation check fails closed (AC 12).
+	crlRefreshInterval = 5 * time.Minute
+
 	// Exponential backoff constants for reconnection
 	minInitialBackoff = 5 * time.Second
 	maxInitialBackoff = 10 * time.Second

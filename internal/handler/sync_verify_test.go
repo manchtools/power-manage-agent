@@ -28,8 +28,17 @@ func testCAAndSigner(t *testing.T) ([]byte, *verify.ActionSigner) {
 // those bytes with the CA signer, returning the bytes the agent receives
 // (envelope) and the CA signature over them. The agent MUST verify over,
 // and unmarshal-then-execute, THESE SAME bytes (sdk#82).
+// testDeviceID is the device id the verifier handlers are configured with, and
+// the default target every signed test envelope is bound to (see signEnvelope),
+// so the PMSEC-001 target check passes. Cross-device tests set TargetDeviceId
+// explicitly.
+const testDeviceID = "01TESTDEVICE0000000000000A"
+
 func signEnvelope(t *testing.T, signer *verify.ActionSigner, env *pb.SignedActionEnvelope) (envelope []byte, signature []byte) {
 	t.Helper()
+	if env.GetTargetDeviceId() == "" {
+		env.TargetDeviceId = testDeviceID
+	}
 	envBytes, err := verify.MarshalEnvelope(env)
 	require.NoError(t, err)
 	sig, err := signer.Sign(envBytes)
@@ -45,7 +54,9 @@ func newVerifierHandler(t *testing.T, caPEM []byte) (*Handler, chan struct{}) {
 	verifier, err := verify.NewActionVerifier(caPEM)
 	require.NoError(t, err)
 	syncTrigger := make(chan struct{}, 1)
-	h := NewHandler(slog.Default(), executor.NewExecutor(verifier, nil), nil, nil, syncTrigger)
+	exec := executor.NewExecutor(verifier, nil)
+	exec.SetDeviceID(testDeviceID)
+	h := NewHandler(slog.Default(), exec, nil, nil, syncTrigger)
 	return h, syncTrigger
 }
 
@@ -160,6 +171,28 @@ func TestOnAction_ParamsTamperRefused(t *testing.T) {
 	require.NoError(t, err)
 	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
 		"tampered envelope bytes must be refused before any execution")
+}
+
+// TestOnAction_CrossDeviceEnvelopeRefused is the push-path half of the PMSEC-001
+// regression: a validly-signed (same-CA) envelope whose target_device_id is a
+// DIFFERENT device — the compromised-relay cross-device replay — must be refused
+// end-to-end (FAILED, nothing executes), even though the signature is genuine.
+func TestOnAction_CrossDeviceEnvelopeRefused(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	h, _ := newVerifierHandler(t, caPEM) // handler device id == testDeviceID
+
+	env := &pb.SignedActionEnvelope{
+		ActionId:       &pb.ActionId{Value: "01HXDEV"},
+		ActionType:     pb.ActionType_ACTION_TYPE_SHELL,
+		TargetDeviceId: "01OTHERDEVICE0000000000B", // NOT this device
+		Params:         &pb.SignedActionEnvelope_Shell{Shell: &pb.ShellParams{Script: "true", RunAsRoot: true}},
+	}
+	envBytes, sig := signEnvelope(t, signer, env) // target set, so not defaulted
+
+	res, err := h.OnAction(context.Background(), envBytes, sig)
+	require.NoError(t, err)
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, res.Status,
+		"a validly-signed envelope for a DIFFERENT device must be refused, not executed")
 }
 
 // TestOnAction_NoVerifierIsFailClosed pins that an executor with no verifier
