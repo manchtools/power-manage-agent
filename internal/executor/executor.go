@@ -303,16 +303,12 @@ func (e *Executor) VerifyEnvelope(envelopeBytes, signature []byte) (*pb.SignedAc
 	// (CA-covered) action onto another device that trusts the same CA
 	// (PMSEC-001). Verification alone proves the bytes are authentic, not that
 	// this device is their intended target — so make verification an
-	// authorization step. Fail closed: refuse if we do not know our own device id
-	// or the envelope targets a different (or empty) device. The control server's
-	// single signing seam (actionparams.BuildAndSignEnvelope) always binds the
-	// target device, so a legitimate envelope for this device always matches.
-	expected := e.getDeviceID()
-	if expected == "" {
-		return nil, fmt.Errorf("refusing to execute: agent device id not configured")
-	}
-	if target := env.GetTargetDeviceId(); target != expected {
-		return nil, fmt.Errorf("refusing to execute: action target device %q is not this device %q", target, expected)
+	// authorization step. The control server's single signing seam
+	// (actionparams.BuildAndSignEnvelope) always binds the target device, so a
+	// legitimate envelope for this device always matches. The same helper guards
+	// the four non-action stream-RPC surfaces (see enforceTargetDevice).
+	if err := e.enforceTargetDevice(env.GetTargetDeviceId()); err != nil {
+		return nil, err
 	}
 	return env, nil
 }
