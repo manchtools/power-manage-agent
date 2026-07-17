@@ -70,9 +70,16 @@ func noVerifierHandler(t *testing.T, oq osqueryRunner) *Handler {
 }
 
 // signOSQuery / signLogQuery / signRevoke / signInventory set the message's
-// signature to a valid control-server signature over its canonical bytes.
+// signature to a valid control-server signature over its canonical bytes. Each
+// defaults target_device_id to testDeviceID (this device) when the caller left
+// it unset, so a happy-path message is targeted at the verifying agent and the
+// PMSEC-001 target check passes — mirroring the action-envelope test helpers.
+// A cross-device test sets target_device_id to a DIFFERENT device explicitly.
 func signOSQuery(t *testing.T, s *verify.ActionSigner, q *pb.OSQuery) {
 	t.Helper()
+	if q.GetTargetDeviceId() == "" {
+		q.TargetDeviceId = testDeviceID
+	}
 	c, err := verify.OSQueryCanonical(q)
 	require.NoError(t, err)
 	sig, err := s.SignDomain(verify.OSQuerySignatureDomain, c)
@@ -82,6 +89,9 @@ func signOSQuery(t *testing.T, s *verify.ActionSigner, q *pb.OSQuery) {
 
 func signLogQuery(t *testing.T, s *verify.ActionSigner, q *pb.LogQuery) {
 	t.Helper()
+	if q.GetTargetDeviceId() == "" {
+		q.TargetDeviceId = testDeviceID
+	}
 	c, err := verify.LogQueryCanonical(q)
 	require.NoError(t, err)
 	sig, err := s.SignDomain(verify.LogQuerySignatureDomain, c)
@@ -91,6 +101,9 @@ func signLogQuery(t *testing.T, s *verify.ActionSigner, q *pb.LogQuery) {
 
 func signRevoke(t *testing.T, s *verify.ActionSigner, m *pb.RevokeLuksDeviceKey) {
 	t.Helper()
+	if m.GetTargetDeviceId() == "" {
+		m.TargetDeviceId = testDeviceID
+	}
 	c, err := verify.RevokeLuksDeviceKeyCanonical(m)
 	require.NoError(t, err)
 	sig, err := s.SignDomain(verify.LuksRevokeSignatureDomain, c)
@@ -100,6 +113,9 @@ func signRevoke(t *testing.T, s *verify.ActionSigner, m *pb.RevokeLuksDeviceKey)
 
 func signInventory(t *testing.T, s *verify.ActionSigner, m *pb.RequestInventory) {
 	t.Helper()
+	if m.GetTargetDeviceId() == "" {
+		m.TargetDeviceId = testDeviceID
+	}
 	c, err := verify.RequestInventoryCanonical(m)
 	require.NoError(t, err)
 	sig, err := s.SignDomain(verify.InventorySignatureDomain, c)
@@ -579,6 +595,71 @@ func TestOnRequestInventory_NoVerifierFailsClosed(t *testing.T) {
 	assert.Empty(t, oq.tableCalls)
 }
 
+// ---------------------------------------------------------------------------
+// Cross-device replay (H3 / PMSEC-001) — the agent-side enforcement half
+// ---------------------------------------------------------------------------
+
+// TestStreamRPC_RejectsCrossDeviceReplay is the H3 handler-level regression: on
+// every non-action stream-RPC surface, a message VALIDLY signed but bound to a
+// DIFFERENT device must be refused, and the root work (osquery, journalctl, the
+// destructive LUKS slot-7 wipe) must never run. The signature is authentic
+// (same CA), so ONLY the target==self check stops it — before target_device_id
+// was bound into the signed bytes and checked here, a compromised gateway
+// relaying device-A's signed message to this device would have executed it. The
+// canonical-bytes half of this defense is proven in the sdk
+// (verify.TestCrossDeviceReplay_RejectedAllSurfaces); this is the enforcement
+// half that turns the binding into a refusal.
+func TestStreamRPC_RejectsCrossDeviceReplay(t *testing.T) {
+	caPEM, signer := testCAAndSigner(t)
+	const otherDeviceID = "01OTHERDEVICE0000000000B" // NOT testDeviceID
+
+	t.Run("osquery", func(t *testing.T) {
+		oq := &fakeOsquery{}
+		h := verifierHandler(t, caPEM, oq)
+		q := &pb.OSQuery{QueryId: validULID(t), Table: "processes", TargetDeviceId: otherDeviceID}
+		signOSQuery(t, signer, q) // valid signature, but targets another device
+		res, err := h.OnQuery(context.Background(), q)
+		require.NoError(t, err)
+		assert.False(t, res.Success, "an osquery targeted at another device must be refused")
+		assert.Contains(t, res.Error, "refusing")
+		assert.Equal(t, 0, oq.queryCalls, "cross-device osquery must NOT reach osquery")
+	})
+
+	t.Run("logquery", func(t *testing.T) {
+		calls := fakeJournalctl(t)
+		h := verifierHandler(t, caPEM, nil)
+		q := &pb.LogQuery{QueryId: validULID(t), Unit: "nginx.service", Lines: 10, TargetDeviceId: otherDeviceID}
+		signLogQuery(t, signer, q)
+		res, err := h.OnLogQuery(context.Background(), q)
+		require.NoError(t, err)
+		assert.False(t, res.Success, "a log query targeted at another device must be refused")
+		assert.Contains(t, res.Error, "refusing")
+		assert.Empty(t, *calls, "cross-device log query must NOT invoke journalctl")
+	})
+
+	t.Run("luks_revoke", func(t *testing.T) {
+		h := verifierHandler(t, caPEM, nil)
+		m := &pb.RevokeLuksDeviceKey{ActionId: "01J0R00000000000000000000R", TargetDeviceId: otherDeviceID}
+		signRevoke(t, signer, m)
+		ok, msg := h.OnRevokeLuksDeviceKey(context.Background(), m)
+		assert.False(t, ok, "a revoke targeted at another device must be refused")
+		assert.Contains(t, msg, "refusing",
+			"a cross-device LUKS wipe must be refused at the gate, never reach the executor")
+		assert.NotContains(t, msg, "agent store not configured",
+			"a cross-device revoke must NOT enter the wipe path")
+	})
+
+	t.Run("inventory", func(t *testing.T) {
+		oq := &fakeOsquery{}
+		h := verifierHandler(t, caPEM, oq)
+		m := &pb.RequestInventory{QueryId: validULID(t), TargetDeviceId: otherDeviceID}
+		signInventory(t, signer, m)
+		inv := h.OnRequestInventory(context.Background(), m)
+		assert.Nil(t, inv, "a cross-device inventory request must return nil")
+		assert.Empty(t, oq.tableCalls, "cross-device inventory must NOT query osquery")
+	})
+}
+
 // TestCollectInventory_TableSetIsHardcoded pins that the osquery tables queried
 // are EXACTLY the hardcoded union of inventoryCoreTables + inventoryPackageTables
 // (self-discovering from the package vars), and that RequestInventory carries no
@@ -611,13 +692,16 @@ func TestCollectInventory_TableSetIsHardcoded(t *testing.T) {
 	}
 
 	// RequestInventory must carry NO field that could smuggle a table name: its
-	// fields are exactly query_id + signature. A new field fails here, forcing a
-	// review of whether it could carry a table name.
+	// fields are exactly query_id + signature + target_device_id. A new field
+	// fails here, forcing a review of whether it could carry a table name.
+	// target_device_id (PMSEC-001) is a device binding checked against this
+	// agent's own id — it never selects a table, so it is safe here; the
+	// hardcoded table set above remains the sole source of queried tables.
 	fields := (&pb.RequestInventory{}).ProtoReflect().Descriptor().Fields()
 	names := map[string]bool{}
 	for i := 0; i < fields.Len(); i++ {
 		names[string(fields.Get(i).Name())] = true
 	}
-	assert.Equal(t, map[string]bool{"query_id": true, "signature": true}, names,
+	assert.Equal(t, map[string]bool{"query_id": true, "signature": true, "target_device_id": true}, names,
 		"RequestInventory gained a field — confirm it cannot carry a table name")
 }
