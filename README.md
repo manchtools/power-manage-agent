@@ -647,7 +647,7 @@ The agent prevents actions from modifying its own infrastructure:
 
 ### Root Stream-RPC Verification (WS4)
 
-<!-- docref: begin src=internal/executor/executor.go#Executor.VerifyEnvelope:93e0873f,internal/handler/handler.go#Handler.OnRequestInventory:398d6189 -->
+<!-- docref: begin src=internal/executor/executor.go#Executor.VerifyEnvelope:7cba0124,internal/executor/verify_stream_rpc.go#Executor.enforceTargetDevice:f0a564e3,internal/handler/handler.go#Handler.OnRequestInventory:398d6189 -->
 The agent runs as root, and the Gateway/Valkey relay is **untrusted for
 origination**. So beyond signed actions, the four root stream-RPCs are verified
 fail-closed against the CA certificate **before any root work**:
@@ -667,11 +667,14 @@ one — the CA cert is required at startup). All inventory collection is
 server-initiated over this signed path (manual refresh and the spec-22
 server-side scheduler); the agent has no periodic collector of its own.
 
-Signed **actions** are additionally bound to the target device: `VerifyEnvelope`
-refuses an envelope whose signed `target_device_id` is not this agent's own id
-(and refuses when the agent's id is unset), so a compromised relay cannot replay
-one device's validly-signed, root-capable action onto another device that trusts
-the same CA (PMSEC-001).
+Every CA-signed surface — the signed **action** envelope and all four
+stream-RPCs above — is additionally bound to the target device through the
+shared `enforceTargetDevice` check: it refuses a message whose signed
+`target_device_id` is not this agent's own id (and refuses when the agent's id
+is unset), so a compromised relay cannot replay one device's validly-signed,
+root-capable message — an action, an osquery, a journalctl read, or the
+irreversible LUKS slot-7 wipe — onto another device that trusts the same CA
+(PMSEC-001).
 <!-- docref: end -->
 
 ### Package / Repository Argument Hardening (WS8)
