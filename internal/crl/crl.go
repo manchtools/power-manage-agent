@@ -44,6 +44,22 @@ type Cache struct {
 	revoked  map[string]struct{}
 	notAfter time.Time
 	loaded   bool
+
+	// Live-session revocation (AC 11): the leaf fingerprint the currently
+	// connected gateway authenticated with (recorded by CheckSession on a
+	// successful handshake) and the canceler that tears that session down. A
+	// later refresh that newly revokes watchedFP, or the cached list ageing past
+	// notAfter while the session is still up, cancels the session so it
+	// re-handshakes through the (now-failing) check — handshake-only revocation
+	// would otherwise let an in-flight stream to a revoked gateway run until
+	// natural disconnect. sessionID tokens the registration: a torn-down
+	// client's transport can still complete an in-flight dial handshake after
+	// the next session registered, and without the token that stale handshake
+	// would overwrite the live session's fingerprint (missing its later
+	// revocation) or its teardown would clear the live canceler.
+	sessionID     uint64
+	watchedFP     string
+	cancelSession context.CancelFunc
 }
 
 // New builds a Cache. A nil logger is replaced with the default logger; a nil
@@ -66,7 +82,11 @@ func New(fetch FetchFunc, logger *slog.Logger, opts ...Option) *Cache {
 func (c *Cache) Check(fingerprint string) error {
 	c.mu.RLock()
 	defer c.mu.RUnlock()
+	return c.checkLocked(fingerprint)
+}
 
+// checkLocked is the CRL policy; callers hold c.mu (read or write).
+func (c *Cache) checkLocked(fingerprint string) error {
 	if !c.loaded {
 		return errors.New("gateway CRL not yet loaded — refusing until the first list is fetched")
 	}
@@ -77,6 +97,86 @@ func (c *Cache) Check(fingerprint string) error {
 		return fmt.Errorf("gateway certificate %s is revoked", fingerprint)
 	}
 	return nil
+}
+
+// CheckSession is the per-handshake gate for the session registered as id: the
+// same policy as Check, plus — while id is still the active registration —
+// recording the approved fingerprint as the watched session peer so a later
+// refresh/expiry that condemns it can cancel the session (AC 11). A stale
+// client's late handshake (its registration already replaced) still gets the
+// policy verdict but must NOT overwrite the live session's fingerprint.
+func (c *Cache) CheckSession(id uint64, fingerprint string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.checkLocked(fingerprint); err != nil {
+		return err
+	}
+	if c.sessionID == id {
+		c.watchedFP = fingerprint
+	}
+	return nil
+}
+
+// WatchSession registers the active gateway session's context canceler so a
+// later CRL refresh that revokes the connected gateway — or the cached list
+// expiring while the session is still up — can tear the session down (AC 11).
+// runAgent calls this for each new connection; the peer fingerprint is filled
+// in by CheckSession when that connection's handshake completes. The returned
+// token binds CheckSession/UnwatchSession to THIS registration so a torn-down
+// session's lingering handshake or teardown cannot touch a newer session's
+// state. A new registration forgets the prior peer.
+func (c *Cache) WatchSession(cancel context.CancelFunc) uint64 {
+	c.mu.Lock()
+	c.sessionID++
+	id := c.sessionID
+	c.cancelSession = cancel
+	c.watchedFP = ""
+	c.mu.Unlock()
+	return id
+}
+
+// UnwatchSession unregisters the session registered as id; a no-op when a
+// newer session has already replaced the registration.
+func (c *Cache) UnwatchSession(id uint64) {
+	c.mu.Lock()
+	if c.sessionID == id {
+		c.cancelSession = nil
+		c.watchedFP = ""
+	}
+	c.mu.Unlock()
+}
+
+// enforceSessionRevocation cancels the live gateway session when its
+// authenticated peer is now revoked, or the cached CRL has aged past not_after
+// while the session is still up (AC 11 — fail closed for the in-flight session,
+// not only at the next handshake). Called after every refresh attempt and on the
+// staleness ticker; a no-op until a session is registered and its handshake has
+// recorded a peer fingerprint. Cancels at most once per registration — the
+// session tears down and re-registers on reconnect.
+func (c *Cache) enforceSessionRevocation() {
+	c.mu.Lock()
+	cancel := c.cancelSession
+	fp := c.watchedFP
+	reason := ""
+	if cancel != nil && fp != "" {
+		_, revoked := c.revoked[fp]
+		switch {
+		case c.loaded && !c.now().Before(c.notAfter):
+			reason = "cached gateway CRL expired while the session was live"
+		case revoked:
+			reason = "connected gateway certificate was revoked"
+		}
+	}
+	if reason != "" {
+		c.cancelSession = nil
+		c.watchedFP = ""
+	}
+	c.mu.Unlock()
+
+	if reason != "" {
+		c.logger.Warn("cancelling live gateway session (spec 31 AC 11): "+reason, "fingerprint", fp)
+		cancel()
+	}
 }
 
 // Refresh fetches a new snapshot and atomically swaps it in. On fetch failure
@@ -105,6 +205,10 @@ func (c *Cache) Refresh(ctx context.Context) error {
 	c.notAfter = snap.NotAfter
 	c.loaded = true
 	c.mu.Unlock()
+
+	// A refresh that newly revokes the connected gateway must cancel the live
+	// session, not wait for its next handshake (AC 11).
+	c.enforceSessionRevocation()
 	return nil
 }
 
@@ -122,6 +226,10 @@ func (c *Cache) Run(ctx context.Context, interval time.Duration) {
 		case <-t.C:
 			if err := c.Refresh(ctx); err != nil {
 				c.logger.Warn("gateway CRL refresh failed; using last snapshot until not_after", "error", err)
+				// A failed refresh may have let the cached list age past not_after
+				// while a session is live; enforce staleness here too (AC 11/12).
+				// Refresh already enforced on its success path.
+				c.enforceSessionRevocation()
 			}
 		}
 	}
