@@ -173,6 +173,64 @@ func TestEnforce_CancelsLiveSessionWhenCRLExpires(t *testing.T) {
 	}
 }
 
+// TestRefresh_SuccessAfterStalenessReverifiesInsteadOfCancel pins the deliberate
+// ordering in Refresh: when the cached CRL ages past not_after mid-interval and
+// the NEXT tick's refresh SUCCEEDS, the live session is re-verified against the
+// fresh snapshot rather than cancelled for the transient staleness — an
+// unrevoked peer keeps its session (cancelling would be a pure availability hit
+// after trust was just re-established), while a revoked peer is still cancelled
+// within the same refresh cycle. The expiry-cancel path is for staleness that
+// canNOT be resolved (failed refresh — see TestEnforce_CancelsLiveSessionWhenCRLExpires).
+func TestRefresh_SuccessAfterStalenessReverifiesInsteadOfCancel(t *testing.T) {
+	load := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	clk := load
+	snaps := []*sdk.GatewayCRL{
+		{NotAfter: load.Add(time.Hour), RefreshedAt: load},                                                                 // initial, expires at +1h
+		{NotAfter: load.Add(3 * time.Hour), RefreshedAt: load.Add(2 * time.Hour)},                                          // fresh after staleness, peer not revoked
+		{RevokedFingerprints: []string{"peerfp"}, NotAfter: load.Add(3 * time.Hour), RefreshedAt: load.Add(2 * time.Hour)}, // now revokes the peer
+	}
+	call := 0
+	fetch := func(context.Context) (*sdk.GatewayCRL, error) {
+		s := snaps[call]
+		if call < len(snaps)-1 {
+			call++
+		}
+		return s, nil
+	}
+	c := New(fetch, nil, WithClock(func() time.Time { return clk }))
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	id := c.WatchSession(cancel)
+	if err := c.CheckSession(id, "peerfp"); err != nil {
+		t.Fatalf("handshake check: %v", err)
+	}
+
+	// The cached CRL expires mid-interval; the next tick's refresh succeeds.
+	clk = load.Add(2 * time.Hour)
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh after staleness: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+		t.Fatal("session cancelled although a successful refresh re-verified the unrevoked peer")
+	default:
+	}
+
+	// The security half stays intact: a fresh snapshot revoking the peer cancels.
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("revoking refresh: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("live session was not cancelled after its gateway was revoked (AC 11)")
+	}
+}
+
 // TestCheckSession_StaleRegistrationCannotHijackWatch pins the registration
 // token: a torn-down session's transport can complete an in-flight dial
 // handshake AFTER the next session registered, and its teardown can run late
