@@ -128,6 +128,13 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Create a child context for this connection session
 		sessionCtx, cancelSession := context.WithCancel(ctx)
 
+		// Register this session's canceler with the CRL cache so a mid-stream
+		// revocation of the connected gateway (learned on a later refresh) — or the
+		// cached CRL expiring while still connected — tears the session down instead
+		// of streaming to a revoked gateway until natural disconnect (spec 31 AC 11).
+		// The peer fingerprint is recorded by crlCache.Check at handshake.
+		crlCache.WatchSession(cancelSession)
+
 		// Wire LUKS key store to the current client for this connection session
 		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
 
@@ -208,6 +215,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
+		crlCache.WatchSession(nil) // unregister; next iteration re-registers the new session
 		h.Executor().SetLuksKeyStore(nil)
 		if luksDaemon != nil {
 			luksDaemon.ClearSession()

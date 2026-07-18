@@ -92,3 +92,83 @@ func TestRefresh_RetainsLastSnapshotOnError(t *testing.T) {
 		t.Errorf("last-good snapshot should still allow an unrevoked fingerprint: %v", err)
 	}
 }
+
+// TestRefresh_CancelsLiveSessionWhenPeerRevoked pins AC 11: after a gateway
+// handshake records the connected peer's fingerprint, a later refresh that newly
+// revokes that fingerprint cancels the live session — handshake-only revocation
+// would let the in-flight stream run to a revoked gateway until natural
+// disconnect.
+func TestRefresh_CancelsLiveSessionWhenPeerRevoked(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	snaps := []*sdk.GatewayCRL{
+		{NotAfter: now.Add(time.Hour), RefreshedAt: now},                                          // fresh, nothing revoked
+		{RevokedFingerprints: []string{"peerfp"}, NotAfter: now.Add(time.Hour), RefreshedAt: now}, // revokes the peer
+	}
+	call := 0
+	fetch := func(context.Context) (*sdk.GatewayCRL, error) {
+		s := snaps[call]
+		if call < len(snaps)-1 {
+			call++
+		}
+		return s, nil
+	}
+	c := New(fetch, nil, WithClock(fixedClock(now)))
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("first refresh: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.WatchSession(cancel)
+	// Simulate the gateway handshake: Check approves and records the peer.
+	if err := c.Check("peerfp"); err != nil {
+		t.Fatalf("handshake check should pass for an unrevoked peer: %v", err)
+	}
+
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("second refresh: %v", err)
+	}
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("live session was not cancelled after its gateway was revoked (AC 11)")
+	}
+}
+
+// TestEnforce_CancelsLiveSessionWhenCRLExpires pins the other AC 11 trigger: a
+// cached CRL ageing past not_after while a session is still up fails closed for
+// the in-flight session too, not only at the next handshake. Mirrors what Run
+// does on the failed-refresh path.
+func TestEnforce_CancelsLiveSessionWhenCRLExpires(t *testing.T) {
+	load := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	clk := load
+	snap := &sdk.GatewayCRL{NotAfter: load.Add(time.Hour), RefreshedAt: load}
+	c := New(func(context.Context) (*sdk.GatewayCRL, error) { return snap, nil }, nil, WithClock(func() time.Time { return clk }))
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	c.WatchSession(cancel)
+	if err := c.Check("peerfp"); err != nil {
+		t.Fatalf("handshake check: %v", err)
+	}
+
+	// Still fresh: enforcing must NOT cancel a healthy live session.
+	c.enforceSessionRevocation()
+	select {
+	case <-ctx.Done():
+		t.Fatal("session cancelled while the CRL was still fresh")
+	default:
+	}
+
+	// Past not_after: a live session on a now-stale CRL fails closed.
+	clk = load.Add(2 * time.Hour)
+	c.enforceSessionRevocation()
+	select {
+	case <-ctx.Done():
+	default:
+		t.Fatal("live session was not cancelled when the cached CRL expired (AC 11/12)")
+	}
+}
