@@ -46,12 +46,18 @@ type Cache struct {
 	loaded   bool
 
 	// Live-session revocation (AC 11): the leaf fingerprint the currently
-	// connected gateway authenticated with (recorded by Check on a successful
-	// handshake) and the canceler that tears that session down. A later refresh
-	// that newly revokes watchedFP, or the cached list ageing past notAfter while
-	// the session is still up, cancels the session so it re-handshakes through the
-	// (now-failing) Check — handshake-only revocation would otherwise let an
-	// in-flight stream to a revoked gateway run until natural disconnect.
+	// connected gateway authenticated with (recorded by CheckSession on a
+	// successful handshake) and the canceler that tears that session down. A
+	// later refresh that newly revokes watchedFP, or the cached list ageing past
+	// notAfter while the session is still up, cancels the session so it
+	// re-handshakes through the (now-failing) check — handshake-only revocation
+	// would otherwise let an in-flight stream to a revoked gateway run until
+	// natural disconnect. sessionID tokens the registration: a torn-down
+	// client's transport can still complete an in-flight dial handshake after
+	// the next session registered, and without the token that stale handshake
+	// would overwrite the live session's fingerprint (missing its later
+	// revocation) or its teardown would clear the live canceler.
+	sessionID     uint64
 	watchedFP     string
 	cancelSession context.CancelFunc
 }
@@ -74,9 +80,13 @@ func New(fetch FetchFunc, logger *slog.Logger, opts ...Option) *Cache {
 // every gateway TLS handshake with the gateway's hex SHA-256 leaf fingerprint.
 // A non-nil return fails the handshake.
 func (c *Cache) Check(fingerprint string) error {
-	c.mu.Lock()
-	defer c.mu.Unlock()
+	c.mu.RLock()
+	defer c.mu.RUnlock()
+	return c.checkLocked(fingerprint)
+}
 
+// checkLocked is the CRL policy; callers hold c.mu (read or write).
+func (c *Cache) checkLocked(fingerprint string) error {
 	if !c.loaded {
 		return errors.New("gateway CRL not yet loaded — refusing until the first list is fetched")
 	}
@@ -86,24 +96,53 @@ func (c *Cache) Check(fingerprint string) error {
 	if _, ok := c.revoked[fingerprint]; ok {
 		return fmt.Errorf("gateway certificate %s is revoked", fingerprint)
 	}
-	// Approved: this is the peer of the live session. Record it (under the write
-	// lock) so a later refresh/expiry that condemns it can cancel the session
-	// (AC 11). Only meaningful once WatchSession has registered a canceler.
-	c.watchedFP = fingerprint
+	return nil
+}
+
+// CheckSession is the per-handshake gate for the session registered as id: the
+// same policy as Check, plus — while id is still the active registration —
+// recording the approved fingerprint as the watched session peer so a later
+// refresh/expiry that condemns it can cancel the session (AC 11). A stale
+// client's late handshake (its registration already replaced) still gets the
+// policy verdict but must NOT overwrite the live session's fingerprint.
+func (c *Cache) CheckSession(id uint64, fingerprint string) error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if err := c.checkLocked(fingerprint); err != nil {
+		return err
+	}
+	if c.sessionID == id {
+		c.watchedFP = fingerprint
+	}
 	return nil
 }
 
 // WatchSession registers the active gateway session's context canceler so a
 // later CRL refresh that revokes the connected gateway — or the cached list
 // expiring while the session is still up — can tear the session down (AC 11).
-// runAgent calls this for each new connection; the peer fingerprint is filled in
-// by Check when that connection's handshake completes. A new registration
-// forgets the prior peer so a refresh in the gap between sessions cannot cancel
-// the wrong one. Pass nil to unregister when a session ends.
-func (c *Cache) WatchSession(cancel context.CancelFunc) {
+// runAgent calls this for each new connection; the peer fingerprint is filled
+// in by CheckSession when that connection's handshake completes. The returned
+// token binds CheckSession/UnwatchSession to THIS registration so a torn-down
+// session's lingering handshake or teardown cannot touch a newer session's
+// state. A new registration forgets the prior peer.
+func (c *Cache) WatchSession(cancel context.CancelFunc) uint64 {
 	c.mu.Lock()
+	c.sessionID++
+	id := c.sessionID
 	c.cancelSession = cancel
 	c.watchedFP = ""
+	c.mu.Unlock()
+	return id
+}
+
+// UnwatchSession unregisters the session registered as id; a no-op when a
+// newer session has already replaced the registration.
+func (c *Cache) UnwatchSession(id uint64) {
+	c.mu.Lock()
+	if c.sessionID == id {
+		c.cancelSession = nil
+		c.watchedFP = ""
+	}
 	c.mu.Unlock()
 }
 

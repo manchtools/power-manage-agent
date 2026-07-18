@@ -119,9 +119,9 @@ func TestRefresh_CancelsLiveSessionWhenPeerRevoked(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.WatchSession(cancel)
-	// Simulate the gateway handshake: Check approves and records the peer.
-	if err := c.Check("peerfp"); err != nil {
+	id := c.WatchSession(cancel)
+	// Simulate the gateway handshake: CheckSession approves and records the peer.
+	if err := c.CheckSession(id, "peerfp"); err != nil {
 		t.Fatalf("handshake check should pass for an unrevoked peer: %v", err)
 	}
 
@@ -150,8 +150,8 @@ func TestEnforce_CancelsLiveSessionWhenCRLExpires(t *testing.T) {
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	c.WatchSession(cancel)
-	if err := c.Check("peerfp"); err != nil {
+	id := c.WatchSession(cancel)
+	if err := c.CheckSession(id, "peerfp"); err != nil {
 		t.Fatalf("handshake check: %v", err)
 	}
 
@@ -170,5 +170,77 @@ func TestEnforce_CancelsLiveSessionWhenCRLExpires(t *testing.T) {
 	case <-ctx.Done():
 	default:
 		t.Fatal("live session was not cancelled when the cached CRL expired (AC 11/12)")
+	}
+}
+
+// TestCheckSession_StaleRegistrationCannotHijackWatch pins the registration
+// token: a torn-down session's transport can complete an in-flight dial
+// handshake AFTER the next session registered, and its teardown can run late
+// too. Neither may touch the live session's watch state — a stale handshake
+// overwriting the fingerprint would make the live session miss its own
+// revocation, and a stale unregister would clear the live canceler.
+func TestCheckSession_StaleRegistrationCannotHijackWatch(t *testing.T) {
+	now := time.Date(2026, 7, 18, 12, 0, 0, 0, time.UTC)
+	fresh := &sdk.GatewayCRL{NotAfter: now.Add(time.Hour), RefreshedAt: now}
+	revokesA := &sdk.GatewayCRL{RevokedFingerprints: []string{"fpA"}, NotAfter: now.Add(time.Hour), RefreshedAt: now}
+	revokesB := &sdk.GatewayCRL{RevokedFingerprints: []string{"fpB"}, NotAfter: now.Add(time.Hour), RefreshedAt: now}
+	snaps := []*sdk.GatewayCRL{fresh, revokesA, revokesB}
+	call := 0
+	fetch := func(context.Context) (*sdk.GatewayCRL, error) {
+		s := snaps[call]
+		if call < len(snaps)-1 {
+			call++
+		}
+		return s, nil
+	}
+	c := New(fetch, nil, WithClock(fixedClock(now)))
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("initial refresh: %v", err)
+	}
+
+	// Session A lives and dies.
+	ctxA, cancelA := context.WithCancel(context.Background())
+	defer cancelA()
+	idA := c.WatchSession(cancelA)
+	if err := c.CheckSession(idA, "fpA"); err != nil {
+		t.Fatalf("A handshake: %v", err)
+	}
+	cancelA()
+	c.UnwatchSession(idA)
+	_ = ctxA
+
+	// Session B registers and completes its handshake.
+	ctxB, cancelB := context.WithCancel(context.Background())
+	defer cancelB()
+	idB := c.WatchSession(cancelB)
+	if err := c.CheckSession(idB, "fpB"); err != nil {
+		t.Fatalf("B handshake: %v", err)
+	}
+
+	// A's transport finishes a stale dial handshake and a late teardown.
+	if err := c.CheckSession(idA, "fpA"); err != nil {
+		t.Fatalf("stale handshake still gets the policy verdict: %v", err)
+	}
+	c.UnwatchSession(idA)
+
+	// Revoking A's peer must NOT cancel B.
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh revoking fpA: %v", err)
+	}
+	select {
+	case <-ctxB.Done():
+		t.Fatal("stale session A's fingerprint hijacked the watch: revoking fpA cancelled B")
+	default:
+	}
+
+	// Revoking B's actual peer must still cancel B (the stale unregister must
+	// not have cleared the live canceler).
+	if err := c.Refresh(context.Background()); err != nil {
+		t.Fatalf("refresh revoking fpB: %v", err)
+	}
+	select {
+	case <-ctxB.Done():
+	default:
+		t.Fatal("live session B was not cancelled when its own peer was revoked")
 	}
 }
