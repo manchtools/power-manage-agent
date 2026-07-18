@@ -193,7 +193,9 @@ func TestOnQuery_EnforcesSignature(t *testing.T) {
 	t.Run("absent_signature", func(t *testing.T) {
 		oq := &fakeOsquery{}
 		h := verifierHandler(t, caPEM, oq)
-		q := &pb.OSQuery{QueryId: validULID(t), Table: "processes"} // no Signature
+		// Well-formed (valid id + this-device target) but unsigned, so the
+		// SIGNATURE check — not boundary validation — is what refuses it.
+		q := &pb.OSQuery{QueryId: validULID(t), Table: "processes", TargetDeviceId: testDeviceID}
 		res, err := h.OnQuery(context.Background(), q)
 		require.NoError(t, err)
 		assert.False(t, res.Success)
@@ -330,7 +332,9 @@ func TestOnLogQuery_EnforcesSignature(t *testing.T) {
 	t.Run("absent_signature", func(t *testing.T) {
 		calls := fakeJournalctl(t)
 		h := verifierHandler(t, caPEM, nil)
-		q := &pb.LogQuery{QueryId: validULID(t), Unit: "nginx.service"} // no Signature
+		// Well-formed (valid id + this-device target) but unsigned, so the
+		// SIGNATURE check — not boundary validation — is what refuses it.
+		q := &pb.LogQuery{QueryId: validULID(t), Unit: "nginx.service", TargetDeviceId: testDeviceID}
 		res, err := h.OnLogQuery(context.Background(), q)
 		require.NoError(t, err)
 		assert.False(t, res.Success)
@@ -611,7 +615,13 @@ func TestOnRequestInventory_NoVerifierFailsClosed(t *testing.T) {
 // half that turns the binding into a refusal.
 func TestStreamRPC_RejectsCrossDeviceReplay(t *testing.T) {
 	caPEM, signer := testCAAndSigner(t)
-	const otherDeviceID = "01OTHERDEVICE0000000000B" // NOT testDeviceID
+	// A valid 26-char ULID that is NOT testDeviceID. It MUST be well-formed:
+	// the osquery/logquery surfaces validate target_device_id (required,ulid) at
+	// the boundary, so a malformed target would be dropped there and never reach
+	// the enforceTargetDevice gate this test is exercising. Kept to canonical
+	// Crockford Base32 (no I/L/O/U) so it is unambiguously valid under any ULID
+	// parser, not just the lenient one this build happens to use.
+	const otherDeviceID = "01J0DEV000000000000000000B"
 
 	t.Run("osquery", func(t *testing.T) {
 		oq := &fakeOsquery{}
