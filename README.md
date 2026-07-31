@@ -6,7 +6,7 @@ The Power Manage Agent runs on managed devices and executes actions dispatched f
 
 The executor delegates low-level system operations to the SDK's `sys/` packages (`sys/exec`, `sys/fs`, `sys/user`, `sys/systemd`), keeping the agent focused on action dispatch, idempotency checks, and result reporting.
 
-> **LUKS executor exception (audit F039):** the LUKS action type does NOT delegate purely to `sys/encryption`. Key material flows through a separate `LuksKeyStore` interface that proxies to the gateway over the live SDK stream — the executor calls `e.luksKeyStore.GetKey/StoreKey/RotateKey`, those methods round-trip through the connected `sdk.Client` to the gateway, and the gateway forwards to the control server's encrypted key store. **Implication for operators:** LUKS rotations cannot proceed when the agent is disconnected from the gateway; an offline agent will see the action in its scheduled queue but fail at the `GetKey` call with "LUKS key store not configured (no stream connection)". This is intentional fail-closed behaviour — no LUKS operation should rely on a stale local key.
+> **LUKS executor exception (audit F039):** the LUKS action type does NOT delegate purely to `sys/encryption`. Key material flows through a separate `LuksKeyStore` interface carried on the live SDK stream — the executor calls `e.luksKeyStore.GetKey/StoreKey`, those methods round-trip through the connected `sdk.Client` to control, and control reads/writes its encrypted key store. **Implication for operators:** LUKS rotations cannot proceed while the agent is disconnected; an offline agent will see the action in its scheduled queue but refuse before touching a slot. This is intentional fail-closed behaviour — never rotate to a passphrase that cannot be handed back to the operator. The same rule governs LPS password rotation.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -32,11 +32,16 @@ The executor delegates low-level system operations to the SDK's `sys/` packages 
             │ (1) Register                    │ (2) Stream
             ▼                                 ▼
 ┌───────────────────────────┐   ┌─────────────────────────────────┐
-│  Control Server (RPC)     │   │   Gateway Server (mTLS gRPC)    │
+│  Control :8081 (API)      │   │  Control :8082 (agent mTLS)     │
 │  - Token validation       │   │   - Bidirectional streaming     │
 │  - Certificate signing    │   │   - Action dispatch             │
-│  - Returns gateway URL    │   │   - Heartbeats & results        │
+│  - Returns the stream URL │   │   - Heartbeats & results        │
 └───────────────────────────┘   └─────────────────────────────────┘
+
+Both listeners belong to the same control server. They are reached through
+different hostnames because the edge dispatches :443 by SNI: the API host
+terminates TLS, the agent host is passed through untouched so control can
+validate the agent's client certificate itself.
 ```
 
 ### Enrollment Flow
@@ -51,7 +56,7 @@ The agent supports two enrollment methods:
 4. The CLI sends an `Enroll` RPC to the agent over the unix socket
 5. The agent calls the **Control Server** `Register` RPC with the token and a locally-generated CSR
 6. The Control Server validates the token, signs the certificate, and returns credentials
-7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and connects to the gateway
+7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and opens its stream to control
 
 <!-- docref: begin src=internal/deviceauth/enroll_server.go#EnrollSocketPath:9838543e -->
 > **Trust boundary (deliberate self-service design).** The enrollment
@@ -86,9 +91,9 @@ The agent supports two enrollment methods:
                                   │    Register RPC ──────► Control Server
                                   │         │               │   - Validate token
                                   │    Save credentials     │   - Sign certificate
-                                  │    Close enroll socket  │   - Return gateway URL
+                                  │    Close enroll socket  │   - Return stream URL
                                   │    Start auth socket    │
-                                  │    Connect to gateway   │
+                                  │    Open the stream      │
                                   └─────────────────────────┘
 ```
 
@@ -110,8 +115,8 @@ Both enrollment methods use the same underlying protocol:
    - Device ID
    - Signed mTLS certificate
    - CA certificate
-   - Gateway URL
-3. The agent stores the encrypted credentials and connects to the **Gateway** using mTLS for streaming communication
+   - The stream URL (control's agent listener — a different host from the API it registered against)
+3. The agent stores the encrypted credentials and opens its stream to that URL using mTLS
 
 ## Installation
 
@@ -489,7 +494,7 @@ thin client to a root daemon the agent runs in-process on a Unix socket at
 `RuntimeDirectory=pm-agent`).
 
 The client sends **only** `{token, passphrase}`. The root agent then, with its
-**own** credentials over its **own** authenticated gateway connection:
+**own** credentials over its **own** authenticated connection to control:
 
 1. validates (and consumes) the server-issued token — it is **device-bound,
    single-use, and short-TTL**; authorization is the token, **never** the local
@@ -503,7 +508,7 @@ This replaces the previous model, where the command ran under a
 `NOPASSWD: ... luks set-passphrase *` sudoers rule with an
 attacker-controllable `--data-dir` flag — a local privilege escalation (any
 local user could point root's `cryptsetup` at a forged credential store and a
-hostile gateway). The token, not the local user, is the sole authority.
+hostile server). The token, not the local user, is the sole authority.
 
 ### Repository (`REPOSITORY`)
 
@@ -594,12 +599,12 @@ When enabled, the scheduler checks if the system state already matches the desir
 
 ### Scheduling resilience
 
-The offline scheduler and the SDK stream loop are hardened against corrupt local state, clock excursions, crashes, and a compromised/relay gateway:
+The offline scheduler and the SDK stream loop are hardened against corrupt local state, clock excursions, crashes, and a compromised server:
 
 - **Maintenance window fails closed on decode error.** The active maintenance window is persisted to the agent's SQLite store so a restart inside a freeze keeps gating. If that persisted window exists but cannot be proto-decoded (a corrupt or tampered settings row), the scheduler does **not** boot unconstrained — it enters a deny-until-next-sync state that defers every due dispatch until the next successful window sync overwrites the bad row. A truly-absent window (a never-synced device) still boots unconstrained, the same default a fresh install gets.
 - **Forward clock jumps are clamped.** A future-dated `next_execute_at` cursor (left behind by a transient forward wall-clock excursion that was later corrected back) is clamped to at most `now + interval`, so a single clock jump can delay drift-prevention by at most one interval instead of suppressing it indefinitely.
 - **Crash-replay guard.** The due cursor is advanced one interval **before** an action executes, so a crash between execution and result recording does not silently re-run a non-idempotent action on the next boot. (Best-effort for non-idempotent actions; idempotent actions are unaffected, and the authoritative cursor is still written when the result is recorded.)
-- **One handler panic cannot crash the agent.** The SDK stream-dispatch loop wraps each inbound `ServerMessage` in a scoped `recover()` and isolates its goroutine fan-out, so a panic triggered by a malformed or hostile frame from a compromised gateway is logged and dropped as non-fatal rather than crash-looping the agent (a fleet DoS). Oversized inbound frames are refused (resource-exhausted) instead of being allocated, and PTY dimensions are validated before use. See the SDK README "Stream-loop robustness".
+- **One handler panic cannot crash the agent.** The SDK stream-dispatch loop wraps each inbound `ServerMessage` in a scoped `recover()` and isolates its goroutine fan-out, so a panic triggered by a malformed or hostile frame from a compromised server is logged and dropped as non-fatal rather than crash-looping the agent (a fleet DoS). Oversized inbound frames are refused (resource-exhausted) instead of being allocated, and PTY dimensions are validated before use. See the SDK README "Stream-loop robustness".
 - **The offline results table is bounded independently of sync state.** Synced results are pruned after the retention period, but unsynced results are also evicted past a hard age ceiling (30 days) and the table is capped to a maximum row count (oldest first) — so an agent that cannot reach the server for a long time cannot exhaust local disk with undelivered results. When unsynced (undelivered) results are dropped, the scheduler logs a warning.
 - **A server-dispatched action runs off the receive loop.** Actions execute on a single worker goroutine (in order, one at a time), so a long-running action no longer head-of-line-blocks terminal control frames (Stop/Input/Resize). The privileged terminal-setup steps (usermod, chown) also run under a bounded context, so a slow/hung step surfaces an error within a deadline instead of wedging the loop. On reconnect the prior connection's idle transport connections are released, so a long-lived reconnect loop doesn't leak sockets.
 - **Shutdown joins the scheduler before the store closes.** `Scheduler.Stop()` blocks until the run loop has returned; on SIGTERM the agent calls it before closing the offline store, so an action executing at shutdown finishes recording its result rather than racing the store close (no lost result / use-after-close). The offline store also re-asserts `0700` on its data dir and `0600` on the DB files (incl. WAL/SHM) on every `New()`.
@@ -638,17 +643,17 @@ The agent prevents actions from modifying its own infrastructure:
 ### Network Security
 
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
-- **mTLS**: After registration, the agent connects to the Gateway using mutual TLS with certificates signed by the Control Server CA
+- **mTLS**: After registration, the agent connects to control's agent listener using mutual TLS with certificates signed by the Control Server CA
 <!-- docref: begin src=cmd/power-manage-agent/cert_rotation.go#renewAt:211ccaeb -->
 - **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
-- **Trust roots — control server vs gateway asymmetry**: Every gateway-bound RPC validates the gateway certificate against the **internal CA** that signed the agent's own certificate (i.e., `WithMTLSFromPEM`). The Control Server's `RenewCertificate` RPC is the one exception: it validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because the control server typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
+- **Trust roots — two hosts, two trust anchors**: the agent stream validates control's certificate against the **internal CA** that signed the agent's own certificate (`WithMTLSFromPEM`), because that host is passed through the edge untouched and control presents its CA-signed cert. The Control Server's `RenewCertificate` RPC is the exception: it goes to the public API host and validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because that host typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
 <!-- docref: end -->
 - **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id (plus a per-store random salt), written `0600` in a `0700` owner-only directory. The store fails closed if its directory is group/world-**writable** (a non-owner could otherwise forge the salt/ciphertext), and Save tightens an existing directory to `0700`. The machine-ID binding means the ciphertext will not decrypt if copied to another host, but it is **not** protection against offline theft of the disk or a backup (the machine ID lives on the same disk) — use **full-disk encryption** for that. A same-disk key file would add no real defense, so it is intentionally not used (WS10 accepted residual; see ADR 0014).
 
 ### Root Stream-RPC Verification (WS4)
 
 <!-- docref: begin src=internal/executor/executor.go#Executor.VerifyEnvelope:7cba0124,internal/executor/verify_stream_rpc.go#Executor.enforceTargetDevice:f0a564e3,internal/handler/handler.go#Handler.OnRequestInventory:398d6189 -->
-The agent runs as root, and the Gateway/Valkey relay is **untrusted for
+The agent runs as root, and the Valkey relay is **untrusted for
 origination**. So beyond signed actions, the four root stream-RPCs are verified
 fail-closed against the CA certificate **before any root work**:
 
@@ -733,14 +738,14 @@ Exit code 0 = enabled, 1 = disabled. Combined with `is_compliance=true` + `compl
 
 ### Inbound-message & action-input validation (WS17a)
 
-The agent treats every server/gateway-supplied field that reaches a filesystem path, a shell, or a privileged call as untrusted and validates it before use. These device-side rejection guards are exercised by dedicated rejection-path tests:
+The agent treats every server-supplied field that reaches a filesystem path, a shell, or a privileged call as untrusted and validates it before use. These device-side rejection guards are exercised by dedicated rejection-path tests:
 
 - **TTY `session_id` is validated as a ULID.** `TerminalStart.session_id` is spliced into the per-session `/tmp/<tty-user>.<session-id>` directory that is created and `chown`-ed as root, so it must parse as a ULID. Path-meaningful values (`../../etc`, `a/b`), embedded NULs, and the empty string are refused before any filesystem use; together with the validated `pm-tty-*` username this makes the joined path unable to escape `/tmp`.
 - **Locked/disabled TTY users are refused.** A `pm-tty-*` account that is shadow-locked cannot open a session.
 - **`FILE` actions refuse to overwrite a directory.** Writing a file to a path that already exists as a directory reports `FAILED` and leaves the directory untouched, rather than moving a temp file inside it (WS6).
 - **`WIFI` action IDs are filesystem-validated.** The action ID is run through the same `validateActionIDForFilesystem` guard the sudo/ssh/sshd executors use before it is spliced into the EAP-TLS cert directory or the `pm-wifi-<id>` connection name.
 - **`SHELL` env vars go through the SDK hijack allow-list.** Caller-supplied `LD_PRELOAD` / `PATH` / `LD_LIBRARY_PATH` and friends are refused before the interpreter is launched.
-- **The gateway URL must be `https://host`.** Cleartext / h2c / opaque / hostless gateway URLs are refused before the mTLS dial (WS15).
+- **The stream URL must be `https://host`.** Cleartext / h2c / opaque / hostless URLs are refused before the mTLS dial (WS15).
 - **osquery refuses credential-bearing tables.** The SDK's convenience table path denies `shadow` / `process_envs` / `crontab` / `shell_history` / `sudoers` (the signed `RawSql` escape hatch is unaffected) — see the SDK README.
 
 CI runs the agent unit/arch suite (`go test -race ./...`, no build tags) separately from the per-distro `-tags=integration` executor suite, so these pure-function and handler-level guards are covered without requiring root or a real device.
@@ -763,7 +768,7 @@ journalctl -u power-manage-agent -f
 │   └── device.key      # Device private key
 ├── agent.db             # SQLite database (LPS state, execution tracking)
 ├── luks/                # LUKS encryption state (per-action SQLite databases)
-├── state.json           # Agent state (server URL, device ID, gateway URL)
+├── state.json           # Agent state (server URL, device ID, stream URL)
 ├── update/              # Auto-update working directory
 │   └── agent-update-*.tmp  # Downloaded new binary (during update, deleted after self-test)
 └── results/             # Pending execution results
@@ -794,7 +799,7 @@ The agent refuses a candidate **older** than the running version (`vYYYY.MM.PP` 
 2. Run `<tmpPath> version`, compare with running — skip if same; refuse a downgrade unless `allow_downgrade`
 3. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
-   - Establishes an mTLS connection to the gateway
+   - Establishes an mTLS connection to control's agent listener
    - Sends `Hello`, waits for `Welcome` (proves bidirectional stream)
    - Calls `SyncActions` (proves unary RPC works)
    - Exits 0 on success, 1 on any failure
