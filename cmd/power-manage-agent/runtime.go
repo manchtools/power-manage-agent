@@ -3,8 +3,6 @@ package main
 
 import (
 	"context"
-	"errors"
-	"fmt"
 	"log/slog"
 	"os"
 	"strings"
@@ -13,7 +11,6 @@ import (
 	sdk "github.com/manchtools/power-manage-sdk"
 	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
-	"github.com/manchtools/power-manage/agent/internal/crl"
 	"github.com/manchtools/power-manage/agent/internal/handler"
 	"github.com/manchtools/power-manage/agent/internal/luksd"
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
@@ -60,38 +57,17 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 	// certificate before building the mTLS client.
 	firstConnect := true
 
-	// Gateway CRL (spec 31 Part D): the revocation list is fetched from control
-	// and every gateway's server-cert fingerprint is checked against it during
-	// the mTLS handshake (WithMTLSFromPEMAndRevocationCheck below). The fetch
-	// reloads creds each time so it always presents the freshest (rotated)
-	// device cert, and reaches control directly — no gateway relay (AC 13), so
-	// a revoked gateway can be learned about even while still connected to it.
-	// Best-effort initial load so the first connect can pass the gate; until a
-	// list loads, Check fails closed and the connection loop retries (AC 12).
-	crlCache := crl.New(func(fctx context.Context) (*sdk.GatewayCRL, error) {
-		// Load straight from the store each fetch. This presents the current
-		// (rotated) device cert to control AND avoids capturing runAgent's
-		// `creds` variable, which the reconnect loop reassigns concurrently —
-		// reading it from this refresh goroutine would be a data race. A load
-		// failure returns an error; the cache keeps its last-good snapshot
-		// until not_after, then Check fails closed.
-		cur, err := credStore.Load()
-		if err != nil {
-			return nil, fmt.Errorf("load credentials for CRL fetch: %w", err)
-		}
-		if strings.TrimSpace(cur.ControlAddr) == "" {
-			return nil, errors.New("no control address in credentials for CRL fetch")
-		}
-		mtls, err := sdk.WithMTLSFromPEMAndSystemRoots(cur.Certificate, cur.PrivateKey, cur.CACert)
-		if err != nil {
-			return nil, fmt.Errorf("configure control mTLS for CRL: %w", err)
-		}
-		return sdk.FetchGatewayCRL(fctx, cur.ControlAddr, mtls)
-	}, logger, crl.WithClock(now))
-	if err := crlCache.Refresh(ctx); err != nil {
-		logger.Warn("initial gateway CRL fetch failed; gateway connections refused until it loads", "error", err)
-	}
-	go crlCache.Run(ctx, crlRefreshInterval)
+	// Spec 41: no client-side revocation list. It existed to check the GATEWAY's
+	// server certificate — the relay was the least-trusted server-side actor, so
+	// the agent had to be able to learn that one had been revoked while still
+	// connected to it. The agent now dials control directly, and control's
+	// identity is the CA's own peer: there is no third party left to revoke, and
+	// nothing serves the list any more. The property died with the mechanism
+	// rather than being dropped.
+	//
+	// Revocation still exists in the other direction, which is the one that
+	// protects the fleet: control checks each AGENT certificate against its
+	// database on every handshake and drops the live stream on revocation.
 
 	for {
 		if !firstConnect {
@@ -102,45 +78,37 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Reset handler connection state for new connection
 		h.ResetConnection()
 
-		// rc10: refuse anything but https://host for the network gateway
-		// path. The only h2c use in this binary is the local unix-socket
-		// enrollment client, never a remote gateway. A non-https (or
-		// malformed) GatewayAddr means either a dev-leftover creds file or a
-		// tampered redirect — both are reasons to fail fast rather than
-		// silently skip mTLS on the live fleet. Shared predicate with
-		// cmd_selftest.go so the guard cannot drift (closes the HasPrefix
-		// case/opaque/hostless gaps).
-		if err := requireHTTPSGateway(creds.GatewayAddr); err != nil {
-			logger.Error("refusing gateway URL — re-enrol against an https:// gateway or delete the cached credentials",
-				"gateway", creds.GatewayAddr, "error", err)
+		// rc10: refuse anything but https://host for the stream path. The only
+		// h2c use in this binary is the local unix-socket enrollment client,
+		// never a remote endpoint. A non-https (or malformed) StreamAddr means
+		// either a dev-leftover creds file or a tampered redirect — both are
+		// reasons to fail fast rather than silently skip mTLS on the live fleet.
+		// Shared predicate with cmd_selftest.go so the guard cannot drift
+		// (closes the HasPrefix case/opaque/hostless gaps).
+		if err := requireHTTPSStreamAddr(creds.StreamAddr); err != nil {
+			logger.Error("refusing stream URL — re-enrol against an https:// control server or delete the cached credentials",
+				"stream_addr", creds.StreamAddr, "error", err)
 			os.Exit(1)
 		}
 		// Create a child context for this connection session
 		sessionCtx, cancelSession := context.WithCancel(ctx)
 
-		// Register this session's canceler with the CRL cache so a mid-stream
-		// revocation of the connected gateway (learned on a later refresh) — or the
-		// cached CRL expiring while still connected — tears the session down instead
-		// of streaming to a revoked gateway until natural disconnect (spec 31 AC 11).
-		// The returned token binds this session's handshake gate (below) and its
-		// teardown to THIS registration: a previous client's transport can still
-		// complete an in-flight dial handshake after we registered, and untokened
-		// it would overwrite this session's recorded peer fingerprint.
-		crlSession := crlCache.WatchSession(cancelSession)
-
-		mtlsOpt, err := sdk.WithMTLSFromPEMAndRevocationCheck(creds.Certificate, creds.PrivateKey, creds.CACert,
-			func(fingerprint string) error { return crlCache.CheckSession(crlSession, fingerprint) })
+		// Validate control against the CA this device enrolled with — not the
+		// system roots. The agent host is served through a TCP-passthrough router
+		// precisely so control presents its own CA-signed certificate here.
+		mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
 		if err != nil {
 			logger.Error("failed to configure mTLS", "error", err)
 			os.Exit(1)
 		}
-		client := sdk.NewClient(strings.TrimSpace(creds.GatewayAddr),
+		client := sdk.NewClient(strings.TrimSpace(creds.StreamAddr),
 			mtlsOpt,
 			sdk.WithAuth(creds.DeviceID, ""),
 		)
 
 		// Wire LUKS key store to the current client for this connection session
 		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
+		h.Executor().SetLpsPasswordStore(&clientLpsPasswordStore{client: client})
 
 		// Wire the LUKS passphrase daemon to this connection so it can
 		// validate tokens and fetch managed keys over the agent's own
@@ -219,8 +187,10 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 
 		// Stop the goroutines and clear connection-dependent state
 		cancelSession()
-		crlCache.UnwatchSession(crlSession)
 		h.Executor().SetLuksKeyStore(nil)
+		// Clearing this makes LPS rotation refuse to change a password while
+		// disconnected, rather than rotate one it cannot report.
+		h.Executor().SetLpsPasswordStore(nil)
 		if luksDaemon != nil {
 			luksDaemon.ClearSession()
 		}
@@ -504,14 +474,6 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 	// restart inside an active freeze keeps deferring instead of
 	// blasting through queued work. See manchtools/power-manage-server#58.
 	sched.SetMaintenanceWindow(result.MaintenanceWindow)
-
-	// Apply the control server's LPS sealing key from the same sync. Verified
-	// (CA signature) and persisted by the executor; a failure keeps the last
-	// good key and is non-fatal to the sync — LPS rotation fails closed on its
-	// own if no key is ever stored. See spec 18 / manchtools/power-manage-agent#62.
-	if err := sched.ApplyLpsPublicKey(result.LpsPublicKey); err != nil {
-		logger.Error("failed to apply control LPS public key; keeping previous key", "error", err)
-	}
 
 	// Convert sync interval from minutes to duration
 	var syncInterval time.Duration

@@ -68,8 +68,15 @@ type Credentials struct {
 	CACert      []byte `json:"ca_cert"`
 	Certificate []byte `json:"certificate"`
 	PrivateKey  []byte `json:"private_key"`
-	GatewayAddr string `json:"gateway_addr"`
-	ControlAddr string `json:"control_addr,omitempty"` // Control Server URL for device auth proxy
+	// StreamAddr is where the agent opens its AgentService stream. Spec 41:
+	// this used to be the gateway; control terminates agent mTLS itself now, so
+	// it is control's agent listener — a different host from ControlAddr,
+	// because the edge routes the two by SNI (one terminates TLS for the web,
+	// one passes it through).
+	StreamAddr string `json:"stream_addr"`
+	// ControlAddr is where the agent enrolled and re-registers: control's
+	// public API host.
+	ControlAddr string `json:"control_addr,omitempty"`
 }
 
 // Store manages encrypted credential storage.

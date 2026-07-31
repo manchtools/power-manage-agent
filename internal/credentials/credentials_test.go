@@ -24,7 +24,7 @@ func sampleCreds() *Credentials {
 		CACert:      []byte("ca-cert-bytes"),
 		Certificate: []byte("client-cert-bytes"),
 		PrivateKey:  []byte("client-key-bytes"),
-		GatewayAddr: "https://gateway.example.test:443",
+		StreamAddr:  "https://gateway.example.test:443",
 		ControlAddr: "https://control.example.test:443",
 	}
 }
@@ -57,8 +57,8 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !bytes.Equal(out.PrivateKey, in.PrivateKey) {
 		t.Errorf("PrivateKey mismatch")
 	}
-	if out.GatewayAddr != in.GatewayAddr {
-		t.Errorf("GatewayAddr mismatch: got %q want %q", out.GatewayAddr, in.GatewayAddr)
+	if out.StreamAddr != in.StreamAddr {
+		t.Errorf("StreamAddr mismatch: got %q want %q", out.StreamAddr, in.StreamAddr)
 	}
 	if out.ControlAddr != in.ControlAddr {
 		t.Errorf("ControlAddr mismatch: got %q want %q", out.ControlAddr, in.ControlAddr)

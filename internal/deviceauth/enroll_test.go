@@ -61,7 +61,7 @@ func TestEnroll_Success(t *testing.T) {
 				DeviceId:    &pm.DeviceId{Value: "dev-123"},
 				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
 				Certificate: []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
-				GatewayUrl:  "https://gw.example.com:8443",
+				ControlUrl:  "https://gw.example.com:8443",
 			}), nil
 		},
 	}
@@ -88,7 +88,7 @@ func TestEnroll_Success(t *testing.T) {
 	// Callback was called
 	require.NotNil(t, enrolledCreds)
 	assert.Equal(t, "dev-123", enrolledCreds.DeviceID)
-	assert.Equal(t, "https://gw.example.com:8443", enrolledCreds.GatewayAddr)
+	assert.Equal(t, "https://gw.example.com:8443", enrolledCreds.StreamAddr)
 	assert.Equal(t, srv.URL, enrolledCreds.ControlAddr)
 
 	// Credentials saved to store
@@ -120,7 +120,7 @@ func TestEnroll_AlreadyEnrolled(t *testing.T) {
 		CACert:      []byte("ca"),
 		Certificate: []byte("cert"),
 		PrivateKey:  []byte("key"),
-		GatewayAddr: "https://gw.example.com",
+		StreamAddr:  "https://gw.example.com",
 	})
 
 	logger := slog.Default()
@@ -176,7 +176,7 @@ func TestGetEnrollmentStatus_Enrolled(t *testing.T) {
 		CACert:      []byte("ca"),
 		Certificate: []byte("cert"),
 		PrivateKey:  []byte("key"),
-		GatewayAddr: "https://gw.example.com",
+		StreamAddr:  "https://gw.example.com",
 	})
 
 	logger := slog.Default()
@@ -195,7 +195,7 @@ func TestEnrollServer_EndToEnd(t *testing.T) {
 				DeviceId:    &pm.DeviceId{Value: "dev-e2e"},
 				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n"),
 				Certificate: []byte("-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n"),
-				GatewayUrl:  "https://gw.example.com",
+				ControlUrl:  "https://gw.example.com",
 			}), nil
 		},
 	}

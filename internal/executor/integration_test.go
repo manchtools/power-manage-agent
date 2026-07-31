@@ -20,7 +20,6 @@ import (
 	"testing"
 	"time"
 
-	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 
@@ -81,20 +80,43 @@ func newTestExecutor() *Executor {
 		panic("failed to create test store: " + err.Error())
 	}
 	e.SetStore(s)
-	// Seed a control LPS public key + device ID so LPS rotations can seal
-	// (spec 18). Integration tests exercise the real rotation side effects
-	// (chpasswd, state persistence); they don't unseal, so a throwaway key
-	// whose private half we discard is enough to satisfy the fail-closed
-	// seal precondition.
-	priv, err := sdkcrypto.GenerateX25519()
-	if err != nil {
-		panic("failed to generate test LPS key: " + err.Error())
-	}
-	if err := s.SetSetting(lpsPublicKeySettingKey, string(priv.PublicKey().Bytes())); err != nil {
-		panic("failed to seed test LPS key: " + err.Error())
-	}
+	// Wire the password store + device ID so LPS rotations and user-create
+	// temp passwords can be reported. Spec 41: these used to be sealed to a
+	// seeded control public key and read back out of the action metadata;
+	// they now go to control on the stream, so the integration lane records
+	// them here instead of unsealing them.
+	e.SetLpsPasswordStore(testLpsReports)
 	e.SetDeviceID("01HKINTEGRATIONDEVICE00000")
 	return e
+}
+
+// testLpsReports collects every password the executor reports, standing in for
+// control. Shared across the lane and queried by username, so tests do not
+// depend on execution order.
+var testLpsReports = &recordingLpsStore{}
+
+type recordingLpsStore struct {
+	mu        sync.Mutex
+	rotations []*pb.LpsPasswordRotation
+}
+
+func (r *recordingLpsStore) StorePasswords(_ context.Context, _ string, rotations []*pb.LpsPasswordRotation) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.rotations = append(r.rotations, rotations...)
+	return nil
+}
+
+// reportedFor returns the last rotation reported for username, or nil.
+func (r *recordingLpsStore) reportedFor(username string) *pb.LpsPasswordRotation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for i := len(r.rotations) - 1; i >= 0; i-- {
+		if r.rotations[i].GetUsername() == username {
+			return r.rotations[i]
+		}
+	}
+	return nil
 }
 
 var testActionCounter int
@@ -863,9 +885,9 @@ func TestIntegration_User(t *testing.T) {
 		if v, _ := userExists(context.Background(), username); !v {
 			t.Error("user not created")
 		}
-		// Verify password metadata returned
-		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
-			t.Error("expected lps.rotations metadata with temp password")
+		// The temp password must have been reported to control.
+		if testLpsReports.reportedFor(username) == nil {
+			t.Error("expected the temporary password to be reported to control")
 		}
 	})
 
@@ -1005,7 +1027,7 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 
 // TestIntegration_User_NoPassword locks down the contract for the
 // UserParams.no_password flag (sdk #77, server #327): when NoPassword=true the
-// agent must NOT generate a temp password, call chpasswd, or emit lps.rotations.
+// agent must NOT generate a temp password, call chpasswd, or report one.
 // Under the lock=disabled model, an ENABLED no_password account rests at "*" (no
 // password, NOT locked) — so no password LOGIN path succeeds (the #94 guarantee:
 // "*" is never an empty/login-able password), while the agent's terminal handler
@@ -1013,8 +1035,8 @@ func TestIntegration_User_CreateHomeRespected(t *testing.T) {
 // opener works because it bypasses PAM entirely.
 //
 // Two sub-tests, both non-system users to exercise the temp-password branch:
-//   - NoPasswordTrue: lps.rotations absent, account rests at "*"
-//   - NoPasswordFalse: lps.rotations present (regression guard)
+//   - NoPasswordTrue: nothing reported, account rests at "*"
+//   - NoPasswordFalse: a password is reported (regression guard)
 func TestIntegration_User_NoPassword(t *testing.T) {
 	e := newTestExecutor()
 	ctx := context.Background()
@@ -1037,10 +1059,9 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 			t.Fatal("user not created")
 		}
 
-		// L1: no lps.rotations metadata emitted.
-		if result.Metadata != nil && result.Metadata["lps.rotations"] != "" {
-			t.Errorf("expected no lps.rotations metadata when NoPassword=true, got %q",
-				result.Metadata["lps.rotations"])
+		// L1: nothing reported to control — no password was generated at all.
+		if rot := testLpsReports.reportedFor(username); rot != nil {
+			t.Errorf("expected no password reported when NoPassword=true, got one for %q", rot.GetUsername())
 		}
 
 		// L2: an ENABLED no_password account is NOT locked — the agent
@@ -1072,8 +1093,8 @@ func TestIntegration_User_NoPassword(t *testing.T) {
 		}}
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
-		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
-			t.Error("expected lps.rotations metadata when NoPassword=false (default), got none")
+		if testLpsReports.reportedFor(username) == nil {
+			t.Error("expected a password reported when NoPassword=false (default), got none")
 		}
 	})
 }
@@ -1112,8 +1133,8 @@ func TestIntegration_User_ReapplyNoPasswordStaysStar(t *testing.T) {
 		a.Params = &pb.Action_User{User: params}
 		res := e.ExecuteEnvelope(ctx, actionToEnvelope(a))
 		assertSuccess(t, res)
-		if res.Metadata != nil && res.Metadata["lps.rotations"] != "" {
-			t.Errorf("%s: a no_password account must not emit lps.rotations (no password set), got %q", stage, res.Metadata["lps.rotations"])
+		if rot := testLpsReports.reportedFor(username); rot != nil {
+			t.Errorf("%s: a no_password account must not report a password (none is set), got one for %q", stage, rot.GetUsername())
 		}
 		return res
 	}
@@ -1561,8 +1582,8 @@ func TestIntegration_LPS(t *testing.T) {
 		result := e.ExecuteEnvelope(ctx, actionToEnvelope(action))
 		assertSuccess(t, result)
 		assertChanged(t, result, true)
-		if result.Metadata == nil || result.Metadata["lps.rotations"] == "" {
-			t.Error("expected lps.rotations metadata")
+		if testLpsReports.reportedFor(username) == nil {
+			t.Error("expected the rotated password to be reported to control")
 		}
 	})
 

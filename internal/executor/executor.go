@@ -76,15 +76,15 @@ type Executor struct {
 	runner       sysexec.Runner
 	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
-	mu           sync.RWMutex // protects luksKeyStore, store, actionStore, deviceID
+	mu           sync.RWMutex // protects luksKeyStore, lpsStore, store, actionStore, deviceID
 	luksKeyStore LuksKeyStore
+	lpsStore     LpsPasswordStore
 	store        *store.Store
 	actionStore  ActionStore
 	updateCfg    *AgentUpdateConfig
-	// deviceID is this agent's own device ULID, used as part of the LPS
-	// seal context (device|action|username) so the sealed password binds to
-	// the exact record the control server unseals it into. Set from
-	// credentials in main.go.
+	// deviceID is this agent's own device ULID. Control derives the at-rest
+	// AAD from it, and the executor refuses to rotate a credential it cannot
+	// attribute to a device. Set from credentials in main.go.
 	deviceID string
 
 	// Per-cycle AGENT_UPDATE dedup. Audit F042 + F048: previously
@@ -206,6 +206,22 @@ func (e *Executor) SetLuksKeyStore(ks LuksKeyStore) {
 	e.mu.Unlock()
 }
 
+// SetLpsPasswordStore sets the LPS password store for stream-based rotation
+// reporting. Nil while disconnected, which makes the rotation path refuse to
+// change a password it could not report.
+func (e *Executor) SetLpsPasswordStore(ps LpsPasswordStore) {
+	e.mu.Lock()
+	e.lpsStore = ps
+	e.mu.Unlock()
+}
+
+// getLpsPasswordStore returns the LPS password store (thread-safe).
+func (e *Executor) getLpsPasswordStore() LpsPasswordStore {
+	e.mu.RLock()
+	defer e.mu.RUnlock()
+	return e.lpsStore
+}
+
 // SetStore sets the agent store for LUKS state persistence.
 func (e *Executor) SetStore(s *store.Store) {
 	e.mu.Lock()
@@ -213,7 +229,7 @@ func (e *Executor) SetStore(s *store.Store) {
 	e.mu.Unlock()
 }
 
-// SetDeviceID sets this agent's own device ULID, used in the LPS seal context.
+// SetDeviceID sets this agent's own device ULID.
 func (e *Executor) SetDeviceID(id string) {
 	e.mu.Lock()
 	e.deviceID = id

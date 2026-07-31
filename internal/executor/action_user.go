@@ -213,15 +213,14 @@ func (e *Executor) createUser(ctx context.Context, params *pb.UserParams, action
 				}
 				output.WriteString(fmt.Sprintf("temporary password set for %s (must be changed on first login)\n", params.Username))
 
-				// Report the temp password via lps.rotations metadata for operator
-				// retrieval — SEALED to the control LPS public key, exactly like a
-				// rotation (spec 18), so the gateway never sees it in cleartext. If
-				// no verified key is available or sealing fails, the user is still
-				// created but the password is NOT reported (never leak cleartext);
-				// the operator resets it out of band.
-				if md := e.sealedUserCreateMetadata(params.Username, actionID, tempPassword.Reveal(), output); md != nil {
-					metadata = md
-				}
+				// Report the temp password to control on the agent's own stream,
+				// exactly like a rotation. Unlike the rotation path this runs
+				// AFTER the account exists and the password is set, so it cannot
+				// be ordered defensively: the user was created either way. A
+				// failure therefore leaves the account in place and unreported,
+				// and the operator resets it out of band — which is what the
+				// previous seal-failure branch did too.
+				e.reportUserCreatePassword(ctx, params.Username, actionID, tempPassword.Reveal(), output)
 			}
 		}
 	}

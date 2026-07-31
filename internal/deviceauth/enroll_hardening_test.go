@@ -118,7 +118,7 @@ func TestEnroll_ConcurrentSerializesToOneRegistration(t *testing.T) {
 				DeviceId:    &pm.DeviceId{Value: "dev-123"},
 				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
 				Certificate: []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
-				GatewayUrl:  "https://gw.example.com:8443",
+				ControlUrl:  "https://gw.example.com:8443",
 			}), nil
 		},
 	}
@@ -171,7 +171,7 @@ func TestEnroll_RejectsMissingMTLSCerts(t *testing.T) {
 						DeviceId:    &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
 						CaCert:      tc.ca,
 						Certificate: tc.cert,
-						GatewayUrl:  "https://gw.example.com",
+						ControlUrl:  "https://gw.example.com",
 					}), nil
 				},
 			}
@@ -203,7 +203,7 @@ func TestEnroll_BindsOutboundRegisterRequest(t *testing.T) {
 				DeviceId:    &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
 				CaCert:      []byte(fakeLeafPEM),
 				Certificate: []byte(fakeLeafPEM),
-				GatewayUrl:  "https://gw.example.com",
+				ControlUrl:  "https://gw.example.com",
 			}), nil
 		},
 	}

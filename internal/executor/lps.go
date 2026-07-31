@@ -3,30 +3,46 @@ package executor
 import (
 	"context"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"log/slog"
 	"strings"
 	"time"
 
-	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
-// lpsRotationEntry is the JSON structure reported in action result metadata.
-// SealedPassword is base64 of the password sealed to the control server's LPS
-// public key (crypto.SealLpsPassword): the gateway relays it opaquely and
-// cannot read it. The old cleartext `password` field is gone (spec 18).
-type lpsRotationEntry struct {
-	Username       string `json:"username"`
-	SealedPassword string `json:"sealed_password"`
-	RotatedAt      string `json:"rotated_at"`
-	Reason         string `json:"reason"`
+// LpsPasswordStore reports rotated local passwords to control over the agent's
+// own mTLS stream.
+//
+// Spec 41 replaced two mechanisms at once. The passwords used to be sealed to a
+// control public key and smuggled out inside the action result's
+// `lps.rotations` metadata, because the agent had no authenticated channel of
+// its own — a gateway relayed the result, and the seal existed so that relay
+// could not read what it carried. The agent now holds a direct session with
+// control, so the passwords travel on it as a first-class message and nothing
+// in between ever sees them. Control encrypts them at rest on receipt.
+type LpsPasswordStore interface {
+	StorePasswords(ctx context.Context, actionID string, rotations []*pb.LpsPasswordRotation) error
+}
+
+// lpsRotationReason maps this package's internal reason strings to the wire
+// enum. The string form used to survive to the server, which parsed it back;
+// the enum is now set at the source and the server-side parser is gone.
+func lpsRotationReason(reason string) pb.RotationReason {
+	switch reason {
+	case "initial", "user_created":
+		return pb.RotationReason_ROTATION_REASON_INITIAL
+	case "scheduled":
+		return pb.RotationReason_ROTATION_REASON_SCHEDULED
+	case "auth_grace":
+		return pb.RotationReason_ROTATION_REASON_AUTH_GRACE
+	default:
+		return pb.RotationReason_ROTATION_REASON_UNSPECIFIED
+	}
 }
 
 // executeLps manages local user password rotation (Local Password Solution).
@@ -61,19 +77,18 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		return nil, false, nil, fmt.Errorf("agent store not configured")
 	}
 
-	// Fail closed BEFORE touching any account: without the control LPS public
-	// key we cannot seal the rotated password, and rotating without being able
-	// to return it to the operator would strand the new credential. The key
-	// arrives (CA-verified) on sync; a device that has never synced, or a
-	// server with no keypair, simply doesn't rotate until it does.
-	lpsPub, err := e.lpsPublicKey()
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("LPS rotation requires the control public key: %w", err)
+	// Fail closed BEFORE touching any account: without a live session to
+	// control we cannot report the rotated password, and rotating a credential
+	// we cannot return to the operator would strand it. This is the same gate
+	// the sealing key provided — a device that is not connected simply doesn't
+	// rotate until it is.
+	lpsStore := e.getLpsPasswordStore()
+	if lpsStore == nil {
+		return nil, false, nil, fmt.Errorf("LPS rotation requires a connection to the server (not connected)")
 	}
-	// The seal AAD binds device|action|username; without this agent's own
-	// device ID we cannot build it, so fail closed rather than seal loosely.
-	deviceID := e.getDeviceID()
-	if deviceID == "" {
+	// Control attributes the password to this device; without our own ID the
+	// rotation could not be recorded against the right record.
+	if e.getDeviceID() == "" {
 		return nil, false, nil, fmt.Errorf("LPS rotation requires the agent device ID (not configured)")
 	}
 
@@ -100,7 +115,9 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		complexity = sysuser.ComplexityComplex
 	}
 
-	var rotations []lpsRotationEntry
+	// reported counts passwords control has accepted; it drives the
+	// changed flag that used to be derived from the metadata batch.
+	reported := 0
 	var rotatedUsers []string
 	var anyError error
 
@@ -152,18 +169,22 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			continue
 		}
 
-		// Seal the new password to the control key BEFORE setting it locally.
+		// Report the new password to control BEFORE setting it locally.
 		// password is an exec.Secret; Reveal() is the sanctioned plaintext
-		// access. Sealing first means a seal failure leaves the account's
+		// access. Reporting first means a failure here leaves the account's
 		// password UNCHANGED — never rotate to a credential we cannot return
-		// to the operator (the whole point of LPS). AAD binds the sealed blob
-		// to this device/action/user so control unseals it into the right
-		// record and only that record.
+		// to the operator, which is the whole point of LPS. This is the
+		// ordering the seal enforced; only the mechanism changed.
 		plaintext := password.Reveal()
-		sealed, err := sdkcrypto.SealLpsPassword(lpsPub, plaintext, deviceID, actionID, username)
-		if err != nil {
-			anyError = fmt.Errorf("seal password for %s: %w", username, err)
-			output.WriteString(fmt.Sprintf("LPS: %s — failed to seal password, not rotating: %v\n", username, err))
+		rotatedAt := e.now().UTC()
+		if err := lpsStore.StorePasswords(ctx, actionID, []*pb.LpsPasswordRotation{{
+			Username:  username,
+			Password:  plaintext,
+			RotatedAt: rotatedAt.Format(time.RFC3339),
+			Reason:    lpsRotationReason(reason),
+		}}); err != nil {
+			anyError = fmt.Errorf("report password for %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to report password to server, not rotating: %v\n", username, err))
 			continue
 		}
 
@@ -176,7 +197,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 		rotatedUsers = append(rotatedUsers, username)
 
-		now := e.now().UTC()
+		now := rotatedAt
 		output.WriteString(fmt.Sprintf("LPS: %s — rotated password (reason: %s)\n", username, reason))
 
 		// Update per-user state in SQLite. The drift hash is over the local
@@ -194,12 +215,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 			anyError = fmt.Errorf("rotated password for %s but failed to persist rotation state (will re-rotate next cycle): %w", username, err)
 		}
 
-		rotations = append(rotations, lpsRotationEntry{
-			Username:       username,
-			SealedPassword: base64.StdEncoding.EncodeToString(sealed),
-			RotatedAt:      now.Format(time.RFC3339),
-			Reason:         reason,
-		})
+		reported++
 	}
 
 	// Notify affected users and terminate sessions after a grace period
@@ -221,7 +237,7 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 	}
 
 	// If no rotations occurred
-	if len(rotations) == 0 {
+	if reported == 0 {
 		if anyError != nil {
 			return &pb.CommandOutput{
 				ExitCode: 1,
@@ -234,19 +250,14 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}, false, nil, nil
 	}
 
-	// Build metadata with JSON array of rotations
-	rotationsJSON, err := json.Marshal(rotations)
-	if err != nil {
-		slog.Warn("failed to marshal LPS rotations", "error", err)
-	}
-	metadata := map[string]string{
-		"lps.rotations": string(rotationsJSON),
-	}
-
+	// No metadata: the passwords went to control on the stream, not through
+	// the action result. Nothing parses `lps.rotations` any more — the gateway
+	// that did is gone — so emitting it would only be a second copy of a
+	// credential travelling a path with no reader.
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),
-	}, true, metadata, anyError
+	}, true, nil, anyError
 }
 
 // removeLpsManagement handles ABSENT state — stops managing, cleans up state.
@@ -338,4 +349,36 @@ func killUserSessions(ctx context.Context, username string) {
 	}
 	// Brief wait for processes to fully exit
 	time.Sleep(500 * time.Millisecond)
+}
+
+// reportUserCreatePassword sends a freshly created account's temporary password
+// to control so an operator can retrieve it, using the same stream and the same
+// message as an LPS rotation.
+//
+// Best-effort by design, and the one place in this file where that is the right
+// call: the account already exists and already has the password by the time
+// this runs, so refusing to report cannot un-create it. Every failure path
+// writes a line into the action output, because the operator's only recovery is
+// to notice and reset out of band.
+func (e *Executor) reportUserCreatePassword(ctx context.Context, username, actionID, plaintext string, output *strings.Builder) {
+	ps := e.getLpsPasswordStore()
+	if ps == nil {
+		e.logger.Warn("user create: no server connection; temp password not reported", "username", username)
+		output.WriteString("warning: temporary password not reported (not connected; reset out of band)\n")
+		return
+	}
+	if e.getDeviceID() == "" {
+		e.logger.Warn("user create: no device ID; temp password not reported", "username", username)
+		output.WriteString("warning: temporary password not reported (no device identity; reset out of band)\n")
+		return
+	}
+	if err := ps.StorePasswords(ctx, actionID, []*pb.LpsPasswordRotation{{
+		Username:  username,
+		Password:  plaintext,
+		RotatedAt: e.now().UTC().Format(time.RFC3339),
+		Reason:    pb.RotationReason_ROTATION_REASON_INITIAL,
+	}}); err != nil {
+		e.logger.Warn("user create: failed to report temp password", "username", username, "error", err)
+		output.WriteString("warning: temporary password not reported (server rejected it; reset out of band)\n")
+	}
 }

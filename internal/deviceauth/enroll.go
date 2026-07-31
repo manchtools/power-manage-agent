@@ -215,7 +215,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		CACert:      result.CACert,
 		Certificate: result.Certificate,
 		PrivateKey:  keyPEM,
-		GatewayAddr: result.GatewayURL,
+		StreamAddr:  result.ControlURL,
 		ControlAddr: req.Msg.ServerUrl,
 	}
 
@@ -228,7 +228,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
-	h.logger.Info("enrollment successful", "device_id", result.DeviceID, "gateway", result.GatewayURL)
+	h.logger.Info("enrollment successful", "device_id", result.DeviceID, "gateway", result.ControlURL)
 
 	// Prime the status cache so subsequent GetEnrollmentStatus calls
 	// don't re-derive the Argon2id key just to learn the device id.

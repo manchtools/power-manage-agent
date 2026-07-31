@@ -63,9 +63,9 @@ func runSelfTest(args []string) int {
 	// managed devices and must exercise the same security posture as
 	// normal agent operation. Shared predicate with runtime.go so the
 	// guard cannot drift between dial sites.
-	gatewayAddr := strings.TrimSpace(creds.GatewayAddr)
-	if err := requireHTTPSGateway(creds.GatewayAddr); err != nil {
-		logger.Error("self-test: refusing gateway URL", "gateway", creds.GatewayAddr, "error", err)
+	gatewayAddr := strings.TrimSpace(creds.StreamAddr)
+	if err := requireHTTPSStreamAddr(creds.StreamAddr); err != nil {
+		logger.Error("self-test: refusing gateway URL", "gateway", creds.StreamAddr, "error", err)
 		return 1
 	}
 	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)

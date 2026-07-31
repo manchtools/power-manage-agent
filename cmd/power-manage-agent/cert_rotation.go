@@ -43,7 +43,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 
 	logger.Info("registration successful",
 		"device_id", result.DeviceID,
-		"gateway_url", result.GatewayURL,
+		"gateway_url", result.ControlURL,
 	)
 
 	// Verify we received CA cert and signed certificate
@@ -56,7 +56,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 		CACert:      result.CACert,
 		Certificate: result.Certificate,
 		PrivateKey:  keyPEM, // Private key generated locally, never sent to server
-		GatewayAddr: result.GatewayURL,
+		StreamAddr:  result.ControlURL,
 		ControlAddr: cfg.ServerURL, // Control Server URL for device auth proxy
 	}, nil
 }

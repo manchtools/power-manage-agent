@@ -7,7 +7,7 @@ import (
 	"strings"
 )
 
-// requireHTTPSGateway validates that addr is a cleartext-refusing
+// requireHTTPSStreamAddr validates that addr is a cleartext-refusing
 // https://host network URL — the only kind permitted to reach the mTLS
 // gateway dial (sdk.WithMTLSFromPEM). It is the single shared predicate for
 // every gateway dial site (runtime.go, cmd_selftest.go) so the guard cannot
@@ -21,7 +21,7 @@ import (
 // "https:" parses with Scheme="https" but no Host, and an opaque "https:foo"
 // parses with Opaque set rather than as a network URL — both would slip past a
 // Scheme-only check.
-func requireHTTPSGateway(addr string) error {
+func requireHTTPSStreamAddr(addr string) error {
 	trimmed := strings.TrimSpace(addr)
 	parsed, err := url.Parse(trimmed)
 	if err != nil || strings.ToLower(parsed.Scheme) != "https" || parsed.Opaque != "" || parsed.Host == "" {

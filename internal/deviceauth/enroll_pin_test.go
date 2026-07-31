@@ -32,7 +32,7 @@ func caReturningMock(caPEM []byte) *mockRegisterService {
 				DeviceId:    &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
 				CaCert:      caPEM,
 				Certificate: []byte(fakeLeafPEM),
-				GatewayUrl:  "https://gw.example.com:8443",
+				ControlUrl:  "https://gw.example.com:8443",
 			}), nil
 		},
 	}
