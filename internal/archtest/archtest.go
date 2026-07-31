@@ -36,6 +36,12 @@
 //   - TestNoStdlibJSONOfProtoMessage ...... proto_json_test.go
 //   - TestNoContextBackgroundInRequestPaths ... context_background_test.go
 //   - TestNoMathRandForCrypto ............. mathrand_test.go
+//   - TestNoDirectOSIOInSensitivePaths .... no_direct_os_io_test.go
+//   - TestNoRedundantPackageManagerLookPath ... no_redundant_lookpath_test.go
+//   - TestProtoSecretFieldSinks ........... proto_secret_sink_test.go
+//   - TestCIRunsEveryIntegrationTest ...... ci_coverage_test.go
+//   - TestStreamDialPinsEnrollmentCA ...... stream_mtls_trust_test.go
+//   - TestSystemRootsTrustIsConfinedToThePublicCAEndpoint ... stream_mtls_trust_test.go
 package archtest
 
 import (
