@@ -2,11 +2,17 @@
 
 The Power Manage Agent runs on managed devices and executes actions dispatched from the Control Server. It supports autonomous operation, executing scheduled actions even when disconnected from the server.
 
+The sole workspace system-design authority is
+`../DESIGN_2026_07_31/00_TARGET_DESIGN.md`. This README documents the agent
+surface and must not override it.
+
 ## Architecture
 
 The executor delegates low-level system operations to the SDK's `sys/` packages (`sys/exec`, `sys/fs`, `sys/user`, `sys/systemd`), keeping the agent focused on action dispatch, idempotency checks, and result reporting.
 
-> **LUKS executor exception (audit F039):** the LUKS action type does NOT delegate purely to `sys/encryption`. Key material flows through a separate `LuksKeyStore` interface carried on the live SDK stream — the executor calls `e.luksKeyStore.GetKey/StoreKey`, those methods round-trip through the connected `sdk.Client` to control, and control reads/writes its encrypted key store. **Implication for operators:** LUKS rotations cannot proceed while the agent is disconnected; an offline agent will see the action in its scheduled queue but refuse before touching a slot. This is intentional fail-closed behaviour — never rotate to a passphrase that cannot be handed back to the operator. The same rule governs LPS password rotation.
+LUKS and LPS key material uses recipient-bound X25519 field sealing on the
+direct control stream. If the agent cannot seal a new value to the pinned
+control key, it refuses before changing the device secret.
 
 ```
 ┌─────────────────────────────────────────────────────────────────┐
@@ -71,7 +77,7 @@ The agent supports two enrollment methods:
 > a self-hosted MDM, not for adversarial multi-tenant hosts.
 <!-- docref: end -->
 >
-> **Hardening (WS9).** `server_url` must be **https** (cleartext/opaque
+> **Enrollment hardening.** `server_url` must be **https** (cleartext/opaque
 > URLs are refused before any network call). Token delivery is via
 > `-token-file` or the `PM_REGISTRATION_TOKEN` env var; passing `-token`
 > on argv still works but warns (it leaks via `/proc/<pid>/cmdline`).
@@ -80,7 +86,7 @@ The agent supports two enrollment methods:
 > Control Server CA matches the pin before trusting it, defending against
 > a first-enrollment trust-anchor swap. Without a pin, first enrollment
 > is trust-on-first-use — an accepted residual mitigated by enroll-at-
-> install plus short-lived, single-use, revocable tokens. See ADR 0013.
+> install plus short-lived, single-use, revocable tokens.
 
 ```
                                   ┌─────────────────────────┐
@@ -97,7 +103,7 @@ The agent supports two enrollment methods:
                                   └─────────────────────────┘
 ```
 
-#### Direct enrollment (backwards compatible, requires sudo)
+#### Direct enrollment (requires sudo)
 
 For environments where the agent is not yet running as a service, direct enrollment still works:
 
@@ -110,7 +116,7 @@ This is equivalent to the previous behavior: the agent registers directly, saves
 ### Registration Protocol
 
 Both enrollment methods use the same underlying protocol:
-1. The agent generates an ECDSA P-256 key pair and CSR locally — the private key never leaves the device
+1. The agent generates an Ed25519 identity key and CSR locally — the private key never leaves the device
 2. The Control Server validates the registration token, signs the certificate, and returns:
    - Device ID
    - Signed mTLS certificate
@@ -136,7 +142,7 @@ The install script:
 4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
 5. Enrolls via the enrollment socket if `--server` and `--token` were provided
 
-The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links (WS7 #4). When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
+The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links. When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
 
 There is **no LUKS sudoers rule** — `power-manage-agent luks set-passphrase` is an unprivileged client to the root agent's LUKS daemon socket (see [LUKS passphrase daemon](#luks-passphrase-daemon)).
 
@@ -179,7 +185,9 @@ power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_T
 The agent supports a `power-manage://` URI scheme for easy enrollment from the web UI.
 When clicked, the desktop handler launches the agent which tries socket enrollment first (no sudo), falling back to direct registration.
 
-> The desktop handler that registers this scheme is **opt-in** (`--enable-uri-handler`, off by default — WS7 #4). The CLI invocation below works regardless; only the clickable browser-link registration requires the handler.
+> The desktop handler that registers this scheme is **opt-in**
+> (`--enable-uri-handler`, off by default). The CLI invocation below works
+> regardless; only clickable browser-link registration requires the handler.
 
 ```bash
 power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
@@ -437,7 +445,9 @@ Download and install standalone application binaries.
 - `PRESENT`: Download and install the application
 - `ABSENT`: Remove the installed file
 
-> **Mandatory integrity (WS7):** `url` must be HTTPS and `checksum_sha256` is required for all download-and-install actions (`APP_IMAGE`/`DEB`/`RPM`). Without a checksum the only authenticity would be TLS to a possibly-compromised origin, so the agent fails closed.
+> **Mandatory integrity:** `url` must be HTTPS and `checksum_sha256` is
+> required for all download-and-install actions
+> (`APP_IMAGE`/`DEB`/`RPM`). Without a checksum the agent fails closed.
 
 ### DEB Package (`DEB`)
 
@@ -524,7 +534,7 @@ Manage package manager repositories.
 
 Only one repository type should be set per action. The matching type is determined by the detected package manager.
 
-**Argument hardening:** `dnf.baseurl` / `zypper.url` / `pacman.server` must be **HTTPS** (these fetch root-installed packages, so the transport is the trust boundary); `apt.url` is exempt because apt's security is the gpg-signed Release file. `dnf`/`zypper` `gpgkey` refs are restricted to an https URL, a `file:///abs` path, or an absolute path (never a flag, `http://`, or rpm `ext::` transport) and are imported via `rpm --import -- <ref>`. `gpgcheck` is an **operator choice** — an https mirror with `gpgcheck=false` is permitted (the transport is still verified; package-signature verification is the operator's call, mirroring the auto-update `checksum_url` posture). See ADR 0012.
+**Argument hardening:** `dnf.baseurl` / `zypper.url` / `pacman.server` must be **HTTPS** (these fetch root-installed packages, so the transport is the trust boundary); `apt.url` is exempt because apt's security is the gpg-signed Release file. `dnf`/`zypper` `gpgkey` refs are restricted to an https URL, a `file:///abs` path, or an absolute path (never a flag, `http://`, or rpm `ext::` transport) and are imported via `rpm --import -- <ref>`. `gpgcheck` is an **operator choice** — an https mirror with `gpgcheck=false` is permitted.
 
 **Desired State:**
 - `PRESENT`: Add or update the repository configuration
@@ -646,43 +656,24 @@ The agent prevents actions from modifying its own infrastructure:
 - **mTLS**: After registration, the agent connects to control's agent listener using mutual TLS with certificates signed by the Control Server CA
 <!-- docref: begin src=cmd/power-manage-agent/cert_rotation.go#renewAt:211ccaeb -->
 - **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
-- **Trust roots — two hosts, two trust anchors**: the agent stream validates control's certificate against the **internal CA** that signed the agent's own certificate (`WithMTLSFromPEM`), because that host is passed through the edge untouched and control presents its CA-signed cert. The Control Server's `RenewCertificate` RPC is the exception: it goes to the public API host and validates against the **host system trust roots** (`WithMTLSFromPEMAndSystemRoots`), because that host typically sits behind a public CA (Let's Encrypt, an enterprise CA, etc.). If you front the control server with a corporate-CA proxy, the host's CA bundle must include that proxy's root — otherwise certificate renewal will fail with a TLS verification error even though every other RPC keeps working.
+- **Trust root**: the direct agent stream validates control against the pinned
+  enrollment CA. Renewal occurs through authenticated control and preserves CA
+  continuity.
 <!-- docref: end -->
-- **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id (plus a per-store random salt), written `0600` in a `0700` owner-only directory. The store fails closed if its directory is group/world-**writable** (a non-owner could otherwise forge the salt/ciphertext), and Save tightens an existing directory to `0700`. The machine-ID binding means the ciphertext will not decrypt if copied to another host, but it is **not** protection against offline theft of the disk or a backup (the machine ID lives on the same disk) — use **full-disk encryption** for that. A same-disk key file would add no real defense, so it is intentionally not used (WS10 accepted residual; see ADR 0014).
+- **Certificate Storage**: Credentials are encrypted at rest using AES-256-GCM with a key derived from the machine ID via Argon2id (plus a per-store random salt), written `0600` in a `0700` owner-only directory. The store fails closed if its directory is group/world-writable. Machine-ID binding is not protection against offline theft of the same disk; use full-disk encryption.
 
-### Root Stream-RPC Verification (WS4)
+### Direct-stream validation
 
-<!-- docref: begin src=internal/executor/executor.go#Executor.VerifyEnvelope:7cba0124,internal/executor/verify_stream_rpc.go#Executor.enforceTargetDevice:f0a564e3,internal/handler/handler.go#Handler.OnRequestInventory:398d6189 -->
-The agent runs as root, and the Valkey relay is **untrusted for
-origination**. So beyond signed actions, the four root stream-RPCs are verified
-fail-closed against the CA certificate **before any root work**:
+The agent accepts root-capable work only on its authenticated direct mTLS
+stream. It validates every message and target device before invoking osquery,
+journalctl, LUKS, inventory, or an action executor. Application frames are not
+separately signed.
 
-| RPC | Verified before | Refusal |
-|-----|-----------------|---------|
-| `OnQuery` (osquery, incl. raw SQL) | invoking osquery | `Success=false`, error "refusing to execute unsigned/tampered query" |
-| `OnLogQuery` (journalctl) | building any journalctl invocation | "refusing to execute unsigned/tampered log query" |
-| `OnRevokeLuksDeviceKey` (slot-7 wipe) | touching the key store | "refusing to revoke unsigned/tampered LUKS device key" |
-| `OnRequestInventory` (server-originated) | running osquery | returns no inventory |
+Classified secret fields are versioned X25519 envelopes bound to direction,
+message, field, device, and action/session context. A missing, malformed,
+wrong-recipient, or wrong-context envelope fails before the privileged sink.
 
-Each verifies the Control Server's signature over the message's canonical bytes
-under that surface's disjoint domain. **Raw SQL is permitted only when signed**
-(an unsigned/tampered raw query never reaches osquery); the message is validated
-at the boundary first. A missing verifier fails closed (production always has
-one — the CA cert is required at startup). All inventory collection is
-server-initiated over this signed path (manual refresh and the spec-22
-server-side scheduler); the agent has no periodic collector of its own.
-
-Every CA-signed surface — the signed **action** envelope and all four
-stream-RPCs above — is additionally bound to the target device through the
-shared `enforceTargetDevice` check: it refuses a message whose signed
-`target_device_id` is not this agent's own id (and refuses when the agent's id
-is unset), so a compromised relay cannot replay one device's validly-signed,
-root-capable message — an action, an osquery, a journalctl read, or the
-irreversible LUKS slot-7 wipe — onto another device that trusts the same CA
-(PMSEC-001).
-<!-- docref: end -->
-
-### Package / Repository Argument Hardening (WS8)
+### Package / Repository Argument Hardening
 
 Every value that reaches a package-manager `argv` is validated against its
 intent before the command runs, and positionals are passed after an explicit
@@ -698,8 +689,7 @@ flag-shaped value can never be reparsed as an option:
 | `FLATPAK` app-id / remote | `pkg.ValidatePackageName` / `pkg.ValidateRemoteName`, **before** dispatch | `flatpak install … -- <remote> <appId>` |
 
 A self-discovering test walks every string field of each repository proto and
-fails closed if a newly-added field forgets its config-injection guard. See
-ADR 0012.
+fails closed if a newly added field forgets its config-injection guard.
 
 ### Enrollment Rate Limiting
 
@@ -736,17 +726,20 @@ power-manage-agent tty status
 
 Exit code 0 = enabled, 1 = disabled. Combined with `is_compliance=true` + `compliance_expected_output=enabled` (or `disabled`), admins can report on fleet-wide TTY state without a new action type.
 
-### Inbound-message & action-input validation (WS17a)
+### Inbound-message & action-input validation
 
 The agent treats every server-supplied field that reaches a filesystem path, a shell, or a privileged call as untrusted and validates it before use. These device-side rejection guards are exercised by dedicated rejection-path tests:
 
 - **TTY `session_id` is validated as a ULID.** `TerminalStart.session_id` is spliced into the per-session `/tmp/<tty-user>.<session-id>` directory that is created and `chown`-ed as root, so it must parse as a ULID. Path-meaningful values (`../../etc`, `a/b`), embedded NULs, and the empty string are refused before any filesystem use; together with the validated `pm-tty-*` username this makes the joined path unable to escape `/tmp`.
 - **Locked/disabled TTY users are refused.** A `pm-tty-*` account that is shadow-locked cannot open a session.
-- **`FILE` actions refuse to overwrite a directory.** Writing a file to a path that already exists as a directory reports `FAILED` and leaves the directory untouched, rather than moving a temp file inside it (WS6).
+- **`FILE` actions refuse to overwrite a directory.** Writing a file to a path that already exists as a directory reports `FAILED` and leaves the directory untouched.
 - **`WIFI` action IDs are filesystem-validated.** The action ID is run through the same `validateActionIDForFilesystem` guard the sudo/ssh/sshd executors use before it is spliced into the EAP-TLS cert directory or the `pm-wifi-<id>` connection name.
 - **`SHELL` env vars go through the SDK hijack allow-list.** Caller-supplied `LD_PRELOAD` / `PATH` / `LD_LIBRARY_PATH` and friends are refused before the interpreter is launched.
-- **The stream URL must be `https://host`.** Cleartext / h2c / opaque / hostless URLs are refused before the mTLS dial (WS15).
-- **osquery refuses credential-bearing tables.** The SDK's convenience table path denies `shadow` / `process_envs` / `crontab` / `shell_history` / `sudoers` (the signed `RawSql` escape hatch is unaffected) — see the SDK README.
+- **The stream URL must be `https://host`.** Cleartext / h2c / opaque / hostless URLs are refused before the mTLS dial.
+- **osquery refuses credential-bearing tables.** The SDK's convenience table
+  path denies `shadow`, `process_envs`, `crontab`, `shell_history`, and
+  `sudoers`. Authorized raw SQL still crosses the validated direct mTLS
+  boundary.
 
 CI runs the agent unit/arch suite (`go test -race ./...`, no build tags) separately from the per-distro `-tags=integration` executor suite, so these pure-function and handler-level guards are covered without requiring root or a real device.
 
@@ -776,14 +769,19 @@ journalctl -u power-manage-agent -f
 
 ## Auto-Update
 
-The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins schedule this action on their managed devices; the action payload carries, per architecture, an HTTPS `binary_url` and an integrity source. The action is CA-signed, so its fields cannot be tampered in transit.
+The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins
+schedule it on managed devices; the authenticated direct delivery carries an
+HTTPS `binary_url` and an integrity source.
 
 ### Integrity: your choice of `checksum_url` (default) or a pinned `expected_sha256`
 
 Each arch must provide **at least one** of:
 
 - **`checksum_url`** (default) — a `SHA256SUMS` file the agent fetches and verifies the binary against. This is the **hands-off** option: point `binary_url` + `checksum_url` at your `releases/latest/...` assets and the fleet tracks new releases with no per-release action change. Authenticity here is **origin-trust** (TLS + your release host).
-- **`expected_sha256`** (opt-in) — an exact, lowercase-hex hash. When set it **overrides** `checksum_url` and is the authoritative gate: it travels inside the CA-signed action, so the agent verifies against a hash bound to the control server's signature, not a file from the download origin. Use it to **pin an exact binary** (staged rollouts) or for stronger authenticity. The trade-off: a new version means updating + re-signing the action, so it's opt-in, not the default.
+- **`expected_sha256`** (opt-in) — an exact, lowercase-hex hash. When set it
+  **overrides** `checksum_url` and arrives in the authenticated delivery. Use
+  it to pin an exact binary for staged rollouts. A new version requires
+  updating the action.
 
 `binary_url` (and `checksum_url`, when used) must be HTTPS. An action with neither integrity source is rejected at create time and by the agent.
 
@@ -791,7 +789,9 @@ Each arch must provide **at least one** of:
 
 ### Anti-rollback
 
-The agent refuses a candidate **older** than the running version (`vYYYY.MM.PP` comparison); an unparseable version fails closed (never treated as newer). A downgrade requires the signed action to set `allow_downgrade` — the bypass is an explicit, authenticated operator decision, also inside the CA-signed payload.
+The agent refuses a candidate **older** than the running version
+(`vYYYY.MM.PP` comparison); an unparseable version fails closed. A downgrade
+requires `allow_downgrade` in the authenticated delivery.
 
 ### Update Process
 
