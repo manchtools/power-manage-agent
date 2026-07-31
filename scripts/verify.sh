@@ -33,21 +33,23 @@ go vet ./...
 echo "== go vet (integration tag)"
 go vet -tags integration ./...
 
-if command -v staticcheck >/dev/null 2>&1; then
-  echo "== staticcheck"
-  staticcheck ./...
-else
-  echo "staticcheck not installed — skipping (CI runs it)" >&2
+# Fail closed on a MISSING tool. Skipping it and reporting green is the exact
+# shape this gate exists to prevent: a pass that means "not checked".
+if ! command -v staticcheck >/dev/null 2>&1; then
+  echo "staticcheck is not installed — the gate cannot certify this tree" >&2
+  exit 1
 fi
+echo "== staticcheck"
+staticcheck ./...
 
 echo "== go test"
 go test ./... -count=1
 
-if command -v docref >/dev/null 2>&1; then
-  echo "== docref check"
-  docref check
-else
-  echo "docref not installed — skipping (CI runs it)" >&2
+if ! command -v docref >/dev/null 2>&1; then
+  echo "docref is not installed — the gate cannot certify this tree" >&2
+  exit 1
 fi
+echo "== docref check"
+docref check
 
 echo "== agent gate green"
