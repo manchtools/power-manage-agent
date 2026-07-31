@@ -173,8 +173,15 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		// password is an exec.Secret; Reveal() is the sanctioned plaintext
 		// access. Reporting first means a failure here leaves the account's
 		// password UNCHANGED — never rotate to a credential we cannot return
-		// to the operator, which is the whole point of LPS. This is the
-		// ordering the seal enforced; only the mechanism changed.
+		// to the operator, which is the whole point of LPS.
+		//
+		// This is STRONGER than the seal-era ordering, not a mirror of it: the
+		// seal only guaranteed the value COULD be reported, while the durable
+		// report rode the action result AFTER SetPassword — so a lost result
+		// left a password existing only on this device, locking the operator
+		// out unrecoverably. Report-first inverts the residual: on a failure
+		// after the ack, control is ahead of the device, the execution errors
+		// visibly, and the previous recorded password still opens the account.
 		plaintext := password.Reveal()
 		rotatedAt := e.now().UTC()
 		if err := lpsStore.StorePasswords(ctx, actionID, []*pb.LpsPasswordRotation{{
