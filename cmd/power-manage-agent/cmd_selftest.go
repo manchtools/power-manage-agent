@@ -21,7 +21,7 @@ import (
 //  1. Loads credentials from the data directory
 //  2. Establishes an mTLS connection to the control
 //  3. Sends Hello, waits for Welcome (proves bidirectional stream)
-//  4. Calls SyncActions (proves unary RPC works)
+//  4. Synchronizes state on that stream
 //
 // Does NOT start the scheduler, open the enrollment socket, execute actions,
 // or modify any local state. Read-only connectivity check.
@@ -104,13 +104,16 @@ func runSelfTest(args []string) int {
 	logger.Info("self-test: stream connected, welcome received",
 		"server_version", msg.GetWelcome().ServerVersion)
 
-	// Step 4: Call SyncActions (proves unary RPC path works)
-	_, err = client.SyncActions(ctx)
+	// Step 4: synchronize on the same stream. The receiver owns subsequent
+	// inbound frames and routes the correlated response to Sync.
+	stopReceiver := client.StartReceiver(ctx)
+	defer stopReceiver()
+	_, err = client.Sync(ctx)
 	if err != nil {
-		logger.Error("self-test: sync actions failed", "error", err)
+		logger.Error("self-test: stream synchronization failed", "error", err)
 		return 1
 	}
-	logger.Info("self-test: sync actions succeeded")
+	logger.Info("self-test: stream synchronization succeeded")
 
 	logger.Info("self-test: all checks passed")
 	return 0

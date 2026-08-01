@@ -71,7 +71,7 @@ func (e *Executor) markAgentUpdateExecuted() bool {
 //  7. Compare with running version → skip if same; refuse a downgrade
 //     unless allow_downgrade is set on the control-authored action (anti-rollback)
 //  8. Run ./agent-new self-test → subprocess validates connectivity
-//     (credentials load, mTLS, stream, SyncActions). If it fails,
+//     (credentials load, mTLS, stream synchronization). If it fails,
 //     the old binary stays untouched.
 //  9. Atomically swap binary via SafeBackupAndReplace (O_NOFOLLOW +
 //     renameat2; copies the old binary to .bak first)
@@ -197,7 +197,7 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	e.logger.Info("updating agent", "from", cfg.Version, "to", newVersion)
 
 	// Step 8: Run the new binary in self-test mode. This validates
-	// connectivity (mTLS, stream, SyncActions) WITHOUT replacing the
+	// connectivity (mTLS and stream synchronization) WITHOUT replacing the
 	// live binary. If the self-test fails, the old binary continues
 	// running unchanged. See the function doc comment for retry semantics.
 	selfTestCtx, selfTestCancel := context.WithTimeout(ctx, 60*time.Second)

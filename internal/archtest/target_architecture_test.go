@@ -15,6 +15,7 @@ func TestTargetArchitectureHasNoAbolishedAgentRuntime(t *testing.T) {
 		"github.com/manchtools/power-manage-sdk/verify",
 		"SignedActionEnvelope",
 		"ActionEnvelope",
+		"SyncActions",
 		"SyncStandaloneAndGrouped",
 		"SaveAction(",
 		"GetDueActions(",
