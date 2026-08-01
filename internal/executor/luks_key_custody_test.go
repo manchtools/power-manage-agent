@@ -116,6 +116,24 @@ func TestTakeOwnership_StoresTheSamePassphraseItAddsToTheVolume(t *testing.T) {
 		"the passphrase must reach control BEFORE the PSK slot is removed")
 }
 
+func TestVerifyKeyRoundTrip_DoesNotRetryCommittedMismatch(t *testing.T) {
+	fakeEnc := &fakeSealEncManager{}
+	swapEncMgr(t, fakeEnc)
+
+	ks := &fakeLuksKeyStore{
+		getKeyFunc: func(_ context.Context, _ string) (string, error) {
+			return "different-key", nil
+		},
+	}
+	e := &Executor{logger: slog.Default(), now: time.Now}
+	e.SetLuksKeyStore(ks)
+
+	err := e.verifyKeyRoundTrip(context.Background(), "01HXMISMATCH00000000000000", "/dev/mapper/test", "expected-key")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "different key")
+	assert.Equal(t, 1, ks.getKeyCalls, "a committed CRUD read mismatch is not eventual-consistency lag")
+}
+
 // Without a device identity nothing is stored AND nothing is mutated — the gate
 // fires before AddKey, so no half-owned volume is left. Same gate as before;
 // only its precondition changed, from "a verified control key exists" to "the
