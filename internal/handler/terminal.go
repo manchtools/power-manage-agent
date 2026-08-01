@@ -73,7 +73,7 @@ const (
 
 	// Activated shell to assign to the TTY user during a session. The
 	// agent reverts to nologin on disconnect; this is intentionally
-	// hard-coded so it cannot be overridden from the gateway side.
+	// hard-coded so it cannot be overridden from the control side.
 	terminalActivatedShell   = "/bin/bash"
 	terminalDeactivatedShell = "/usr/sbin/nologin"
 
@@ -100,7 +100,7 @@ func validateDims(cols, rows uint32) error {
 }
 
 // TerminalSender is the subset of the SDK Client that the terminal
-// handler needs to push messages back to the gateway. The agent's
+// handler needs to push messages back to the control. The agent's
 // main.go injects the *sdk.Client which satisfies this interface
 // implicitly so the handler package doesn't depend on the entire
 // client.
@@ -238,7 +238,7 @@ func (h *Handler) snapshotTerminalSender() TerminalSender {
 // OnTerminalStart implements sdk.TerminalHandler. It validates the
 // dedicated TTY user, activates its shell, allocates the PTY via the
 // SDK terminal package, kicks off the read goroutine that pumps PTY
-// output back to the gateway, and emits a STARTED state change. Any
+// output back to the control, and emits a STARTED state change. Any
 // failure surfaces via SendTerminalStateChange with STATE_ERROR
 // instead of returning an error from the dispatch loop, so a single
 // bad request never tears down the agent connection.
@@ -320,7 +320,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	// created and chowned as root, so it must be a well-formed ULID — the proto
 	// declares session_id as validate:"required,ulid", and the agent enforces
 	// that on inbound stream messages rather than trusting a possibly-compromised
-	// gateway. ulid.Parse rejects path-meaningful values ("../../etc", "a/b",
+	// control. ulid.Parse rejects path-meaningful values ("../../etc", "a/b",
 	// embedded NULs) and the empty string before any filesystem use; together
 	// with the validated pm-tty-* username this makes the joined path unable to
 	// escape /tmp. Placed after the TTY/dims gates so those keep their existing
@@ -413,7 +413,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	}
 
 	// abortFail tears down whatever was built and emits STATE_ERROR.
-	// Used for failures during start prep that the gateway hasn't
+	// Used for failures during start prep that the control hasn't
 	// asked for.
 	abortFail := func(reason string) {
 		cleanup()
@@ -421,7 +421,7 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	}
 
 	// abortStopped tears down whatever was built but does NOT emit a
-	// STATE_ERROR — Stop arrived externally and the gateway already
+	// STATE_ERROR — Stop arrived externally and the control already
 	// knows the session is being killed.
 	abortStopped := func() {
 		logger.Info("terminal start aborted by concurrent stop")
@@ -519,9 +519,9 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 	ts.touchLocked()
 	ts.mu.Unlock()
 
-	// Tell the gateway/web client we're live BEFORE starting the
+	// Tell the control/web client we're live BEFORE starting the
 	// reader, so the first byte of output cannot race ahead of the
-	// STARTED state change. If this fails, the gateway never
+	// STARTED state change. If this fails, the control never
 	// learned we're alive — there's no point keeping the PTY open
 	// and burning a slot, so tear the session down.
 	if err := sender.SendTerminalStateChange(ctx, &pb.TerminalStateChange{
@@ -544,7 +544,7 @@ func (ts *terminalSession) touchLocked() {
 }
 
 // OnTerminalInput writes the bytes to the named session's PTY. Unknown
-// sessions are ignored at debug level — the gateway may have already
+// sessions are ignored at debug level — the control may have already
 // torn down the session and a few in-flight frames are normal.
 func (h *Handler) OnTerminalInput(ctx context.Context, req *pb.TerminalInput) error {
 	ts := h.lookupTerminal(req.SessionId)
@@ -602,7 +602,7 @@ func (h *Handler) OnTerminalResize(ctx context.Context, req *pb.TerminalResize) 
 // OnTerminalStop terminates the named session and reverts side
 // effects: closes the PTY, removes the temp home, and reverts the
 // TTY user's shell to nologin if it was the last active session for
-// that user. Idempotent: unknown sessions are no-ops so the gateway
+// that user. Idempotent: unknown sessions are no-ops so the control
 // can fire and forget. Sessions still in the starting state are
 // marked stopping and cleaned up by OnTerminalStart on its next
 // state check.
@@ -635,7 +635,7 @@ func (h *Handler) pumpTerminalOutput(sessionCtx context.Context, ts *terminalSes
 			State:     pb.TerminalSessionState_TERMINAL_SESSION_STATE_EXITED,
 			ExitCode:  int32(exitCode),
 		}
-		// Bound the EXITED-state send so a hung/unresponsive gateway
+		// Bound the EXITED-state send so a hung/unresponsive control
 		// peer cannot wedge this goroutine forever, holding the
 		// terminal-limit slot and blocking new sessions. Audit F053:
 		// previously context.Background() with no timeout. closeTerminal
@@ -673,7 +673,7 @@ func (h *Handler) pumpTerminalOutput(sessionCtx context.Context, ts *terminalSes
 				// Returning here triggers the deferred Wait + EXITED
 				// + closeTerminal path, so the PTY is torn down and
 				// the slot is freed. Without this teardown, a
-				// disconnected gateway would leak the PTY indefinitely.
+				// disconnected control would leak the PTY indefinitely.
 				return
 			}
 		}
@@ -685,7 +685,7 @@ func (h *Handler) pumpTerminalOutput(sessionCtx context.Context, ts *terminalSes
 	}
 }
 
-// failTerminalStart sends a STATE_ERROR back to the gateway and gives
+// failTerminalStart sends a STATE_ERROR back to the control and gives
 // up on the session. Used during the validation/preparation phase
 // before the I/O goroutine has been started; once the goroutine is
 // running, errors flow through pumpTerminalOutput's deferred

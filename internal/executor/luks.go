@@ -19,14 +19,9 @@ import (
 // reads it via --key-file). NewMultilineSecret accepts arbitrary key material.
 func luksSecret(s string) sysexec.Secret { return sysexec.NewMultilineSecret(s) }
 
-// LuksKeyStore is the interface for LUKS key operations via the agent stream.
-//
-// StoreKey carries the passphrase in the clear. Spec 41: it used to be sealed
-// to a control public key because a gateway relayed it, and the relay was the
-// least-trusted server-side actor. The agent now holds a direct mTLS session
-// with control, so there is no intermediary to withhold the plaintext from.
-// Confidentiality at rest is unchanged — control encrypts under its KEK with a
-// device|action AAD on receipt.
+// LuksKeyStore is the executor's narrow in-process key boundary. The runtime
+// adapter seals outbound passphrases and opens inbound passphrases immediately
+// before this interface is crossed; protobuf never carries plaintext.
 type LuksKeyStore interface {
 	GetKey(ctx context.Context, actionID string) (string, error)
 	StoreKey(ctx context.Context, actionID, devicePath, passphrase string, reason pb.RotationReason) error
@@ -36,10 +31,6 @@ type LuksKeyStore interface {
 // without a usable route to control the new passphrase could never be stored,
 // so bail BEFORE any LUKS slot is touched — a failed store after AddKey needs a
 // rollback, and a rollback that itself fails orphans a slot.
-//
-// This is the same gate the seal readiness check performed; only the
-// precondition changed, from "a verified control public key exists" to "a live
-// stream and a device identity exist".
 func (e *Executor) requireLuksStoreReady() error {
 	if e.getLuksKeyStore() == nil {
 		return fmt.Errorf("no server connection; cannot store the new passphrase (fail closed, no cleartext-only rotation)")

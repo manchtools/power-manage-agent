@@ -15,23 +15,13 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
-// LpsPasswordStore reports rotated local passwords to control over the agent's
-// own mTLS stream.
-//
-// Spec 41 replaced two mechanisms at once. The passwords used to be sealed to a
-// control public key and smuggled out inside the action result's
-// `lps.rotations` metadata, because the agent had no authenticated channel of
-// its own — a gateway relayed the result, and the seal existed so that relay
-// could not read what it carried. The agent now holds a direct session with
-// control, so the passwords travel on it as a first-class message and nothing
-// in between ever sees them. Control encrypts them at rest on receipt.
+// LpsPasswordStore sends rotated passwords as dedicated sealed fields over the
+// agent's authenticated control stream. Passwords never enter action metadata.
 type LpsPasswordStore interface {
 	StorePasswords(ctx context.Context, actionID string, rotations []*pb.LpsPasswordRotation) error
 }
 
-// lpsRotationReason maps this package's internal reason strings to the wire
-// enum. The string form used to survive to the server, which parsed it back;
-// the enum is now set at the source and the server-side parser is gone.
+// lpsRotationReason maps the executor's reason strings to the wire enum.
 func lpsRotationReason(reason string) pb.RotationReason {
 	switch reason {
 	case "initial", "user_created":
@@ -265,10 +255,8 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		}, false, nil, nil
 	}
 
-	// No metadata: the passwords went to control on the stream, not through
-	// the action result. Nothing parses `lps.rotations` any more — the gateway
-	// that did is gone — so emitting it would only be a second copy of a
-	// credential travelling a path with no reader.
+	// No metadata: each password was sealed into its dedicated control-stream
+	// message, so action metadata must not carry a second copy.
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),

@@ -14,7 +14,7 @@ import (
 // (defaulting to the bare time.Now value), so every time-dependent path
 // is deterministically testable with a fixed clock. This extends the
 // existing seam already used by internal/terminal,
-// internal/compliance and internal/gateway/registry to the whole module.
+// internal/compliance and internal/control/registry to the whole module.
 //
 // The bare `time.Now` *value* (the injection default, e.g. `now: time.Now`)
 // is not a call and is therefore allowed — it is the single sanctioned

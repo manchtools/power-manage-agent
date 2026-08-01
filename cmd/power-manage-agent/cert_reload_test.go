@@ -18,7 +18,7 @@ func testCreds(cert string) *credentials.Credentials {
 		CACert:      []byte("ca"),
 		Certificate: []byte(cert),
 		PrivateKey:  []byte("key"),
-		StreamAddr:  "https://gw:8443",
+		AgentAddr:   "https://gw:8443",
 		ControlAddr: "https://ctl",
 	}
 }

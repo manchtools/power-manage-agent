@@ -2,14 +2,14 @@ package main
 
 import "testing"
 
-// WS15 #3 — the gateway-URL guard must reject every non-https://host value,
+// WS15 #3 — the control-URL guard must reject every non-https://host value,
 // consistently, using url.Parse discipline (scheme=="https" case-insensitively,
 // empty Opaque, non-empty Host).
 //
 // runtime.go used strings.HasPrefix(addr, "http://"), which lets HTTP:// (case),
 // Https:// (mixed case), https:foo (opaque), https: (no host), ftp://, h2c://,
 // "" (empty), and " http://x" (leading whitespace) through to WithMTLSFromPEM.
-// requireHTTPSStreamAddr consolidates the cmd_selftest.go predicate so all gateway
+// requireHTTPSAgentAddr consolidates the cmd_selftest.go predicate so all control
 // dial sites share one definition. "wrong" cases are sourced from the intent
 // ("only a cleartext-refusing https network URL may reach WithMTLSFromPEM"),
 // NOT from the old HasPrefix artifact.
@@ -42,12 +42,12 @@ func TestStreamURLGuard_RejectsNonHTTPS(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			err := requireHTTPSStreamAddr(tc.addr)
+			err := requireHTTPSAgentAddr(tc.addr)
 			if tc.wantErr && err == nil {
-				t.Fatalf("requireHTTPSStreamAddr(%q) = nil, want error", tc.addr)
+				t.Fatalf("requireHTTPSAgentAddr(%q) = nil, want error", tc.addr)
 			}
 			if !tc.wantErr && err != nil {
-				t.Fatalf("requireHTTPSStreamAddr(%q) = %v, want nil", tc.addr, err)
+				t.Fatalf("requireHTTPSAgentAddr(%q) = %v, want nil", tc.addr, err)
 			}
 		})
 	}

@@ -46,10 +46,8 @@ func (s *clientLuksKeyStore) ValidateLuksToken(ctx context.Context, token string
 	return s.client.ValidateLuksToken(ctx, token)
 }
 
-// clientLpsPasswordStore adapts sdk.Client to executor.LpsPasswordStore.
-// Rotated local passwords used to leave the device inside the action result's
-// metadata, sealed, because the gateway relayed that result. They now travel on
-// the agent's own authenticated stream as StoreLpsPasswords.
+// clientLpsPasswordStore sends sealed password rotations over the agent's
+// authenticated control stream.
 type clientLpsPasswordStore struct {
 	client *sdk.Client
 }

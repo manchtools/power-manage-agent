@@ -19,7 +19,7 @@ import (
 //
 // The probe:
 //  1. Loads credentials from the data directory
-//  2. Establishes an mTLS connection to the gateway
+//  2. Establishes an mTLS connection to the control
 //  3. Sends Hello, waits for Welcome (proves bidirectional stream)
 //  4. Calls SyncActions (proves unary RPC works)
 //
@@ -27,7 +27,7 @@ import (
 // or modify any local state. Read-only connectivity check.
 //
 // Session-conflict caveat: the self-test connects with the same device identity
-// as the live agent, and the gateway's connection manager closes any existing
+// as the live agent, and the control's connection manager closes any existing
 // stream on re-register (see server internal/connection/manager.go Register).
 // Consequence: the live agent briefly disconnects during the self-test and
 // reconnects when the subprocess exits — typically 3-5 seconds of offline
@@ -63,9 +63,9 @@ func runSelfTest(args []string) int {
 	// managed devices and must exercise the same security posture as
 	// normal agent operation. Shared predicate with runtime.go so the
 	// guard cannot drift between dial sites.
-	gatewayAddr := strings.TrimSpace(creds.StreamAddr)
-	if err := requireHTTPSStreamAddr(creds.StreamAddr); err != nil {
-		logger.Error("self-test: refusing gateway URL", "gateway", creds.StreamAddr, "error", err)
+	controlAddr := strings.TrimSpace(creds.AgentAddr)
+	if err := requireHTTPSAgentAddr(creds.AgentAddr); err != nil {
+		logger.Error("self-test: refusing control URL", "control", creds.AgentAddr, "error", err)
 		return 1
 	}
 	mtlsOpt, err := sdk.WithMTLSFromPEM(creds.Certificate, creds.PrivateKey, creds.CACert)
@@ -73,14 +73,14 @@ func runSelfTest(args []string) int {
 		logger.Error("self-test: failed to configure mTLS", "error", err)
 		return 1
 	}
-	client := sdk.NewClient(gatewayAddr,
+	client := sdk.NewClient(controlAddr,
 		mtlsOpt,
 		sdk.WithAuth(creds.DeviceID, ""),
 	)
 
 	// Step 3: Connect and send Hello, wait for Welcome
 	if err := client.Connect(ctx); err != nil {
-		logger.Error("self-test: failed to connect to gateway", "error", err)
+		logger.Error("self-test: failed to connect to control", "error", err)
 		return 1
 	}
 	defer client.Close()

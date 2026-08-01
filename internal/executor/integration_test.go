@@ -81,10 +81,7 @@ func newTestExecutor() *Executor {
 	}
 	e.SetStore(s)
 	// Wire the password store + device ID so LPS rotations and user-create
-	// temp passwords can be reported. Spec 41: these used to be sealed to a
-	// seeded control public key and read back out of the action metadata;
-	// they now go to control on the stream, so the integration lane records
-	// them here instead of unsealing them.
+	// temporary passwords can be observed by the integration lane.
 	e.SetLpsPasswordStore(testLpsReports)
 	e.SetDeviceID("01HKINTEGRATIONDEVICE00000")
 	return e

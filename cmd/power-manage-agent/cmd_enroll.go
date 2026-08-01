@@ -22,12 +22,12 @@ import (
 // parseRegistrationURI parses a power-manage:// URI.
 // Format: power-manage://server:port?token=xxx
 // Examples:
-//   - power-manage://gateway.example.com:8080?token=abc123
+//   - power-manage://control.example.com:8080?token=abc123
 //
 // TLS verification is always enforced. The previous `skip-verify=true`
 // and `tls=false` query parameters were removed because bypassing
 // TLS during initial registration enables MITM attacks that can
-// substitute the gateway URL and a malicious certificate before the
+// substitute the control URL and a malicious certificate before the
 // agent has any trust anchor of its own.
 func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	// Replace power-manage:// with https:// for parsing.

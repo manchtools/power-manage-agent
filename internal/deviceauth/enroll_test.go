@@ -95,7 +95,7 @@ func TestEnroll_Success(t *testing.T) {
 	// Callback was called
 	require.NotNil(t, enrolledCreds)
 	assert.Equal(t, "dev-123", enrolledCreds.DeviceID)
-	assert.Equal(t, "https://gw.example.com:8443", enrolledCreds.StreamAddr)
+	assert.Equal(t, "https://gw.example.com:8443", enrolledCreds.AgentAddr)
 	assert.Equal(t, srv.URL, enrolledCreds.ControlAddr)
 	assert.Len(t, enrolledCreds.SealingPrivateKey, 32)
 	assert.Equal(t, testControlSealingPublicKey(), enrolledCreds.ControlSealingPublicKey)
@@ -131,7 +131,7 @@ func TestEnroll_AlreadyEnrolled(t *testing.T) {
 		CACert:      []byte("ca"),
 		Certificate: []byte("cert"),
 		PrivateKey:  []byte("key"),
-		StreamAddr:  "https://gw.example.com",
+		AgentAddr:   "https://gw.example.com",
 	})
 
 	logger := slog.Default()
@@ -187,7 +187,7 @@ func TestGetEnrollmentStatus_Enrolled(t *testing.T) {
 		CACert:      []byte("ca"),
 		Certificate: []byte("cert"),
 		PrivateKey:  []byte("key"),
-		StreamAddr:  "https://gw.example.com",
+		AgentAddr:   "https://gw.example.com",
 	})
 
 	logger := slog.Default()

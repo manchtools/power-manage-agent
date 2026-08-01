@@ -163,7 +163,7 @@ func TestExecuteAgentUpdate_ChecksumMismatchAbortsSwap(t *testing.T) {
 // and a malicious same-origin checksum document is NOT trusted. Serve a
 // SHA256SUMS that advertises a MATCHING hash for the tampered bytes while
 // expected_sha256 holds the genuine hash → tampered binary rejected.
-func TestExecuteAgentUpdate_HashBoundToSignedAction_NotChecksumFile(t *testing.T) {
+func TestExecuteAgentUpdate_HashBoundToControlAction_NotChecksumFile(t *testing.T) {
 	genuine := agentScript("v2026.06.05", 0)
 	tampered := append([]byte{}, genuine...)
 	tampered[len(tampered)-2] ^= 0xff

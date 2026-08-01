@@ -165,7 +165,7 @@ func main() {
 		}
 		logger.Info("credentials loaded",
 			"device_id", creds.DeviceID,
-			"gateway", creds.StreamAddr,
+			"control", creds.AgentAddr,
 		)
 
 		// Ignore registration token if already registered. Promoted
@@ -247,7 +247,7 @@ func main() {
 	// `power-manage-agent luks set-passphrase` and the root agent performs
 	// the cryptsetup work with its OWN credentials, authorized by the
 	// server-issued token — replacing the old NOPASSWD sudoers rule +
-	// attacker-controllable --data-dir. The gateway session is wired in
+	// attacker-controllable --data-dir. The control session is wired in
 	// per connection (SetSession/ClearSession) inside runAgent.
 	luksDaemon := luksd.NewDaemon(luksd.DefaultSocketPath, actionStore, luksd.NewSysencEnroller(), logger)
 	go func() {
@@ -322,7 +322,7 @@ func main() {
 
 	// Run the agent
 	logger.Info("starting agent",
-		"gateway", creds.StreamAddr,
+		"control", creds.AgentAddr,
 		"device_id", creds.DeviceID,
 		"hostname", hostname,
 		"version", version,

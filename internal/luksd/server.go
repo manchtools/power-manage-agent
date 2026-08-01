@@ -19,7 +19,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
-// Session is the agent's authenticated gateway connection, supplying the
+// Session is the agent's authenticated control connection, supplying the
 // two operations the daemon performs against the server: validating (and
 // consuming) the one-time LUKS token, and fetching the managed unlock key
 // for the action. It is swapped in on connect and cleared on disconnect,
@@ -56,7 +56,7 @@ type Daemon struct {
 	enroller   Enroller
 
 	mu      sync.RWMutex
-	session Session // nil while the agent is not connected to the gateway
+	session Session // nil while the agent is not connected to the control
 
 	listenerMu sync.Mutex
 	listener   net.Listener
@@ -77,7 +77,7 @@ func NewDaemon(socketPath string, st StateStore, enroller Enroller, logger *slog
 	return &Daemon{socketPath: socketPath, logger: logger, store: st, enroller: enroller, now: time.Now}
 }
 
-// SetSession installs the current connected gateway session. Called on
+// SetSession installs the current connected control session. Called on
 // connect.
 func (d *Daemon) SetSession(s Session) {
 	d.mu.Lock()
@@ -85,7 +85,7 @@ func (d *Daemon) SetSession(s Session) {
 	d.mu.Unlock()
 }
 
-// ClearSession removes the gateway session. Called on disconnect; while
+// ClearSession removes the control session. Called on disconnect; while
 // cleared, requests fail with CodeNotConnected.
 func (d *Daemon) ClearSession() {
 	d.mu.Lock()
@@ -209,12 +209,12 @@ func (d *Daemon) handleRequest(ctx context.Context, req Request) Response {
 		return errResponse(CodeMissingToken, "token is required")
 	}
 
-	// Authorize via the agent's own gateway connection — NOT the socket
+	// Authorize via the agent's own control connection — NOT the socket
 	// peer. ValidateLuksToken consumes the single-use, device-bound,
 	// short-TTL token server-side and returns the action's policy.
 	sess := d.currentSession()
 	if sess == nil {
-		return errResponse(CodeNotConnected, "agent is not connected to the gateway; retry when online")
+		return errResponse(CodeNotConnected, "agent is not connected to the control; retry when online")
 	}
 	result, err := sess.ValidateLuksToken(ctx, req.Token)
 	if err != nil {

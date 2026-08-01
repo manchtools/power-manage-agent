@@ -171,7 +171,7 @@ func TestLuksDaemon_RejectsRequestWithoutToken(t *testing.T) {
 	})
 }
 
-// WS6: when the agent is not connected to the gateway there is no session
+// WS6: when the agent is not connected to the control there is no session
 // to authorize against — fail closed, never enroll.
 func TestLuksDaemon_RejectsWhenNotConnected(t *testing.T) {
 	enr := &spyEnroller{}

@@ -69,7 +69,7 @@ func (e *Executor) markAgentUpdateExecuted() bool {
 //     expected_sha256 (WS7 #1 — NOT a same-origin checksum file)
 //  6. Run ./agent-new version → extract version string
 //  7. Compare with running version → skip if same; refuse a downgrade
-//     unless allow_downgrade is set on the signed action (anti-rollback)
+//     unless allow_downgrade is set on the control-authored action (anti-rollback)
 //  8. Run ./agent-new self-test → subprocess validates connectivity
 //     (credentials load, mTLS, stream, SyncActions). If it fails,
 //     the old binary stays untouched.
@@ -110,8 +110,8 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	// Step 4: determine the expected binary hash. Operator's choice (WS7):
-	//   - expected_sha256 set → AUTHORITATIVE, CA-signed pin. It rides
-	//     inside the signed action, so even a compromised download origin
+	//   - expected_sha256 set → AUTHORITATIVE, control-authored pin. It rides
+	//     inside the control-authored action, so even a compromised download origin
 	//     cannot vouch for a tampered binary. Overrides checksum_url.
 	//   - otherwise → fetch the operator's checksum_url (SHA256SUMS) and
 	//     verify against it. This is the default that lets binary_url +
@@ -175,9 +175,9 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	}
 
 	// Anti-rollback (WS7 #7): refuse a candidate that is older than the
-	// running version unless the signed action explicitly allows a
+	// running version unless the control-authored action explicitly allows a
 	// downgrade. An unparseable version fails CLOSED — never treated as
-	// newer. allow_downgrade rides inside the CA-signed action, so a
+	// newer. allow_downgrade rides inside the control-authored action, so a
 	// downgrade is an explicit, authenticated operator decision.
 	if !params.AllowDowngrade {
 		cmp, cmpErr := compareAgentVersion(cfg.Version, newVersion)
@@ -437,7 +437,7 @@ func extractFilename(rawURL string) string {
 // (expected_sha256, or the hash resolved from checksum_url) and an https->http
 // downgrade is refused by the SDK regardless, so the flag opts into a
 // host-changing hop, not into unchecked bytes — mirroring allow_downgrade as a
-// security-sensitive operator decision that rides inside the signed action.
+// security-sensitive operator decision that rides inside the control-authored action.
 func updateRedirectPolicy(params *pb.AgentUpdateParams) remote.RedirectPolicy {
 	if params.GetAllowRedirect() {
 		return remote.RedirectCrossOrigin

@@ -16,7 +16,7 @@ import (
 
 // register performs initial registration with the control server.
 // The agent generates its own key pair locally and sends a CSR to the control server.
-// The private key never leaves the agent. The control server returns the gateway URL
+// The private key never leaves the agent. The control server returns the control URL
 // for subsequent mTLS streaming connections.
 func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Logger) (*credentials.Credentials, error) {
 	logger.Info("registering with control server",
@@ -38,7 +38,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 	// Register via control server RPC. TLS verification is always
 	// enforced — there is intentionally no opt-out, as bypassing it
 	// during initial registration enables MITM attacks that can
-	// substitute the gateway URL and a malicious certificate before
+	// substitute the control URL and a malicious certificate before
 	// the agent has any trust anchor of its own.
 	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM, sealingPrivate.PublicKey().Bytes())
 	if err != nil {
@@ -47,7 +47,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 
 	logger.Info("registration successful",
 		"device_id", result.DeviceID,
-		"gateway_url", result.ControlURL,
+		"control_url", result.ControlURL,
 	)
 
 	// Verify we received CA cert and signed certificate
@@ -63,7 +63,7 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 		CACert:                  result.CACert,
 		Certificate:             result.Certificate,
 		PrivateKey:              keyPEM, // Private key generated locally, never sent to server
-		StreamAddr:              result.ControlURL,
+		AgentAddr:               result.ControlURL,
 		ControlAddr:             cfg.ServerURL, // Control Server URL for device auth proxy
 		SealingPrivateKey:       sealingPrivate.Bytes(),
 		ControlSealingPublicKey: result.ControlSealingPublicKey,
@@ -192,7 +192,7 @@ func startCertRotation(ctx context.Context, credStore *credentials.Store, hostna
 		// Let's Encrypt in the reference deployment), so server
 		// verification needs the host's system roots — the strict
 		// sdk.WithMTLSFromPEM (internal CA only, as of SDK audit
-		// pass) is correct for the gateway mTLS path but not for
+		// pass) is correct for the control mTLS path but not for
 		// this one. Application-layer identity of the agent is
 		// already proven by the current certificate in the
 		// RenewCertificate request body.

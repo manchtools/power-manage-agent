@@ -12,7 +12,7 @@ import (
 
 // setupSSHKeys must refuse an authorized_keys entry that carries an embedded
 // newline (or carriage return) BEFORE it writes anything to disk. Without the
-// guard, a single signed action could smuggle extra authorized_keys lines —
+// guard, a single control-authored action could smuggle extra authorized_keys lines —
 // additional principals, a command="…" override, a restrict= bypass — by
 // embedding "\nssh-rsa ATTACKER…" in one key value: the prefix check passes on
 // the first line and the appended lines land in the file unfiltered.

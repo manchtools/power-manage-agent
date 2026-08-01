@@ -13,7 +13,7 @@ import (
 // runShellScript builds the child environment from a curated baseline plus
 // only the caller-supplied entries that pass the SDK hijack allow-list. A
 // blocklisted variable (LD_PRELOAD, PATH, LD_LIBRARY_PATH, …) must be refused
-// BEFORE the interpreter is ever launched, so a compromised gateway cannot
+// BEFORE the interpreter is ever launched, so a compromised control cannot
 // inject an ambient-library hijack through a SHELL action.
 //
 // The wrong inputs are sourced from intent (the classic LD_* / PATH hijack

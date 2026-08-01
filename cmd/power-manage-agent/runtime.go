@@ -17,7 +17,7 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/scheduler"
 )
 
-// runAgent connects to the gateway and processes messages.
+// runAgent connects to the control and processes messages.
 // The agent continues to run scheduled actions even when disconnected.
 // If securityAlert is non-nil, it will be sent to the server after connection.
 // reloadCredsForReconnect returns the latest credentials from disk,
@@ -58,17 +58,8 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 	// certificate before building the mTLS client.
 	firstConnect := true
 
-	// Spec 41: no client-side revocation list. It existed to check the GATEWAY's
-	// server certificate — the relay was the least-trusted server-side actor, so
-	// the agent had to be able to learn that one had been revoked while still
-	// connected to it. The agent now dials control directly, and control's
-	// identity is the CA's own peer: there is no third party left to revoke, and
-	// nothing serves the list any more. The property died with the mechanism
-	// rather than being dropped.
-	//
-	// Revocation still exists in the other direction, which is the one that
-	// protects the fleet: control checks each AGENT certificate against its
-	// database on every handshake and drops the live stream on revocation.
+	// There is no client-side CRL cache. Control checks the agent certificate at
+	// every handshake and closes the live stream when the device is revoked.
 
 	for {
 		if !firstConnect {
@@ -81,14 +72,14 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 
 		// rc10: refuse anything but https://host for the stream path. The only
 		// h2c use in this binary is the local unix-socket enrollment client,
-		// never a remote endpoint. A non-https (or malformed) StreamAddr means
+		// never a remote endpoint. A non-https (or malformed) AgentAddr means
 		// either a dev-leftover creds file or a tampered redirect — both are
 		// reasons to fail fast rather than silently skip mTLS on the live fleet.
 		// Shared predicate with cmd_selftest.go so the guard cannot drift
 		// (closes the HasPrefix case/opaque/hostless gaps).
-		if err := requireHTTPSStreamAddr(creds.StreamAddr); err != nil {
+		if err := requireHTTPSAgentAddr(creds.AgentAddr); err != nil {
 			logger.Error("refusing stream URL — re-enrol against an https:// control server or delete the cached credentials",
-				"stream_addr", creds.StreamAddr, "error", err)
+				"agent_addr", creds.AgentAddr, "error", err)
 			os.Exit(1)
 		}
 		// Create a child context for this connection session
@@ -102,7 +93,7 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 			logger.Error("failed to configure mTLS", "error", err)
 			os.Exit(1)
 		}
-		client := sdk.NewClient(strings.TrimSpace(creds.StreamAddr),
+		client := sdk.NewClient(strings.TrimSpace(creds.AgentAddr),
 			mtlsOpt,
 			sdk.WithAuth(creds.DeviceID, ""),
 		)
@@ -137,8 +128,8 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		// Sync actions from server (unary RPC — the stream is connecting in
 		// parallel). The FIRST sync of a connection is a full reconcile, and
 		// it MUST land: a single transient failure (most commonly the unary
-		// sync racing ahead of the stream's device→gateway binding publish, so
-		// control returns "device not live on any gateway") would otherwise
+		// sync racing ahead of the stream's device→control binding publish, so
+		// control returns "device not live on any control") would otherwise
 		// drop the agent into incremental-only mode, skipping every unchanged
 		// action and leaving any drift — e.g. an account locked by an older
 		// agent — uncorrected until the next reconnect. Retry until one full
@@ -363,7 +354,7 @@ const firstSyncMaxAttempts = 6
 
 // firstSyncBaseBackoff / firstSyncMaxBackoff bound the exponential backoff
 // between initial full-sync attempts. The dominant failure — the sync racing
-// the device→gateway binding publish — clears within the stream handshake, so
+// the device→control binding publish — clears within the stream handshake, so
 // the first retry (after ~1s) almost always lands. Package vars, not consts, so
 // tests can shrink them (the retry loop is otherwise dominated by real sleeps).
 var (

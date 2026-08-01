@@ -577,7 +577,7 @@ func (e *Executor) setupSSHKeys(ctx context.Context, params *pb.UserParams, outp
 			continue
 		}
 		// Reject keys with embedded newlines BEFORE the prefix check.
-		// Without this, a signed action could smuggle additional
+		// Without this, a control-authored action could smuggle additional
 		// authorized_keys entries (extra principals, command=
 		// overrides, restrict= bypasses) by embedding "\nssh-rsa
 		// ATTACKER..." in a single key value. The prefix check on

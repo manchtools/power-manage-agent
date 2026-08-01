@@ -27,10 +27,8 @@ import (
 // heartbeats are advisory metrics, never worth wedging the stream for.
 const heartbeatQueryTimeout = 10 * time.Second
 
-// streamValidator validates incoming stream-RPC messages at the agent boundary
-// (validate → verify-signature → execute). The control server already validates
-// before dispatch; this is defense-in-depth so a malformed message is rejected
-// before any signature/root work.
+// streamValidator rejects malformed messages at the agent boundary before any
+// privileged work. Control also validates before dispatch.
 var streamValidator = validate.NewValidator()
 
 // handlerRunner is the unprivileged runner OnLogQuery shells out through (the
@@ -46,8 +44,7 @@ var handlerRunner = func() sysexec.Runner {
 
 // osqueryRunner is the minimal osquery surface the handler uses. Declared as an
 // interface (vs the concrete osquery client) so tests can inject a fake that
-// records calls — letting the WS4 charter assert "osquery was NOT invoked" when
-// a stream-RPC signature is missing/invalid. The SDK's osquery.Querier satisfies it.
+// records calls and prove invalid requests do not reach osquery.
 type osqueryRunner interface {
 	Query(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error)
 	QueryTable(ctx context.Context, tableName string) ([]*pb.OSQueryRow, error)
@@ -124,8 +121,7 @@ func (h *Handler) getOsquery() osqueryRunner {
 	return h.osquery
 }
 
-// setOsqueryForTest injects a fake osquery runner so tests can assert whether a
-// stream-RPC reached osquery (call-count) under a missing/invalid signature.
+// setOsqueryForTest injects a fake osquery runner for boundary tests.
 func (h *Handler) setOsqueryForTest(r osqueryRunner) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
@@ -279,7 +275,7 @@ func isBase64Char(b byte) bool {
 func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error) {
 	h.logger.Info("received query", "query_id", query.QueryId, "table", query.Table)
 
-	// Validate at the boundary (validate → verify → execute).
+	// Validate at the boundary before executing privileged work.
 	if msg, ok := validate.Struct(streamValidator, query); !ok {
 		h.logger.Warn("rejecting invalid query", "query_id", query.GetQueryId(), "error", msg)
 		return &pb.OSQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil
@@ -384,7 +380,7 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, req *pb.RevokeLuksD
 func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQueryResult, error) {
 	h.logger.Info("received log query", "query_id", query.QueryId, "unit", query.Unit)
 
-	// Validate at the boundary (validate → verify → execute).
+	// Validate at the boundary before executing privileged work.
 	if msg, ok := validate.Struct(streamValidator, query); !ok {
 		h.logger.Warn("rejecting invalid log query", "query_id", query.GetQueryId(), "error", msg)
 		return &pb.LogQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil

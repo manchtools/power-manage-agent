@@ -24,10 +24,10 @@ const widenedTrustOption = "WithMTLSFromPEMAndSystemRoots"
 // AgentService stream client.
 const streamClientCtor = "NewClient"
 
-// streamAddrField is the credentials field naming the control-stream
+// agentAddrField is the credentials field naming the control-stream
 // endpoint; a function that both constructs an SDK client and names this
 // field is a stream dial site.
-const streamAddrField = "StreamAddr"
+const agentAddrField = "AgentAddr"
 
 // TestStreamDialPinsEnrollmentCA pins the TLS trust posture of the agent's
 // control-stream dial.
@@ -51,7 +51,7 @@ const streamAddrField = "StreamAddr"
 // and a different CI lane.
 //
 // Discovery is self-locating: the whole module is walked and a dial site is
-// any function that both calls <sdk>.NewClient and references .StreamAddr,
+// any function that both calls <sdk>.NewClient and references .AgentAddr,
 // so the guard follows the code when it moves between files or functions
 // (it covers runAgent and runSelfTest today). Finding no site at all is a
 // FATAL matches-zero failure, not a pass — an unlocatable dial site means
@@ -96,7 +96,7 @@ func TestStreamDialPinsEnrollmentCA(t *testing.T) {
 	}
 	if sites == 0 {
 		t.Fatalf("matches-zero guard: no function in the module both calls sdk.%s and references .%s — the stream dial site moved or was renamed, so this guard now pins nothing. Re-point it at the new construction site.",
-			streamClientCtor, streamAddrField)
+			streamClientCtor, agentAddrField)
 	}
 }
 
@@ -212,7 +212,7 @@ func sdkCallNames(fd *ast.FuncDecl, sdkName string) map[string]bool {
 // buildsStreamClient reports whether fd is a control-stream dial site: it
 // constructs an SDK client and names the credentials' stream endpoint in
 // the same function. Requiring both keeps out the log statements that
-// mention creds.StreamAddr without dialling anything.
+// mention creds.AgentAddr without dialling anything.
 func buildsStreamClient(fd *ast.FuncDecl, sdkName string) bool {
 	var ctor, streamAddr bool
 	ast.Inspect(fd.Body, func(n ast.Node) bool {
@@ -222,7 +222,7 @@ func buildsStreamClient(fd *ast.FuncDecl, sdkName string) bool {
 				ctor = true
 			}
 		case *ast.SelectorExpr:
-			if x.Sel.Name == streamAddrField {
+			if x.Sel.Name == agentAddrField {
 				streamAddr = true
 			}
 		}

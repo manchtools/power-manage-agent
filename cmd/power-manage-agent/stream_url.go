@@ -7,10 +7,10 @@ import (
 	"strings"
 )
 
-// requireHTTPSStreamAddr validates that addr is a cleartext-refusing
+// requireHTTPSAgentAddr validates that addr is a cleartext-refusing
 // https://host network URL — the only kind permitted to reach the mTLS
-// gateway dial (sdk.WithMTLSFromPEM). It is the single shared predicate for
-// every gateway dial site (runtime.go, cmd_selftest.go) so the guard cannot
+// control dial (sdk.WithMTLSFromPEM). It is the single shared predicate for
+// every control dial site (runtime.go, cmd_selftest.go) so the guard cannot
 // drift between them.
 //
 // Parse the URL rather than checking a literal prefix so case variants
@@ -21,11 +21,11 @@ import (
 // "https:" parses with Scheme="https" but no Host, and an opaque "https:foo"
 // parses with Opaque set rather than as a network URL — both would slip past a
 // Scheme-only check.
-func requireHTTPSStreamAddr(addr string) error {
+func requireHTTPSAgentAddr(addr string) error {
 	trimmed := strings.TrimSpace(addr)
 	parsed, err := url.Parse(trimmed)
 	if err != nil || strings.ToLower(parsed.Scheme) != "https" || parsed.Opaque != "" || parsed.Host == "" {
-		return fmt.Errorf("refusing non-https or hostless gateway URL %q: agent requires https://host for gateway connections", addr)
+		return fmt.Errorf("refusing non-https or hostless control URL %q: agent requires https://host for control connections", addr)
 	}
 	return nil
 }

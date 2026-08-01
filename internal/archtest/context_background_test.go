@@ -8,7 +8,7 @@ import (
 )
 
 // TestNoContextBackgroundInRequestPaths enforces the NIS2 / spec-12 / CLAUDE
-// rule on the agent: request-path code (the signed On* stream-RPC handlers and
+// rule on the agent: request-path code (the On* stream-RPC handlers and
 // everything they call) MUST propagate the caller's context and MUST NOT root a
 // fresh context.Background()/context.TODO(). A fresh root silently drops the
 // RPC's deadline and cancellation — the bug this guard pins was

@@ -70,7 +70,7 @@ func sign(n int) int {
 
 // WS7 #7: a staged binary OLDER than the running version is refused
 // (anti-rollback), unchanged binary, no shutdown — unless allow_downgrade
-// is set in the signed action.
+// is set in the control-authored action.
 func TestExecuteAgentUpdate_RefusesOlderVersion(t *testing.T) {
 	staged := agentScript("v2026.05.01", 0)
 	h := newUpdateHarness(t, "v2026.06.02", staged, nil) // running newer than staged
@@ -121,7 +121,7 @@ func TestExecuteAgentUpdate_RefusesMalformedRunningVersion(t *testing.T) {
 	}
 }
 
-// allow_downgrade in the signed action is the ONLY bypass: an older staged
+// allow_downgrade in the control-authored action is the ONLY bypass: an older staged
 // version then proceeds (swaps + shuts down).
 func TestExecuteAgentUpdate_AllowDowngradeBypass(t *testing.T) {
 	staged := agentScript("v2026.05.01", 0)

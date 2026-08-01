@@ -21,7 +21,7 @@ import (
 // performs all privileged cryptsetup work with its own credentials. There
 // is no --data-dir flag and no sudoers rule: the old design ran this under
 // NOPASSWD sudo with an attacker-controllable --data-dir, letting any
-// local user point root's cryptsetup at a forged store + hostile gateway.
+// local user point root's cryptsetup at a forged store + hostile control.
 func runLuks(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: power-manage-agent luks set-passphrase --token <token>")

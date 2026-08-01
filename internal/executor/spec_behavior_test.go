@@ -14,7 +14,7 @@ import (
 
 func TestSpecSDK_ULIDNotUUID_Documented(t *testing.T) {
 	// The agent executor neither generates nor parses identifiers — it echoes
-	// the server-emitted ActionId (a ULID) from the verified envelope, proven by
+	// the control-emitted ActionId (a ULID), proven by
 	// TestExecutor_ExecutesVerifiedEnvelopeParams. The "ULIDs for all
 	// identifiers" invariant is enforced where IDs are actually produced/checked:
 	//   - SDK ULID generation (ulidx) — tested in the sdk module.

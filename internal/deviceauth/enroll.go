@@ -130,7 +130,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 	// https-only gate (WS9 #2/#16): refuse a cleartext or malformed
 	// control-plane URL BEFORE any CSR generation or network call. The
 	// agent has no trust anchor yet, so a non-TLS endpoint would let a
-	// MITM substitute the gateway URL and a malicious CA.
+	// MITM substitute the control URL and a malicious CA.
 	if err := sdk.ValidateHTTPSURL(req.Msg.ServerUrl); err != nil {
 		return connect.NewResponse(&pm.EnrollResponse{
 			Success: false,
@@ -222,7 +222,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		CACert:                  result.CACert,
 		Certificate:             result.Certificate,
 		PrivateKey:              keyPEM,
-		StreamAddr:              result.ControlURL,
+		AgentAddr:               result.ControlURL,
 		ControlAddr:             req.Msg.ServerUrl,
 		SealingPrivateKey:       sealingPrivate.Bytes(),
 		ControlSealingPublicKey: result.ControlSealingPublicKey,
@@ -237,7 +237,7 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
-	h.logger.Info("enrollment successful", "device_id", result.DeviceID, "gateway", result.ControlURL)
+	h.logger.Info("enrollment successful", "device_id", result.DeviceID, "control", result.ControlURL)
 
 	// Prime the status cache so subsequent GetEnrollmentStatus calls
 	// don't re-derive the Argon2id key just to learn the device id.

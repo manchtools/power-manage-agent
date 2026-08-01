@@ -13,7 +13,7 @@ import (
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
 	// Fail closed when this executor has no privilege runner (the
 	// NewExecutor(nil) unit-test convention). Without this, a test that
-	// dispatches a signed REBOOT envelope through a real handler+executor would
+	// dispatches a REBOOT action through a real handler+executor would
 	// fall back to the process-global Direct runner and issue a REAL
 	// `shutdown -r +5` on the developer's machine — which is exactly what
 	// happened (systemd-logind grants reboot to an active desktop session via

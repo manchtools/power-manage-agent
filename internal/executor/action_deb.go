@@ -157,7 +157,7 @@ func (e *Executor) executeDeb(ctx context.Context, params *pb.AppInstallParams, 
 func (e *Executor) debAbsentPackageName(ctx context.Context, mgr pkg.Manager, params *pb.AppInstallParams) (string, error) {
 	// SECURITY (#173 review finding): the fetched artifact's control file
 	// may only choose the REMOVAL TARGET when the fetch is verified —
-	// https plus the sha256 that travels inside the CA-signed action.
+	// https plus the sha256 that travels inside the control-authored action.
 	// fetchArtifact skips checksum verification when the checksum is
 	// empty, so an unverified fetch would let the origin (or a redirect
 	// target) serve a .deb whose Package field names ANY package and have

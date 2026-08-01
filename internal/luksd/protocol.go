@@ -6,11 +6,11 @@
 // `power-manage-agent luks set-passphrase` under a NOPASSWD sudoers rule
 // with an attacker-controllable `--data-dir`, so any local user could
 // point root's cryptsetup helper at a forged credential store and a
-// hostile gateway. This daemon removes BOTH: the sudoers rule is deleted,
+// hostile control. This daemon removes BOTH: the sudoers rule is deleted,
 // and the only thing crossing the socket is `{token, passphrase}` — no
 // data dir, no store path. Authorization is the existing server-issued
 // LUKS token (device-bound, single-use, short-TTL), validated by the
-// daemon over the agent's OWN authenticated gateway connection — NEVER the
+// daemon over the agent's OWN authenticated control connection — NEVER the
 // socket peer's OS identity. So the socket can be world-connectable (0666,
 // mirroring enroll.sock): the token is the authority, not the local user.
 package luksd

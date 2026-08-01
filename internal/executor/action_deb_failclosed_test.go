@@ -50,7 +50,7 @@ func TestExecuteDeb_RejectsBeforeRemount(t *testing.T) {
 // #173 review finding (SECURITY): with no verifiable checksum the ABSENT
 // path must NEVER fetch the artifact — an unverified origin-served .deb's
 // Package field would otherwise choose what gets removed. The name must
-// come from the CA-signed URL's filename instead.
+// come from the control-authored URL's filename instead.
 func TestDebAbsentPackageName_NoChecksumNeverFetches(t *testing.T) {
 	fetchCalls := 0
 	orig := fetchArtifact

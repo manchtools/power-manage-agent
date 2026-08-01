@@ -22,7 +22,7 @@ func fastBackoff(t *testing.T) {
 	firstSyncMaxBackoff = time.Millisecond
 }
 
-// A first sync that fails a few times (the device→gateway binding race) then
+// A first sync that fails a few times (the device→control binding race) then
 // succeeds must be retried until it lands, returning the success interval — so
 // the connection gets its one full reconcile instead of dropping to
 // incremental-only mode.

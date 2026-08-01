@@ -30,7 +30,7 @@ func (f *ctxCapturingOsquery) QueryTable(ctx context.Context, _ string) ([]*pb.O
 type inventoryCtxKey string
 
 // TestSupplementWithOsquery_PropagatesRequestContext proves inventory osquery
-// collection honours the caller's context. A signed RequestInventory RPC flows
+// collection honours the caller's context. A RequestInventory frame flows
 // OnRequestInventory(ctx) -> CollectInventory(ctx) -> supplementWithOsquery;
 // before the fix that last hop dropped the ctx and rooted context.Background()
 // for every osquery QueryTable, so the RPC's deadline/cancellation never

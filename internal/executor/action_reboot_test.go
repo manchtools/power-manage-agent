@@ -9,7 +9,7 @@ import (
 // an executor built without a privilege runner (NewExecutor(nil), the
 // unit-test convention) must REFUSE to schedule a reboot rather than fall back
 // to the process-global Direct runner and issue a real `shutdown -r +5`. A
-// handler test that dispatched a signed REBOOT envelope through such an executor
+// handler test that dispatched a REBOOT action through such an executor
 // once rebooted a developer's workstation (systemd-logind grants reboot to an
 // active desktop session via polkit, no sudo needed).
 //

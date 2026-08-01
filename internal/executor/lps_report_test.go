@@ -16,17 +16,9 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
-// This file replaces lps_sealed_test.go. Spec 41 deleted the seal: rotated
-// passwords used to be encrypted to a CA-signed control public key and carried
-// out inside the action result's metadata, because a gateway relayed that
-// result and had to be unable to read it. The agent now reports them to control
-// on its own mTLS session.
-//
-// The three ApplyLpsPublicKey tests are gone with the key they verified — there
-// is no longer a key to swap, so "a hostile gateway cannot swap it" is not a
-// property that can hold or fail. What survives, and is tested harder here, is
-// the ordering invariant those tests protected: NEVER rotate a credential that
-// cannot be returned to the operator.
+// These tests pin both X25519 field sealing and the ordering invariant: never
+// rotate a credential that cannot first be returned to control for the
+// operator.
 
 // lpsRecorder observes both sides of the rotation in one ordered log, so a test
 // can assert not just that the password was reported and set, but that the
@@ -188,16 +180,15 @@ func TestExecuteLps_ReportsBeforeSettingThePassword(t *testing.T) {
 		t.Errorf("reported under action %v, want %q", rec.actionIDs, actionID)
 	}
 
-	// The action result must carry no password at all. It used to carry a
-	// sealed one; now the credential travels only on the stream, so any
-	// metadata here would be a second copy on a path with no reader.
+	// The action result must carry no password. The credential travels only as
+	// a dedicated sealed stream field.
 	for k, v := range metadata {
 		if strings.Contains(v, rec.setCalls[0]) {
 			t.Errorf("action metadata %q leaks the rotated password", k)
 		}
 	}
 	if metadata["lps.rotations"] != "" {
-		t.Errorf("lps.rotations metadata is still emitted (%q); nothing parses it since the gateway was removed",
+		t.Errorf("lps.rotations metadata is still emitted (%q); passwords belong only in sealed stream fields",
 			metadata["lps.rotations"])
 	}
 }

@@ -22,13 +22,8 @@ import (
 //     mutation — no half-owned volume, no slot holding a passphrase nobody can
 //     recover.
 //
-// Spec 41 removed the seal these tests were originally written around (the
-// passphrase was encrypted to a control public key so a relaying gateway could
-// not read it). The relay is gone and the agent holds a direct mTLS session
-// with control, so the confidentiality boundary the seal drew no longer has an
-// untrusted party on the far side. What has NOT changed is custody: a volume
-// must never end up with a passphrase control did not receive, and that is what
-// these tests still pin.
+// Wire sealing is tested at the runtime adapter. These tests pin local custody:
+// a volume must never end up with a passphrase control did not receive.
 
 // fakeSealEncManager stubs the encryption Manager for the seal tests: AddKey
 // and RemoveKey are recorded no-ops, VerifyPassphrase always matches. Every

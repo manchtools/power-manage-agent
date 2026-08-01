@@ -20,12 +20,14 @@ func requireMachineID(t *testing.T) {
 
 func sampleCreds() *Credentials {
 	return &Credentials{
-		DeviceID:    "01HXYZSAMPLE",
-		CACert:      []byte("ca-cert-bytes"),
-		Certificate: []byte("client-cert-bytes"),
-		PrivateKey:  []byte("client-key-bytes"),
-		StreamAddr:  "https://gateway.example.test:443",
-		ControlAddr: "https://control.example.test:443",
+		DeviceID:                "01HXYZSAMPLE",
+		CACert:                  []byte("ca-cert-bytes"),
+		Certificate:             []byte("client-cert-bytes"),
+		PrivateKey:              []byte("client-key-bytes"),
+		AgentAddr:               "https://agent.control.example.test:443",
+		ControlAddr:             "https://control.example.test:443",
+		SealingPrivateKey:       bytes.Repeat([]byte{0x11}, 32),
+		ControlSealingPublicKey: bytes.Repeat([]byte{0x22}, 32),
 	}
 }
 
@@ -57,11 +59,17 @@ func TestSaveLoadRoundTrip(t *testing.T) {
 	if !bytes.Equal(out.PrivateKey, in.PrivateKey) {
 		t.Errorf("PrivateKey mismatch")
 	}
-	if out.StreamAddr != in.StreamAddr {
-		t.Errorf("StreamAddr mismatch: got %q want %q", out.StreamAddr, in.StreamAddr)
+	if out.AgentAddr != in.AgentAddr {
+		t.Errorf("AgentAddr mismatch: got %q want %q", out.AgentAddr, in.AgentAddr)
 	}
 	if out.ControlAddr != in.ControlAddr {
 		t.Errorf("ControlAddr mismatch: got %q want %q", out.ControlAddr, in.ControlAddr)
+	}
+	if !bytes.Equal(out.SealingPrivateKey, in.SealingPrivateKey) {
+		t.Error("SealingPrivateKey mismatch")
+	}
+	if !bytes.Equal(out.ControlSealingPublicKey, in.ControlSealingPublicKey) {
+		t.Error("ControlSealingPublicKey mismatch")
 	}
 }
 

@@ -51,14 +51,8 @@ const (
 	// Default data directory
 	DefaultDataDir = "/var/lib/power-manage"
 
-	// credentialsMagicV1 is the magic prefix for the v1 on-disk
-	// credential format (Argon2id-derived AES-256-GCM, nonce
-	// prepended to the GCM ciphertext). The prefix lets future
-	// format migrations (e.g. TPM-sealed key, different KDF
-	// parameters, alternate cipher) be detected at Load() time
-	// instead of requiring a flag-day migration. Pre-versioning
-	// installs have no magic prefix; Load() detects the absence
-	// and falls back to the legacy parser.
+	// credentialsMagicV1 identifies the only accepted on-disk format.
+	// Agents are re-enrolled instead of carrying format compatibility code.
 	credentialsMagicV1 = "pmcred:v1:"
 )
 
@@ -68,12 +62,11 @@ type Credentials struct {
 	CACert      []byte `json:"ca_cert"`
 	Certificate []byte `json:"certificate"`
 	PrivateKey  []byte `json:"private_key"`
-	// StreamAddr is where the agent opens its AgentService stream. Spec 41:
-	// this used to be the gateway; control terminates agent mTLS itself now, so
-	// it is control's agent listener — a different host from ControlAddr,
+	// AgentAddr is control's direct mTLS listener — a different host from
+	// ControlAddr,
 	// because the edge routes the two by SNI (one terminates TLS for the web,
 	// one passes it through).
-	StreamAddr string `json:"stream_addr"`
+	AgentAddr string `json:"agent_addr"`
 	// ControlAddr is where the agent enrolled and re-registers: control's
 	// public API host.
 	ControlAddr string `json:"control_addr,omitempty"`
@@ -184,12 +177,7 @@ func (s *Store) Save(creds *Credentials) error {
 		return fmt.Errorf("marshal credentials: %w", err)
 	}
 
-	// Encrypt and prepend the format-version magic. New writes
-	// always use v1; Load() recognises both v1 (magic-prefixed) and
-	// the original unprefixed layout for backward compatibility with
-	// agents enrolled before the format was versioned. Future
-	// migrations (e.g. TPM-sealed key, different KDF parameters)
-	// bump the magic and Load() picks the matching path.
+	// Encrypt and prepend the required format marker.
 	ciphertext, err := encrypt(key, plaintext)
 	if err != nil {
 		return fmt.Errorf("encrypt credentials: %w", err)
@@ -240,23 +228,10 @@ func (s *Store) Load() (*Credentials, error) {
 		return nil, fmt.Errorf("read credentials: %w", err)
 	}
 
-	// Strip the format-version magic if present. New writes always
-	// include the v1 prefix; pre-versioning installs have raw
-	// nonce+ciphertext with no prefix. The decrypt path is identical
-	// either way once the prefix is removed — the version difference
-	// is purely about future-proofing format migrations, not about
-	// the cipher in use today.
-	//
-	// Audit F038: reject any future "pmcred:vN:" prefix that isn't
-	// the v1 we know about. Without this guard a v2 blob would fall
-	// through to decrypt and surface as an opaque AES-GCM auth-tag
-	// error, which is hard to diagnose. Tell the operator they need
-	// to re-enroll instead.
-	if bytes.HasPrefix(ciphertext, []byte(credentialsMagicV1)) {
-		ciphertext = ciphertext[len(credentialsMagicV1):]
-	} else if bytes.HasPrefix(ciphertext, []byte("pmcred:")) {
-		return nil, errors.New("unsupported credentials format version, please re-enroll the agent (delete credentials.enc and re-run with a fresh registration token)")
+	if !bytes.HasPrefix(ciphertext, []byte(credentialsMagicV1)) {
+		return nil, errors.New("unsupported credentials format, please re-enroll the agent (delete credentials.enc and use a fresh registration token)")
 	}
+	ciphertext = ciphertext[len(credentialsMagicV1):]
 
 	// Decrypt
 	plaintext, err := decrypt(key, ciphertext)

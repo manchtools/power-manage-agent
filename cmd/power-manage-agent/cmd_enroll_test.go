@@ -94,7 +94,7 @@ func TestRegistrationURIRefusedByHandler(t *testing.T) {
 		uri    string
 		refuse bool
 	}{
-		{"power-manage://gateway.example.com:8080?token=abc123", true}, // registration → refused
+		{"power-manage://control.example.com:8080?token=abc123", true}, // registration → refused
 		{"power-manage://server?token=t&pin=DEADBEEF", true},
 		{"power-manage://luks/set-passphrase?token=xxx", false}, // luks op → allowed through to runLuksURI
 		{"power-manage://luks/rotate", false},
