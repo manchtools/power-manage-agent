@@ -302,12 +302,17 @@ func (s *Scheduler) executeManifest(ctx context.Context, delivery *pb.ManifestDe
 			// kernel boot ID. The durable STARTED row prevents re-scheduling.
 			return
 		}
-		resultID, err := s.store.RecordOccurrenceResult(result)
+		suppressUnchanged := manifest.GetSchedule().GetSkipIfUnchanged() &&
+			result.GetStatus() == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
+			!result.GetChanged()
+		resultID, suppressed, err := s.store.RecordOccurrenceResult(result, suppressUnchanged)
 		if err != nil {
 			s.logger.Error("record occurrence result", "delivery_id", delivery.GetDeliveryId(), "occurrence_id", occurrence.GetOccurrenceId(), "error", err)
 			return
 		}
-		s.publish(&ExecutionResult{ResultID: resultID, ActionResult: result})
+		if !suppressed {
+			s.publish(&ExecutionResult{ResultID: resultID, ActionResult: result})
+		}
 		aggregate, aggregateError = aggregateStatus(aggregate, aggregateError, result.GetStatus(), result.GetError())
 		if result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED {
 			stop = occurrence.GetOnFailure() == pb.OnFailure_ON_FAILURE_STOP

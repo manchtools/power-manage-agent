@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"database/sql"
 	"encoding/hex"
 	"errors"
@@ -349,38 +350,92 @@ func (s *Store) GetManifestOccurrenceStates(deliveryID string) (map[string]Manif
 	return states, rows.Err()
 }
 
-func (s *Store) RecordOccurrenceResult(result *pb.ActionResult) (string, error) {
+func (s *Store) RecordOccurrenceResult(result *pb.ActionResult, suppressUnchanged bool) (string, bool, error) {
 	if result == nil || result.GetDeliveryId() == "" || result.GetOccurrenceId() == "" {
-		return "", errors.New("record occurrence result: missing delivery or occurrence identity")
+		return "", false, errors.New("record occurrence result: missing delivery or occurrence identity")
 	}
 	state, err := occurrenceState(result.GetStatus())
 	if err != nil {
-		return "", err
+		return "", false, err
 	}
-	return s.recordResult("ACTION", result, func(tx *sql.Tx, completedAt time.Time) error {
-		updated, err := tx.Exec(`
-			UPDATE manifest_occurrences
-			SET state = ?, completed_at = ?, result_status = ?, result_error = ?
-			WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
-		`, state, completedAt, result.GetStatus(), result.GetError(),
-			result.GetDeliveryId(), result.GetOccurrenceId(), OccurrenceStarted)
-		if err != nil {
-			return err
+	payload, err := marshalStoredProto(result)
+	if err != nil {
+		return "", false, fmt.Errorf("record occurrence result: marshal: %w", err)
+	}
+	resultHash, err := actionResultHash(result)
+	if err != nil {
+		return "", false, err
+	}
+	now := s.now().UTC()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return "", false, err
+	}
+	defer tx.Rollback()
+	var previousHash string
+	if err := tx.QueryRow(`
+		SELECT last_result_hash FROM manifest_occurrences
+		WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
+	`, result.GetDeliveryId(), result.GetOccurrenceId(), OccurrenceStarted).Scan(&previousHash); err != nil {
+		return "", false, err
+	}
+	updated, err := tx.Exec(`
+		UPDATE manifest_occurrences
+		SET state = ?, completed_at = ?, result_status = ?, result_error = ?, last_result_hash = ?
+		WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
+	`, state, now, result.GetStatus(), result.GetError(), resultHash,
+		result.GetDeliveryId(), result.GetOccurrenceId(), OccurrenceStarted)
+	if err != nil {
+		return "", false, err
+	}
+	rows, err := updated.RowsAffected()
+	if err != nil {
+		return "", false, err
+	}
+	if rows != 1 {
+		return "", false, errors.New("record occurrence result: occurrence was not STARTED")
+	}
+	if _, err := tx.Exec(`
+		DELETE FROM reboot_markers WHERE delivery_id = ? AND occurrence_id = ?
+	`, result.GetDeliveryId(), result.GetOccurrenceId()); err != nil {
+		return "", false, err
+	}
+	if suppressUnchanged && previousHash != "" && previousHash == resultHash {
+		if err := tx.Commit(); err != nil {
+			return "", false, err
 		}
-		rows, err := updated.RowsAffected()
-		if err != nil {
-			return err
-		}
-		if rows != 1 {
-			return errors.New("record occurrence result: occurrence was not STARTED")
-		}
-		if _, err := tx.Exec(`
-			DELETE FROM reboot_markers WHERE delivery_id = ? AND occurrence_id = ?
-		`, result.GetDeliveryId(), result.GetOccurrenceId()); err != nil {
-			return err
-		}
-		return nil
-	})
+		return "", true, nil
+	}
+	id, err := randomResultID("ACTION", now)
+	if err != nil {
+		return "", false, err
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO result_outbox (id, kind, payload, created_at)
+		VALUES (?, 'ACTION', ?, ?)
+	`, id, payload, now); err != nil {
+		return "", false, err
+	}
+	if err := tx.Commit(); err != nil {
+		return "", false, err
+	}
+	return id, false, nil
+}
+
+func actionResultHash(result *pb.ActionResult) (string, error) {
+	stable := proto.Clone(result).(*pb.ActionResult)
+	stable.CompletedAt = nil
+	stable.DurationMs = 0
+	stable.DeliveryId = ""
+	stable.OccurrenceId = ""
+	encoded, err := canonicalProtoBytes(stable)
+	if err != nil {
+		return "", fmt.Errorf("hash action result: %w", err)
+	}
+	sum := sha256.Sum256(encoded)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 func (s *Store) RecordManifestResult(result *pb.ManifestResult) (string, error) {

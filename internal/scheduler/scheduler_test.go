@@ -99,6 +99,42 @@ func TestManifestStopPolicyRecordsRemainingOccurrenceAsSkipped(t *testing.T) {
 	require.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, pending[2].ManifestResult.GetStatus())
 }
 
+func TestSkipIfUnchangedSuppressesRepeatedActionOutputButStillExecutes(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	st.SetClockForTest(func() time.Time { return now })
+	delivery := scheduledDelivery(pb.OnFailure_ON_FAILURE_CONTINUE)
+	delivery.Manifest.Schedule.SkipIfUnchanged = true
+	exec := &recordingExecutor{status: map[string]pb.ExecutionStatus{}}
+	sched := New(st, exec, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sched.now = func() time.Time { return now }
+	_, err = sched.RecordDelivery(context.Background(), delivery)
+	require.NoError(t, err)
+
+	sched.runDue(context.Background())
+	now = now.Add(8 * time.Hour)
+	sched.runDue(context.Background())
+	require.Len(t, exec.executed, 4, "deduplication must not suppress reconciliation")
+
+	pending, err := st.GetPendingResults()
+	require.NoError(t, err)
+	require.Len(t, pending, 4, "the repeated action outputs are suppressed; each manifest result remains")
+	actionResults := 0
+	manifestResults := 0
+	for _, result := range pending {
+		if result.ActionResult != nil {
+			actionResults++
+		}
+		if result.ManifestResult != nil {
+			manifestResults++
+		}
+	}
+	require.Equal(t, 2, actionResults)
+	require.Equal(t, 2, manifestResults)
+}
+
 func TestRebootCompletesOnlyAfterBootIDChangesAndManifestResumes(t *testing.T) {
 	st, err := store.New(t.TempDir())
 	require.NoError(t, err)

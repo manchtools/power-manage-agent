@@ -29,6 +29,7 @@ CREATE TABLE manifest_occurrences (
     completed_at DATETIME,
     result_status INTEGER,
     result_error TEXT NOT NULL DEFAULT '',
+    last_result_hash TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (delivery_id, occurrence_id),
     UNIQUE (delivery_id, position),
     FOREIGN KEY (delivery_id) REFERENCES manifest_deliveries(delivery_id) ON DELETE CASCADE
