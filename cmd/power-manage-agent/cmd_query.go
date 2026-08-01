@@ -11,7 +11,7 @@ import (
 	"strings"
 	"text/tabwriter"
 
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/sys/osquery"
 )

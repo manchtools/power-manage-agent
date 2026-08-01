@@ -5,14 +5,14 @@ import (
 	"context"
 	"fmt"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysreboot "github.com/manchtools/power-manage-sdk/sys/reboot"
 )
 
 // executeReboot schedules a system reboot in 5 minutes.
 func (e *Executor) executeReboot(ctx context.Context) (*pb.CommandOutput, error) {
 	// Fail closed when this executor has no privilege runner (the
-	// NewExecutor(_, nil) unit-test convention). Without this, a test that
+	// NewExecutor(nil) unit-test convention). Without this, a test that
 	// dispatches a signed REBOOT envelope through a real handler+executor would
 	// fall back to the process-global Direct runner and issue a REAL
 	// `shutdown -r +5` on the developer's machine — which is exactly what

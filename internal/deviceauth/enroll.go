@@ -10,8 +10,8 @@ import (
 
 	"connectrpc.com/connect"
 
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1/powermanagev1connect"
 
 	sdk "github.com/manchtools/power-manage-sdk"
 	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
@@ -31,7 +31,7 @@ type credentialStore interface {
 // on the local enrollment socket. All other DeviceAuthService RPCs
 // return Unimplemented.
 type EnrollHandler struct {
-	pmv1connect.UnimplementedDeviceAuthServiceHandler
+	powermanagev1connect.UnimplementedDeviceAuthServiceHandler
 
 	hostname   string
 	version    string
@@ -166,9 +166,13 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 			Error:   fmt.Sprintf("failed to generate CSR: %v", err),
 		}), nil
 	}
+	sealingPrivate, err := pmcrypto.GenerateX25519()
+	if err != nil {
+		return connect.NewResponse(&pm.EnrollResponse{Success: false, Error: "failed to generate agent sealing key"}), nil
+	}
 
 	// Register via control server RPC.
-	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM, h.registerOpts...)
+	result, err := sdk.RegisterAgent(ctx, req.Msg.ServerUrl, req.Msg.Token, h.hostname, h.version, csrPEM, sealingPrivate.PublicKey().Bytes(), h.registerOpts...)
 	if err != nil {
 		h.logger.Error("registration failed", "error", err)
 		return connect.NewResponse(&pm.EnrollResponse{
@@ -183,6 +187,9 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 			Success: false,
 			Error:   "server did not provide mTLS certificates",
 		}), nil
+	}
+	if _, err := pmcrypto.ParseX25519PublicKey(result.ControlSealingPublicKey); err != nil {
+		return connect.NewResponse(&pm.EnrollResponse{Success: false, Error: "server did not provide a valid sealing public key"}), nil
 	}
 
 	// Optional out-of-band CA-pin verification (WS9 #5): if the operator
@@ -211,12 +218,14 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 	}
 
 	creds := &credentials.Credentials{
-		DeviceID:    result.DeviceID,
-		CACert:      result.CACert,
-		Certificate: result.Certificate,
-		PrivateKey:  keyPEM,
-		StreamAddr:  result.ControlURL,
-		ControlAddr: req.Msg.ServerUrl,
+		DeviceID:                result.DeviceID,
+		CACert:                  result.CACert,
+		Certificate:             result.Certificate,
+		PrivateKey:              keyPEM,
+		StreamAddr:              result.ControlURL,
+		ControlAddr:             req.Msg.ServerUrl,
+		SealingPrivateKey:       sealingPrivate.Bytes(),
+		ControlSealingPublicKey: result.ControlSealingPublicKey,
 	}
 
 	// Save credentials

@@ -3,13 +3,14 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"strings"
 	"time"
 
 	sdk "github.com/manchtools/power-manage-sdk"
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/handler"
 	"github.com/manchtools/power-manage/agent/internal/luksd"
@@ -107,14 +108,15 @@ func runAgent(ctx context.Context, credStore *credentials.Store, creds *credenti
 		)
 
 		// Wire LUKS key store to the current client for this connection session
-		h.Executor().SetLuksKeyStore(&clientLuksKeyStore{client: client})
+		luksStore := &clientLuksKeyStore{client: client, executor: h.Executor()}
+		h.Executor().SetLuksKeyStore(luksStore)
 		h.Executor().SetLpsPasswordStore(&clientLpsPasswordStore{client: client})
 
 		// Wire the LUKS passphrase daemon to this connection so it can
 		// validate tokens and fetch managed keys over the agent's own
 		// authenticated stream (WS6 #1/#19).
 		if luksDaemon != nil {
-			luksDaemon.SetSession(client)
+			luksDaemon.SetSession(luksStore)
 		}
 
 		// Wire the terminal sender so the handler's terminal session
@@ -342,55 +344,12 @@ func sendScheduledResults(ctx context.Context, client *sdk.Client, sched *schedu
 				return
 			}
 
-			// Skip results already sent by syncPendingResults on this
-			// same reconnect. An action executed while offline is BOTH
-			// persisted (unsynced) AND buffered in this channel;
-			// syncPendingResults runs first (synchronously, before this
-			// goroutine starts) and sends + marks the stored copy synced.
-			// Without this check the buffered copy is sent a second time,
-			// and the wire ActionResult carries no result id for the
-			// server to dedup on — duplicate result events per offline
-			// execution.
-			if synced, err := sched.IsResultSynced(result.ResultID); err != nil {
-				logger.Warn("failed to check result synced state; sending to be safe",
-					"result_id", result.ResultID, "error", err)
-			} else if synced {
-				logger.Debug("skipping result already synced by syncPendingResults",
-					"result_id", result.ResultID, "action_id", result.ActionID)
+			if err := sendResult(ctx, client, result.ActionResult, result.ManifestResult); err != nil {
+				logger.Warn("failed to send scheduled result", "result_id", result.ResultID, "error", err)
 				continue
 			}
-
-			// Skip unchanged results unless this is the first execution of the action
-			if !result.HasChanges && sched.HasPriorExecution(result.ActionID) {
-				logger.Debug("skipping unchanged result (not first run)",
-					"action_id", result.ActionID,
-				)
-				continue
-			}
-
-			logger.Info("sending scheduled execution result",
-				"result_id", result.ResultID,
-				"action_id", result.ActionID,
-				"status", result.Result.Status.String(),
-				"duration_ms", result.Result.DurationMs,
-			)
-
-			if err := client.SendActionResult(ctx, result.Result); err != nil {
-				logger.Warn("failed to send scheduled result",
-					"result_id", result.ResultID,
-					"action_id", result.ActionID,
-					"error", err,
-				)
-				// Result is already stored locally, will be synced later via syncPendingResults
-				continue
-			}
-
-			// Mark result as synced in local store using the result ID (not action ID)
-			if err := sched.MarkResultSynced(result.ResultID); err != nil {
-				logger.Warn("failed to mark result synced",
-					"result_id", result.ResultID,
-					"error", err,
-				)
+			if err := sched.MarkPendingResultSynced(result.ResultID); err != nil {
+				logger.Warn("failed to mark result synced", "result_id", result.ResultID, "error", err)
 			}
 		}
 	}
@@ -463,9 +422,14 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 		return 0
 	}
 
-	if err := sched.SyncActions(ctx, result.StandaloneActions, result.GroupedActions, firstSync); err != nil {
-		logger.Error("failed to update local action store", "error", err)
-		return 0
+	for _, delivery := range result.Deliveries {
+		if _, err := sched.RecordDelivery(ctx, delivery); err != nil {
+			logger.Error("failed to durably record synced delivery", "delivery_id", delivery.GetDeliveryId(), "error", err)
+			continue
+		}
+		if err := client.SendDeliveryReceipt(ctx, delivery.GetDeliveryId()); err != nil {
+			logger.Warn("failed to send synced delivery receipt", "delivery_id", delivery.GetDeliveryId(), "error", err)
+		}
 	}
 
 	// Apply the resolved maintenance window from the same sync. Done
@@ -483,9 +447,8 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 		syncInterval = defaultSyncInterval
 	}
 
-	logger.Info("actions synced from server",
-		"standalone_total", len(result.StandaloneActions),
-		"groups_total", len(result.GroupedActions),
+	logger.Info("manifests synced from server",
+		"delivery_total", len(result.Deliveries),
 		"first_sync", firstSync,
 		"sync_interval", syncInterval.String(),
 	)
@@ -496,7 +459,7 @@ func syncActionsFromServer(ctx context.Context, client *sdk.Client, sched *sched
 // syncPendingResults sends any unsynced execution results to the server.
 // This is called on connection to sync results that were stored while offline.
 func syncPendingResults(ctx context.Context, sched *scheduler.Scheduler, client *sdk.Client, logger *slog.Logger) {
-	results, err := sched.GetUnsyncedResults()
+	results, err := sched.GetPendingResults()
 	if err != nil {
 		logger.Warn("failed to get unsynced results", "error", err)
 		return
@@ -515,43 +478,24 @@ func syncPendingResults(ctx context.Context, sched *scheduler.Scheduler, client 
 		default:
 		}
 
-		// Skip unchanged successes unless this is the first execution of the action
-		if !r.HasChanges && r.Status == pm.ExecutionStatus_EXECUTION_STATUS_SUCCESS && sched.HasPriorExecution(r.ActionID) {
-			if err := sched.MarkResultSynced(r.ID); err != nil {
-				logger.Warn("failed to mark result synced", "result_id", r.ID, "error", err)
-			}
+		if err := sendResult(ctx, client, r.ActionResult, r.ManifestResult); err != nil {
+			logger.Warn("failed to send pending result", "result_id", r.ID, "error", err)
 			continue
 		}
-
-		logger.Info("sending offline execution result",
-			"action_id", r.ActionID,
-			"status", r.Status.String(),
-			"executed_at", r.ExecutedAt,
-			"has_changes", r.HasChanges,
-		)
-
-		// Reconstruct ActionResult from StoredResult
-		actionResult := &pm.ActionResult{
-			ActionId:   &pm.ActionId{Value: r.ActionID},
-			Status:     r.Status,
-			Error:      r.Error,
-			Output:     r.Output,
-			DurationMs: r.DurationMs,
-		}
-
-		// Send result to server
-		if err := client.SendActionResult(ctx, actionResult); err != nil {
-			logger.Warn("failed to send offline result",
-				"action_id", r.ActionID,
-				"error", err,
-			)
-			// Don't mark as synced, will retry on next connection
-			continue
-		}
-
-		if err := sched.MarkResultSynced(r.ID); err != nil {
+		if err := sched.MarkPendingResultSynced(r.ID); err != nil {
 			logger.Warn("failed to mark result synced", "result_id", r.ID, "error", err)
 		}
+	}
+}
+
+func sendResult(ctx context.Context, client *sdk.Client, action *pm.ActionResult, manifest *pm.ManifestResult) error {
+	switch {
+	case action != nil && manifest == nil:
+		return client.SendActionResult(ctx, action)
+	case manifest != nil && action == nil:
+		return client.SendManifestResult(ctx, manifest)
+	default:
+		return fmt.Errorf("result outbox entry must contain exactly one payload")
 	}
 }
 

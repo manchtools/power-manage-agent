@@ -16,7 +16,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	sdk "github.com/manchtools/power-manage-sdk"
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 

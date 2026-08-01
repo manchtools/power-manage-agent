@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
@@ -15,7 +15,7 @@ import (
 // rejected before any package-manager work runs. The executor rejects at the
 // field level, not by crashing on a nil dereference deeper in the call chain.
 func TestExecutePackage_RejectsNilParams(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executePackage(context.Background(), nil, pb.DesiredState_DESIRED_STATE_PRESENT)
 	if err == nil {
 		t.Fatal("expected error for nil params, got nil")
@@ -32,7 +32,7 @@ func TestExecutePackage_RejectsNilParams(t *testing.T) {
 // executor fails closed when no package manager was detected (pkgManager is
 // nil). A nil manager must surface as an error, not a silent no-op.
 func TestExecutePackage_FailsWhenNoPackageManager(t *testing.T) {
-	e := NewExecutor(nil, nil) // runner=nil → pkgManager stays nil
+	e := NewExecutor(nil) // runner=nil → pkgManager stays nil
 	params := &pb.PackageParams{Name: "curl"}
 	_, changed, err := e.executePackage(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT)
 	if err == nil {

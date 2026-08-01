@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
@@ -92,7 +92,7 @@ func TestSetupSSHKeys_CreatesDotSSHViaFSManager(t *testing.T) {
 		SshAuthorizedKeys: []string{keyLine},
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	var out strings.Builder
 	changed, err := e.setupSSHKeys(context.Background(), params, &out)
 	if err != nil {

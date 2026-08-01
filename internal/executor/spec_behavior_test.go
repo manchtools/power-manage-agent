@@ -5,9 +5,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
 	"github.com/manchtools/power-manage-sdk/sys/remote"
-	"github.com/manchtools/power-manage-sdk/verify"
 )
 
 // =============================================================================
@@ -25,76 +23,6 @@ func TestSpecSDK_ULIDNotUUID_Documented(t *testing.T) {
 	//     handler package.
 	// A tautological 26-vs-36 length check here asserted nothing about either,
 	// so this is an honest documentation pointer rather than a fake assertion.
-}
-
-// =============================================================================
-// SPEC: 12-agent-spec.md — Invariant 1: Never execute unsigned actions
-// =============================================================================
-
-func TestSpecAgent_NeverExecuteUnsigned_VerifyRejectsTampered(t *testing.T) {
-	// Build a REAL verifier + matching signer (fresh self-signed CA) so this
-	// exercises actual signature verification, not the nil-verifier shortcut.
-	exec, signer := testVerifierAndSigner(t)
-	env := &pb.SignedActionEnvelope{
-		ActionId:   &pb.ActionId{Value: "01HSPECTAMPER000000000000"},
-		ActionType: pb.ActionType_ACTION_TYPE_SHELL,
-		Params:     &pb.SignedActionEnvelope_Shell{Shell: &pb.ShellParams{Script: "echo hi", RunAsRoot: true}},
-	}
-	envBytes, sig := signEnv(t, signer, env)
-
-	// Positive control: a genuine signature must verify — proving we reach real
-	// verification (the old nil-verifier test could never accept a valid sig).
-	if _, err := exec.VerifyEnvelope(envBytes, sig); err != nil {
-		t.Fatalf("a genuine signature must verify, got %v", err)
-	}
-	// Tampered signature under a valid envelope → must be refused.
-	badSig := append([]byte(nil), sig...)
-	badSig[0] ^= 0xFF
-	if _, err := exec.VerifyEnvelope(envBytes, badSig); err == nil {
-		t.Fatal("SPEC VIOLATION: VerifyEnvelope accepted a tampered signature")
-	}
-	// Tampered envelope under a valid signature → must be refused.
-	badEnv := append([]byte(nil), envBytes...)
-	badEnv[len(badEnv)-1] ^= 0xFF
-	if _, err := exec.VerifyEnvelope(badEnv, sig); err == nil {
-		t.Fatal("SPEC VIOLATION: VerifyEnvelope accepted a tampered envelope")
-	}
-}
-
-func TestSpecAgent_NeverExecuteUnsigned_NilVerifierFailsClosed(t *testing.T) {
-	e := NewExecutor(nil, nil)
-	_, err := e.VerifyEnvelope([]byte("payload"), []byte("signature"))
-	if err == nil {
-		t.Fatal("SPEC VIOLATION: nil verifier accepted envelope")
-	}
-	if !strings.Contains(err.Error(), "no action verifier") {
-		t.Errorf("error must mention 'no action verifier': %v", err)
-	}
-}
-
-// =============================================================================
-// SPEC: 12-agent-spec.md — Invariant 2: Fail-closed on stream RPC boundaries
-// =============================================================================
-
-func TestSpecAgent_FailClosedStreamRPCBoundaries(t *testing.T) {
-	e := NewExecutor(nil, nil)
-
-	tests := []struct {
-		name string
-		fn   func() error
-	}{
-		{"OSQuery", func() error { return e.VerifyOSQuery(&pb.OSQuery{QueryId: "q1", Table: "uptime"}) }},
-		{"LogQuery", func() error { return e.VerifyLogQuery(&pb.LogQuery{QueryId: "q1", Unit: "foo.service"}) }},
-		{"RevokeLuks", func() error { return e.VerifyRevokeLuksDeviceKey(&pb.RevokeLuksDeviceKey{ActionId: "01J123456789"}) }},
-		{"RequestInventory", func() error { return e.VerifyRequestInventory(&pb.RequestInventory{QueryId: "q1"}) }},
-	}
-	for _, tt := range tests {
-		t.Run(tt.name, func(t *testing.T) {
-			if err := tt.fn(); err == nil {
-				t.Fatalf("SPEC VIOLATION: nil verifier accepted %s", tt.name)
-			}
-		})
-	}
 }
 
 // =============================================================================
@@ -192,21 +120,6 @@ func TestSpecRemoteRedirect_HTTPSOnlyBeforeFetch(t *testing.T) {
 					tt.url, tt.checksum, err, tt.wantErr)
 			}
 		})
-	}
-}
-
-// =============================================================================
-// SPEC: 12-agent-spec.md — mTLS certificate requirements
-// =============================================================================
-
-func TestSpecAgent_mTLSActionVerifierRequiresCert(t *testing.T) {
-	_, err := verify.NewActionVerifier(nil)
-	if err == nil {
-		t.Fatal("SPEC VIOLATION: NewActionVerifier(nil) must fail — would verify nothing")
-	}
-	_, err = verify.NewActionVerifier([]byte{})
-	if err == nil {
-		t.Fatal("SPEC VIOLATION: NewActionVerifier(empty) must fail — would accept any signature")
 	}
 }
 

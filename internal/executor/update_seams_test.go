@@ -143,7 +143,7 @@ func TestScheduleRebootAfterUpdate(t *testing.T) {
 		notifyAll = func(ctx context.Context, title, body string) { notified++ }
 
 		var out strings.Builder
-		e := &Executor{} // runner is nil — the NewExecutor(_, nil) unit-test convention
+		e := &Executor{} // runner is nil — the NewExecutor(nil) unit-test convention
 		err := e.scheduleRebootAfterUpdate(context.Background(), &out)
 		if err == nil {
 			t.Fatal("a reboot with no privilege runner must fail closed, not fall through to the global Direct runner")

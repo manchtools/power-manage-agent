@@ -9,7 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 // =============================================================================
@@ -19,7 +19,7 @@ import (
 
 // TestExecuteDirectory_RejectsNilParams verifies nil params rejection.
 func TestExecuteDirectory_RejectsNilParams(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeDirectory(context.Background(), nil, pb.DesiredState_DESIRED_STATE_PRESENT)
 	require.Error(t, err)
 	assert.False(t, changed)
@@ -28,7 +28,7 @@ func TestExecuteDirectory_RejectsNilParams(t *testing.T) {
 
 // TestExecuteDirectory_RejectsEmptyPath verifies empty path rejection.
 func TestExecuteDirectory_RejectsEmptyPath(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeDirectory(context.Background(),
 		&pb.DirectoryParams{Path: ""}, pb.DesiredState_DESIRED_STATE_PRESENT)
 	require.Error(t, err)
@@ -37,7 +37,7 @@ func TestExecuteDirectory_RejectsEmptyPath(t *testing.T) {
 
 // TestExecuteDirectory_RejectsUnknownState verifies unknown state rejection.
 func TestExecuteDirectory_RejectsUnknownState(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeDirectory(context.Background(),
 		&pb.DirectoryParams{Path: "/tmp/test"}, pb.DesiredState(999))
 	require.Error(t, err)
@@ -48,7 +48,7 @@ func TestExecuteDirectory_RejectsUnknownState(t *testing.T) {
 // system paths are rejected BEFORE any privileged filesystem access. The
 // "correct" (non-protected) creation path moved to container_test.go.
 func TestExecuteDirectory_PRESENT_RefusesProtectedPath(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 
 	for _, p := range []string{
 		"/etc", "/", "/usr",
@@ -67,7 +67,7 @@ func TestExecuteDirectory_PRESENT_RefusesProtectedPath(t *testing.T) {
 // TestExecuteDirectory_ABSENT_DenyByDefault verifies subtree protection
 // for ABSENT — refuse deletion before the existence check uses Stat.
 func TestExecuteDirectory_ABSENT_DenyByDefault(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 
 	for _, p := range []string{
 		"/etc/sudoers.d/pm-ws6-nope",

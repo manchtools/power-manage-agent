@@ -7,13 +7,13 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 
 // TestExecuteFile_RejectsNilParams verifies that nil FileParams is rejected.
 func TestExecuteFile_RejectsNilParams(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeFile(context.Background(), nil, pb.DesiredState_DESIRED_STATE_PRESENT)
 	if err == nil {
 		t.Fatal("expected error for nil params, got nil")
@@ -26,7 +26,7 @@ func TestExecuteFile_RejectsNilParams(t *testing.T) {
 // TestExecuteFile_RejectsContentExceedingMaxSize verifies that file content
 // exceeding maxFileContentSize (10 MiB) is rejected before any I/O.
 func TestExecuteFile_RejectsContentExceedingMaxSize(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	oversized := strings.Repeat("x", maxFileContentSize+1)
 	params := &pb.FileParams{Path: "/tmp/test.txt", Content: oversized}
 	_, changed, err := e.executeFile(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT)
@@ -45,7 +45,7 @@ func TestExecuteFile_RejectsContentExceedingMaxSize(t *testing.T) {
 // at maxFileContentSize is accepted (not rejected as oversized). The guard
 // uses `>` not `>=`.
 func TestExecuteFile_ContentAtMaxSizeAccepted(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	atLimit := strings.Repeat("x", maxFileContentSize)
 	params := &pb.FileParams{Path: "/tmp/nonexistent/test.txt", Content: atLimit}
 	_, _, err := e.executeFile(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT)
@@ -58,7 +58,7 @@ func TestExecuteFile_ContentAtMaxSizeAccepted(t *testing.T) {
 
 // TestExecuteFile_RejectsUnknownDesiredState verifies rejection of unknown state.
 func TestExecuteFile_RejectsUnknownDesiredState(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	params := &pb.FileParams{Path: "/tmp/test.txt", Content: "hello"}
 	_, changed, err := e.executeFile(context.Background(), params, pb.DesiredState(999))
 	if err == nil {
@@ -72,7 +72,7 @@ func TestExecuteFile_RejectsUnknownDesiredState(t *testing.T) {
 // TestFileMatchesDesired_ReturnsFalseForMissingFile verifies that
 // fileMatchesDesired returns false when the file does not exist.
 func TestFileMatchesDesired_ReturnsFalseForMissingFile(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	if e.fileMatchesDesired(context.Background(), "/nonexistent/path/that/does/not/exist.txt", &pb.FileParams{
 		Content: "hello",
 	}) {
@@ -83,7 +83,7 @@ func TestFileMatchesDesired_ReturnsFalseForMissingFile(t *testing.T) {
 // TestFileMatchesDesired_ReturnsFalseWhenPathIsDirectory verifies that a
 // directory (not a regular file) is not considered a match.
 func TestFileMatchesDesired_ReturnsFalseWhenPathIsDirectory(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	if e.fileMatchesDesired(context.Background(), "/tmp", &pb.FileParams{Content: "hello"}) {
 		t.Error("fileMatchesDesired must return false for a directory")
 	}
@@ -95,7 +95,7 @@ func TestFileMatchesDesired_ReturnsFalseWhenPathIsDirectory(t *testing.T) {
 // used to compare currentOwner against empty, making fileMatchesDesired never
 // return true.
 func TestFileMatchesDesired_OwnerOnlyCheck(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	ctx := context.Background()
 
 	// Real file owned by the test user, with known content. fileMatchesDesired
@@ -138,7 +138,7 @@ func TestFileMatchesDesired_OwnerOnlyCheck(t *testing.T) {
 // TestDirectoryMatchesDesired_OwnerOnlyCheck mirrors TestFileMatchesDesired_OwnerOnlyCheck
 // for the directory variant (same bug class was fixed there too).
 func TestDirectoryMatchesDesired_ReturnsFalseForMissingDir(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	if e.directoryMatchesDesired(context.Background(), "/nonexistent/dir", &pb.DirectoryParams{}) {
 		t.Error("directoryMatchesDesired must return false for a non-existent directory")
 	}
@@ -147,7 +147,7 @@ func TestDirectoryMatchesDesired_ReturnsFalseForMissingDir(t *testing.T) {
 // TestDirectoryMatchesDesired_ReturnsFalseForRegularFile verifies that a
 // regular file (not a directory) is not considered a match.
 func TestDirectoryMatchesDesired_ReturnsFalseForRegularFile(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	// /etc/hostname is a regular file on most systems
 	if e.directoryMatchesDesired(context.Background(), "/etc/hostname", &pb.DirectoryParams{}) {
 		t.Error("directoryMatchesDesired must return false for a regular file")
@@ -213,7 +213,7 @@ func TestIsProtectedPath_DeniesEtcSubdirs(t *testing.T) {
 // test covers the PRESENT overwrite path for critical files.
 func TestExecuteFile_PRESENT_RejectsBeforeRemount(t *testing.T) {
 	var remountCalled bool
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	e.repairFS = func(ctx context.Context) bool {
 		remountCalled = true
 		return true

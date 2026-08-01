@@ -14,8 +14,8 @@ import (
 
 	"connectrpc.com/connect"
 
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1/powermanagev1connect"
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 )
 
@@ -138,7 +138,7 @@ func runEnroll(args []string) {
 
 	// Connect to the enrollment socket
 	httpClient := unixSocketHTTPClient(*socketPath)
-	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+	client := powermanagev1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
 
 	// Check enrollment status first
 	status, err := client.GetEnrollmentStatus(ctx, connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))

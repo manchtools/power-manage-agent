@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
@@ -183,21 +183,21 @@ func TestSecurityOnlyNotApplicable_Decision(t *testing.T) {
 	}
 }
 
-// TestExecuteEnvelope_SecurityOnly_NotApplicableStatus pins the central
+// TestExecuteAction_SecurityOnly_NotApplicableStatus pins the central
 // classification (spec 23 AC 2 end to end in the agent): the sentinel from
 // the update path surfaces as EXECUTION_STATUS_NOT_APPLICABLE on the
 // ActionResult — not FAILED — with the reason in the result error and
 // Changed=false.
-func TestExecuteEnvelope_SecurityOnly_NotApplicableStatus(t *testing.T) {
+func TestExecuteAction_SecurityOnly_NotApplicableStatus(t *testing.T) {
 	fake := &upgradeFakeMgr{backend: pkg.Pacman, upgradeErr: pkg.ErrSecurityOnlyUnsupported}
 	e := updateTestExecutor(t, fake)
 
-	env := &pb.SignedActionEnvelope{
-		ActionId:   &pb.ActionId{Value: "01JZTESTNOTAPPLICABLE0000A"},
-		ActionType: pb.ActionType_ACTION_TYPE_UPDATE,
-		Params:     &pb.SignedActionEnvelope_Update{Update: &pb.UpdateParams{SecurityOnly: true}},
+	action := &pb.Action{
+		Id:     &pb.ActionId{Value: "01JZTESTNOTAPPLICABLE0000A"},
+		Type:   pb.ActionType_ACTION_TYPE_UPDATE,
+		Params: &pb.Action_Update{Update: &pb.UpdateParams{SecurityOnly: true}},
 	}
-	result := e.ExecuteWithStreaming(context.Background(), env, nil)
+	result := e.ExecuteWithStreaming(context.Background(), action, nil)
 
 	if result.Status != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE {
 		t.Fatalf("expected NOT_APPLICABLE, got %s (error: %s)", result.Status, result.Error)

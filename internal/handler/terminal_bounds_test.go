@@ -10,7 +10,7 @@ import (
 
 	"github.com/manchtools/power-manage-sdk/sys/terminal"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 // WS15 #6 — terminal Cols/Rows bounds before the uint16 narrowing.

@@ -6,7 +6,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
 
@@ -25,7 +25,7 @@ import (
 // The env validation runs BEFORE the command dispatches, so a nil executor
 // (no runner) exercises it without needing a real subprocess.
 func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	ctx := context.Background()
 
 	const bogusInterp = "/nonexistent/pm-ws17a-interp"
@@ -78,7 +78,7 @@ func TestRunShellScript_RejectsBlocklistedEnvVar(t *testing.T) {
 // it) is exercised against a real runner in container_test.go
 // (TestIntegration_ShellScriptRunsThroughRealRunner).
 func TestRunShellScript_DoesNotInjectReservedLocaleVar(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	ctx := context.Background()
 
 	const bogusInterp = "/nonexistent/pm-reserved-locale-interp"

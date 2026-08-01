@@ -10,7 +10,7 @@ import (
 	"testing"
 	"time"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 func TestGetArchEntry(t *testing.T) {

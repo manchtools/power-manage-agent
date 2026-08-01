@@ -11,7 +11,7 @@ import (
 	"sync"
 	"time"
 
-	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
+	"github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1/powermanagev1connect"
 )
 
 const (
@@ -67,7 +67,7 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 
 	// Create HTTP mux with Connect-RPC handler
 	mux := http.NewServeMux()
-	path, handler := pmv1connect.NewDeviceAuthServiceHandler(s.handler)
+	path, handler := powermanagev1connect.NewDeviceAuthServiceHandler(s.handler)
 	mux.Handle(path, handler)
 
 	s.httpServer = &http.Server{

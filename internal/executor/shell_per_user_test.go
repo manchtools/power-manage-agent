@@ -8,7 +8,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 // TestRunShellScript_RunAsRootFalseNoSessions pins the empty-set
@@ -27,7 +27,7 @@ func TestRunShellScript_RunAsRootFalseNoSessions(t *testing.T) {
 	}
 
 	var buf bytes.Buffer
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	e.logger = slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
 
 	out, err := e.runShellScript(context.Background(), &pb.ShellParams{
@@ -70,7 +70,7 @@ func TestRunShellScript_RunAsRootFalseDispatchesToLoop(t *testing.T) {
 		t.Skip("no active desktop sessions — TestRunShellScript_RunAsRootFalseNoSessions covers the empty-set path here")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	out, err := e.runShellScript(context.Background(), &pb.ShellParams{
 		// `id -un` prints the username; if the per-user fan-out
 		// works, the merged stdout will contain the desktop user's

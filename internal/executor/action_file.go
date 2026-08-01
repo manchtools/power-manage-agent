@@ -10,7 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysfs "github.com/manchtools/power-manage-sdk/sys/fs"
 )
 

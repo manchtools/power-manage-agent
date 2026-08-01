@@ -11,9 +11,8 @@ import (
 	"time"
 
 	"google.golang.org/protobuf/types/known/durationpb"
-	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 	"github.com/manchtools/power-manage-sdk/sys/inventory"
 	syslog "github.com/manchtools/power-manage-sdk/sys/log"
@@ -173,123 +172,45 @@ func (h *Handler) ResetConnection() {
 	h.mu.Unlock()
 }
 
-// OnAction handles action dispatch from the server.
-// Actions are stored locally and executed on schedule for drift prevention.
-func (h *Handler) OnAction(ctx context.Context, envelope []byte, signature []byte) (*pb.ActionResult, error) {
-	return h.OnActionWithStreaming(ctx, envelope, signature, nil)
+// OnManifestDelivery durably records a manifest before the SDK emits its
+// receipt. Execution is scheduler-driven from that record, never from the
+// transport callback, so a disconnected agent can finish received work.
+func (h *Handler) OnManifestDelivery(ctx context.Context, delivery *pb.ManifestDelivery) error {
+	return h.recordManifestDelivery(ctx, delivery)
 }
 
-// OnActionWithStreaming handles action dispatch with optional output streaming.
-// The sendChunk callback is called for each line of output during execution.
-//
-// The handler receives the SIGNED envelope bytes and the CA signature. It
-// verifies the signature over those bytes and unmarshals THOSE SAME bytes
-// into a SignedActionEnvelope (VerifyEnvelope) BEFORE any side effect — no
-// storing, no sync trigger, no execution happens on an unverified envelope
-// (sdk#82). Verification is fail-closed: any verify/unmarshal error returns a
-// FAILED result and nothing runs.
-func (h *Handler) OnActionWithStreaming(ctx context.Context, envelope []byte, signature []byte, sendChunk func(*pb.OutputChunk) error) (*pb.ActionResult, error) {
-	// Verify FIRST. The verified envelope is the only thing we act on; we read
-	// the type/id/params off it, never off any advisory wire field. A failure
-	// here is a hard refusal — return FAILED and do not store, sync, or run.
-	env, err := h.executor.VerifyEnvelope(envelope, signature)
+// OnManifestDeliveryWithStreaming has the same durable boundary. Output is
+// emitted later by the scheduler; the receipt must not wait for execution.
+func (h *Handler) OnManifestDeliveryWithStreaming(ctx context.Context, delivery *pb.ManifestDelivery, _ func(*pb.OutputChunk) error) error {
+	return h.recordManifestDelivery(ctx, delivery)
+}
+
+func (h *Handler) recordManifestDelivery(ctx context.Context, delivery *pb.ManifestDelivery) error {
+	if h.scheduler != nil {
+		inserted, err := h.scheduler.RecordDelivery(ctx, delivery)
+		if err != nil {
+			return err
+		}
+		h.logger.Info("manifest durably recorded",
+			"delivery_id", delivery.GetDeliveryId(),
+			"manifest_id", delivery.GetManifest().GetManifestId(),
+			"new", inserted,
+		)
+		return nil
+	}
+	if h.store == nil {
+		return fmt.Errorf("record manifest delivery: agent store unavailable")
+	}
+	inserted, err := h.store.RecordManifestDelivery(ctx, delivery)
 	if err != nil {
-		h.logger.Warn("refusing to execute unsigned/tampered action", "error", err)
-		return &pb.ActionResult{
-			Status:      pb.ExecutionStatus_EXECUTION_STATUS_FAILED,
-			Error:       fmt.Sprintf("refusing to execute unsigned/tampered action: %v", err),
-			CompletedAt: timestamppb.Now(),
-		}, nil
+		return err
 	}
-
-	actionID := env.GetActionId().GetValue()
-	h.logger.Info("received action", "action_id", actionID, "type", env.GetActionType().String())
-
-	// Handle SYNC instant action directly — trigger sync and return success.
-	//
-	// Safe because the type is bound INSIDE the verified envelope: a signature
-	// minted for a non-SYNC action cannot be lifted onto a SYNC envelope, and
-	// a non-SYNC envelope delivered here can never reach this branch. SYNC
-	// returns before the executor's typed switch, so verifying the envelope
-	// up front is the only thing that can enforce the CA signature on this
-	// path — which we now always do above.
-	if env.GetActionType() == pb.ActionType_ACTION_TYPE_SYNC {
-		h.logger.Info("triggering immediate sync via instant action")
-		if h.syncTrigger != nil {
-			select {
-			case h.syncTrigger <- struct{}{}:
-				h.logger.Info("sync trigger sent")
-			default:
-				h.logger.Warn("sync trigger channel full, sync already pending")
-			}
-		}
-		return &pb.ActionResult{
-			ActionId:    env.GetActionId(),
-			Status:      pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS,
-			CompletedAt: timestamppb.Now(),
-			Output:      &pb.CommandOutput{Stdout: "Sync triggered"},
-		}, nil
-	}
-
-	// Store the action for scheduled execution (skip for instant and one-off
-	// actions). The stored wire Action carries the verified envelope bytes +
-	// signature so the offline scheduler re-verifies and executes the SAME
-	// bytes later; the typed oneof on the stored Action is advisory only.
-	if h.scheduler != nil && !executor.IsInstantAction(env.GetActionType()) && env.GetActionType() != pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
-		stored := &pb.Action{
-			Id:             env.GetActionId(),
-			Type:           env.GetActionType(),
-			DesiredState:   env.GetDesiredState(),
-			TimeoutSeconds: env.GetTimeoutSeconds(),
-			Schedule:       env.GetSchedule(),
-			SignedEnvelope: envelope,
-			Signature:      signature,
-		}
-		if err := h.scheduler.AddAction(stored); err != nil {
-			h.logger.Error("failed to store action", "action_id", actionID, "error", err)
-		} else {
-			h.logger.Info("action stored for scheduled execution", "action_id", actionID)
-		}
-	}
-
-	// Streaming relay, wrapped in the per-execution budget (audit A-02,
-	// #170): one marker chunk on exhaustion, then silence — the action
-	// itself runs to completion regardless.
-	outputCallback := budgetedChunkCallback(actionID, sendChunk, h.logger)
-
-	// Execute the VERIFIED envelope with streaming support.
-	result := h.executor.ExecuteWithStreaming(ctx, env, outputCallback)
-
-	h.logger.Info("action completed",
-		"action_id", actionID,
-		"status", result.Status.String(),
-		"duration_ms", result.DurationMs,
+	h.logger.Info("manifest durably recorded",
+		"delivery_id", delivery.GetDeliveryId(),
+		"manifest_id", delivery.GetManifest().GetManifestId(),
+		"new", inserted,
 	)
-
-	if result.Error != "" {
-		h.logger.Error("action failed", "action_id", actionID, "error", result.Error)
-	}
-
-	// Log output for debugging — but truncate + redact (audit F-32).
-	// The exact contract (see sanitizeForLog): the AES-GCM `enc:v1:`
-	// ciphertext token the server uses for secrets-at-rest is redacted,
-	// and the whole preview is length-bounded. A PLAINTEXT secret (a LUKS
-	// passphrase or API token printed without the enc:v1: prefix) is NOT
-	// redacted — only length-bounded — so this is a payload-size guard plus
-	// ciphertext redaction, not a plaintext-secret scrubber. Truncating to a
-	// tail preview keeps debugging useful for short-output checks without
-	// dumping multi-KB payloads into journald + downstream log shippers
-	// (Loki, journald-to-syslog forwarders, etc.).
-	if result.Output != nil {
-		if result.Output.Stdout != "" {
-			h.logger.Debug("action stdout", "action_id", actionID, "stdout", sanitizeForLog(result.Output.Stdout))
-		}
-		if result.Output.Stderr != "" {
-			h.logger.Debug("action stderr", "action_id", actionID, "stderr", sanitizeForLog(result.Output.Stderr))
-		}
-	}
-
-	return result, nil
+	return nil
 }
 
 // maxLogOutputBytes caps each stream-line preview at 256 bytes
@@ -354,20 +275,6 @@ func isBase64Char(b byte) bool {
 		b == '+' || b == '/' || b == '='
 }
 
-// OnActionRemove handles action removal from the server.
-func (h *Handler) OnActionRemove(ctx context.Context, actionID string) error {
-	h.logger.Info("received action removal", "action_id", actionID)
-
-	if h.scheduler != nil {
-		if err := h.scheduler.RemoveAction(ctx, actionID); err != nil {
-			h.logger.Error("failed to remove action", "action_id", actionID, "error", err)
-			return err
-		}
-	}
-
-	return nil
-}
-
 // OnQuery handles OS queries from the server.
 func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryResult, error) {
 	h.logger.Info("received query", "query_id", query.QueryId, "table", query.Table)
@@ -376,18 +283,6 @@ func (h *Handler) OnQuery(ctx context.Context, query *pb.OSQuery) (*pb.OSQueryRe
 	if msg, ok := validate.Struct(streamValidator, query); !ok {
 		h.logger.Warn("rejecting invalid query", "query_id", query.GetQueryId(), "error", msg)
 		return &pb.OSQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil
-	}
-
-	// WS4: verify the CA signature before ANY osquery execution (incl. raw SQL).
-	// Fail-closed — a missing/tampered/wrong-domain signature, or no verifier,
-	// is refused and osquery is never invoked.
-	if err := h.executor.VerifyOSQuery(query); err != nil {
-		h.logger.Warn("refusing unsigned/tampered query", "query_id", query.GetQueryId(), "error", err)
-		return &pb.OSQueryResult{
-			QueryId: query.GetQueryId(),
-			Success: false,
-			Error:   "refusing to execute unsigned/tampered query: " + err.Error(),
-		}, nil
 	}
 
 	// Check if osquery is available (lazy init — detects installs without restart)
@@ -475,14 +370,6 @@ func (h *Handler) OnRevokeLuksDeviceKey(ctx context.Context, req *pb.RevokeLuksD
 	actionID := req.GetActionId()
 	h.logger.Info("received LUKS device key revocation", "action_id", actionID)
 
-	// WS4: the slot-7 device-key wipe is destructive and irreversible — verify
-	// the CA signature binding action_id before touching the executor.
-	// Fail-closed (incl. nil verifier).
-	if err := h.executor.VerifyRevokeLuksDeviceKey(req); err != nil {
-		h.logger.Error("refusing unsigned/tampered LUKS device key revocation", "action_id", actionID, "error", err)
-		return false, "refusing to revoke unsigned/tampered LUKS device key: " + err.Error()
-	}
-
 	success, errMsg := h.executor.RevokeLuksDeviceKey(ctx, actionID)
 	if !success {
 		h.logger.Error("LUKS device key revocation failed", "action_id", actionID, "error", errMsg)
@@ -501,17 +388,6 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 	if msg, ok := validate.Struct(streamValidator, query); !ok {
 		h.logger.Warn("rejecting invalid log query", "query_id", query.GetQueryId(), "error", msg)
 		return &pb.LogQueryResult{QueryId: query.GetQueryId(), Success: false, Error: msg}, nil
-	}
-
-	// WS4: journalctl runs as root — verify the CA signature before building any
-	// journalctl invocation. Fail-closed.
-	if err := h.executor.VerifyLogQuery(query); err != nil {
-		h.logger.Warn("refusing unsigned/tampered log query", "query_id", query.GetQueryId(), "error", err)
-		return &pb.LogQueryResult{
-			QueryId: query.GetQueryId(),
-			Success: false,
-			Error:   "refusing to execute unsigned/tampered log query: " + err.Error(),
-		}, nil
 	}
 
 	// The journalctl invocation — including the line cap, the priority
@@ -558,19 +434,11 @@ func (h *Handler) OnLogQuery(ctx context.Context, query *pb.LogQuery) (*pb.LogQu
 }
 
 // OnRequestInventory handles a SERVER-originated inventory collection request.
-// Implements sdk.InventoryHandler. The request is verified fail-closed before
-// any osquery runs (WS4) — a compromised gateway cannot forge it. All
+// Implements sdk.InventoryHandler. All
 // inventory collection is server-initiated over this path (manual refresh and
 // the spec-22 server-side scheduler); the agent has no periodic collector of
 // its own.
 func (h *Handler) OnRequestInventory(ctx context.Context, req *pb.RequestInventory) *pb.DeviceInventory {
-	// WS4: a server-originated request runs osquery as root — verify the CA
-	// signature before collecting. Fail-closed (incl. nil verifier): a forged
-	// request from a compromised gateway returns nil and never runs osquery.
-	if err := h.executor.VerifyRequestInventory(req); err != nil {
-		h.logger.Warn("refusing unsigned/tampered inventory request", "query_id", req.GetQueryId(), "error", err)
-		return nil
-	}
 	return h.CollectInventory(ctx)
 }
 

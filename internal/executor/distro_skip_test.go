@@ -7,7 +7,7 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 )
 
@@ -47,7 +47,7 @@ func TestExecuteDeb_NotApplicableWhenDpkgMissing(t *testing.T) {
 		t.Skip("apt (deb backend) detected — test requires a non-deb host")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	// A well-formed action (https + checksum): the executor-boundary
 	// requireVerifiedArtifact guard runs before the dpkg lookup, so a
 	// checksum-less action would be rejected rather than reported
@@ -68,7 +68,7 @@ func TestExecuteRpm_NotApplicableWhenRpmMissing(t *testing.T) {
 		t.Skip("dnf/zypper (rpm backend) detected — test requires a non-rpm host")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	// Well-formed action so requireVerifiedArtifact (which runs before the rpm
 	// lookup) passes and the test reaches the inapplicability path.
 	_, changed, err := e.executeRpm(context.Background(), &pb.AppInstallParams{
@@ -87,7 +87,7 @@ func TestExecuteFlatpak_NotApplicableWhenFlatpakMissing(t *testing.T) {
 		t.Skip("flatpak detected — test requires a host without flatpak")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId: "org.example.Test",
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)
@@ -102,7 +102,7 @@ func TestExecuteDeb_DoesNotSkipWhenDpkgPresent(t *testing.T) {
 		t.Skip("apt (deb backend) not detected on this host")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	// A well-formed action (https + valid checksum) so it passes the
 	// requireVerifiedArtifact guard and proceeds past the tool check; the
 	// unresolvable host then fails the download (proving it didn't skip).
@@ -135,7 +135,7 @@ func TestExecuteRpm_DoesNotSkipWhenRpmPresent(t *testing.T) {
 		t.Skip("dnf/zypper (rpm backend) not detected on this host")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	// A well-formed action (https + valid checksum) so it passes the
 	// requireVerifiedArtifact guard and proceeds past the rpm check; the
 	// unresolvable host then fails the download (proving it didn't skip).
@@ -167,7 +167,7 @@ func TestExecuteFlatpak_DoesNotSkipWhenFlatpakPresent(t *testing.T) {
 		t.Skip("flatpak not detected on this host")
 	}
 
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	output, _, err := e.executeFlatpak(context.Background(), &pb.FlatpakParams{
 		AppId: "org.nonexistent.surely_does_not_exist_12345",
 	}, pb.DesiredState_DESIRED_STATE_PRESENT)

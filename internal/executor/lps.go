@@ -9,7 +9,7 @@ import (
 	"strings"
 	"time"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysuser "github.com/manchtools/power-manage-sdk/sys/user"
 
 	"github.com/manchtools/power-manage/agent/internal/store"
@@ -184,9 +184,17 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 		// visibly, and the previous recorded password still opens the account.
 		plaintext := password.Reveal()
 		rotatedAt := e.now().UTC()
+		sealedPassword, err := e.sealToControl([]byte(plaintext),
+			"powermanage.v1.LpsPasswordRotation", "password",
+			e.getDeviceID(), actionID, username)
+		if err != nil {
+			anyError = fmt.Errorf("seal password for %s: %w", username, err)
+			output.WriteString(fmt.Sprintf("LPS: %s — failed to seal password for server, not rotating\n", username))
+			continue
+		}
 		if err := lpsStore.StorePasswords(ctx, actionID, []*pb.LpsPasswordRotation{{
 			Username:  username,
-			Password:  plaintext,
+			Password:  sealedPassword,
 			RotatedAt: rotatedAt.Format(time.RFC3339),
 			Reason:    lpsRotationReason(reason),
 		}}); err != nil {
@@ -379,9 +387,17 @@ func (e *Executor) reportUserCreatePassword(ctx context.Context, username, actio
 		output.WriteString("warning: temporary password not reported (no device identity; reset out of band)\n")
 		return
 	}
+	sealedPassword, err := e.sealToControl([]byte(plaintext),
+		"powermanage.v1.LpsPasswordRotation", "password",
+		e.getDeviceID(), actionID, username)
+	if err != nil {
+		e.logger.Warn("user create: failed to seal temp password", "username", username, "error", err)
+		output.WriteString("warning: temporary password not reported (sealing failed; reset out of band)\n")
+		return
+	}
 	if err := ps.StorePasswords(ctx, actionID, []*pb.LpsPasswordRotation{{
 		Username:  username,
-		Password:  plaintext,
+		Password:  sealedPassword,
 		RotatedAt: e.now().UTC().Format(time.RFC3339),
 		Reason:    pb.RotationReason_ROTATION_REASON_INITIAL,
 	}}); err != nil {

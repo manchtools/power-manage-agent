@@ -3,6 +3,7 @@ package executor
 
 import (
 	"context"
+	"crypto/ecdh"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -13,13 +14,11 @@ import (
 	"sync/atomic"
 	"time"
 
-	"google.golang.org/protobuf/proto"
 	"google.golang.org/protobuf/types/known/timestamppb"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage-sdk/pkg"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
-	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/store"
 )
 
@@ -69,12 +68,11 @@ type Executor struct {
 	pkgBackend pkg.Backend // the detected backend driving pkgManager (zero when nil)
 	// runner is the privilege runner this executor was constructed with, or nil
 	// when NewExecutor was called without one (the unit-test convention,
-	// NewExecutor(_, nil)). The destructive reboot path uses it DIRECTLY and
+	// NewExecutor(nil)). The destructive reboot path uses it DIRECTLY and
 	// fails closed when it is nil — never the process-global Direct default — so
 	// a test that dispatches a REBOOT through a no-runner executor can never
 	// issue a real `shutdown` on the host (it once rebooted a workstation).
 	runner       sysexec.Runner
-	verifier     *verify.ActionVerifier
 	logger       *slog.Logger
 	mu           sync.RWMutex // protects luksKeyStore, lpsStore, store, actionStore, deviceID
 	luksKeyStore LuksKeyStore
@@ -85,7 +83,9 @@ type Executor struct {
 	// deviceID is this agent's own device ULID. Control derives the at-rest
 	// AAD from it, and the executor refuses to rotate a credential it cannot
 	// attribute to a device. Set from credentials in main.go.
-	deviceID string
+	deviceID             string
+	sealingPrivate       *ecdh.PrivateKey
+	controlSealingPublic *ecdh.PublicKey
 
 	// Per-cycle AGENT_UPDATE dedup. Audit F042 + F048: previously
 	// package-level globals which made parallel tests serialise on
@@ -127,16 +127,17 @@ func (e *Executor) pkgManagerForCtx(ctx context.Context) pkg.Manager {
 	return e.pkgManager
 }
 
-// NewExecutor creates a new action executor. If verifier is non-nil, action
-// signatures are checked before execution. runner is the privilege-backend
-// runner the package manager dispatches through; a nil runner leaves the package
+// NewExecutor creates a new action executor. Transport authentication and
+// integrity are supplied by the direct mTLS connection; actions are plain
+// contract messages and carry no second application signature. runner is the
+// privilege-backend runner the package manager dispatches through; a nil runner leaves the package
 // manager unset (package actions fail) — used by unit tests that inject their
 // own pkg.Manager into e.pkgManager.
 // executorGlobalsAdopted latches the first runner-bearing construction
 // so re-adoption of the package-global managers is logged (#173).
 var executorGlobalsAdopted atomic.Bool
 
-func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Executor {
+func NewExecutor(runner sysexec.Runner) *Executor {
 	logger := slog.Default()
 	var (
 		mgr     pkg.Manager
@@ -193,7 +194,6 @@ func NewExecutor(verifier *verify.ActionVerifier, runner sysexec.Runner) *Execut
 		pkgManager: mgr,
 		pkgBackend: backend,
 		runner:     runner,
-		verifier:   verifier,
 		logger:     logger,
 		now:        time.Now,
 	}
@@ -281,69 +281,19 @@ func (e *Executor) getActionStore() ActionStore {
 	return e.actionStore
 }
 
-// ExecuteEnvelope runs a previously-VERIFIED action envelope and returns the
-// result. Callers must pass only an envelope returned by VerifyEnvelope — the
-// executed bytes must be the verified bytes (sdk#82).
-func (e *Executor) ExecuteEnvelope(ctx context.Context, env *pb.SignedActionEnvelope) *pb.ActionResult {
-	return e.ExecuteWithStreaming(ctx, env, nil)
+// ExecuteAction runs one manifest occurrence.
+func (e *Executor) ExecuteAction(ctx context.Context, action *pb.Action) *pb.ActionResult {
+	return e.ExecuteWithStreaming(ctx, action, nil)
 }
 
-// VerifyEnvelope is the single verify-then-unmarshal seam every execution
-// path funnels through (sdk#82). It verifies the CA signature over the EXACT
-// envelope bytes it received and, on success, unmarshals THOSE SAME bytes
-// into a SignedActionEnvelope — so the message that executes is byte-for-byte
-// the message that was verified. A compromised gateway/Valkey relay cannot
-// flip desired_state, swap params, change the timeout/schedule, lift the type
-// onto SYNC, or retarget the device under a still-valid signature, because
-// every one of those fields is inside the signed bytes.
-//
-// Fail-closed: a nil verifier returns an error rather than passing the
-// envelope through unverified. In production the agent always has a verifier
-// (the CA cert is required at startup); a nil verifier means misconfiguration
-// or a test that forgot to wire one, and either way must NOT become a silent
-// "execute everything unsigned" hole. The caller must treat any error here as
-// a hard refusal and never execute.
-func (e *Executor) VerifyEnvelope(envelopeBytes, signature []byte) (*pb.SignedActionEnvelope, error) {
-	if e.verifier == nil {
-		return nil, fmt.Errorf("no action verifier configured; refusing to execute unverified action")
-	}
-	if err := e.verifier.Verify(envelopeBytes, signature); err != nil {
-		return nil, err
-	}
-	env := &pb.SignedActionEnvelope{}
-	if err := proto.Unmarshal(envelopeBytes, env); err != nil {
-		return nil, fmt.Errorf("unmarshal verified envelope: %w", err)
-	}
-	// Enforce the SIGNED target binding. target_device_id exists precisely to
-	// stop a compromised gateway/relay from replaying one device's validly-signed
-	// (CA-covered) action onto another device that trusts the same CA
-	// (PMSEC-001). Verification alone proves the bytes are authentic, not that
-	// this device is their intended target — so make verification an
-	// authorization step. The control server's single signing seam
-	// (actionparams.BuildAndSignEnvelope) always binds the target device, so a
-	// legitimate envelope for this device always matches. The same helper guards
-	// the four non-action stream-RPC surfaces (see enforceTargetDevice).
-	if err := e.enforceTargetDevice(env.GetTargetDeviceId()); err != nil {
-		return nil, err
-	}
-	return env, nil
-}
-
-// ExecuteWithStreaming runs a VERIFIED action envelope with optional output
+// ExecuteWithStreaming runs an action with optional output
 // streaming. The callback is called for each line of output as it's produced
 // (for shell actions).
-//
-// Signature verification is NOT done here — it happens in VerifyEnvelope,
-// which the caller MUST run first and whose returned envelope is the only
-// thing this method should ever receive. Passing a hand-built (unverified)
-// envelope is a caller bug: the whole point of sdk#82 is that the executed
-// bytes are the verified bytes. WHAT runs (type, params, desired_state,
-// timeout) is read exclusively off env.
-func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActionEnvelope, callback OutputCallback) *pb.ActionResult {
+func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.Action, callback OutputCallback) *pb.ActionResult {
 	start := e.now()
 
 	result := &pb.ActionResult{
-		ActionId: env.GetActionId(),
+		ActionId: env.GetId(),
 		Status:   pb.ExecutionStatus_EXECUTION_STATUS_RUNNING,
 		Changed:  true, // Default to true; scheduler may override based on output comparison
 	}
@@ -354,7 +304,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	// classification below can tell "the parent deadline fired" apart
 	// from "the per-action timeout fired" (CR catch on #179).
 	parentCtx := ctx
-	timeout := defaultTimeoutForAction(env.ActionType, env.GetTimeoutSeconds())
+	timeout := defaultTimeoutForAction(env.Type, env.GetTimeoutSeconds())
 	if timeout > 0 {
 		var cancel context.CancelFunc
 		ctx, cancel = context.WithTimeout(ctx, time.Duration(timeout)*time.Second)
@@ -364,7 +314,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 	var execErr error
 	var output *pb.CommandOutput
 
-	switch env.ActionType {
+	switch env.Type {
 	case pb.ActionType_ACTION_TYPE_PACKAGE:
 		var changed bool
 		output, changed, execErr = e.executePackage(ctx, env.GetPackage(), env.DesiredState)
@@ -465,7 +415,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 		output, changed, execErr = e.executeAgentUpdate(ctx, env.GetAgentUpdate())
 		result.Changed = changed
 	default:
-		execErr = fmt.Errorf("unsupported action type: %v", env.ActionType)
+		execErr = fmt.Errorf("unsupported action type: %v", env.Type)
 	}
 
 	result.Output = output
@@ -503,7 +453,7 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.SignedActio
 
 	// For shell/script actions, non-zero exit codes indicate failure
 	if result.Status == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
-		if env.ActionType == pb.ActionType_ACTION_TYPE_SHELL || env.ActionType == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
+		if env.Type == pb.ActionType_ACTION_TYPE_SHELL || env.Type == pb.ActionType_ACTION_TYPE_SCRIPT_RUN {
 			if result.DetectionOutput != nil && result.DetectionOutput.ExitCode != 0 {
 				result.Status = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 				result.Error = fmt.Sprintf("script exited with code %d", result.DetectionOutput.ExitCode)

@@ -1,6 +1,7 @@
 package deviceauth
 
 import (
+	"bytes"
 	"context"
 	"log/slog"
 	"net"
@@ -14,16 +15,20 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
-	"github.com/manchtools/power-manage-sdk/gen/go/pm/v1/pmv1connect"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
+	"github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1/powermanagev1connect"
 
 	sdk "github.com/manchtools/power-manage-sdk"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
 
+func testControlSealingPublicKey() []byte {
+	return bytes.Repeat([]byte{0x42}, 32)
+}
+
 // mockRegisterService implements the Register RPC of ControlServiceHandler.
 type mockRegisterService struct {
-	pmv1connect.UnimplementedControlServiceHandler
+	powermanagev1connect.UnimplementedControlServiceHandler
 
 	registerFunc func(context.Context, *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error)
 }
@@ -41,7 +46,7 @@ func (m *mockRegisterService) Register(ctx context.Context, req *connect.Request
 func startMockControlServer(t *testing.T, mock *mockRegisterService) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
-	path, handler := pmv1connect.NewControlServiceHandler(mock)
+	path, handler := powermanagev1connect.NewControlServiceHandler(mock)
 	mux.Handle(path, handler)
 	srv := httptest.NewTLSServer(mux)
 	t.Cleanup(srv.Close)
@@ -57,11 +62,13 @@ func trustServer(srv *httptest.Server) []sdk.ClientOption {
 func TestEnroll_Success(t *testing.T) {
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, req *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
+			require.Len(t, req.Msg.AgentSealingPublicKey, 32)
 			return connect.NewResponse(&pm.RegisterResponse{
-				DeviceId:    &pm.DeviceId{Value: "dev-123"},
-				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
-				Certificate: []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
-				ControlUrl:  "https://gw.example.com:8443",
+				DeviceId:                &pm.DeviceId{Value: "dev-123"},
+				CaCert:                  []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
+				Certificate:             []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
+				ControlUrl:              "https://gw.example.com:8443",
+				ControlSealingPublicKey: testControlSealingPublicKey(),
 			}), nil
 		},
 	}
@@ -90,12 +97,16 @@ func TestEnroll_Success(t *testing.T) {
 	assert.Equal(t, "dev-123", enrolledCreds.DeviceID)
 	assert.Equal(t, "https://gw.example.com:8443", enrolledCreds.StreamAddr)
 	assert.Equal(t, srv.URL, enrolledCreds.ControlAddr)
+	assert.Len(t, enrolledCreds.SealingPrivateKey, 32)
+	assert.Equal(t, testControlSealingPublicKey(), enrolledCreds.ControlSealingPublicKey)
 
 	// Credentials saved to store
 	assert.True(t, credStore.Exists())
 	loaded, err := credStore.Load()
 	require.NoError(t, err)
 	assert.Equal(t, "dev-123", loaded.DeviceID)
+	assert.Len(t, loaded.SealingPrivateKey, 32)
+	assert.Equal(t, testControlSealingPublicKey(), loaded.ControlSealingPublicKey)
 }
 
 func TestEnroll_MissingFields(t *testing.T) {
@@ -192,10 +203,11 @@ func TestEnrollServer_EndToEnd(t *testing.T) {
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			return connect.NewResponse(&pm.RegisterResponse{
-				DeviceId:    &pm.DeviceId{Value: "dev-e2e"},
-				CaCert:      []byte("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n"),
-				Certificate: []byte("-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n"),
-				ControlUrl:  "https://gw.example.com",
+				DeviceId:                &pm.DeviceId{Value: "dev-e2e"},
+				CaCert:                  []byte("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n"),
+				Certificate:             []byte("-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n"),
+				ControlUrl:              "https://gw.example.com",
+				ControlSealingPublicKey: testControlSealingPublicKey(),
 			}), nil
 		},
 	}
@@ -236,7 +248,7 @@ func TestEnrollServer_EndToEnd(t *testing.T) {
 			},
 		},
 	}
-	client := pmv1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
+	client := powermanagev1connect.NewDeviceAuthServiceClient(httpClient, "http://localhost")
 
 	// Check status: not enrolled
 	status, err := client.GetEnrollmentStatus(context.Background(), connect.NewRequest(&pm.GetEnrollmentStatusRequest{}))

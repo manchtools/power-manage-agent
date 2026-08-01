@@ -7,7 +7,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	"github.com/manchtools/power-manage/agent/internal/executor"
 )
 
@@ -37,7 +37,7 @@ type inventoryCtxKey string
 // reached osquery. This is the NIS2 / spec-12 "no context.Background() in a
 // request path" invariant for the inventory path.
 func TestSupplementWithOsquery_PropagatesRequestContext(t *testing.T) {
-	h := NewHandler(slog.Default(), executor.NewExecutor(nil, nil), nil, nil, make(chan struct{}, 1))
+	h := NewHandler(slog.Default(), executor.NewExecutor(nil), nil, nil, make(chan struct{}, 1))
 	oq := &ctxCapturingOsquery{}
 
 	const k inventoryCtxKey = "req-sentinel"

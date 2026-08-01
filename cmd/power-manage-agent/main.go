@@ -14,7 +14,6 @@ import (
 
 	"github.com/manchtools/power-manage-sdk/logging"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
-	"github.com/manchtools/power-manage-sdk/verify"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 	"github.com/manchtools/power-manage/agent/internal/deviceauth"
 	"github.com/manchtools/power-manage/agent/internal/executor"
@@ -257,23 +256,12 @@ func main() {
 		}
 	}()
 
-	// Initialize action signature verifier from the CA certificate (required)
-	var actionVerifier *verify.ActionVerifier
-	if len(creds.CACert) > 0 {
-		v, err := verify.NewActionVerifier(creds.CACert)
-		if err != nil {
-			logger.Error("failed to initialize action verifier", "error", err)
-			os.Exit(1)
-		}
-		actionVerifier = v
-		logger.Info("action signature verification enabled")
-	} else {
-		logger.Error("CA certificate missing from credentials, cannot verify action signatures")
+	// Initialize the scheduler for autonomous action execution
+	exec := executor.NewExecutor(runner)
+	if err := exec.ConfigureSealing(creds.SealingPrivateKey, creds.ControlSealingPublicKey); err != nil {
+		logger.Error("invalid enrollment sealing keys; remove the agent state and re-enroll", "error", err)
 		os.Exit(1)
 	}
-
-	// Initialize the scheduler for autonomous action execution
-	exec := executor.NewExecutor(actionVerifier, runner)
 	exec.SetStore(actionStore)
 	// The agent's own device ID is part of the LPS seal context so control
 	// unseals each rotated password into the right (device, action, user) record.
@@ -286,6 +274,7 @@ func main() {
 
 	// Create sync trigger channel for instant SYNC actions
 	syncTrigger := make(chan struct{}, 1)
+	sched.SetSyncTrigger(syncTrigger)
 
 	// Create handler with scheduler integration
 	h := handler.NewHandler(logger, exec, sched, actionStore, syncTrigger)

@@ -5,14 +5,14 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
-// All tests in this file use NewExecutor(nil, nil) — no real runner, no
+// All tests in this file use NewExecutor(nil) — no real runner, no
 // binary dependencies, no container needed. They test pure validation.
 
 func TestExecuteService_RejectsNilParams(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeService(context.Background(), nil)
 	if err == nil {
 		t.Fatal("expected error for nil params, got nil")
@@ -26,7 +26,7 @@ func TestExecuteService_RejectsNilParams(t *testing.T) {
 }
 
 func TestExecuteService_RejectsAgentOwnService(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	name := "power-manage-agent.service"
 	params := &pb.ServiceParams{UnitName: name}
 	_, changed, err := e.executeService(context.Background(), params)
@@ -55,7 +55,7 @@ func TestExecuteService_RejectsAgentOwnService(t *testing.T) {
 }
 
 func TestExecuteService_RejectsInvalidUnitName(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	invalidNames := []string{
 		"",
 		"../etc/systemd/system/evil.service",
@@ -74,7 +74,7 @@ func TestExecuteService_RejectsInvalidUnitName(t *testing.T) {
 
 func TestExecuteService_RejectsBeforeRemount(t *testing.T) {
 	var remountCalled bool
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	e.repairFS = func(ctx context.Context) bool {
 		remountCalled = true
 		return true
@@ -90,7 +90,7 @@ func TestExecuteService_RejectsBeforeRemount(t *testing.T) {
 }
 
 func TestExecuteService_IsUnitEnabled_ProbeErrorFailsSafe(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	enabled := e.isUnitEnabled(context.Background(), "nonexistent.service")
 	if enabled {
 		t.Error("isUnitEnabled must return false (fail safe) when the probe fails")
@@ -98,7 +98,7 @@ func TestExecuteService_IsUnitEnabled_ProbeErrorFailsSafe(t *testing.T) {
 }
 
 func TestExecuteService_IsUnitMasked_ProbeErrorFailsSafe(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	masked := e.isUnitMasked(context.Background(), "nonexistent.service")
 	if masked {
 		t.Error("isUnitMasked must return false (fail safe) when the probe fails")
@@ -106,7 +106,7 @@ func TestExecuteService_IsUnitMasked_ProbeErrorFailsSafe(t *testing.T) {
 }
 
 func TestExecuteService_IsUnitActive_ProbeErrorFailsSafe(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	active := e.isUnitActive(context.Background(), "nonexistent.service")
 	if active {
 		t.Error("isUnitActive must return false (fail safe) when the probe fails")

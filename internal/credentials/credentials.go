@@ -77,6 +77,13 @@ type Credentials struct {
 	// ControlAddr is where the agent enrolled and re-registers: control's
 	// public API host.
 	ControlAddr string `json:"control_addr,omitempty"`
+	// SealingPrivateKey is this agent's dedicated X25519 recipient key. The
+	// public half is registered with control; the private half never leaves the
+	// encrypted credential store.
+	SealingPrivateKey []byte `json:"sealing_private_key"`
+	// ControlSealingPublicKey pins the deployment recipient used for
+	// agent-to-control secret fields.
+	ControlSealingPublicKey []byte `json:"control_sealing_public_key"`
 }
 
 // Store manages encrypted credential storage.

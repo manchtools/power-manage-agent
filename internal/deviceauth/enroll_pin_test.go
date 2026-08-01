@@ -10,7 +10,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
-	pm "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pm "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 
 	pmcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	"github.com/manchtools/power-manage-sdk/cryptotest"
@@ -29,10 +29,11 @@ func caReturningMock(caPEM []byte) *mockRegisterService {
 	return &mockRegisterService{
 		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			return connect.NewResponse(&pm.RegisterResponse{
-				DeviceId:    &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
-				CaCert:      caPEM,
-				Certificate: []byte(fakeLeafPEM),
-				ControlUrl:  "https://gw.example.com:8443",
+				DeviceId:                &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
+				CaCert:                  caPEM,
+				Certificate:             []byte(fakeLeafPEM),
+				ControlUrl:              "https://gw.example.com:8443",
+				ControlSealingPublicKey: testControlSealingPublicKey(),
 			}), nil
 		},
 	}

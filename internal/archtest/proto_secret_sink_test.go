@@ -9,7 +9,7 @@ import (
 	"google.golang.org/protobuf/reflect/protoregistry"
 	"google.golang.org/protobuf/types/descriptorpb"
 
-	_ "github.com/manchtools/power-manage-sdk/gen/go/pm/v1" // registers the descriptors this guard reads
+	_ "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1" // registers the descriptors this guard reads
 )
 
 // secretLogSinkAllowlist lists the ONLY places a secret-named field may be
@@ -22,12 +22,9 @@ var secretLogSinkAllowlist = map[string]string{}
 
 // TestProtoSecretFieldSinks: a credential must never reach a log.
 //
-// Spec 41 moved LUKS passphrases and LPS passwords from sealed blobs to
-// plaintext on the wire, arguing the agent's mTLS terminates at control so
-// there is no relay to withhold them from. That covers the NETWORK and nothing
-// else. In-process these are now ordinary string fields, and protobuf's
-// generated String() prints them: one %v on the enclosing AgentMessage writes a
-// live disk passphrase into whatever log caught it.
+// LUKS passphrases and LPS passwords are sealed on the wire, but the agent must
+// still handle plaintext at the narrow operating-system sink. A field selector
+// handed to formatting or logging can therefore disclose a live credential.
 //
 // The agent is where these values ORIGINATE — it generates the password, sets
 // it on the account, and reports it — so it holds the plaintext longest and
@@ -111,7 +108,7 @@ func secretFieldNamesFromDescriptors(t *testing.T) map[string]bool {
 	t.Helper()
 	out := map[string]bool{}
 	protoregistry.GlobalFiles.RangeFiles(func(fd protoreflect.FileDescriptor) bool {
-		if !strings.HasPrefix(string(fd.Package()), "pm.") {
+		if !strings.HasPrefix(string(fd.Package()), "powermanage.") {
 			return true
 		}
 		msgs := fd.Messages()

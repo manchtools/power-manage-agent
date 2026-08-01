@@ -17,7 +17,7 @@ var protoJSONAllowlist = map[string]string{}
 
 // protoPkgPathSuffix identifies the generated protobuf package regardless of
 // the import alias a file chooses (conventionally "pm").
-const protoPkgPathSuffix = "-sdk/gen/go/pm/v1"
+const protoPkgPathSuffix = "-sdk/gen/go/powermanage/v1"
 
 // TestNoStdlibJSONOfProtoMessage forbids passing a generated protobuf type to
 // the standard library encoding/json (Marshal / MarshalIndent / Unmarshal, and
@@ -97,7 +97,7 @@ func TestNoStdlibJSONOfProtoMessage(t *testing.T) {
 }
 
 // protoImportAliases returns the set of local names by which f imports the
-// generated protobuf package (path suffix /sdk/gen/go/pm/v1). Self-discovered
+// generated protobuf package (path suffix /sdk/gen/go/powermanage/v1). Self-discovered
 // from the import block so the guard is not tied to the conventional "pm".
 func protoImportAliases(f *ast.File) map[string]bool {
 	out := map[string]bool{}
@@ -110,11 +110,11 @@ func protoImportAliases(f *ast.File) map[string]bool {
 			out[imp.Name.Name] = true
 		} else {
 			// Unaliased import: pure-AST parsing can't resolve the package's
-			// declared name. The generated protobuf package is `package pmv1`,
+			// declared name. The generated protobuf package is `package powermanagev1`,
 			// but register the last path segment `v1` too so neither possible
 			// identifier bypasses the guard. Both are scoped to this exact
 			// import path, so there is no collision with other /v1 packages.
-			out["pmv1"] = true
+			out["powermanagev1"] = true
 			out["v1"] = true
 		}
 	}

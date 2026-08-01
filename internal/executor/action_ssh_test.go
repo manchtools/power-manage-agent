@@ -5,12 +5,12 @@ import (
 	"strings"
 	"testing"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 // TestExecuteSsh_RejectsNilParams verifies nil SSH params are rejected.
 func TestExecuteSsh_RejectsNilParams(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	_, changed, err := e.executeSsh(context.Background(), nil, pb.DesiredState_DESIRED_STATE_PRESENT, "test1234")
 	if err == nil {
 		t.Fatal("expected error for nil params, got nil")
@@ -25,7 +25,7 @@ func TestExecuteSsh_RejectsNilParams(t *testing.T) {
 
 // TestExecuteSsh_RejectsEmptyUsers verifies that an empty user list is rejected.
 func TestExecuteSsh_RejectsEmptyUsers(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	params := &pb.SshParams{}
 	_, changed, err := e.executeSsh(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT, "test1234")
 	if err == nil {
@@ -39,7 +39,7 @@ func TestExecuteSsh_RejectsEmptyUsers(t *testing.T) {
 // TestExecuteSsh_RejectsInvalidUsername verifies that non-alphanumeric or empty
 // usernames are rejected by sysuser.IsValidName BEFORE any group creation.
 func TestExecuteSsh_RejectsInvalidUsername(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	invalidUsers := []string{
 		"",
 		"user name with spaces",
@@ -62,7 +62,7 @@ func TestExecuteSsh_RejectsInvalidUsername(t *testing.T) {
 // the group name and config path — an empty one would produce an empty group
 // name, which is invalid.
 func TestExecuteSsh_RejectsEmptyActionID(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	params := &pb.SshParams{Users: []string{"alice"}}
 	_, changed, err := e.executeSsh(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT, "")
 	if err == nil {
@@ -76,7 +76,7 @@ func TestExecuteSsh_RejectsEmptyActionID(t *testing.T) {
 // TestExecuteSsh_RejectsTooLongActionID verifies that action IDs exceeding
 // maxActionIDForFilesystem are rejected.
 func TestExecuteSsh_RejectsTooLongActionID(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	params := &pb.SshParams{Users: []string{"alice"}}
 	longID := strings.Repeat("a", maxActionIDForFilesystem+1)
 	_, changed, err := e.executeSsh(context.Background(), params, pb.DesiredState_DESIRED_STATE_PRESENT, longID)
@@ -92,7 +92,7 @@ func TestExecuteSsh_RejectsTooLongActionID(t *testing.T) {
 // non-alphanumeric characters are rejected — these could produce path-
 // meaningful group names or config file names.
 func TestExecuteSsh_RejectsUnsafeCharsInActionID(t *testing.T) {
-	e := NewExecutor(nil, nil)
+	e := NewExecutor(nil)
 	params := &pb.SshParams{Users: []string{"alice"}}
 	unsafeIDs := []string{
 		"../../etc",

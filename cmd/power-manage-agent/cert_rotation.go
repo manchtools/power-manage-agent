@@ -30,13 +30,17 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 	if err != nil {
 		return nil, fmt.Errorf("generate CSR: %w", err)
 	}
+	sealingPrivate, err := pmcrypto.GenerateX25519()
+	if err != nil {
+		return nil, fmt.Errorf("generate sealing key: %w", err)
+	}
 
 	// Register via control server RPC. TLS verification is always
 	// enforced — there is intentionally no opt-out, as bypassing it
 	// during initial registration enables MITM attacks that can
 	// substitute the gateway URL and a malicious certificate before
 	// the agent has any trust anchor of its own.
-	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM)
+	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM, sealingPrivate.PublicKey().Bytes())
 	if err != nil {
 		return nil, fmt.Errorf("register: %w", err)
 	}
@@ -50,14 +54,19 @@ func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Lo
 	if len(result.CACert) == 0 || len(result.Certificate) == 0 {
 		return nil, fmt.Errorf("server did not provide mTLS certificates")
 	}
+	if _, err := pmcrypto.ParseX25519PublicKey(result.ControlSealingPublicKey); err != nil {
+		return nil, fmt.Errorf("server did not provide a valid sealing public key: %w", err)
+	}
 
 	return &credentials.Credentials{
-		DeviceID:    result.DeviceID,
-		CACert:      result.CACert,
-		Certificate: result.Certificate,
-		PrivateKey:  keyPEM, // Private key generated locally, never sent to server
-		StreamAddr:  result.ControlURL,
-		ControlAddr: cfg.ServerURL, // Control Server URL for device auth proxy
+		DeviceID:                result.DeviceID,
+		CACert:                  result.CACert,
+		Certificate:             result.Certificate,
+		PrivateKey:              keyPEM, // Private key generated locally, never sent to server
+		StreamAddr:              result.ControlURL,
+		ControlAddr:             cfg.ServerURL, // Control Server URL for device auth proxy
+		SealingPrivateKey:       sealingPrivate.Bytes(),
+		ControlSealingPublicKey: result.ControlSealingPublicKey,
 	}, nil
 }
 

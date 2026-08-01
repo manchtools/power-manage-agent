@@ -8,7 +8,7 @@ import (
 	"regexp"
 	"strings"
 
-	pb "github.com/manchtools/power-manage-sdk/gen/go/pm/v1"
+	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 )
 
 // errReadOnlyFS is a sentinel error returned when the filesystem is read-only and repair failed.
@@ -39,11 +39,11 @@ var validActionIDRegex = regexp.MustCompile(`^[A-Za-z0-9]+$`)
 // and Linux group names (action_ssh.go etc.) is the authenticated one, not an
 // advisory wire field. The alphanumeric/length validation is defense in depth
 // against an id that slips path-meaningful characters into those derivations.
-func envActionID(env *pb.SignedActionEnvelope) string {
-	if env == nil || env.GetActionId() == nil {
+func envActionID(env *pb.Action) string {
+	if env == nil || env.GetId() == nil {
 		return ""
 	}
-	id := env.GetActionId().GetValue()
+	id := env.GetId().GetValue()
 	if id == "" || len(id) > 64 || !validActionIDRegex.MatchString(id) {
 		return ""
 	}
