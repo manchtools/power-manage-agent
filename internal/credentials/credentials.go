@@ -322,12 +322,8 @@ func (s *Store) deriveKey(salt []byte) ([]byte, error) {
 // the cross-machine binding (credentials saved under one machine ID do
 // not decrypt under another).
 var getMachineID = func() ([]byte, error) {
-	// COMPAT PIN (#173): the RAW file bytes — including the trailing
-	// newline — are the Argon2id password. Trimming, normalizing, or
-	// re-encoding here would silently change the derived key and brick
-	// decryption of every credentials.enc in the fleet. Never "clean
-	// this up"; a format change requires a versioned migration
-	// (credentialsMagicV1 exists for exactly that).
+	// The raw file bytes, including the trailing newline, are the Argon2id
+	// password for the current credential format.
 	// Try /etc/machine-id first (systemd)
 	id, err := os.ReadFile("/etc/machine-id")
 	if err == nil && len(id) > 0 {

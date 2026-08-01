@@ -25,7 +25,7 @@ SCP_OPTS    := $(KEY_OPTS)
 
 # ── Targets ────────────────────────────────────────────────────
 .PHONY: build deploy install logs status restart stop \
-    test-integration test-integration-debian test-integration-fedora \
+    test-integration-debian test-integration-fedora \
     test-integration-opensuse test-integration-archlinux test-integration-all \
     test-integration-edgecase
 
@@ -83,9 +83,6 @@ test-integration-opensuse:
 test-integration-archlinux:
 	$(CONTAINER_CMD) build -f test/Dockerfile.integration.archlinux -t pm-agent-test-archlinux ../
 	$(CONTAINER_CMD) run --rm pm-agent-test-archlinux $(TEST_CMD)
-
-# Backward-compatible alias (Debian only)
-test-integration: test-integration-debian
 
 # Run all 4 distros in parallel
 test-integration-all:

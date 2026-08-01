@@ -103,11 +103,9 @@ func main() {
 	slog.SetDefault(logger)
 	logger.Info("logger initialized", "level", cfg.LogLevel, "format", cfg.LogFormat)
 
-	// Select SDK pluggable backends BEFORE any privileged call fires.
-	// Defaults stay at sudo / systemd / luks so every existing
-	// Linux-systemd-sudo deployment continues working with no
-	// configuration; operators on OpenBSD-style doas or OpenRC-flavoured
-	// systems flip the backend once via env var.
+	// Select SDK pluggable backends before any privileged call fires. The
+	// packaged agent runs as root, so its empty privilege setting resolves to
+	// direct execution; explicit overrides support development invocations.
 	resolvedBackend, err := applyBackendOverrides(cfg, logger)
 	if err != nil {
 		logger.Error("backend validation failed", "error", err)
@@ -176,7 +174,7 @@ func main() {
 			logger.Info("ignoring registration token — agent is already registered; delete credentials.enc first to re-enroll")
 		}
 	} else if cfg.Token != "" {
-		// Direct registration (backwards compatible, works with sudo)
+		// Register directly when the first-run token is supplied on the CLI.
 		if cfg.ServerURL == "" {
 			logger.Error("server URL required for registration")
 			os.Exit(1)
@@ -242,13 +240,12 @@ func main() {
 	}
 	defer actionStore.Close()
 
-	// Start the LUKS passphrase daemon (WS6 #1/#19). It listens on a
+	// Start the LUKS passphrase daemon. It listens on a
 	// world-connectable unix socket; an unprivileged user runs
 	// `power-manage-agent luks set-passphrase` and the root agent performs
 	// the cryptsetup work with its OWN credentials, authorized by the
-	// server-issued token — replacing the old NOPASSWD sudoers rule +
-	// attacker-controllable --data-dir. The control session is wired in
-	// per connection (SetSession/ClearSession) inside runAgent.
+	// server-issued token. The control session is wired in per connection
+	// (SetSession/ClearSession) inside runAgent.
 	luksDaemon := luksd.NewDaemon(luksd.DefaultSocketPath, actionStore, luksd.NewSysencEnroller(), logger)
 	go func() {
 		if err := luksDaemon.Start(ctx); err != nil {

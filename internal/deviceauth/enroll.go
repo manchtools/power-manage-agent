@@ -138,12 +138,6 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		}), nil
 	}
 
-	// (The SkipVerify rejection check that lived here was removed
-	// once the SDK dropped the proto field — see SDK PR. The wire
-	// format now has no path to request a TLS bypass; outdated
-	// clients sending the legacy field number are silently
-	// dropped by the proto3 unknown-field handler.)
-
 	// Check if already enrolled
 	if h.credStore.Exists() {
 		creds, err := h.credStore.Load()

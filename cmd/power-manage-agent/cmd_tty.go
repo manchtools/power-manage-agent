@@ -18,10 +18,8 @@ import (
 //	power-manage-agent tty status
 //
 // The toggle is stored in the agent's SQLite database. `enable` and
-// `disable` require ROOT (euid 0, e.g. via sudo) — the guard below is
-// root-only; the retired sudoers-mode "power-manage user" identity has
-// no special standing anymore (#173 doc/code mismatch). `status` only
-// needs read access to the agent's database.
+// `disable` require root (euid 0). `status` only needs read access to the
+// agent's database.
 func runTTY(args []string) int {
 	fs := flag.NewFlagSet("tty", flag.ExitOnError)
 	dataDir := fs.String("data-dir", credentials.DefaultDataDir, "Agent data directory")

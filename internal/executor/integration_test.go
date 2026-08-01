@@ -889,21 +889,6 @@ func TestIntegration_User(t *testing.T) {
 		assertSuccess(t, result)
 		assertChanged(t, result, false)
 	})
-
-	t.Run("ProtectPowerManage", func(t *testing.T) {
-		// Ensure power-manage user exists
-		if v, _ := userExists(context.Background(), "power-manage"); !v {
-			sudoRun("useradd", "--system", "--no-create-home", "--shell", "/usr/sbin/nologin", "power-manage").Run()
-			t.Cleanup(func() { sudoRun("userdel", "power-manage").Run() })
-		}
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_USER, pb.DesiredState_DESIRED_STATE_ABSENT)
-		action.Params = &pb.Action_User{User: &pb.UserParams{Username: "power-manage"}}
-		result := e.ExecuteAction(ctx, testAction(action))
-		assertFailed(t, result)
-		if v, _ := userExists(context.Background(), "power-manage"); !v {
-			t.Error("power-manage user was deleted despite protection")
-		}
-	})
 }
 
 // TestIntegration_User_CreateHomeRespected locks down the fix for the
@@ -1215,20 +1200,6 @@ func TestIntegration_Group(t *testing.T) {
 		assertChanged(t, result, true)
 		if v, _ := groupExists(context.Background(), groupName); v {
 			t.Error("group still exists")
-		}
-	})
-
-	t.Run("ProtectPowerManage", func(t *testing.T) {
-		if v, _ := groupExists(context.Background(), "power-manage"); !v {
-			sudoRun("groupadd", "power-manage").Run()
-			t.Cleanup(func() { sudoRun("groupdel", "power-manage").Run() })
-		}
-		action := makeAction(t, pb.ActionType_ACTION_TYPE_GROUP, pb.DesiredState_DESIRED_STATE_ABSENT)
-		action.Params = &pb.Action_Group{Group: &pb.GroupParams{Name: "power-manage"}}
-		result := e.ExecuteAction(ctx, testAction(action))
-		assertFailed(t, result)
-		if v, _ := groupExists(context.Background(), "power-manage"); !v {
-			t.Error("power-manage group was deleted despite protection")
 		}
 	})
 }

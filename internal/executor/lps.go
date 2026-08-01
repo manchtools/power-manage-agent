@@ -93,9 +93,8 @@ func (e *Executor) setupLpsPasswords(ctx context.Context, params *pb.LpsParams, 
 
 	// Map the complexity enum to the SDK's boolean flag. COMPLEX enables
 	// special characters; ALPHANUMERIC uses letters and digits only.
-	// UNSPECIFIED falls back to ALPHANUMERIC for compatibility with older
-	// server versions that didn't set the field — logged so operators can
-	// spot misconfigured policies.
+	// UNSPECIFIED is an invalid policy choice, but fail safely to the least
+	// surprising character set and log the authoring error.
 	if params.Complexity == pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_UNSPECIFIED {
 		e.logger.Warn("LPS policy has no complexity set, defaulting to alphanumeric",
 			"action_id", actionID)

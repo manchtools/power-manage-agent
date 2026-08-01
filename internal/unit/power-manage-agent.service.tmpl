@@ -8,9 +8,7 @@ StartLimitBurst=3
 
 [Service]
 Type=simple
-# Agent runs as root. The previous power-manage + sudoers escalation
-# model was retired (see agent/README.md "Runs as root"); every
-# privileged operation now runs in-process without a sudo round-trip.
+# Privileged operations run in-process under the root service identity.
 User=root
 Group=root
 

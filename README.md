@@ -111,7 +111,7 @@ For environments where the agent is not yet running as a service, direct enrollm
 sudo power-manage-agent -server=URL -token=TOKEN
 ```
 
-This is equivalent to the previous behavior: the agent registers directly, saves credentials, and starts.
+The agent registers directly, saves credentials, and starts.
 
 ### Registration Protocol
 
@@ -131,22 +131,19 @@ Both enrollment methods use the same underlying protocol:
 ```bash
 # Download, install, and enroll in one step
 curl -fsSL https://your-server/install.sh | sudo bash -s -- \
-  --server control.example.com:8081 \
+  --server https://control.example.com:8081 \
   --token YOUR_REGISTRATION_TOKEN
 ```
 
 The install script:
 1. Downloads and installs the agent binary (verifies SHA256 against the publisher's `SHA256SUMS`)
 2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
-3. Removes any leftover `/etc/sudoers.d/power-manage`, `/etc/sudoers.d/power-manage-luks`, or `/etc/doas.d/power-manage.conf` from a previous (pre-root-mode) install
-4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
-5. Enrolls via the enrollment socket if `--server` and `--token` were provided
+3. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
+4. Enrolls via the enrollment socket if `--server` and `--token` were provided
 
 The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links. When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
 
 There is **no LUKS sudoers rule** — `power-manage-agent luks set-passphrase` is an unprivileged client to the root agent's LUKS daemon socket (see [LUKS passphrase daemon](#luks-passphrase-daemon)).
-
-The legacy `--user` flag is accepted but ignored — the agent runs as root and no service user is created.
 
 ### Manual Installation
 
@@ -196,10 +193,8 @@ power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
 URI Parameters:
 - `server:port` - Control server address (required)
 - `token` - Registration token (required for first run)
-- `tls=false` - Use HTTP instead of HTTPS
 
-> TLS verification is mandatory; the previous `skip-verify` URI parameter
-> was removed (it has no effect on current builds).
+> TLS verification is mandatory; there is no bypass parameter.
 
 ### Subcommands
 
@@ -207,11 +202,11 @@ URI Parameters:
 |------------|-------------|
 | `enroll` | Enroll the agent via the enrollment socket (no sudo required). Supports `-s`/`-t` shorthand flags. |
 | `version` | Print agent version |
-| `setup` | No-op deprecation notice (agent now runs as root; see Security section) |
 | `query` | Query system information via osquery |
 | `luks` | LUKS passphrase management |
 | `tty` | Manage the device-local remote terminal toggle (`enable` / `disable` / `status`) |
 | `self-test` | Connectivity probe used by the self-update flow to validate a new binary before installing |
+| `install-unit` | Install or reconcile the root-owned systemd unit |
 
 ## Configuration
 
@@ -224,8 +219,7 @@ URI Parameters:
 | `-data-dir` | `/var/lib/power-manage` | Data directory for state |
 | `-log-level` | `info` | Log level (debug, info, warn, error) |
 
-> TLS verification is mandatory; the previous `-skip-verify` flag was
-> removed (along with the `POWER_MANAGE_SKIP_VERIFY` env var below).
+> TLS verification is mandatory; there is no bypass flag or environment variable.
 
 ### Environment Variables
 
@@ -237,7 +231,7 @@ applied first, then env vars override).
 | `POWER_MANAGE_SERVER` | Control server URL (used for registration) |
 | `POWER_MANAGE_TOKEN` | Registration token (first run only) |
 | `POWER_MANAGE_DATA_DIR` | Data directory for state |
-| `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `sudo` (default) or `doas` |
+| `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `root`, `sudo`, or `doas` (empty selects `root` for the packaged service) |
 | `POWER_MANAGE_SERVICE_BACKEND` | Service backend override: `systemd` (default) |
 | `POWER_MANAGE_ENCRYPTION_BACKEND` | Encryption backend override: `luks` (default) |
 
@@ -514,11 +508,8 @@ The client sends **only** `{token, passphrase}`. The root agent then, with its
 3. fetches the managed key and runs `cryptsetup` directly — no `--data-dir`, no
    sudo.
 
-This replaces the previous model, where the command ran under a
-`NOPASSWD: ... luks set-passphrase *` sudoers rule with an
-attacker-controllable `--data-dir` flag — a local privilege escalation (any
-local user could point root's `cryptsetup` at a forged credential store and a
-hostile server). The token, not the local user, is the sole authority.
+The device-bound, single-use token—not the local socket user—is the sole
+authority for this operation.
 
 ### Repository (`REPOSITORY`)
 
@@ -634,21 +625,9 @@ The agent automatically detects the system's package manager:
 
 ### Runs as root
 
-The agent runs as `root` (systemd `User=root`). The previous "dedicated `power-manage` user with sudoers escalation" model has been retired — every privileged operation now runs in-process without a `sudo -n` round-trip, eliminating the sudoers drop-in as both an attack surface and a per-distro install / validate / packaging burden.
-
-The `power-manage-agent setup` subcommand still exists for backwards compatibility but is a no-op deprecation notice; legacy operator scripts that invoke it keep working without erroring. Operators upgrading from the sudoers-mode build should:
-
-1. Remove `/etc/sudoers.d/power-manage` (or `/etc/doas.d/power-manage.conf`) left over from the previous install.
-2. Update the systemd unit's `User=` to `root` (was `power-manage`).
-3. The `power-manage` system user can be deleted if no other tooling depends on it.
-
-The privileged-operation surface is the same as before — package managers, systemd unit lifecycle, file/user/group management, LUKS, etc. — it just no longer tunnels through `sudo`.
-
-### Self-Protection
-
-The agent prevents actions from modifying its own infrastructure:
-- The `power-manage` user and group cannot be deleted via USER/GROUP actions (defensive holdover from the sudoers-mode era — harmless if neither exists)
-- This prevents accidental self-destruction through misconfigured actions
+The packaged agent runs as `root` (systemd `User=root`). Package management,
+systemd lifecycle, file/user/group management, LUKS, and terminal session setup
+run in-process without a separate escalation account or sudoers policy.
 
 ### Network Security
 
@@ -801,7 +780,7 @@ requires `allow_downgrade` in the authenticated delivery.
    - Loads stored credentials
    - Establishes an mTLS connection to control's agent listener
    - Sends `Hello`, waits for `Welcome` (proves bidirectional stream)
-   - Calls `SyncActions` (proves unary RPC works)
+   - Requests synchronization and receives it on the same stream
    - Exits 0 on success, 1 on any failure
 4. If the self-test exits 0: swap the live binary via `SafeBackupAndReplace` (O_NOFOLLOW + renameat2; the previous binary is copied to `<BinaryPath>.bak` first) and trigger graceful shutdown. Systemd restarts with the new binary.
 5. If the self-test fails: report the action as `EXECUTION_STATUS_FAILED` and leave the live binary untouched.
@@ -902,13 +881,15 @@ make build GOARCH=arm64
 # Build + deploy + restart on remote machine
 make deploy SSH=user@testserver
 
-# Full install (including setup)
+# Full install
 make install SSH=user@testserver
 ```
 
 ### Running Integration Tests
 
-The agent includes a comprehensive integration test suite that runs inside Docker/Podman containers. Tests execute as the `power-manage` user with the production sudoers template, ensuring the test environment matches production exactly.
+The agent includes a comprehensive integration test suite that runs inside
+Docker/Podman containers. Capability tests cover both direct-root execution and
+the SDK's explicit escalation backends; the packaged agent itself runs as root.
 
 ```bash
 # Run tests on a single distro

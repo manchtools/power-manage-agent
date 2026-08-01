@@ -16,12 +16,9 @@ import (
 // runLuks handles the "luks" subcommand.
 // Usage: power-manage-agent luks set-passphrase --token XXX
 //
-// This CLI is UNPRIVILEGED (WS6 #1/#19). It collects the passphrase and
+// This CLI is unprivileged. It collects the passphrase and
 // hands {token, passphrase} to the root agent's LUKS daemon socket, which
-// performs all privileged cryptsetup work with its own credentials. There
-// is no --data-dir flag and no sudoers rule: the old design ran this under
-// NOPASSWD sudo with an attacker-controllable --data-dir, letting any
-// local user point root's cryptsetup at a forged store + hostile control.
+// performs all privileged cryptsetup work with its own credentials.
 func runLuks(args []string) {
 	if len(args) == 0 {
 		fmt.Fprintln(os.Stderr, "usage: power-manage-agent luks set-passphrase --token <token>")

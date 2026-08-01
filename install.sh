@@ -436,11 +436,6 @@ uninstall() {
         systemctl daemon-reload
     fi
 
-    if [[ -f "/etc/sudoers.d/power-manage-luks" ]]; then
-        log_info "Removing LUKS sudoers configuration..."
-        rm -f "/etc/sudoers.d/power-manage-luks"
-    fi
-
     # Remove desktop handler
     if [[ -f "/usr/share/applications/power-manage-agent.desktop" ]]; then
         log_info "Removing desktop handler..."
@@ -495,17 +490,12 @@ EOF
     log_info "Desktop URI handler installed"
 }
 
-# NOTE: the LUKS set-passphrase flow no longer uses a sudoers rule (WS6
-# #1/#19). The agent runs as root and exposes an in-process daemon socket
+# The agent runs as root and exposes an in-process LUKS daemon socket
 # at /run/pm-agent/luks.sock (created at runtime under the unit's
 # RuntimeDirectory=pm-agent). The unprivileged `power-manage-agent luks
 # set-passphrase` client sends only {token, passphrase} to that socket;
 # the root agent performs the cryptsetup work with its own credentials,
-# authorized by the server-issued device-bound, single-use token. The old
-# `ALL ALL=(root) NOPASSWD: <binary> luks set-passphrase *` rule (with an
-# attacker-controllable --data-dir) is removed entirely. The uninstall
-# path still deletes /etc/sudoers.d/power-manage-luks to clean it up on
-# upgrade from a pre-WS6 install.
+# authorized by the server-issued device-bound, single-use token.
 
 show_status() {
     echo ""

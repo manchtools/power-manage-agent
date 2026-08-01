@@ -449,14 +449,6 @@ func (e *Executor) updateUser(ctx context.Context, params *pb.UserParams, output
 // removeUser removes a user account from the system.
 // Returns the command output, whether changes were made, and any error.
 func (e *Executor) removeUser(ctx context.Context, username string) (*pb.CommandOutput, bool, error) {
-	// Never allow removal of the agent's own service user
-	if username == "power-manage" {
-		return &pb.CommandOutput{
-			ExitCode: 1,
-			Stderr:   "refusing to remove the power-manage service user\n",
-		}, false, fmt.Errorf("cannot remove protected user: power-manage")
-	}
-
 	uExists, err := userExists(ctx, username)
 	if err != nil {
 		return nil, false, fmt.Errorf("check user %s: %w", username, err)
