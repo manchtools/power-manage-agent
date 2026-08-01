@@ -50,14 +50,10 @@ type Config struct {
 	LogLevel  string
 	LogFormat string
 
-	// Backend selections resolved from POWER_MANAGE_*_BACKEND env vars
-	// at parseFlags() time. Stored as lowercase strings because the SDK
-	// enum conversion lives inside applyBackendOverrides — keeping the
-	// Config free of SDK types makes the struct trivially serializable
-	// and keeps parseFlags a pure string parser. Empty means "default".
-	PrivilegeBackend  string
-	ServiceBackend    string
-	EncryptionBackend string
+	// PrivilegeBackend is resolved from POWER_MANAGE_PRIVILEGE_BACKEND at
+	// parseFlags time. Empty selects direct execution for the packaged root
+	// service and sudo for an explicit non-root invocation.
+	PrivilegeBackend string
 
 	// Pending security alert to send after connection (internal use)
 	pendingSecurityAlert *pendingSecurityAlert
@@ -422,8 +418,6 @@ func parseFlags() *Config {
 	}
 
 	cfg.PrivilegeBackend = strings.ToLower(os.Getenv("POWER_MANAGE_PRIVILEGE_BACKEND"))
-	cfg.ServiceBackend = strings.ToLower(os.Getenv("POWER_MANAGE_SERVICE_BACKEND"))
-	cfg.EncryptionBackend = strings.ToLower(os.Getenv("POWER_MANAGE_ENCRYPTION_BACKEND"))
 
 	return cfg
 }

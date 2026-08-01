@@ -232,8 +232,6 @@ applied first, then env vars override).
 | `POWER_MANAGE_TOKEN` | Registration token (first run only) |
 | `POWER_MANAGE_DATA_DIR` | Data directory for state |
 | `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `root`, `sudo`, or `doas` (empty selects `root` for the packaged service) |
-| `POWER_MANAGE_SERVICE_BACKEND` | Service backend override: `systemd` (default) |
-| `POWER_MANAGE_ENCRYPTION_BACKEND` | Encryption backend override: `luks` (default) |
 
 Log level has no env var; set it via the `-log-level` flag.
 

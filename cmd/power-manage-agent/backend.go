@@ -33,9 +33,7 @@ func randomBackoff() time.Duration {
 // applyBackendOverrides maps the backend strings resolved by
 // parseFlags() onto the SDK's pluggable backend selectors. Called once
 // at startup before any privileged helper runs. Unknown or empty
-// values fall through to the default (sudo / systemd / luks) and the
-// function pins the SDK explicitly rather than relying on zero-value
-// state, so an unknown value is still deterministic.
+// values fail at startup rather than selecting a different privilege model.
 //
 // Returns an error if the selected backend's required binary isn't on
 // PATH (e.g. POWER_MANAGE_PRIVILEGE_BACKEND=doas on a host with no
@@ -46,22 +44,18 @@ func applyBackendOverrides(cfg *Config, logger *slog.Logger) (sysexec.PrivilegeB
 	if err != nil {
 		return resolved, err
 	}
-	// Service manager. The reworked SDK implements only systemd
-	// (service.New(service.Systemd, runner)); the OpenRC/Runit/S6 scaffolds and
-	// the global SetServiceBackend selector were removed. Warn loudly if a
-	// non-systemd backend was requested — the first SERVICE action will fail, but
-	// the warning explains why before that happens — and require systemctl since
-	// the Manager always drives systemd.
-	if sb := normalizedServiceBackend(cfg.ServiceBackend); sb != "systemd" {
-		logger.Warn("only the systemd service backend is implemented; SERVICE actions will fail on this host",
-			"requested", sb)
-	}
+	// SERVICE actions use systemd. Refuse startup when its control utility is
+	// absent rather than carrying a runtime selector with no alternative.
 	if _, err := osexec.LookPath("systemctl"); err != nil {
-		return resolved, fmt.Errorf("systemd service backend requires systemctl on PATH: %w", err)
+		return resolved, fmt.Errorf("service actions require systemctl on PATH: %w", err)
 	}
-	logger.Info("service backend set", "backend", "systemd")
+	logger.Info("service manager ready", "manager", "systemd")
 
-	setEncryptionBackend(cfg.EncryptionBackend, logger)
+	// LUKS is optional: its missing host utility must not prevent unrelated
+	// capabilities from running.
+	if _, err := osexec.LookPath("cryptsetup"); err != nil {
+		logger.Warn("cryptsetup not found; encryption actions are unavailable", "error", err)
+	}
 	return resolved, nil
 }
 
@@ -104,9 +98,7 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.Privilege
 			privilegeTool = "sudo"
 		}
 	default:
-		logger.Warn("unknown POWER_MANAGE_PRIVILEGE_BACKEND, staying on sudo", "value", backend)
-		resolved = sysexec.Sudo
-		privilegeTool = "sudo"
+		return sysexec.Direct, fmt.Errorf("unknown privilege backend %q", backend)
 	}
 	// The resolved backend is returned to the caller, which builds the one
 	// process-wide exec.Runner from it (sysexec.NewRunner) and injects that into
@@ -123,35 +115,4 @@ func setPrivilegeBackend(backend string, logger *slog.Logger) (sysexec.Privilege
 	}
 	logger.Info("privilege backend set", "backend", privilegeTool)
 	return resolved, nil
-}
-
-// setEncryptionBackend validates the configured encryption backend. The reworked
-// SDK implements only LUKS (encryption.New(encryption.LUKS, runner)) and the
-// global backend selector was removed, so this only warns on a non-luks request
-// and checks that cryptsetup is on PATH.
-func setEncryptionBackend(backend string, logger *slog.Logger) {
-	encName := backend
-	switch backend {
-	case "luks", "":
-		encName = "luks"
-	default:
-		logger.Warn("only the luks encryption backend is implemented; ENCRYPTION actions will fail on this host", "requested", backend)
-		encName = "luks"
-	}
-	if encName == "luks" {
-		if _, err := osexec.LookPath("cryptsetup"); err != nil {
-			logger.Warn("luks backend selected but cryptsetup not on PATH; encryption actions will fail", "error", err)
-		}
-	}
-	logger.Info("encryption backend set", "backend", encName)
-}
-
-// normalizedServiceBackend returns the canonical name for logging so
-// the empty-string default case doesn't log "service backend set
-// backend=" with a blank value.
-func normalizedServiceBackend(s string) string {
-	if s == "" {
-		return "systemd"
-	}
-	return s
 }

@@ -1,7 +1,6 @@
 package main
 
 import (
-	"bytes"
 	"io"
 	"log/slog"
 	"os"
@@ -19,9 +18,7 @@ import (
 // tests assert on the return value. Every branch still matters:
 //
 //   - A valid known value must resolve to the matching backend and succeed.
-//   - An unknown value must fall through to the safe default AND succeed (we
-//     don't want the agent to refuse to start because someone set
-//     POWER_MANAGE_PRIVILEGE_BACKEND=typo).
+//   - An unknown value must fail instead of silently changing privilege model.
 //   - A known value whose binary is missing must fail fast at startup, not
 //     paper over the error until first privileged call.
 func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
@@ -37,26 +34,21 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 	fakeBin := fakePathWith(t, "sudo", "doas", "systemctl", "cryptsetup")
 
 	cases := []struct {
-		name     string
-		cfg      *Config
-		wantErr  bool
-		want     sysexec.PrivilegeBackend
-		wantWarn bool
+		name    string
+		cfg     *Config
+		wantErr bool
+		want    sysexec.PrivilegeBackend
 	}{
 		{name: "empty defaults to sudo", cfg: &Config{}, want: sysexec.Sudo},
 		{name: "explicit sudo", cfg: &Config{PrivilegeBackend: "sudo"}, want: sysexec.Sudo},
 		{name: "explicit doas", cfg: &Config{PrivilegeBackend: "doas"}, want: sysexec.Doas},
-		{name: "unknown value warns and falls back to sudo", cfg: &Config{PrivilegeBackend: "typo"}, want: sysexec.Sudo, wantWarn: true},
+		{name: "unknown value fails", cfg: &Config{PrivilegeBackend: "typo"}, wantErr: true},
 	}
 
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv("PATH", fakeBin)
-			// Capture logs so the "warns" half of the case name is
-			// actually asserted (#174).
-			var logBuf bytes.Buffer
-			logger := slog.New(slog.NewTextHandler(&logBuf, nil))
-			got, err := applyBackendOverrides(tc.cfg, logger)
+			got, err := applyBackendOverrides(tc.cfg, discardLogger())
 			if err != nil {
 				if !tc.wantErr {
 					t.Fatalf("applyBackendOverrides: %v", err)
@@ -68,9 +60,6 @@ func TestApplyBackendOverrides_PrivilegeBackend(t *testing.T) {
 			}
 			if got != tc.want {
 				t.Errorf("privilege backend = %v, want %v", got, tc.want)
-			}
-			if tc.wantWarn && !strings.Contains(logBuf.String(), "level=WARN") {
-				t.Errorf("expected a WARN log for an unknown backend value, got: %s", logBuf.String())
 			}
 		})
 	}
@@ -157,11 +146,9 @@ func TestSetPrivilegeBackend_RootBackend_RequiresRootEuid(t *testing.T) {
 	})
 }
 
-// The reworked SDK implements only the systemd service backend (the OpenRC/
-// Runit/S6 scaffolds and the global SetServiceBackend selector were removed).
-// The contract is now: systemctl must be on PATH (fatal otherwise); a non-systemd
-// request warns but is NOT fatal (systemd is still used); empty/systemd succeed.
-func TestApplyBackendOverrides_ServiceBackend(t *testing.T) {
+// systemctl is a required agent capability; there is no runtime service-backend
+// selector or fallback.
+func TestApplyBackendOverrides_RequiresSystemd(t *testing.T) {
 	// Non-root so the empty privilege default lands on sudo (present in PATH).
 	origEuid := geteuidFn
 	t.Cleanup(func() { geteuidFn = origEuid })
@@ -178,17 +165,10 @@ func TestApplyBackendOverrides_ServiceBackend(t *testing.T) {
 		}
 	})
 
-	t.Run("non-systemd value warns but is not fatal", func(t *testing.T) {
+	t.Run("systemctl present", func(t *testing.T) {
 		t.Setenv("PATH", fakePathWith(t, "sudo", "cryptsetup", "systemctl"))
-		if _, err := applyBackendOverrides(&Config{ServiceBackend: "openrc"}, discardLogger()); err != nil {
-			t.Fatalf("a non-systemd service backend must warn, not error: %v", err)
-		}
-	})
-
-	t.Run("empty defaults to systemd", func(t *testing.T) {
-		t.Setenv("PATH", fakePathWith(t, "sudo", "cryptsetup", "systemctl"))
-		if _, err := applyBackendOverrides(&Config{ServiceBackend: ""}, discardLogger()); err != nil {
-			t.Fatalf("empty service backend must not error: %v", err)
+		if _, err := applyBackendOverrides(&Config{}, discardLogger()); err != nil {
+			t.Fatalf("applyBackendOverrides: %v", err)
 		}
 	})
 }

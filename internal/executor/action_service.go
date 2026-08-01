@@ -68,21 +68,14 @@ func (e *Executor) executeService(ctx context.Context, params *pb.ServiceParams)
 				return out, false, err
 			}
 
-			// Delegate the write to the SDK so the active service
-			// backend (systemd today; openrc/runit/s6 when implemented)
-			// owns the unit-file location and validation. This keeps
-			// the agent backend-agnostic — a POWER_MANAGE_SERVICE_BACKEND
-			// change no longer silently writes systemd files on a host
-			// that doesn't use systemd.
+			// Delegate systemd unit-path and content validation to the SDK.
 			if err := serviceMgr.WriteUnit(ctx, params.UnitName, params.UnitContent); err != nil {
 				return nil, false, fmt.Errorf("write unit %s: %w", params.UnitName, err)
 			}
 			output.WriteString(fmt.Sprintf("updated unit file %s\n", params.UnitName))
 			changed = true
 
-			// Reload the service manager so it picks up the new unit.
-			// DaemonReload is a no-op for backends that don't need it
-			// (the SDK dispatches per-backend).
+			// Reload systemd so it picks up the new unit.
 			if err := serviceMgr.DaemonReload(ctx); err != nil {
 				return nil, changed, fmt.Errorf("daemon-reload failed: %w", err)
 			}
