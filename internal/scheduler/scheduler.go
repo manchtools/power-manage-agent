@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"os"
+	"strings"
 	"sync"
 	"time"
 
@@ -36,6 +38,7 @@ type Scheduler struct {
 	executor ActionExecutor
 	logger   *slog.Logger
 	now      func() time.Time
+	bootID   func() (string, error)
 	wakeCh   chan struct{}
 	results  chan *ExecutionResult
 
@@ -56,6 +59,7 @@ func New(st *store.Store, executor ActionExecutor, logger *slog.Logger) *Schedul
 		executor: executor,
 		logger:   logger,
 		now:      time.Now,
+		bootID:   readBootID,
 		wakeCh:   make(chan struct{}, 1),
 		results:  make(chan *ExecutionResult, 100),
 	}
@@ -66,6 +70,18 @@ func New(st *store.Store, executor ActionExecutor, logger *slog.Logger) *Schedul
 		s.window = window
 	}
 	return s
+}
+
+func readBootID() (string, error) {
+	raw, err := os.ReadFile("/proc/sys/kernel/random/boot_id")
+	if err != nil {
+		return "", fmt.Errorf("read kernel boot ID: %w", err)
+	}
+	id := strings.TrimSpace(string(raw))
+	if id == "" {
+		return "", fmt.Errorf("kernel boot ID is empty")
+	}
+	return id, nil
 }
 
 func (s *Scheduler) SetSyncTrigger(trigger chan<- struct{}) { s.syncTrigger = trigger }
@@ -117,7 +133,7 @@ func (s *Scheduler) Start(ctx context.Context) {
 	s.mu.Unlock()
 	defer close(done)
 
-	if err := s.store.RecoverInterruptedOccurrences(); err != nil {
+	if err := s.recoverInterruptedOccurrences(); err != nil {
 		s.logger.Error("failed to recover interrupted occurrences; refusing to schedule", "error", err)
 		return
 	}
@@ -154,6 +170,10 @@ func (s *Scheduler) Stop() {
 }
 
 func (s *Scheduler) runDue(ctx context.Context) {
+	if err := s.recoverInterruptedOccurrences(); err != nil {
+		s.logger.Error("recover interrupted occurrences", "error", err)
+		return
+	}
 	if !s.dispatchAllowed(s.now().Local()) {
 		return
 	}
@@ -170,11 +190,31 @@ func (s *Scheduler) runDue(ctx context.Context) {
 	}
 }
 
+func (s *Scheduler) recoverInterruptedOccurrences() error {
+	bootID, err := s.bootID()
+	if err != nil {
+		s.logger.Warn("kernel boot ID unavailable; reboot success cannot be proven", "error", err)
+	}
+	recovered, recoverErr := s.store.RecoverInterruptedOccurrences(bootID)
+	if recoverErr != nil {
+		return recoverErr
+	}
+	for _, result := range recovered {
+		s.publish(&ExecutionResult{ResultID: result.ID, ActionResult: result.ActionResult})
+	}
+	return nil
+}
+
 func (s *Scheduler) executeManifest(ctx context.Context, delivery *pb.ManifestDelivery) {
 	manifest := delivery.GetManifest()
-	started := s.now().UTC()
-	if err := s.store.BeginManifestRun(delivery, started); err != nil {
+	started, err := s.store.BeginManifestRun(delivery, s.now().UTC())
+	if err != nil {
 		s.logger.Error("begin manifest run", "delivery_id", delivery.GetDeliveryId(), "error", err)
+		return
+	}
+	states, err := s.store.GetManifestOccurrenceStates(delivery.GetDeliveryId())
+	if err != nil {
+		s.logger.Error("load occurrence states", "delivery_id", delivery.GetDeliveryId(), "error", err)
 		return
 	}
 	s.executor.ResetUpdateCycle()
@@ -191,7 +231,32 @@ func (s *Scheduler) executeManifest(ctx context.Context, delivery *pb.ManifestDe
 			aggregateError = "manifest contains a malformed occurrence"
 			break
 		}
-		if err := s.store.MarkOccurrenceStarted(delivery.GetDeliveryId(), occurrence.GetOccurrenceId(), s.now()); err != nil {
+		if prior, exists := states[occurrence.GetOccurrenceId()]; exists && prior.State != store.OccurrencePending {
+			if prior.State == store.OccurrenceStarted {
+				return // a scheduled reboot is still waiting for its boot marker
+			}
+			aggregate, aggregateError = aggregateStatus(aggregate, aggregateError, prior.ResultStatus, prior.ResultError)
+			if prior.ResultStatus != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
+				prior.ResultStatus != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE &&
+				prior.ResultStatus != pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED &&
+				occurrence.GetOnFailure() == pb.OnFailure_ON_FAILURE_STOP {
+				stop = true
+			}
+			continue
+		}
+
+		markStarted := s.store.MarkOccurrenceStarted
+		if !stop && action.GetType() == pb.ActionType_ACTION_TYPE_REBOOT {
+			bootID, bootErr := s.bootID()
+			if bootErr != nil {
+				s.logger.Error("read boot marker before reboot", "error", bootErr)
+				return
+			}
+			markStarted = func(deliveryID, occurrenceID string, at time.Time) error {
+				return s.store.MarkRebootStarted(deliveryID, occurrenceID, bootID, at)
+			}
+		}
+		if err := markStarted(delivery.GetDeliveryId(), occurrence.GetOccurrenceId(), s.now()); err != nil {
 			s.logger.Error("mark occurrence started", "delivery_id", delivery.GetDeliveryId(), "occurrence_id", occurrence.GetOccurrenceId(), "error", err)
 			aggregate = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
 			aggregateError = "failed to durably mark occurrence STARTED"
@@ -232,20 +297,19 @@ func (s *Scheduler) executeManifest(ctx context.Context, delivery *pb.ManifestDe
 		if result.CompletedAt == nil {
 			result.CompletedAt = timestamppb.New(s.now())
 		}
+		if action.GetType() == pb.ActionType_ACTION_TYPE_REBOOT && result.GetStatus() == pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS {
+			// Success is reported only after a later process observes a new
+			// kernel boot ID. The durable STARTED row prevents re-scheduling.
+			return
+		}
 		resultID, err := s.store.RecordOccurrenceResult(result)
 		if err != nil {
 			s.logger.Error("record occurrence result", "delivery_id", delivery.GetDeliveryId(), "occurrence_id", occurrence.GetOccurrenceId(), "error", err)
 			return
 		}
 		s.publish(&ExecutionResult{ResultID: resultID, ActionResult: result})
-		if result.GetStatus() == pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE {
-			aggregate = pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE
-			aggregateError = result.GetError()
-		} else if result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED {
-			if aggregate != pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE {
-				aggregate = pb.ExecutionStatus_EXECUTION_STATUS_FAILED
-				aggregateError = result.GetError()
-			}
+		aggregate, aggregateError = aggregateStatus(aggregate, aggregateError, result.GetStatus(), result.GetError())
+		if result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE && result.GetStatus() != pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED {
 			stop = occurrence.GetOnFailure() == pb.OnFailure_ON_FAILURE_STOP
 		}
 	}
@@ -265,6 +329,19 @@ func (s *Scheduler) executeManifest(ctx context.Context, delivery *pb.ManifestDe
 		return
 	}
 	s.publish(&ExecutionResult{ResultID: resultID, ManifestResult: manifestResult})
+}
+
+func aggregateStatus(current pb.ExecutionStatus, currentError string, status pb.ExecutionStatus, resultError string) (pb.ExecutionStatus, string) {
+	if status == pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE {
+		return pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE, resultError
+	}
+	if status != pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS &&
+		status != pb.ExecutionStatus_EXECUTION_STATUS_NOT_APPLICABLE &&
+		status != pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED &&
+		current != pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE {
+		return pb.ExecutionStatus_EXECUTION_STATUS_FAILED, resultError
+	}
+	return current, currentError
 }
 
 func (s *Scheduler) publish(result *ExecutionResult) {

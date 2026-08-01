@@ -98,3 +98,39 @@ func TestManifestStopPolicyRecordsRemainingOccurrenceAsSkipped(t *testing.T) {
 	require.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SKIPPED, pending[1].ActionResult.GetStatus())
 	require.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, pending[2].ManifestResult.GetStatus())
 }
+
+func TestRebootCompletesOnlyAfterBootIDChangesAndManifestResumes(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	now := time.Date(2026, 8, 1, 12, 0, 0, 0, time.UTC)
+	st.SetClockForTest(func() time.Time { return now })
+	delivery := scheduledDelivery(pb.OnFailure_ON_FAILURE_CONTINUE)
+	delivery.Manifest.Occurrences[0].Action.Type = pb.ActionType_ACTION_TYPE_REBOOT
+	exec := &recordingExecutor{status: map[string]pb.ExecutionStatus{}}
+	sched := New(st, exec, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sched.now = func() time.Time { return now }
+	bootID := "boot-before"
+	sched.bootID = func() (string, error) { return bootID, nil }
+	_, err = sched.RecordDelivery(context.Background(), delivery)
+	require.NoError(t, err)
+
+	sched.runDue(context.Background())
+	require.Equal(t, []string{"01K00000000000000000000014"}, exec.executed)
+	pending, err := st.GetPendingResults()
+	require.NoError(t, err)
+	require.Empty(t, pending, "scheduling a reboot is not proof that it completed")
+
+	bootID = "boot-after"
+	now = now.Add(time.Minute)
+	sched.runDue(context.Background())
+	require.Equal(t, []string{
+		"01K00000000000000000000014",
+		"01K00000000000000000000016",
+	}, exec.executed, "the reboot occurrence must not execute twice")
+	pending, err = st.GetPendingResults()
+	require.NoError(t, err)
+	require.Len(t, pending, 3)
+	require.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS, pending[0].ActionResult.GetStatus())
+	require.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS, pending[2].ManifestResult.GetStatus())
+}

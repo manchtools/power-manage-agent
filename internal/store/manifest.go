@@ -29,6 +29,14 @@ type StoredManifestDelivery struct {
 	ReceivedAt    time.Time
 	LastExecuted  *time.Time
 	NextExecuteAt time.Time
+	RunStartedAt  *time.Time
+	RunInProgress bool
+}
+
+type ManifestOccurrenceState struct {
+	State        string
+	ResultStatus pb.ExecutionStatus
+	ResultError  string
 }
 
 type PendingResult struct {
@@ -113,10 +121,11 @@ func (s *Store) GetDueManifestDeliveries(ctx context.Context) ([]StoredManifestD
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 	rows, err := s.db.QueryContext(ctx, `
-		SELECT delivery_id, manifest_blob, received_at, last_executed_at, next_execute_at
+		SELECT delivery_id, manifest_blob, received_at, last_executed_at,
+		       next_execute_at, run_started_at, run_in_progress
 		FROM manifest_deliveries
-		WHERE next_execute_at <= ?
-		ORDER BY next_execute_at, delivery_id
+		WHERE run_in_progress = TRUE OR next_execute_at <= ?
+		ORDER BY run_in_progress DESC, next_execute_at, delivery_id
 	`, s.now().UTC())
 	if err != nil {
 		return nil, err
@@ -128,8 +137,11 @@ func (s *Store) GetDueManifestDeliveries(ctx context.Context) ([]StoredManifestD
 		var deliveryID string
 		var blob []byte
 		var stored StoredManifestDelivery
-		var last sql.NullTime
-		if err := rows.Scan(&deliveryID, &blob, &stored.ReceivedAt, &last, &stored.NextExecuteAt); err != nil {
+		var last, runStarted sql.NullTime
+		if err := rows.Scan(
+			&deliveryID, &blob, &stored.ReceivedAt, &last,
+			&stored.NextExecuteAt, &runStarted, &stored.RunInProgress,
+		); err != nil {
 			return nil, err
 		}
 		manifest := &pb.Manifest{}
@@ -140,6 +152,10 @@ func (s *Store) GetDueManifestDeliveries(ctx context.Context) ([]StoredManifestD
 		if last.Valid {
 			lastTime := last.Time
 			stored.LastExecuted = &lastTime
+		}
+		if runStarted.Valid {
+			runStartedTime := runStarted.Time
+			stored.RunStartedAt = &runStartedTime
 		}
 		deliveries = append(deliveries, stored)
 	}
@@ -187,47 +203,68 @@ func (s *Store) GetManifestActions() ([]*StoredAction, error) {
 	return actions, rows.Err()
 }
 
-// BeginManifestRun advances the manifest cursor before any side effect and
-// resets terminal occurrence states for the new scheduled run. A STARTED row
-// is never reset; startup recovery must turn it into INDETERMINATE first.
-func (s *Store) BeginManifestRun(delivery *pb.ManifestDelivery, startedAt time.Time) error {
+// BeginManifestRun advances the manifest cursor before any side effect. An
+// interrupted run stays active and resumes from its durable occurrence states.
+func (s *Store) BeginManifestRun(delivery *pb.ManifestDelivery, startedAt time.Time) (time.Time, error) {
 	if delivery == nil || delivery.GetManifest() == nil {
-		return errors.New("begin manifest run: missing delivery")
+		return time.Time{}, errors.New("begin manifest run: missing delivery")
 	}
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return time.Time{}, err
 	}
 	defer tx.Rollback()
+	var inProgress bool
+	var priorStarted sql.NullTime
+	if err := tx.QueryRow(`
+		SELECT run_in_progress, run_started_at
+		FROM manifest_deliveries WHERE delivery_id = ?
+	`, delivery.GetDeliveryId()).Scan(&inProgress, &priorStarted); err != nil {
+		return time.Time{}, err
+	}
+	if inProgress {
+		if !priorStarted.Valid {
+			return time.Time{}, errors.New("begin manifest run: active run has no start time")
+		}
+		if err := tx.Commit(); err != nil {
+			return time.Time{}, err
+		}
+		return priorStarted.Time.UTC(), nil
+	}
 	var started int
 	if err := tx.QueryRow(`
 		SELECT COUNT(*) FROM manifest_occurrences
 		WHERE delivery_id = ? AND state = ?
 	`, delivery.GetDeliveryId(), OccurrenceStarted).Scan(&started); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	if started != 0 {
-		return fmt.Errorf("begin manifest run: delivery %s has interrupted occurrences", delivery.GetDeliveryId())
+		return time.Time{}, fmt.Errorf("begin manifest run: delivery %s has interrupted occurrences", delivery.GetDeliveryId())
 	}
 	if _, err := tx.Exec(`
 		UPDATE manifest_occurrences
-		SET state = ?, started_at = NULL, completed_at = NULL
+		SET state = ?, started_at = NULL, completed_at = NULL,
+		    result_status = NULL, result_error = ''
 		WHERE delivery_id = ?
 	`, OccurrencePending, delivery.GetDeliveryId()); err != nil {
-		return err
+		return time.Time{}, err
 	}
 	startedAt = startedAt.UTC()
 	next := calculateNextExecuteFromSchedule(delivery.GetManifest().GetSchedule(), &startedAt, false, s.now())
 	if _, err := tx.Exec(`
 		UPDATE manifest_deliveries
-		SET last_executed_at = ?, next_execute_at = ?
+		SET last_executed_at = ?, next_execute_at = ?,
+		    run_started_at = ?, run_in_progress = TRUE
 		WHERE delivery_id = ?
-	`, startedAt, next, delivery.GetDeliveryId()); err != nil {
-		return err
+	`, startedAt, next, startedAt, delivery.GetDeliveryId()); err != nil {
+		return time.Time{}, err
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return time.Time{}, err
+	}
+	return startedAt, nil
 }
 
 func (s *Store) MarkOccurrenceStarted(deliveryID, occurrenceID string, startedAt time.Time) error {
@@ -250,6 +287,68 @@ func (s *Store) MarkOccurrenceStarted(deliveryID, occurrenceID string, startedAt
 	return nil
 }
 
+func (s *Store) MarkRebootStarted(deliveryID, occurrenceID, bootID string, startedAt time.Time) error {
+	if bootID == "" {
+		return errors.New("mark reboot started: boot ID is empty")
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback()
+	startedAt = startedAt.UTC()
+	result, err := tx.Exec(`
+		UPDATE manifest_occurrences SET state = ?, started_at = ?, completed_at = NULL
+		WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
+	`, OccurrenceStarted, startedAt, deliveryID, occurrenceID, OccurrencePending)
+	if err != nil {
+		return err
+	}
+	changed, err := result.RowsAffected()
+	if err != nil {
+		return err
+	}
+	if changed != 1 {
+		return fmt.Errorf("mark reboot started: invalid state for %s/%s", deliveryID, occurrenceID)
+	}
+	if _, err := tx.Exec(`
+		INSERT INTO reboot_markers (delivery_id, occurrence_id, boot_id, scheduled_at)
+		VALUES (?, ?, ?, ?)
+	`, deliveryID, occurrenceID, bootID, startedAt); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
+func (s *Store) GetManifestOccurrenceStates(deliveryID string) (map[string]ManifestOccurrenceState, error) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	rows, err := s.db.Query(`
+		SELECT occurrence_id, state, result_status, result_error
+		FROM manifest_occurrences WHERE delivery_id = ? ORDER BY position
+	`, deliveryID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	states := make(map[string]ManifestOccurrenceState)
+	for rows.Next() {
+		var occurrenceID, state, resultError string
+		var resultStatus sql.NullInt64
+		if err := rows.Scan(&occurrenceID, &state, &resultStatus, &resultError); err != nil {
+			return nil, err
+		}
+		item := ManifestOccurrenceState{State: state, ResultError: resultError}
+		if resultStatus.Valid {
+			item.ResultStatus = pb.ExecutionStatus(resultStatus.Int64)
+		}
+		states[occurrenceID] = item
+	}
+	return states, rows.Err()
+}
+
 func (s *Store) RecordOccurrenceResult(result *pb.ActionResult) (string, error) {
 	if result == nil || result.GetDeliveryId() == "" || result.GetOccurrenceId() == "" {
 		return "", errors.New("record occurrence result: missing delivery or occurrence identity")
@@ -260,9 +359,11 @@ func (s *Store) RecordOccurrenceResult(result *pb.ActionResult) (string, error) 
 	}
 	return s.recordResult("ACTION", result, func(tx *sql.Tx, completedAt time.Time) error {
 		updated, err := tx.Exec(`
-			UPDATE manifest_occurrences SET state = ?, completed_at = ?
+			UPDATE manifest_occurrences
+			SET state = ?, completed_at = ?, result_status = ?, result_error = ?
 			WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
-		`, state, completedAt, result.GetDeliveryId(), result.GetOccurrenceId(), OccurrenceStarted)
+		`, state, completedAt, result.GetStatus(), result.GetError(),
+			result.GetDeliveryId(), result.GetOccurrenceId(), OccurrenceStarted)
 		if err != nil {
 			return err
 		}
@@ -273,6 +374,11 @@ func (s *Store) RecordOccurrenceResult(result *pb.ActionResult) (string, error) 
 		if rows != 1 {
 			return errors.New("record occurrence result: occurrence was not STARTED")
 		}
+		if _, err := tx.Exec(`
+			DELETE FROM reboot_markers WHERE delivery_id = ? AND occurrence_id = ?
+		`, result.GetDeliveryId(), result.GetOccurrenceId()); err != nil {
+			return err
+		}
 		return nil
 	})
 }
@@ -281,7 +387,24 @@ func (s *Store) RecordManifestResult(result *pb.ManifestResult) (string, error) 
 	if result == nil || result.GetDeliveryId() == "" || result.GetManifestId() == "" {
 		return "", errors.New("record manifest result: missing identity")
 	}
-	return s.recordResult("MANIFEST", result, nil)
+	return s.recordResult("MANIFEST", result, func(tx *sql.Tx, _ time.Time) error {
+		updated, err := tx.Exec(`
+			UPDATE manifest_deliveries
+			SET run_in_progress = FALSE, run_started_at = NULL
+			WHERE delivery_id = ? AND run_in_progress = TRUE
+		`, result.GetDeliveryId())
+		if err != nil {
+			return err
+		}
+		rows, err := updated.RowsAffected()
+		if err != nil {
+			return err
+		}
+		if rows != 1 {
+			return errors.New("record manifest result: manifest run is not active")
+		}
+		return nil
+	})
 }
 
 func (s *Store) recordResult(kind string, message proto.Message, update func(*sql.Tx, time.Time) error) (string, error) {
@@ -360,71 +483,116 @@ func (s *Store) MarkPendingResultSynced(id string) error {
 	return err
 }
 
-// RecoverInterruptedOccurrences converts every persisted STARTED row into an
-// idempotently queued INDETERMINATE result. It runs before the scheduler starts,
-// so a non-idempotent effect is never silently repeated after a process crash.
-func (s *Store) RecoverInterruptedOccurrences() error {
+const rebootResolutionGrace = 15 * time.Minute
+
+// RecoverInterruptedOccurrences resolves durable STARTED rows without ever
+// repeating their side effects. A changed kernel boot ID proves a scheduled
+// reboot completed; other interrupted work is INDETERMINATE. A reboot marker
+// on the current boot is left pending briefly so an agent-service restart does
+// not race the already scheduled operating-system reboot.
+func (s *Store) RecoverInterruptedOccurrences(currentBootID string) ([]PendingResult, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	tx, err := s.db.Begin()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	defer tx.Rollback()
 	rows, err := tx.Query(`
-		SELECT o.delivery_id, o.occurrence_id, o.action_id
+		SELECT o.delivery_id, o.occurrence_id, o.action_id,
+		       r.boot_id, r.scheduled_at
 		FROM manifest_occurrences o
+		LEFT JOIN reboot_markers r
+		  ON r.delivery_id = o.delivery_id AND r.occurrence_id = o.occurrence_id
 		WHERE o.state = ?
 		ORDER BY o.delivery_id, o.position
 	`, OccurrenceStarted)
 	if err != nil {
-		return err
+		return nil, err
 	}
-	type interrupted struct{ deliveryID, occurrenceID, actionID string }
+	type interrupted struct {
+		deliveryID, occurrenceID, actionID string
+		bootID                             sql.NullString
+		scheduledAt                        sql.NullTime
+	}
 	var interruptedRows []interrupted
 	for rows.Next() {
 		var item interrupted
-		if err := rows.Scan(&item.deliveryID, &item.occurrenceID, &item.actionID); err != nil {
+		if err := rows.Scan(
+			&item.deliveryID, &item.occurrenceID, &item.actionID,
+			&item.bootID, &item.scheduledAt,
+		); err != nil {
 			rows.Close()
-			return err
+			return nil, err
 		}
 		interruptedRows = append(interruptedRows, item)
 	}
 	if err := rows.Close(); err != nil {
-		return err
+		return nil, err
 	}
 	if err := rows.Err(); err != nil {
-		return err
+		return nil, err
 	}
 	now := s.now().UTC()
+	var recovered []PendingResult
 	for _, item := range interruptedRows {
+		status := pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE
+		message := "agent restarted after STARTED; effect is unknown and was not repeated"
+		var output *pb.CommandOutput
+		if item.bootID.Valid {
+			switch {
+			case currentBootID != "" && currentBootID != item.bootID.String:
+				status = pb.ExecutionStatus_EXECUTION_STATUS_SUCCESS
+				message = ""
+				output = &pb.CommandOutput{Stdout: "Reboot completed\n"}
+			case item.scheduledAt.Valid && now.Before(item.scheduledAt.Time.Add(rebootResolutionGrace)):
+				continue
+			default:
+				message = "scheduled reboot did not produce a new boot ID; effect is indeterminate"
+			}
+		}
 		result := &pb.ActionResult{
 			ActionId:     &pb.ActionId{Value: item.actionID},
 			DeliveryId:   item.deliveryID,
 			OccurrenceId: item.occurrenceID,
-			Status:       pb.ExecutionStatus_EXECUTION_STATUS_INDETERMINATE,
-			Error:        "agent restarted after STARTED; effect is unknown and was not repeated",
+			Status:       status,
+			Error:        message,
+			Output:       output,
 			CompletedAt:  timestamppb.New(now),
 		}
 		payload, err := marshalStoredProto(result)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		id, err := randomResultID("ACTION", now)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		if _, err := tx.Exec(`INSERT INTO result_outbox (id, kind, payload, created_at) VALUES (?, 'ACTION', ?, ?)`, id, payload, now); err != nil {
-			return err
+			return nil, err
+		}
+		state, err := occurrenceState(status)
+		if err != nil {
+			return nil, err
 		}
 		if _, err := tx.Exec(`
-			UPDATE manifest_occurrences SET state = ?, completed_at = ?
+			UPDATE manifest_occurrences
+			SET state = ?, completed_at = ?, result_status = ?, result_error = ?
 			WHERE delivery_id = ? AND occurrence_id = ? AND state = ?
-		`, OccurrenceIndeterminate, now, item.deliveryID, item.occurrenceID, OccurrenceStarted); err != nil {
-			return err
+		`, state, now, status, message, item.deliveryID, item.occurrenceID, OccurrenceStarted); err != nil {
+			return nil, err
 		}
+		if _, err := tx.Exec(`
+			DELETE FROM reboot_markers WHERE delivery_id = ? AND occurrence_id = ?
+		`, item.deliveryID, item.occurrenceID); err != nil {
+			return nil, err
+		}
+		recovered = append(recovered, PendingResult{ID: id, ActionResult: result})
 	}
-	return tx.Commit()
+	if err := tx.Commit(); err != nil {
+		return nil, err
+	}
+	return recovered, nil
 }
 
 func occurrenceState(status pb.ExecutionStatus) (string, error) {

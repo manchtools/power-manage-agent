@@ -10,7 +10,9 @@ CREATE TABLE manifest_deliveries (
     manifest_blob BLOB NOT NULL,
     received_at DATETIME NOT NULL,
     last_executed_at DATETIME,
-    next_execute_at DATETIME NOT NULL
+    next_execute_at DATETIME NOT NULL,
+    run_started_at DATETIME,
+    run_in_progress BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX idx_manifest_deliveries_due
@@ -25,9 +27,22 @@ CREATE TABLE manifest_occurrences (
         CHECK (state IN ('PENDING', 'STARTED', 'SUCCESS', 'FAILED', 'INDETERMINATE')),
     started_at DATETIME,
     completed_at DATETIME,
+    result_status INTEGER,
+    result_error TEXT NOT NULL DEFAULT '',
     PRIMARY KEY (delivery_id, occurrence_id),
     UNIQUE (delivery_id, position),
     FOREIGN KEY (delivery_id) REFERENCES manifest_deliveries(delivery_id) ON DELETE CASCADE
+);
+
+CREATE TABLE reboot_markers (
+    delivery_id TEXT NOT NULL,
+    occurrence_id TEXT NOT NULL,
+    boot_id TEXT NOT NULL,
+    scheduled_at DATETIME NOT NULL,
+    PRIMARY KEY (delivery_id, occurrence_id),
+    FOREIGN KEY (delivery_id, occurrence_id)
+        REFERENCES manifest_occurrences(delivery_id, occurrence_id)
+        ON DELETE CASCADE
 );
 
 CREATE TABLE result_outbox (
@@ -77,6 +92,7 @@ DROP TABLE lps_state;
 DROP TABLE luks_user_passphrase_history;
 DROP TABLE luks_state;
 DROP TABLE result_outbox;
+DROP TABLE reboot_markers;
 DROP TABLE manifest_occurrences;
 DROP TABLE manifest_deliveries;
 DROP TABLE settings;
