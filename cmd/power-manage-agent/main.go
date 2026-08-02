@@ -39,10 +39,6 @@ const (
 
 // Config holds the agent configuration.
 type Config struct {
-	// Registration
-	Token     string
-	ServerURL string
-
 	// Storage
 	DataDir string
 
@@ -162,34 +158,9 @@ func main() {
 			"control", creds.AgentAddr,
 		)
 
-		// Ignore registration token if already registered. Promoted
-		// from Debug to Info because operators who re-run with a
-		// fresh token expecting re-enrollment otherwise get no
-		// feedback about why nothing happened. Audit F037.
-		if cfg.Token != "" {
-			logger.Info("ignoring registration token — agent is already registered; delete credentials.enc first to re-enroll")
-		}
-	} else if cfg.Token != "" {
-		// Register directly when the first-run token is supplied on the CLI.
-		if cfg.ServerURL == "" {
-			logger.Error("server URL required for registration")
-			os.Exit(1)
-		}
-
-		creds, err = register(ctx, cfg, hostname, logger)
-		if err != nil {
-			logger.Error("registration failed", "error", err)
-			os.Exit(1)
-		}
-
-		// Save credentials
-		if err := credStore.Save(creds); err != nil {
-			logger.Error("failed to save credentials", "error", err)
-			os.Exit(1)
-		}
-		logger.Info("credentials saved", "data_dir", credStore.DataDir())
 	} else {
-		// No credentials and no token — start enrollment socket and wait
+		// No credentials — start the local enrollment socket and wait for the
+		// explicit, CA-pinned `enroll` command.
 		logger.Info("agent not enrolled, waiting for enrollment via socket",
 			"socket", deviceauth.EnrollSocketPath)
 
@@ -370,11 +341,7 @@ func parseFlags() *Config {
 	}
 
 	var uri string
-	flag.StringVar(&uri, "uri", "", "Registration URI (power-manage://server:port?token=xxx)")
-	flag.StringVar(&cfg.Token, "token", "", "Registration token for first-time setup")
-	flag.StringVar(&cfg.Token, "t", "", "Registration token (shorthand)")
-	flag.StringVar(&cfg.ServerURL, "server", "", "Control server URL for registration")
-	flag.StringVar(&cfg.ServerURL, "s", "", "Control server URL (shorthand)")
+	flag.StringVar(&uri, "uri", "", "Registration URI (accepted only by the explicit enroll subcommand)")
 	flag.StringVar(&cfg.DataDir, "data-dir", credentials.DefaultDataDir, "Data directory for credentials")
 	flag.StringVar(&cfg.LogLevel, "log-level", "info", "Log level (debug, info, warn, error)")
 	flag.StringVar(&cfg.LogFormat, "log-format", "text", "Log format (text, json)")
@@ -407,12 +374,6 @@ func parseFlags() *Config {
 	}
 
 	// Allow environment variables to override
-	if v := os.Getenv("POWER_MANAGE_TOKEN"); v != "" {
-		cfg.Token = v
-	}
-	if v := os.Getenv("POWER_MANAGE_SERVER"); v != "" {
-		cfg.ServerURL = v
-	}
 	if v := os.Getenv("POWER_MANAGE_DATA_DIR"); v != "" {
 		cfg.DataDir = v
 	}

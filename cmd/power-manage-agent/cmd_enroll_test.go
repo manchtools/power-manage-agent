@@ -3,15 +3,17 @@ package main
 import (
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
-// TestParseRegistrationURI pins URI parsing (#19): token required, the
-// optional pin is carried, the host always normalizes to https, and any
+// TestParseRegistrationURI pins URI parsing (#19): token and CA pin are
+// required, the host always normalizes to https, and any
 // tls=/skip-verify= query params are ignored (no TLS-bypass path).
 func TestParseRegistrationURI(t *testing.T) {
 	t.Run("well-formed with pin", func(t *testing.T) {
-		u, err := parseRegistrationURI("power-manage://host:8081?token=abc123&pin=DEADBEEF")
+		pin := strings.Repeat("A", 64)
+		u, err := parseRegistrationURI("power-manage://host:8081?token=abc123&pin=" + pin)
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}
@@ -21,8 +23,13 @@ func TestParseRegistrationURI(t *testing.T) {
 		if u.Token != "abc123" {
 			t.Errorf("Token = %q, want abc123", u.Token)
 		}
-		if u.Pin != "DEADBEEF" {
-			t.Errorf("Pin = %q, want DEADBEEF", u.Pin)
+		if u.Pin != pin {
+			t.Errorf("Pin = %q, want %q", u.Pin, pin)
+		}
+	})
+	t.Run("pin required", func(t *testing.T) {
+		if _, err := parseRegistrationURI("power-manage://host?token=t"); err == nil {
+			t.Error("expected error for missing pin")
 		}
 	})
 	t.Run("token required", func(t *testing.T) {
@@ -34,7 +41,7 @@ func TestParseRegistrationURI(t *testing.T) {
 		}
 	})
 	t.Run("tls-bypass params ignored", func(t *testing.T) {
-		u, err := parseRegistrationURI("power-manage://host?token=t&tls=false&skip-verify=true")
+		u, err := parseRegistrationURI("power-manage://host?token=t&pin=" + strings.Repeat("a", 64) + "&tls=false&skip-verify=true")
 		if err != nil {
 			t.Fatalf("unexpected error: %v", err)
 		}

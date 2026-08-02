@@ -39,12 +39,43 @@ func caReturningMock(caPEM []byte) *mockRegisterService {
 	}
 }
 
-// TestEnroll_CAPinMatchAccepted pins the optional OOB CA-pin happy path
-// (#5): when the returned CA matches the pin, enrollment proceeds.
+func caPin(t *testing.T, caPEM []byte) string {
+	t.Helper()
+	pin, err := pmcrypto.CAFingerprintFromPEM(caPEM)
+	require.NoError(t, err)
+	return pin
+}
+
+func TestEnroll_CAPinRequiredBeforeRegistration(t *testing.T) {
+	called := false
+	mock := &mockRegisterService{
+		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
+			called = true
+			return nil, nil
+		},
+	}
+	srv := startMockControlServer(t, mock)
+	credStore := credentials.NewStore(t.TempDir())
+	h := NewEnrollHandler("test-host", "dev", credStore, slog.Default(), nil)
+	h.registerOpts = trustServer(srv)
+
+	for _, pin := range []string{"", "abcd", strings.Repeat("z", 64)} {
+		resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
+			ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: pin,
+		}))
+		require.NoError(t, err)
+		assert.False(t, resp.Msg.Success)
+		assert.Contains(t, strings.ToLower(resp.Msg.Error), "fingerprint pin")
+	}
+	assert.False(t, called, "an invalid pin must fail before registration reaches the network")
+	assert.False(t, credStore.Exists())
+}
+
+// TestEnroll_CAPinMatchAccepted pins the mandatory OOB CA-pin happy path:
+// when the returned CA matches the pin, enrollment proceeds.
 func TestEnroll_CAPinMatchAccepted(t *testing.T) {
 	caPEM := genTestCAPEM(t)
-	wantFP, err := pmcrypto.CAFingerprintFromPEM(caPEM)
-	require.NoError(t, err)
+	wantFP := caPin(t, caPEM)
 
 	srv := startMockControlServer(t, caReturningMock(caPEM))
 	credStore := credentials.NewStore(t.TempDir())
@@ -65,8 +96,7 @@ func TestEnroll_CAPinMatchAccepted(t *testing.T) {
 // matching (operators paste from openssl: uppercase, colon-separated).
 func TestEnroll_CAPinMatchNormalized(t *testing.T) {
 	caPEM := genTestCAPEM(t)
-	fp, err := pmcrypto.CAFingerprintFromPEM(caPEM)
-	require.NoError(t, err)
+	fp := caPin(t, caPEM)
 
 	// Uppercase + colon-separated, as openssl prints it.
 	var b strings.Builder

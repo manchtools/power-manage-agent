@@ -14,62 +14,6 @@ import (
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
 
-// register performs initial registration with the control server.
-// The agent generates its own key pair locally and sends a CSR to the control server.
-// The private key never leaves the agent. The control server returns the control URL
-// for subsequent mTLS streaming connections.
-func register(ctx context.Context, cfg *Config, hostname string, logger *slog.Logger) (*credentials.Credentials, error) {
-	logger.Info("registering with control server",
-		"server", cfg.ServerURL,
-		"hostname", hostname,
-	)
-
-	// Generate key pair and CSR locally - private key never leaves the agent
-	logger.Debug("generating key pair and CSR")
-	csrPEM, keyPEM, err := pmcrypto.GenerateCSR(hostname)
-	if err != nil {
-		return nil, fmt.Errorf("generate CSR: %w", err)
-	}
-	sealingPrivate, err := pmcrypto.GenerateX25519()
-	if err != nil {
-		return nil, fmt.Errorf("generate sealing key: %w", err)
-	}
-
-	// Register via control server RPC. TLS verification is always
-	// enforced — there is intentionally no opt-out, as bypassing it
-	// during initial registration enables MITM attacks that can
-	// substitute the control URL and a malicious certificate before
-	// the agent has any trust anchor of its own.
-	result, err := sdk.RegisterAgent(ctx, cfg.ServerURL, cfg.Token, hostname, version, csrPEM, sealingPrivate.PublicKey().Bytes())
-	if err != nil {
-		return nil, fmt.Errorf("register: %w", err)
-	}
-
-	logger.Info("registration successful",
-		"device_id", result.DeviceID,
-		"control_url", result.ControlURL,
-	)
-
-	// Verify we received CA cert and signed certificate
-	if len(result.CACert) == 0 || len(result.Certificate) == 0 {
-		return nil, fmt.Errorf("server did not provide mTLS certificates")
-	}
-	if _, err := pmcrypto.ParseX25519PublicKey(result.ControlSealingPublicKey); err != nil {
-		return nil, fmt.Errorf("server did not provide a valid sealing public key: %w", err)
-	}
-
-	return &credentials.Credentials{
-		DeviceID:                result.DeviceID,
-		CACert:                  result.CACert,
-		Certificate:             result.Certificate,
-		PrivateKey:              keyPEM, // Private key generated locally, never sent to server
-		AgentAddr:               result.ControlURL,
-		ControlAddr:             cfg.ServerURL, // Control Server URL for device auth proxy
-		SealingPrivateKey:       sealingPrivate.Bytes(),
-		ControlSealingPublicKey: result.ControlSealingPublicKey,
-	}, nil
-}
-
 // renewAt returns how long to wait, measured from now, before renewing a
 // certificate with the given validity window: 80% of its lifetime,
 // clamped to a 1-minute minimum so an already-expired or near-expired

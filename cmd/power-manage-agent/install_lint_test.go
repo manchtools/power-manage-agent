@@ -61,6 +61,15 @@ func TestInstall_TokenDeliveredViaFileNotArgv(t *testing.T) {
 	}
 }
 
+func TestInstall_EnrollmentRequiresCAPin(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	for _, required := range []string{"--pin", "CA_FINGERPRINT_PIN", `-pin=$CA_FINGERPRINT_PIN`} {
+		if !strings.Contains(sh, required) {
+			t.Errorf("install.sh enrollment is missing %q", required)
+		}
+	}
+}
+
 func TestInstall_VerifiesPublisherSignatureBeforeChecksum(t *testing.T) {
 	sh := readRepoFile(t, "install.sh")
 	for _, required := range []string{

@@ -52,14 +52,14 @@ func TestEnroll_RateLimitRejectsSixthInWindow(t *testing.T) {
 
 	for i := 0; i < 5; i++ {
 		resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-			ServerUrl: srv.URL, Token: "tok",
+			ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: testCAPin,
 		}))
 		require.NoError(t, err)
 		assert.Contains(t, resp.Msg.Error, "registration failed", "attempt %d should reach (and fail) registration", i+1)
 	}
 
 	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: srv.URL, Token: "tok",
+		ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: testCAPin,
 	}))
 	require.NoError(t, err)
 	assert.False(t, resp.Msg.Success)
@@ -90,7 +90,7 @@ func TestEnroll_RateLimitSlidingWindowEviction(t *testing.T) {
 
 	// Exhaust the window: 5 reach (and fail) registration, the 6th is rate-limited.
 	for i := 0; i < 6; i++ {
-		_, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+		_, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: testCAPin}))
 		require.NoError(t, err)
 	}
 	require.EqualValues(t, 5, atomic.LoadInt32(&registerCalls), "only 5 attempts may reach the network within one window")
@@ -98,7 +98,7 @@ func TestEnroll_RateLimitSlidingWindowEviction(t *testing.T) {
 	// Advance past the 1-minute window: the prior attempts are evicted, so a
 	// fresh attempt is allowed through to registration again.
 	now = now.Add(61 * time.Second)
-	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"}))
+	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: testCAPin}))
 	require.NoError(t, err)
 	assert.Contains(t, resp.Msg.Error, "registration failed", "after the window resets, enrollment is allowed through again")
 	assert.EqualValues(t, 6, atomic.LoadInt32(&registerCalls), "a fresh attempt after the window must reach registration")
@@ -111,12 +111,14 @@ func TestEnroll_RateLimitSlidingWindowEviction(t *testing.T) {
 // the lock this would race to N registrations / a corrupt Save.
 func TestEnroll_ConcurrentSerializesToOneRegistration(t *testing.T) {
 	var registerCalls int32
+	caPEM := genTestCAPEM(t)
+	pin := caPin(t, caPEM)
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			atomic.AddInt32(&registerCalls, 1)
 			return connect.NewResponse(&pm.RegisterResponse{
 				DeviceId:                &pm.DeviceId{Value: "dev-123"},
-				CaCert:                  []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
+				CaCert:                  caPEM,
 				Certificate:             []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
 				ControlUrl:              "https://gw.example.com:8443",
 				ControlSealingPublicKey: testControlSealingPublicKey(),
@@ -135,7 +137,9 @@ func TestEnroll_ConcurrentSerializesToOneRegistration(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{ServerUrl: srv.URL, Token: "tok"})); err != nil {
+			if _, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
+				ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: pin,
+			})); err != nil {
 				errCh <- err
 			}
 		}()
@@ -183,7 +187,7 @@ func TestEnroll_RejectsMissingMTLSCerts(t *testing.T) {
 			h.registerOpts = trustServer(srv)
 
 			resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-				ServerUrl: srv.URL, Token: "tok",
+				ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: testCAPin,
 			}))
 			require.NoError(t, err)
 			assert.False(t, resp.Msg.Success)
@@ -198,12 +202,13 @@ func TestEnroll_RejectsMissingMTLSCerts(t *testing.T) {
 // keeps (#8) — the "private key never leaves the agent" contract.
 func TestEnroll_BindsOutboundRegisterRequest(t *testing.T) {
 	var captured *pm.RegisterRequest
+	caPEM := genTestCAPEM(t)
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, req *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			captured = req.Msg
 			return connect.NewResponse(&pm.RegisterResponse{
 				DeviceId:                &pm.DeviceId{Value: "01HZZZZZZZZZZZZZZZZZZZZZZZZ"},
-				CaCert:                  []byte(fakeLeafPEM),
+				CaCert:                  caPEM,
 				Certificate:             []byte(fakeLeafPEM),
 				ControlUrl:              "https://gw.example.com",
 				ControlSealingPublicKey: testControlSealingPublicKey(),
@@ -216,7 +221,7 @@ func TestEnroll_BindsOutboundRegisterRequest(t *testing.T) {
 	h.registerOpts = trustServer(srv)
 
 	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: srv.URL, Token: "test-token",
+		ServerUrl: srv.URL, Token: "test-token", CaFingerprintPin: caPin(t, caPEM),
 	}))
 	require.NoError(t, err)
 	require.True(t, resp.Msg.Success, "%s", resp.Msg.Error)
@@ -237,14 +242,15 @@ func TestEnroll_BindsOutboundRegisterRequest(t *testing.T) {
 // TestEnroll_SaveFailureFailsClosed pins #14: a Save error fails the
 // enrollment closed — no callback, status not primed.
 func TestEnroll_SaveFailureFailsClosed(t *testing.T) {
-	srv := startMockControlServer(t, caReturningMock([]byte(fakeLeafPEM)))
+	caPEM := genTestCAPEM(t)
+	srv := startMockControlServer(t, caReturningMock(caPEM))
 	called := false
 	h := NewEnrollHandler("test-host", "dev", credentials.NewStore(t.TempDir()), slog.Default(), func(*credentials.Credentials) { called = true })
 	h.registerOpts = trustServer(srv)
 	h.credStore = &failingStore{credentialStore: h.credStore, saveErr: errors.New("disk full")}
 
 	resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: srv.URL, Token: "tok",
+		ServerUrl: srv.URL, Token: "tok", CaFingerprintPin: caPin(t, caPEM),
 	}))
 	require.NoError(t, err)
 	assert.False(t, resp.Msg.Success)

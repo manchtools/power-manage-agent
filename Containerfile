@@ -34,29 +34,6 @@ RUN mkdir -p /var/lib/power-manage && chmod 700 /var/lib/power-manage
 
 COPY --from=builder /power-manage-agent /usr/local/bin/power-manage-agent
 
-# Create entrypoint script that keeps the container running
-RUN cat > /entrypoint.sh <<'EOF'
-#!/bin/bash
-set -e
-
-# If no token and no stored credentials, wait for token to be provided
-DATA_DIR="${POWER_MANAGE_DATA_DIR:-/var/lib/power-manage}"
-
-if [ -z "$POWER_MANAGE_TOKEN" ] && [ ! -f "$DATA_DIR/credentials.enc" ]; then
-    echo "No registration token provided and no stored credentials found."
-    echo "Set POWER_MANAGE_TOKEN environment variable to register."
-    echo "Container will stay running - use 'podman exec' to register manually."
-    echo ""
-    echo "Example:"
-    echo "  podman exec -e POWER_MANAGE_TOKEN=<token> pm-test-agent power-manage-agent"
-    echo ""
-    # Keep container alive
-    exec sleep infinity
-fi
-
-# Run the agent - it will reconnect on errors automatically
-exec /usr/local/bin/power-manage-agent "$@"
-EOF
-RUN chmod +x /entrypoint.sh
-
-ENTRYPOINT ["/entrypoint.sh"]
+# An unenrolled agent remains running on its local enrollment socket. Enrollment
+# is performed explicitly with a registration token and the control CA pin.
+ENTRYPOINT ["/usr/local/bin/power-manage-agent"]

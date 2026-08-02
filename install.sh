@@ -6,10 +6,10 @@
 # registers with a control server — all in one step.
 #
 # One-liner install (stable):
-#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN
+#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
 #
 # One-liner install (prerelease):
-#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre -s https://your-server.example.com -t YOUR_TOKEN
+#   curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
 #
 # Usage:
 #   sudo ./install.sh [OPTIONS]
@@ -17,6 +17,7 @@
 # Options:
 #   -t, --token TOKEN       Registration token for initial setup
 #   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
+#   -p, --pin SHA256        Required control CA fingerprint supplied with the token
 #   -v, --version VERSION   Version to install (default: latest)
 #   --pre                   Install the latest prerelease (release candidate) version
 #   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
@@ -40,6 +41,7 @@ BINARY_PATH="/usr/local/bin/power-manage-agent"
 SERVICE_NAME="power-manage-agent"
 REGISTRATION_TOKEN=""
 SERVER_URL=""
+CA_FINGERPRINT_PIN=""
 SKIP_DOWNLOAD=""
 PRE_RELEASE=""
 VERSION="latest"
@@ -75,11 +77,12 @@ Usage:
   sudo ./install.sh [OPTIONS]
 
   One-liner:
-  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s URL -t TOKEN
+  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s URL -t TOKEN -p CA_SHA256
 
 Options:
   -t, --token TOKEN       Registration token for initial setup
   -s, --server URL        Control server URL (e.g., https://control.example.com:8081)
+  -p, --pin SHA256        Required control CA fingerprint supplied with the token
   -v, --version VERSION   Version to install (e.g., v2026.2.0; default: latest)
   --pre                   Install the latest prerelease (release candidate) version
   -d, --data-dir DIR      Data directory (default: /var/lib/power-manage)
@@ -90,16 +93,16 @@ Options:
 
 Examples:
   # Download, install and register (one-liner)
-  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s https://power-manage.example.com -t abc123
+  curl -fsSL https://github.com/${GITHUB_REPO}/releases/latest/download/install.sh | sudo bash -s -- -s https://power-manage.example.com -t abc123 -p CA_SHA256
 
   # Install the latest prerelease version
-  sudo ./install.sh --pre -s https://power-manage.example.com -t abc123
+  sudo ./install.sh --pre -s https://power-manage.example.com -t abc123 -p CA_SHA256
 
   # Install a specific version
-  sudo ./install.sh -v v2026.2.0 -s https://power-manage.example.com -t abc123
+  sudo ./install.sh -v v2026.2.0 -s https://power-manage.example.com -t abc123 -p CA_SHA256
 
   # Install with existing binary (skip download)
-  sudo ./install.sh --skip-download -s https://power-manage.example.com -t abc123
+  sudo ./install.sh --skip-download -s https://power-manage.example.com -t abc123 -p CA_SHA256
 
   # Uninstall completely
   sudo ./install.sh --uninstall
@@ -115,6 +118,10 @@ parse_args() {
                 ;;
             -s|--server)
                 SERVER_URL="$2"
+                shift 2
+                ;;
+            -p|--pin)
+                CA_FINGERPRINT_PIN="$2"
                 shift 2
                 ;;
             -d|--data-dir)
@@ -390,11 +397,15 @@ install_systemd_service() {
 }
 
 enroll_agent() {
-    if [[ -z "$REGISTRATION_TOKEN" ]] || [[ -z "$SERVER_URL" ]]; then
-        log_warn "No registration token or server URL provided, skipping enrollment"
+    if [[ -z "$REGISTRATION_TOKEN" ]] && [[ -z "$SERVER_URL" ]] && [[ -z "$CA_FINGERPRINT_PIN" ]]; then
+        log_warn "No enrollment parameters provided; skipping enrollment"
         log_info "You can enroll later by running (no sudo required):"
-        log_info "  $BINARY_PATH enroll -server=<URL> -token-file=<PATH>"
+        log_info "  $BINARY_PATH enroll -server=<URL> -token-file=<PATH> -pin=<CA_SHA256>"
         return
+    fi
+    if [[ -z "$REGISTRATION_TOKEN" ]] || [[ -z "$SERVER_URL" ]] || [[ -z "$CA_FINGERPRINT_PIN" ]]; then
+        log_error "Registration token, server URL, and CA fingerprint pin must be provided together"
+        return 1
     fi
 
     log_info "Enrolling agent with server via socket..."
@@ -417,6 +428,7 @@ enroll_agent() {
         "enroll"
         "-server=$SERVER_URL"
         "-token-file=$token_file"
+        "-pin=$CA_FINGERPRINT_PIN"
     )
 
     # Wait for the enrollment socket to become available (agent needs to start first)
@@ -438,7 +450,7 @@ enroll_agent() {
     else
         log_error "Agent enrollment failed"
         log_info "You can try again later by running:"
-        log_info "  $BINARY_PATH enroll -server=$SERVER_URL -token-file=<PATH>"
+        log_info "  $BINARY_PATH enroll -server=$SERVER_URL -token-file=<PATH> -pin=$CA_FINGERPRINT_PIN"
         return 1
     fi
 }
@@ -451,7 +463,7 @@ enable_and_start_service() {
     log_info "Service started"
 
     # If not yet enrolled, the agent will listen on the enrollment socket
-    # and wait for enrollment via: power-manage-agent enroll -server=URL -token=TOKEN
+    # and wait for enrollment via: power-manage-agent enroll -server=URL -token-file=PATH -pin=CA_SHA256
 }
 
 uninstall() {
@@ -560,7 +572,7 @@ show_status() {
     else
         echo "Agent is NOT enrolled yet."
         echo "To enroll (no sudo required), run:"
-        echo "  $BINARY_PATH enroll -server=<URL> -token=<TOKEN>"
+        echo "  $BINARY_PATH enroll -server=<URL> -token-file=<PATH> -pin=<CA_SHA256>"
     fi
     echo ""
 }

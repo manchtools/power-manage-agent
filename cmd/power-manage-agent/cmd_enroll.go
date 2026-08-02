@@ -20,9 +20,9 @@ import (
 )
 
 // parseRegistrationURI parses a power-manage:// URI.
-// Format: power-manage://server:port?token=xxx
+// Format: power-manage://server:port?token=xxx&pin=sha256
 // Examples:
-//   - power-manage://control.example.com:8080?token=abc123
+//   - power-manage://control.example.com:8080?token=abc123&pin=<CA-SHA256>
 //
 // TLS verification is always enforced. The previous `skip-verify=true`
 // and `tls=false` query parameters were removed because bypassing
@@ -43,14 +43,18 @@ func parseRegistrationURI(rawURI string) (*registrationURI, error) {
 	if token == "" {
 		return nil, fmt.Errorf("token parameter is required in URI")
 	}
+	pin := strings.TrimSpace(parsed.Query().Get("pin"))
+	if pin == "" {
+		return nil, fmt.Errorf("pin parameter is required in URI")
+	}
 
 	return &registrationURI{
 		ServerURL: fmt.Sprintf("https://%s", parsed.Host),
 		Token:     token,
-		// Optional out-of-band CA fingerprint pin. Any tls=/skip-verify=
+		// Mandatory out-of-band CA fingerprint pin. Any tls=/skip-verify=
 		// query params are intentionally ignored — ServerURL is always
 		// normalized to https, there is no TLS-bypass path.
-		Pin: parsed.Query().Get("pin"),
+		Pin: pin,
 	}, nil
 }
 
@@ -79,15 +83,15 @@ func resolveEnrollToken(flagToken, tokenFile, envToken string) (string, error) {
 }
 
 // runEnroll handles the "enroll" subcommand.
-// Usage: power-manage-agent enroll -server=URL -token=TOKEN
+// Usage: power-manage-agent enroll -server=URL -token-file=PATH -pin=SHA256
 //
-//	power-manage-agent enroll 'power-manage://server:port?token=xxx'
+//	power-manage-agent enroll 'power-manage://server:port?token=xxx&pin=<CA-SHA256>'
 func runEnroll(args []string) {
 	fs := flag.NewFlagSet("enroll", flag.ExitOnError)
 	token := fs.String("token", "", "Registration token (INSECURE on argv; prefer -token-file or PM_REGISTRATION_TOKEN)")
 	tokenFile := fs.String("token-file", "", "Path to a file containing the registration token (preferred over -token)")
 	server := fs.String("server", "", "Control server URL")
-	pin := fs.String("pin", "", "Optional CA fingerprint pin (SHA-256 hex of the control CA) verified before trusting the server CA")
+	pin := fs.String("pin", "", "Required CA fingerprint pin (SHA-256 hex of the control CA)")
 	socketPath := fs.String("socket", deviceauth.EnrollSocketPath, "Agent enrollment socket")
 	fs.Parse(args)
 
@@ -125,10 +129,10 @@ func runEnroll(args []string) {
 		resolvedToken = rt
 	}
 
-	if resolvedToken == "" || *server == "" {
-		fmt.Fprintln(os.Stderr, "error: a control server URL and a registration token are required")
-		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token-file=PATH")
-		fmt.Fprintln(os.Stderr, "   or: PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL")
+	if resolvedToken == "" || *server == "" || strings.TrimSpace(caPin) == "" {
+		fmt.Fprintln(os.Stderr, "error: a control server URL, registration token, and CA fingerprint pin are required")
+		fmt.Fprintln(os.Stderr, "usage: power-manage-agent enroll -server=URL -token-file=PATH -pin=SHA256")
+		fmt.Fprintln(os.Stderr, "   or: PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL -pin=SHA256")
 		fmt.Fprintln(os.Stderr, "   or: power-manage-agent enroll 'power-manage://server:port?token=xxx&pin=…'")
 		os.Exit(1)
 	}
@@ -155,7 +159,7 @@ func runEnroll(args []string) {
 
 	// Enroll via the local socket. The SDK proto no longer carries
 	// a TLS-bypass field; agents always validate the server cert
-	// during enrollment. An optional CA fingerprint pin is verified
+	// during enrollment. The CA fingerprint pin is verified
 	// server-side before the returned CA is trusted.
 	resp, err := client.Enroll(ctx, connect.NewRequest(&pm.EnrollRequest{
 		ServerUrl:        *server,
@@ -188,7 +192,7 @@ func registrationURIRefusedByHandler(uri string) bool {
 type registrationURI struct {
 	ServerURL string
 	Token     string
-	Pin       string // optional CA fingerprint pin
+	Pin       string // required CA fingerprint pin
 }
 
 // unixSocketHTTPClient returns an HTTP client that dials the given unix socket.

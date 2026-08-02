@@ -36,8 +36,7 @@ func TestEnroll_RejectsNonHTTPSServerURL(t *testing.T) {
 			h := NewEnrollHandler("h", "dev", credStore, slog.Default(), nil)
 
 			resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-				ServerUrl: u,
-				Token:     "some-token",
+				ServerUrl: u, Token: "some-token", CaFingerprintPin: testCAPin,
 			}))
 			require.NoError(t, err)
 			assert.False(t, resp.Msg.Success)
@@ -64,8 +63,7 @@ func TestEnroll_PerFieldRequired(t *testing.T) {
 			h := NewEnrollHandler("h", "dev", credStore, slog.Default(), nil)
 
 			resp, err := h.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-				ServerUrl: tc.url,
-				Token:     tc.token,
+				ServerUrl: tc.url, Token: tc.token, CaFingerprintPin: testCAPin,
 			}))
 			require.NoError(t, err)
 			assert.False(t, resp.Msg.Success)

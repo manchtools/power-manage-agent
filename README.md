@@ -52,13 +52,14 @@ validate the agent's client certificate itself.
 
 ### Enrollment Flow
 
-The agent supports two enrollment methods:
+The agent has one explicit enrollment method:
 
 #### Socket-based enrollment (recommended, no sudo required)
 
 1. The install script starts the agent as a systemd service
 2. The unenrolled agent opens an **enrollment socket** at `/run/pm-agent/enroll.sock` (mode 0666, any local user can connect)
-3. A regular user runs `power-manage-agent enroll -server=URL -token-file=PATH` (or `PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL`)
+3. A regular user runs `power-manage-agent enroll -server=URL -token-file=PATH -pin=CA_SHA256`
+   (or `PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL -pin=CA_SHA256`)
 4. The CLI sends an `Enroll` RPC to the agent over the unix socket
 5. The agent calls the **Control Server** `Register` RPC with the token and a locally-generated CSR
 6. The Control Server validates the token, signs the certificate, and returns credentials
@@ -69,7 +70,7 @@ The agent supports two enrollment methods:
 > socket is intentionally world-accessible (mode `0666`) so a **non-root
 > user can enroll their own corporate/BYOD device without sudo** — that
 > is the whole point of the socket. The security boundary is the
-> registration **token**, validated by the Control Server; an admin who
+> registration **token** and the CA fingerprint delivered with it; an admin who
 > does *not* want self-service can pre-enroll devices with a bulk
 > registration token instead. The agent applies a **global** rate limit
 > of 5 enrollment attempts per minute, so a local user can briefly
@@ -81,18 +82,18 @@ The agent supports two enrollment methods:
 > URLs are refused before any network call). Token delivery is via
 > `-token-file` or the `PM_REGISTRATION_TOKEN` env var; passing `-token`
 > on argv still works but warns (it leaks via `/proc/<pid>/cmdline`).
-> Optionally the operator can pass an out-of-band **CA fingerprint pin**
-> (`-pin`, or `&pin=` in a `power-manage://` URI): the agent verifies the
+> The operator must pass the out-of-band **CA fingerprint pin** returned beside
+> the registration token (`-pin`, or `&pin=` in a `power-manage://` URI). The agent verifies the
 > Control Server CA matches the pin before trusting it, defending against
-> a first-enrollment trust-anchor swap. Without a pin, first enrollment
-> is trust-on-first-use — an accepted residual mitigated by enroll-at-
-> install plus short-lived, single-use, revocable tokens.
+> a first-enrollment trust-anchor swap. Missing, malformed, and mismatched pins
+> all fail before credentials are saved; there is no trust-on-first-use path.
 
 ```
                                   ┌─────────────────────────┐
   User (no sudo)                  │   Agent (systemd svc)   │
   power-manage-agent enroll ───►  │   /run/pm-agent/        │
-    -server=URL -token=TOK        │     enroll.sock (0666)  │
+    -server=URL -token-file=PATH  │     enroll.sock (0666)  │
+    -pin=CA_SHA256                │         │               │
                                   │         │               │
                                   │    Register RPC ──────► Control Server
                                   │         │               │   - Validate token
@@ -103,19 +104,9 @@ The agent supports two enrollment methods:
                                   └─────────────────────────┘
 ```
 
-#### Direct enrollment (requires sudo)
-
-For environments where the agent is not yet running as a service, direct enrollment still works:
-
-```bash
-sudo power-manage-agent -server=URL -token=TOKEN
-```
-
-The agent registers directly, saves credentials, and starts.
-
 ### Registration Protocol
 
-Both enrollment methods use the same underlying protocol:
+The explicit enrollment command uses this protocol:
 1. The agent generates an Ed25519 identity key and CSR locally — the private key never leaves the device
 2. The Control Server validates the registration token, signs the certificate, and returns:
    - Device ID
@@ -132,7 +123,8 @@ Both enrollment methods use the same underlying protocol:
 # Download, install, and enroll in one step
 curl -fsSL https://your-server/install.sh | sudo bash -s -- \
   --server https://control.example.com:8081 \
-  --token YOUR_REGISTRATION_TOKEN
+  --token YOUR_REGISTRATION_TOKEN \
+  --pin YOUR_CA_SHA256
 ```
 
 <!-- docref: begin src=install.sh#download_binary:3f9090ea -->
@@ -141,7 +133,7 @@ The install script:
    pinned Ed25519 release key, then verifies and installs the agent binary
 2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
 3. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
-4. Enrolls via the enrollment socket if `--server` and `--token` were provided
+4. Enrolls via the enrollment socket only when `--server`, `--token`, and `--pin` are provided
 <!-- docref: end -->
 
 The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links. When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
@@ -158,7 +150,7 @@ go build -o power-manage-agent ./agent/cmd/agent
 sudo ./power-manage-agent
 
 # In another terminal (as any user), enroll via the local socket:
-power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_TOKEN
+power-manage-agent enroll -server=https://control.example.com:8081 -token-file=TOKEN_PATH -pin=YOUR_CA_SHA256
 ```
 
 For a production-style manual install (without the install script):
@@ -177,25 +169,27 @@ sudo systemctl daemon-reload
 sudo systemctl enable --now power-manage-agent
 
 # 4. Enroll (any user, no sudo needed)
-power-manage-agent enroll -server=https://control.example.com:8081 -token=YOUR_TOKEN
+power-manage-agent enroll -server=https://control.example.com:8081 -token-file=TOKEN_PATH -pin=YOUR_CA_SHA256
 ```
 
 ### Using URI Scheme
 
-The agent supports a `power-manage://` URI scheme for easy enrollment from the web UI.
-When clicked, the desktop handler launches the agent which tries socket enrollment first (no sudo), falling back to direct registration.
+The explicit `enroll` subcommand accepts a `power-manage://` URI containing both the token and CA pin.
+The desktop handler never auto-enrolls from a browser click; it refuses registration URIs and prints the
+explicit command the operator may run.
 
 > The desktop handler that registers this scheme is **opt-in**
 > (`--enable-uri-handler`, off by default). The CLI invocation below works
 > regardless; only clickable browser-link registration requires the handler.
 
 ```bash
-power-manage-agent 'power-manage://control.example.com:8081?token=abc123'
+power-manage-agent enroll 'power-manage://control.example.com:8081?token=abc123&pin=CA_SHA256'
 ```
 
 URI Parameters:
 - `server:port` - Control server address (required)
 - `token` - Registration token (required for first run)
+- `pin` - SHA-256 fingerprint of the control CA (required)
 
 > TLS verification is mandatory; there is no bypass parameter.
 
@@ -203,7 +197,7 @@ URI Parameters:
 
 | Subcommand | Description |
 |------------|-------------|
-| `enroll` | Enroll the agent via the enrollment socket (no sudo required). Supports `-s`/`-t` shorthand flags. |
+| `enroll` | Enroll the agent via the local socket with a token and mandatory CA pin (no sudo required). |
 | `version` | Print agent version |
 | `query` | Query system information via osquery |
 | `luks` | LUKS passphrase management |
@@ -217,10 +211,11 @@ URI Parameters:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-server` | (required) | Control server URL (used for registration) |
-| `-token` | (optional) | Registration token (first run only) |
 | `-data-dir` | `/var/lib/power-manage` | Data directory for state |
 | `-log-level` | `info` | Log level (debug, info, warn, error) |
+
+The `enroll` subcommand separately accepts required `-server` and `-pin` flags plus one token source:
+`-token-file` (preferred), `PM_REGISTRATION_TOKEN`, or the discouraged `-token` argv fallback.
 
 > TLS verification is mandatory; there is no bypass flag or environment variable.
 
@@ -231,8 +226,7 @@ applied first, then env vars override).
 
 | Variable | Description |
 |----------|-------------|
-| `POWER_MANAGE_SERVER` | Control server URL (used for registration) |
-| `POWER_MANAGE_TOKEN` | Registration token (first run only) |
+| `PM_REGISTRATION_TOKEN` | Registration token for the explicit `enroll` subcommand |
 | `POWER_MANAGE_DATA_DIR` | Data directory for state |
 | `POWER_MANAGE_PRIVILEGE_BACKEND` | Privilege backend override: `root`, `sudo`, or `doas` (empty selects `root` for the packaged service) |
 

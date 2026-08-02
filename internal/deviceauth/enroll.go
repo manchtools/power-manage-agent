@@ -2,6 +2,7 @@ package deviceauth
 
 import (
 	"context"
+	"encoding/hex"
 	"fmt"
 	"log/slog"
 	"strings"
@@ -83,8 +84,15 @@ func NewEnrollHandler(hostname, version string, credStore *credentials.Store, lo
 // the fingerprint uppercase and colon-separated). Case is handled by
 // EqualFold at the comparison site, so a pin pasted in any common form
 // matches the lowercase-hex value derived from the server CA.
-func normalizePin(pin string) string {
-	return strings.ReplaceAll(strings.TrimSpace(pin), ":", "")
+func normalizePin(pin string) (string, error) {
+	normalized := strings.ReplaceAll(strings.TrimSpace(pin), ":", "")
+	if len(normalized) != 64 {
+		return "", fmt.Errorf("CA fingerprint pin is required and must contain 64 hexadecimal characters")
+	}
+	if _, err := hex.DecodeString(normalized); err != nil {
+		return "", fmt.Errorf("CA fingerprint pin must contain 64 hexadecimal characters")
+	}
+	return strings.ToLower(normalized), nil
 }
 
 // Enroll registers the agent with the PM server using the provided token.
@@ -125,6 +133,10 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 			Success: false,
 			Error:   "server_url and token are required",
 		}), nil
+	}
+	pin, err := normalizePin(req.Msg.CaFingerprintPin)
+	if err != nil {
+		return connect.NewResponse(&pm.EnrollResponse{Success: false, Error: err.Error()}), nil
 	}
 
 	// https-only gate (WS9 #2/#16): refuse a cleartext or malformed
@@ -186,29 +198,26 @@ func (h *EnrollHandler) Enroll(ctx context.Context, req *connect.Request[pm.Enro
 		return connect.NewResponse(&pm.EnrollResponse{Success: false, Error: "server did not provide a valid sealing public key"}), nil
 	}
 
-	// Optional out-of-band CA-pin verification (WS9 #5): if the operator
-	// supplied a fingerprint pin, the CA returned by registration MUST
-	// match it before we adopt it as the trust anchor. Fail closed on a
+	// Mandatory out-of-band CA-pin verification: the CA returned by
+	// registration MUST match before we adopt it as the trust anchor. Fail closed on a
 	// mismatch — no Save, no callback, no status-cache prime — so a
 	// first-enrollment trust-anchor swap is refused. The pin is
 	// normalized (colons stripped) and compared case-insensitively, since
 	// operators paste it from tools like openssl (uppercase, colon-sep).
-	if pin := normalizePin(req.Msg.CaFingerprintPin); pin != "" {
-		got, fpErr := pmcrypto.CAFingerprintFromPEM(result.CACert)
-		if fpErr != nil {
-			return connect.NewResponse(&pm.EnrollResponse{
-				Success: false,
-				Error:   fmt.Sprintf("cannot fingerprint server CA: %v", fpErr),
-			}), nil
-		}
-		if !strings.EqualFold(got, pin) {
-			h.logger.Error("enrollment CA fingerprint mismatch — refusing to trust server CA",
-				"expected_pin", pin, "server_ca_fingerprint", got)
-			return connect.NewResponse(&pm.EnrollResponse{
-				Success: false,
-				Error:   "CA fingerprint mismatch: the server CA does not match the pinned fingerprint",
-			}), nil
-		}
+	got, fpErr := pmcrypto.CAFingerprintFromPEM(result.CACert)
+	if fpErr != nil {
+		return connect.NewResponse(&pm.EnrollResponse{
+			Success: false,
+			Error:   fmt.Sprintf("cannot fingerprint server CA: %v", fpErr),
+		}), nil
+	}
+	if !strings.EqualFold(got, pin) {
+		h.logger.Error("enrollment CA fingerprint mismatch — refusing to trust server CA",
+			"expected_pin", pin, "server_ca_fingerprint", got)
+		return connect.NewResponse(&pm.EnrollResponse{
+			Success: false,
+			Error:   "CA fingerprint mismatch: the server CA does not match the pinned fingerprint",
+		}), nil
 	}
 
 	creds := &credentials.Credentials{

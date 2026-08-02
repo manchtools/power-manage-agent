@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -21,6 +22,8 @@ import (
 	sdk "github.com/manchtools/power-manage-sdk"
 	"github.com/manchtools/power-manage/agent/internal/credentials"
 )
+
+var testCAPin = strings.Repeat("0", 64)
 
 func testControlSealingPublicKey() []byte {
 	return bytes.Repeat([]byte{0x42}, 32)
@@ -60,12 +63,13 @@ func trustServer(srv *httptest.Server) []sdk.ClientOption {
 }
 
 func TestEnroll_Success(t *testing.T) {
+	caPEM := genTestCAPEM(t)
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, req *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			require.Len(t, req.Msg.AgentSealingPublicKey, 32)
 			return connect.NewResponse(&pm.RegisterResponse{
 				DeviceId:                &pm.DeviceId{Value: "dev-123"},
-				CaCert:                  []byte("-----BEGIN CERTIFICATE-----\nfake-ca\n-----END CERTIFICATE-----\n"),
+				CaCert:                  caPEM,
 				Certificate:             []byte("-----BEGIN CERTIFICATE-----\nfake-cert\n-----END CERTIFICATE-----\n"),
 				ControlUrl:              "https://gw.example.com:8443",
 				ControlSealingPublicKey: testControlSealingPublicKey(),
@@ -84,8 +88,7 @@ func TestEnroll_Success(t *testing.T) {
 	handler.registerOpts = trustServer(srv)
 
 	resp, err := handler.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: srv.URL,
-		Token:     "test-token",
+		ServerUrl: srv.URL, Token: "test-token", CaFingerprintPin: caPin(t, caPEM),
 	}))
 	require.NoError(t, err)
 	assert.True(t, resp.Msg.Success)
@@ -138,8 +141,9 @@ func TestEnroll_AlreadyEnrolled(t *testing.T) {
 	handler := NewEnrollHandler("test-host", "dev", credStore, logger, nil)
 
 	resp, err := handler.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: "https://example.com",
-		Token:     "token",
+		ServerUrl:        "https://example.com",
+		Token:            "token",
+		CaFingerprintPin: testCAPin,
 	}))
 	require.NoError(t, err)
 	assert.True(t, resp.Msg.Success) // Returns success with existing device ID
@@ -161,8 +165,7 @@ func TestEnroll_RegistrationFails(t *testing.T) {
 	handler.registerOpts = trustServer(srv)
 
 	resp, err := handler.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: srv.URL,
-		Token:     "bad-token",
+		ServerUrl: srv.URL, Token: "bad-token", CaFingerprintPin: testCAPin,
 	}))
 	require.NoError(t, err)
 	assert.False(t, resp.Msg.Success)
@@ -200,11 +203,12 @@ func TestGetEnrollmentStatus_Enrolled(t *testing.T) {
 }
 
 func TestEnrollServer_EndToEnd(t *testing.T) {
+	caPEM := genTestCAPEM(t)
 	mock := &mockRegisterService{
 		registerFunc: func(_ context.Context, _ *connect.Request[pm.RegisterRequest]) (*connect.Response[pm.RegisterResponse], error) {
 			return connect.NewResponse(&pm.RegisterResponse{
 				DeviceId:                &pm.DeviceId{Value: "dev-e2e"},
-				CaCert:                  []byte("-----BEGIN CERTIFICATE-----\nca\n-----END CERTIFICATE-----\n"),
+				CaCert:                  caPEM,
 				Certificate:             []byte("-----BEGIN CERTIFICATE-----\ncert\n-----END CERTIFICATE-----\n"),
 				ControlUrl:              "https://gw.example.com",
 				ControlSealingPublicKey: testControlSealingPublicKey(),
@@ -257,8 +261,7 @@ func TestEnrollServer_EndToEnd(t *testing.T) {
 
 	// Enroll
 	resp, err := client.Enroll(context.Background(), connect.NewRequest(&pm.EnrollRequest{
-		ServerUrl: controlSrv.URL,
-		Token:     "test-token",
+		ServerUrl: controlSrv.URL, Token: "test-token", CaFingerprintPin: caPin(t, caPEM),
 	}))
 	require.NoError(t, err)
 	assert.True(t, resp.Msg.Success)
