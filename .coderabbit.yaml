@@ -6,15 +6,17 @@ reviews:
   path_instructions:
     - path: "internal/executor/**"
       instructions: >
-        Action executors run as the power-manage user with sudo permissions
-        for required modules. Check for command injection, path traversal,
-        and proper input validation. All external commands must go through
-        the sdk/go/sys/exec package.
-    - path: "internal/updater/**"
+        The agent daemon runs as root because it is an RMM endpoint. Check every
+        action for command injection, path traversal, secret leakage, and
+        strict input validation. External commands and filesystem mutations
+        must use the SDK sys packages. Classified transport fields stay sealed
+        until their narrow sink; application frames are not signed.
+    - path: "internal/executor/agent_update.go"
       instructions: >
-        Agent self-update code. Check for checksum verification, rollback
-        safety, and cooldown handling. Updates must never leave the agent
-        in a broken state.
+        Agent updates must verify either a control-pinned SHA-256 or the
+        Ed25519-signed release manifest before staging a binary, enforce
+        anti-rollback, self-test before the atomic swap, and retain one
+        recoverable previous binary.
   tools:
     golangci-lint:
       enabled: true
