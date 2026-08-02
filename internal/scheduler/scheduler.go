@@ -174,17 +174,21 @@ func (s *Scheduler) runDue(ctx context.Context) {
 		s.logger.Error("recover interrupted occurrences", "error", err)
 		return
 	}
-	if !s.dispatchAllowed(s.now().Local()) {
-		return
-	}
 	deliveries, err := s.store.GetDueManifestDeliveries(ctx)
 	if err != nil {
 		s.logger.Error("load due manifests", "error", err)
 		return
 	}
+	allowed := s.dispatchAllowed(s.now().Local())
 	for _, stored := range deliveries {
 		if ctx.Err() != nil {
 			return
+		}
+		// An explicit dispatch is exempt from the maintenance window — an
+		// operator asking for it "now" means now. Assigned work keeps
+		// deferring until the window opens.
+		if !allowed && !stored.Delivery.GetManifest().GetOneShot() {
+			continue
 		}
 		s.executeManifest(ctx, stored.Delivery)
 	}

@@ -45,6 +45,64 @@ func scheduledDelivery(onFailure pb.OnFailure) *pb.ManifestDelivery {
 	}
 }
 
+// oneShotDelivery mirrors what control's explicit dispatch compiles: the
+// structural one_shot marker and a schedule carrying no cadence. The empty
+// schedule is not the marker — assigned manifests may carry the same one.
+func oneShotDelivery() *pb.ManifestDelivery {
+	return &pb.ManifestDelivery{
+		DeliveryId: "01K00000000000000000000021",
+		Manifest: &pb.Manifest{
+			ManifestId: "01K00000000000000000000022",
+			OneShot:    true,
+			Schedule:   &pb.ActionSchedule{},
+			Occurrences: []*pb.ManifestOccurrence{{
+				OccurrenceId: "01K00000000000000000000023",
+				Action:       &pb.Action{Id: &pb.ActionId{Value: "01K00000000000000000000024"}, Type: pb.ActionType_ACTION_TYPE_PACKAGE},
+			}},
+		},
+	}
+}
+
+// An operator dispatching "now" means now: a one-shot delivery is exempt from
+// the maintenance window. Assigned work in the very same sweep must still
+// defer, so the exemption cannot be a blanket opening of the gate.
+func TestOneShotDispatchRunsWhileWindowDefersScheduledWork(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	require.NoError(t, err)
+	t.Cleanup(func() { require.NoError(t, st.Close()) })
+	// A Wednesday. No real UTC offset (-12h..+14h) can carry it onto a Sunday,
+	// so the Sunday-only window below denies dispatch on every test host.
+	now := time.Date(2026, 8, 5, 12, 0, 0, 0, time.UTC)
+	st.SetClockForTest(func() time.Time { return now })
+	exec := &recordingExecutor{status: map[string]pb.ExecutionStatus{}}
+	sched := New(st, exec, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	sched.now = func() time.Time { return now }
+	sched.SetMaintenanceWindow(&pb.MaintenanceWindow{Schedule: []*pb.MaintenanceWindowEntry{
+		{Days: []string{"sun"}, Allow: "03:00-04:00"},
+	}})
+	require.False(t, sched.dispatchAllowed(sched.now().Local()),
+		"fixture precondition: the window must deny scheduled dispatch at the fake clock")
+
+	scheduled := scheduledDelivery(pb.OnFailure_ON_FAILURE_CONTINUE)
+	_, err = sched.RecordDelivery(context.Background(), scheduled)
+	require.NoError(t, err)
+	oneShot := oneShotDelivery()
+	_, err = sched.RecordDelivery(context.Background(), oneShot)
+	require.NoError(t, err)
+
+	sched.runDue(context.Background())
+
+	require.Equal(t,
+		[]string{oneShot.GetManifest().GetOccurrences()[0].GetAction().GetId().GetValue()},
+		exec.executed,
+		"the one-shot must run despite the closed window; the assigned manifest must not")
+
+	due, err := st.GetDueManifestDeliveries(context.Background())
+	require.NoError(t, err)
+	require.Len(t, due, 1, "the deferred assigned manifest stays due; the finished one-shot does not return")
+	require.Equal(t, scheduled.GetDeliveryId(), due[0].Delivery.GetDeliveryId())
+}
+
 func TestManifestRunsInOrderAndReplayDoesNotDoubleExecute(t *testing.T) {
 	st, err := store.New(t.TempDir())
 	require.NoError(t, err)

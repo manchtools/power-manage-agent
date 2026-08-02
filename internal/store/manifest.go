@@ -125,7 +125,8 @@ func (s *Store) GetDueManifestDeliveries(ctx context.Context) ([]StoredManifestD
 		SELECT delivery_id, manifest_blob, received_at, last_executed_at,
 		       next_execute_at, run_started_at, run_in_progress
 		FROM manifest_deliveries
-		WHERE run_in_progress = TRUE OR next_execute_at <= ?
+		WHERE run_in_progress = TRUE
+		   OR (next_execute_at <= ? AND one_shot_run_at IS NULL)
 		ORDER BY run_in_progress DESC, next_execute_at, delivery_id
 	`, s.now().UTC())
 	if err != nil {
@@ -254,12 +255,18 @@ func (s *Store) BeginManifestRun(delivery *pb.ManifestDelivery, startedAt time.T
 	}
 	startedAt = startedAt.UTC()
 	next := calculateNextExecuteFromSchedule(delivery.GetManifest().GetSchedule(), &startedAt, false, s.now())
+	// Starting a one-shot run is what makes it terminal, and it is recorded in
+	// the same transaction as the cursor it overrides. An interrupted run
+	// returned above without reaching here, so a crash still resumes from
+	// run_in_progress rather than being written off as already run.
+	oneShotRunAt := sql.NullTime{Time: startedAt, Valid: delivery.GetManifest().GetOneShot()}
 	if _, err := tx.Exec(`
 		UPDATE manifest_deliveries
 		SET last_executed_at = ?, next_execute_at = ?,
-		    run_started_at = ?, run_in_progress = TRUE
+		    run_started_at = ?, run_in_progress = TRUE,
+		    one_shot_run_at = ?
 		WHERE delivery_id = ?
-	`, startedAt, next, startedAt, delivery.GetDeliveryId()); err != nil {
+	`, startedAt, next, startedAt, oneShotRunAt, delivery.GetDeliveryId()); err != nil {
 		return time.Time{}, err
 	}
 	if err := tx.Commit(); err != nil {
