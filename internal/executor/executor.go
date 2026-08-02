@@ -631,6 +631,9 @@ func stripHomeAndUser(envVars []string) []string {
 // Returns (executionOutput, detectionOutput, changed, error).
 //
 // Flow:
+//  0. is_compliance: detection-only. Run detection_script and report its
+//     findings; an empty detection_script fails closed and the execution
+//     script is never run.
 //  1. No detection_script: run script as-is (current behavior)
 //  2. Run detection_script. Exit 0 = compliant, skip execution.
 //  3. No script (detection-only): return non-compliant status
@@ -647,6 +650,23 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		return nil, nil, false, fmt.Errorf("detection script exceeds maximum size (%d bytes)", maxScriptSize)
 	}
 
+	// Compliance mode: run detection only, never execute remediation. This is
+	// evaluated FIRST and fails closed on an empty detection script — ordering
+	// it after the no-detection-script branch below made a compliance action
+	// with an empty detection script run its execution body, which is exactly
+	// what the compliance path forbids.
+	if params.GetIsCompliance() {
+		if params.DetectionScript == "" {
+			return nil, nil, false, fmt.Errorf("compliance action requires a non-empty detection script; refusing to run its execution script")
+		}
+		e.logger.Debug("compliance mode: running detection script only")
+		detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
+		if err != nil {
+			return nil, detectionOutput, false, err
+		}
+		return nil, detectionOutput, false, nil
+	}
+
 	// No detection script — run execution script directly (original behavior)
 	if params.DetectionScript == "" {
 		if params.Script == "" {
@@ -654,16 +674,6 @@ func (e *Executor) executeShellStreaming(ctx context.Context, params *pb.ShellPa
 		}
 		output, err := e.runShellScript(ctx, params, params.Script, callback)
 		return output, nil, true, err
-	}
-
-	// Compliance mode: run detection only, never execute remediation
-	if params.GetIsCompliance() {
-		e.logger.Debug("compliance mode: running detection script only")
-		detectionOutput, err := e.runShellScript(ctx, params, params.DetectionScript, nil)
-		if err != nil {
-			return nil, detectionOutput, false, err
-		}
-		return nil, detectionOutput, false, nil
 	}
 
 	// Step 1: Run detection script
