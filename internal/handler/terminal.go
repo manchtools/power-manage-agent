@@ -45,7 +45,14 @@ var (
 	// step cannot wedge the receive loop. Bounds only SETUP, not the session
 	// lifetime (the PTY pump uses sessionCtx).
 	terminalSetupTimeout = 30 * time.Second
+	// terminalCleanupTimeout lets local cleanup outlive a failed stream send,
+	// but prevents a stuck usermod from leaking the dispatch goroutine.
+	terminalCleanupTimeout = 5 * time.Second
 )
+
+func terminalCleanupContext(requestCtx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(requestCtx), terminalCleanupTimeout)
+}
 
 func mustTermUserManager() sysuser.Manager {
 	m, err := sysuser.New(sysuser.ShadowUtils, handlerRunner)
@@ -529,7 +536,9 @@ func (h *Handler) OnTerminalStart(ctx context.Context, req *pb.TerminalStart) er
 		State:     pb.TerminalSessionState_TERMINAL_SESSION_STATE_STARTED,
 	}); err != nil {
 		logger.Warn("failed to send STARTED state change; aborting session", "error", err)
-		h.closeTerminal(context.Background(), req.SessionId, "send started failed")
+		cleanupCtx, cancelCleanup := terminalCleanupContext(ctx)
+		h.closeTerminal(cleanupCtx, req.SessionId, "send started failed")
+		cancelCleanup()
 		return nil
 	}
 

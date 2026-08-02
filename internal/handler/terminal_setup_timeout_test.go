@@ -73,3 +73,26 @@ func TestOnTerminalStart_BoundedSetupContext(t *testing.T) {
 	h.mu.Unlock()
 	assert.False(t, exists, "the half-built session must be removed after a setup failure")
 }
+
+func TestTerminalCleanupContextSurvivesRequestCancellationButStaysBounded(t *testing.T) {
+	originalTimeout := terminalCleanupTimeout
+	terminalCleanupTimeout = 50 * time.Millisecond
+	t.Cleanup(func() { terminalCleanupTimeout = originalTimeout })
+
+	requestCtx, cancelRequest := context.WithCancel(context.Background())
+	cancelRequest()
+
+	cleanupCtx, cancelCleanup := terminalCleanupContext(requestCtx)
+	defer cancelCleanup()
+	require.NoError(t, cleanupCtx.Err(), "cleanup must survive the failed request context")
+	deadline, ok := cleanupCtx.Deadline()
+	require.True(t, ok, "cleanup must always carry a deadline")
+	require.LessOrEqual(t, time.Until(deadline), terminalCleanupTimeout)
+
+	select {
+	case <-cleanupCtx.Done():
+		require.ErrorIs(t, cleanupCtx.Err(), context.DeadlineExceeded)
+	case <-time.After(time.Second):
+		t.Fatal("terminal cleanup context was not bounded")
+	}
+}
