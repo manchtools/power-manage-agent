@@ -121,13 +121,6 @@ func (h *Handler) getOsquery() osqueryRunner {
 	return h.osquery
 }
 
-// setOsqueryForTest injects a fake osquery runner for boundary tests.
-func (h *Handler) setOsqueryForTest(r osqueryRunner) {
-	h.mu.Lock()
-	defer h.mu.Unlock()
-	h.osquery = r
-}
-
 // OnWelcome handles the welcome message from the server.
 func (h *Handler) OnWelcome(ctx context.Context, welcome *pb.Welcome) error {
 	h.logger.Info("received welcome from server", "server_version", welcome.ServerVersion)

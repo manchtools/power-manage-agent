@@ -2,7 +2,11 @@ package executor
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"crypto/sha256"
+	"crypto/x509"
+	"encoding/base64"
 	"encoding/hex"
 	"fmt"
 	"log/slog"
@@ -66,12 +70,33 @@ func newUpdateHarness(t *testing.T, runningVersion string, serveBody, sumsBody [
 		t.Fatalf("seed binary: %v", err)
 	}
 
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("generate release signer: %v", err)
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatalf("marshal release signer: %v", err)
+	}
+	previousReleaseKey := releaseSigningPublicKey
+	releaseSigningPublicKey = base64.StdEncoding.EncodeToString(publicDER)
+	t.Cleanup(func() { releaseSigningPublicKey = previousReleaseKey })
+	signature := ed25519.Sign(privateKey, sumsBody)
+
 	srv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		switch r.URL.Path {
 		case "/agent":
 			w.Write(serveBody)
 		case "/sums":
 			w.Write(sumsBody)
+		case "/sums.sig":
+			if r.URL.Query().Has("tampered") {
+				altered := append([]byte(nil), signature...)
+				altered[0] ^= 1
+				w.Write(altered)
+				return
+			}
+			w.Write(signature)
 		default:
 			http.NotFound(w, r)
 		}
@@ -362,6 +387,31 @@ func TestExecuteAgentUpdate_ChecksumURLMismatchRejected(t *testing.T) {
 	}
 	if got := h.currentBinary(t); string(got) != string(h.oldBytes) {
 		t.Error("live binary must be unchanged")
+	}
+}
+
+func TestExecuteAgentUpdate_ChecksumURLSignatureRejected(t *testing.T) {
+	staged := agentScript("v2026.06.05", 0)
+	sums := []byte(sha256hex(staged) + "  agent\n")
+	h := newUpdateHarness(t, "v2026.06.01", staged, sums)
+	p := &pb.AgentUpdateParams{
+		Amd64: &pb.AgentUpdateArch{
+			BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums?tampered=true",
+		},
+		Arm64: &pb.AgentUpdateArch{
+			BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums?tampered=true",
+		},
+	}
+
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), p)
+	if err == nil {
+		t.Fatal("a checksum manifest with an invalid publisher signature must be rejected")
+	}
+	if changed {
+		t.Fatal("invalid release signature changed the installed binary")
+	}
+	if got := h.currentBinary(t); string(got) != string(h.oldBytes) {
+		t.Fatal("invalid release signature replaced the installed binary")
 	}
 }
 

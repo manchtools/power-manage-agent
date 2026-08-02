@@ -29,6 +29,10 @@
 set -e
 
 GITHUB_REPO="MANCHTOOLS/power-manage-agent"
+# Replaced with the base64-encoded PKIX Ed25519 public key by the protected
+# release workflow. A source-tree installer deliberately fails closed: only a
+# release artifact carries the pinned value.
+RELEASE_SIGNING_PUBLIC_KEY="__RELEASE_SIGNING_PUBLIC_KEY__"
 
 # Default values
 DATA_DIR="/var/lib/power-manage"
@@ -204,6 +208,19 @@ resolve_latest_prerelease() {
     echo "$tag"
 }
 
+verify_release_manifest() {
+    local manifest_path="$1"
+    local signature_path="$2"
+    local public_key_path="$3"
+
+    if ! openssl pkeyutl -verify -rawin -pubin -keyform DER \
+        -inkey "$public_key_path" -sigfile "$signature_path" \
+        -in "$manifest_path" >/dev/null 2>&1; then
+        log_error "SHA256SUMS publisher signature is invalid. Refusing to install."
+        return 1
+    fi
+}
+
 download_binary() {
     if [[ -n "$SKIP_DOWNLOAD" ]]; then
         if [[ ! -f "$BINARY_PATH" ]]; then
@@ -224,7 +241,7 @@ download_binary() {
     local arch
     arch=$(detect_arch)
     local binary_name="power-manage-agent-linux-${arch}"
-    local download_url sums_url release_base
+    local download_url sums_url sums_signature_url release_base
 
     if [[ "$VERSION" == "latest" ]]; then
         release_base="https://github.com/${GITHUB_REPO}/releases/latest/download"
@@ -233,6 +250,7 @@ download_binary() {
     fi
     download_url="${release_base}/${binary_name}"
     sums_url="${release_base}/SHA256SUMS"
+    sums_signature_url="${release_base}/SHA256SUMS.sig"
 
     log_info "Detected architecture: ${arch}"
     log_info "Downloading agent from ${download_url}..."
@@ -246,9 +264,11 @@ download_binary() {
     local dest_dir
     dest_dir=$(dirname "$BINARY_PATH")
     mkdir -p "$dest_dir"
-    local tmp_binary tmp_sums
+    local tmp_binary tmp_sums tmp_signature tmp_public
     tmp_binary=$(mktemp "${dest_dir}/.power-manage-agent.XXXXXX")
     tmp_sums=$(mktemp "${dest_dir}/.SHA256SUMS.XXXXXX")
+    tmp_signature=$(mktemp "${dest_dir}/.SHA256SUMS.sig.XXXXXX")
+    tmp_public=$(mktemp "${dest_dir}/.release-signing-public.XXXXXX")
     # Trap via a named function so the tmp paths are expanded
     # inside the function body (where normal "$var" quoting
     # handles spaces / quotes cleanly) rather than spliced into
@@ -258,7 +278,7 @@ download_binary() {
     # a single quote — unlikely on a typical deploy host, but a
     # gratuitous shell-quoting fragility we can just drop.
     cleanup_download_tmp() {
-        rm -f "$tmp_binary" "$tmp_sums"
+        rm -f "$tmp_binary" "$tmp_sums" "$tmp_signature" "$tmp_public"
     }
     trap cleanup_download_tmp EXIT INT TERM
 
@@ -271,6 +291,10 @@ download_binary() {
             log_error "SHA256SUMS download failed. Refusing to install unverified binary."
             exit 1
         fi
+        if ! curl -gfSL -o "$tmp_signature" "$sums_signature_url"; then
+            log_error "SHA256SUMS signature download failed. Refusing to install unverified binary."
+            exit 1
+        fi
     elif command -v wget &>/dev/null; then
         if ! wget -q --show-progress -O "$tmp_binary" "$download_url"; then
             log_error "Download failed. Check the version and that the release exists."
@@ -280,20 +304,35 @@ download_binary() {
             log_error "SHA256SUMS download failed. Refusing to install unverified binary."
             exit 1
         fi
+        if ! wget -q -O "$tmp_signature" "$sums_signature_url"; then
+            log_error "SHA256SUMS signature download failed. Refusing to install unverified binary."
+            exit 1
+        fi
     else
         log_error "Neither curl nor wget found. Please install one and try again."
         exit 1
     fi
 
-    # Verify the downloaded binary against the publisher's SHA256SUMS.
-    # Fail closed: a missing / mismatched / tampered checksum ends the
-    # install before we touch BINARY_PATH. The SHA256SUMS file is served
-    # by the same GitHub release as the binary, so this does not protect
-    # against a release-channel compromise on its own — the release
-    # workflow should additionally sign the file (cosign / minisign) and
-    # this script should verify that signature once CI publishes it.
-    # Until then, SHA256SUMS still catches the "half-downloaded binary
-    # was silently installed as root" class of failures.
+    if [[ "$RELEASE_SIGNING_PUBLIC_KEY" == "__RELEASE_SIGNING_PUBLIC_KEY__" ]] || \
+        [[ -z "$RELEASE_SIGNING_PUBLIC_KEY" ]]; then
+        log_error "Release signing public key is not configured. Refusing to install."
+        exit 1
+    fi
+    if ! command -v openssl &>/dev/null || ! command -v base64 &>/dev/null; then
+        log_error "openssl and base64 are required for release signature verification."
+        exit 1
+    fi
+    if ! printf '%s' "$RELEASE_SIGNING_PUBLIC_KEY" | base64 --decode > "$tmp_public"; then
+        log_error "Release signing public key is invalid. Refusing to install."
+        exit 1
+    fi
+    if ! verify_release_manifest "$tmp_sums" "$tmp_signature" "$tmp_public"; then
+        exit 1
+    fi
+    log_info "Publisher signature verified."
+
+    # Only the authenticated manifest may supply the expected binary hash.
+    # A missing or mismatched entry ends the install before BINARY_PATH moves.
     local expected_sha actual_sha
     expected_sha=$(awk -v f="$binary_name" '$2 == f || $2 == "*" f { print $1; exit }' "$tmp_sums")
     if [[ -z "$expected_sha" ]]; then
@@ -322,7 +361,7 @@ download_binary() {
         log_error "Failed to install binary to ${BINARY_PATH}."
         exit 1
     fi
-    rm -f "$tmp_sums"
+    rm -f "$tmp_sums" "$tmp_signature" "$tmp_public"
     trap - EXIT INT TERM
 
     log_info "Binary installed to $BINARY_PATH"
@@ -570,5 +609,15 @@ main() {
 
     show_status
 }
+
+if [[ "${1:-}" == "--internal-verify-release-manifest" ]]; then
+    if [[ $# -ne 4 ]]; then
+        exit 2
+    fi
+    if verify_release_manifest "$2" "$3" "$4"; then
+        exit 0
+    fi
+    exit 1
+fi
 
 main "$@"

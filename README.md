@@ -135,11 +135,14 @@ curl -fsSL https://your-server/install.sh | sudo bash -s -- \
   --token YOUR_REGISTRATION_TOKEN
 ```
 
+<!-- docref: begin src=install.sh#download_binary:3f9090ea -->
 The install script:
-1. Downloads and installs the agent binary (verifies SHA256 against the publisher's `SHA256SUMS`)
+1. Downloads `SHA256SUMS` and `SHA256SUMS.sig`, verifies the manifest with the
+   pinned Ed25519 release key, then verifies and installs the agent binary
 2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
 3. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
 4. Enrolls via the enrollment socket if `--server` and `--token` were provided
+<!-- docref: end -->
 
 The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links. When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
 
@@ -750,11 +753,14 @@ The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins
 schedule it on managed devices; the authenticated direct delivery carries an
 HTTPS `binary_url` and an integrity source.
 
-### Integrity: your choice of `checksum_url` (default) or a pinned `expected_sha256`
+### Integrity: signed `checksum_url` or a pinned `expected_sha256`
 
 Each arch must provide **at least one** of:
 
-- **`checksum_url`** (default) — a `SHA256SUMS` file the agent fetches and verifies the binary against. This is the **hands-off** option: point `binary_url` + `checksum_url` at your `releases/latest/...` assets and the fleet tracks new releases with no per-release action change. Authenticity here is **origin-trust** (TLS + your release host).
+- **`checksum_url`** (default) — a `SHA256SUMS` file with an adjacent
+  `SHA256SUMS.sig`. The agent verifies the exact manifest bytes with its pinned
+  Ed25519 release key before trusting a hash. This is the hands-off option:
+  point both URLs at `releases/latest/...` and the fleet tracks signed releases.
 - **`expected_sha256`** (opt-in) — an exact, lowercase-hex hash. When set it
   **overrides** `checksum_url` and arrives in the authenticated delivery. Use
   it to pin an exact binary for staged rollouts. A new version requires
@@ -762,7 +768,15 @@ Each arch must provide **at least one** of:
 
 `binary_url` (and `checksum_url`, when used) must be HTTPS. An action with neither integrity source is rejected at create time and by the agent.
 
-> **Accepted risk (default mode):** with `checksum_url`, a compromised download origin serving a malicious binary *and* a matching checksum file would not be detected — the checksum is self-attesting. The control plane provides ease of use, not artifact provenance. If you need a stronger guarantee: pin `expected_sha256`, host `checksum_url` on a **separate host** from the binary, or — since this is open source — **build and distribute the binaries yourself** and pin hashes as you require. Binary code-signing and signing of the release `SHA256SUMS` are possible future backstops, not current guarantees.
+<!-- docref: begin src=internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3,internal/executor/agent_update.go#downloadAndExtractChecksum:ca7f8bef -->
+Once a trusted installer or agent containing the embedded key is present, a
+compromised artifact host can replace the binary, manifest, and signature but
+cannot produce a signature that it accepts. The initial `curl | bash` bootstrap
+still trusts the source serving that installer; retrieve or inspect it through
+a trusted repository or control-server channel. A control-pinned
+`expected_sha256` remains available for an exact staged rollout and bypasses
+manifest fetching entirely.
+<!-- docref: end -->
 
 ### Anti-rollback
 
@@ -772,7 +786,9 @@ requires `allow_downgrade` in the authenticated delivery.
 
 ### Update Process
 
-1. Download binary to `/var/lib/power-manage/update/agent-update-*.tmp` and verify its SHA256 against the pinned `expected_sha256` if set, otherwise against the hash from `checksum_url`
+1. Download the binary to `/var/lib/power-manage/update/agent-update-*.tmp` and
+   verify its SHA256 against pinned `expected_sha256`, or against a hash from
+   the publisher-signed manifest
 2. Run `<tmpPath> version`, compare with running — skip if same; refuse a downgrade unless `allow_downgrade`
 3. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
@@ -907,7 +923,23 @@ make test-integration-edgecase
 
 Integration tests run automatically on push to `main` and on pull requests via GitHub Actions (`.github/workflows/integration-test.yml`). The workflow is triggered only on actual code changes (Go files, go.mod/sum, Makefile, cmd/**, test/**, internal/**).
 
-The release workflow (`.github/workflows/release.yml`) gates binary builds on passing integration tests, ensuring no release is published without all tests passing across all 4 distros.
+The release workflow (`.github/workflows/release.yml`) gates binary builds on
+passing integration tests, then signs the checksum manifest before publishing.
+
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:aeab103d -->
+Release signing uses two GitHub settings:
+
+- `RELEASE_SIGNING_PRIVATE_KEY`: the PKCS#8 PEM private key, stored only as a
+  secret in a protected `release` environment; and
+- `RELEASE_SIGNING_PUBLIC_KEY`: the base64-encoded PKIX DER public key, stored
+  as a repository Actions variable and embedded into the binary and installer.
+
+Generate the pair offline with OpenSSL, keep a recovery copy of the private key
+in a password manager, and configure required reviewers plus tag restrictions
+on the `release` environment. The workflow derives the public key from the
+private secret and refuses to publish if it does not match the configured
+public value.
+<!-- docref: end -->
 
 ## Integration Test Suite
 

@@ -1,7 +1,11 @@
 package main
 
 import (
+	"crypto/ed25519"
+	"crypto/rand"
+	"crypto/x509"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -54,6 +58,73 @@ func TestInstall_TokenDeliveredViaFileNotArgv(t *testing.T) {
 	}
 	if !strings.Contains(sh, `chmod 600 "$token_file"`) {
 		t.Error("the install.sh token file must be created mode 0600")
+	}
+}
+
+func TestInstall_VerifiesPublisherSignatureBeforeChecksum(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	for _, required := range []string{
+		"SHA256SUMS.sig", "__RELEASE_SIGNING_PUBLIC_KEY__", "openssl pkeyutl -verify", "verify_release_manifest",
+	} {
+		if !strings.Contains(sh, required) {
+			t.Errorf("install.sh is missing signed-release requirement %q", required)
+		}
+	}
+	signatureCheck := strings.Index(sh, `if ! verify_release_manifest "$tmp_sums" "$tmp_signature" "$tmp_public"; then`)
+	hashCheck := strings.Index(sh, `actual_sha=$(sha256sum "$tmp_binary"`)
+	if signatureCheck < 0 || hashCheck < 0 || signatureCheck > hashCheck {
+		t.Error("publisher signature must be verified before trusting SHA256SUMS")
+	}
+	if strings.Contains(sh, "POWER_MANAGE_RELEASE_SIGNING_PUBLIC_KEY") {
+		t.Error("the published installer's pinned release key must not be replaceable through the environment")
+	}
+}
+
+func TestReleaseWorkflowSignsChecksumsInProtectedEnvironment(t *testing.T) {
+	workflow := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+	for _, required := range []string{
+		"environment: release", "RELEASE_SIGNING_PRIVATE_KEY", "RELEASE_SIGNING_PUBLIC_KEY",
+		"SHA256SUMS.sig", "openssl pkeyutl -sign -rawin", "ED25519 Private-Key:",
+	} {
+		if !strings.Contains(workflow, required) {
+			t.Errorf("release workflow is missing %q", required)
+		}
+	}
+}
+
+func TestInstall_ReleaseVerifierAcceptsOnlyConfiguredSigner(t *testing.T) {
+	if _, err := exec.LookPath("openssl"); err != nil {
+		t.Skip("openssl is required by the production installer")
+	}
+	publicKey, privateKey, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	publicDER, err := x509.MarshalPKIXPublicKey(publicKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	manifest := []byte("abc  power-manage-agent-linux-amd64\n")
+	directory := t.TempDir()
+	manifestPath := filepath.Join(directory, "SHA256SUMS")
+	signaturePath := filepath.Join(directory, "SHA256SUMS.sig")
+	publicPath := filepath.Join(directory, "release-public.der")
+	for path, body := range map[string][]byte{
+		manifestPath: manifest, signaturePath: ed25519.Sign(privateKey, manifest), publicPath: publicDER,
+	} {
+		if err := os.WriteFile(path, body, 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	installer := filepath.Join("..", "..", "install.sh")
+	if output, err := exec.Command("bash", installer, "--internal-verify-release-manifest", manifestPath, signaturePath, publicPath).CombinedOutput(); err != nil {
+		t.Fatalf("valid publisher signature rejected: %v\n%s", err, output)
+	}
+	if err := os.WriteFile(manifestPath, append(manifest, 'x'), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := exec.Command("bash", installer, "--internal-verify-release-manifest", manifestPath, signaturePath, publicPath).Run(); err == nil {
+		t.Fatal("installer accepted a manifest modified after signing")
 	}
 }
 

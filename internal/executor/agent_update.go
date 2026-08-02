@@ -109,16 +109,14 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("binary URL validation: %w", err)
 	}
 
-	// Step 4: determine the expected binary hash. Operator's choice (WS7):
+	// Step 4: determine the expected binary hash. The operator can pin it
+	// directly; otherwise the publisher-signed release manifest is authoritative.
 	//   - expected_sha256 set → AUTHORITATIVE, control-authored pin. It rides
 	//     inside the control-authored action, so even a compromised download origin
 	//     cannot vouch for a tampered binary. Overrides checksum_url.
-	//   - otherwise → fetch the operator's checksum_url (SHA256SUMS) and
-	//     verify against it. This is the default that lets binary_url +
-	//     checksum_url track "latest" hands-off; authenticity is
-	//     origin-trust (the action is signed, so only an origin-manipulated
-	//     hash is a concern, which an operator can mitigate by hosting the
-	//     checksum file on a separate host).
+	//   - otherwise → fetch checksum_url and checksum_url.sig, authenticate
+	//     the exact manifest bytes with the release Ed25519 key, then extract
+	//     the binary hash. The download origin cannot sign substituted bytes.
 	// At least one must be present (also enforced server-side) so an update
 	// never runs with no integrity check.
 	expectedChecksum := strings.ToLower(arch.ExpectedSha256)
@@ -445,10 +443,8 @@ func updateRedirectPolicy(params *pb.AgentUpdateParams) remote.RedirectPolicy {
 	return remote.RedirectSameOrigin
 }
 
-// downloadAndExtractChecksum downloads a SHA256SUMS-style file and extracts
-// the checksum for the given filename (format: "<hex>  <filename>"). Used
-// as the default integrity source when the action does not pin
-// expected_sha256 (WS7: operator tracks "latest" via checksum_url).
+// downloadAndExtractChecksum authenticates a SHA256SUMS-style file with its
+// adjacent Ed25519 signature before extracting the requested binary hash.
 func downloadAndExtractChecksum(ctx context.Context, checksumURL, filename string, redirect remote.RedirectPolicy) (string, error) {
 	// Fetch the manifest through the SDK remote path (size-capped, scheme-validated,
 	// same redirect policy as the binary — including the https->http downgrade
@@ -461,6 +457,21 @@ func downloadAndExtractChecksum(ctx context.Context, checksumURL, filename strin
 	})
 	if err != nil {
 		return "", fmt.Errorf("download: %w", err)
+	}
+	signatureURL, err := releaseSignatureURL(checksumURL)
+	if err != nil {
+		return "", err
+	}
+	signature, err := remote.FetchBytes(ctx, remote.HTTPConfig{
+		URL:      signatureURL,
+		Redirect: redirect,
+		Client:   remoteHTTPClient,
+	})
+	if err != nil {
+		return "", fmt.Errorf("download release signature: %w", err)
+	}
+	if err := verifyReleaseManifest(body, signature); err != nil {
+		return "", err
 	}
 
 	scanner := bufio.NewScanner(bytes.NewReader(body))
