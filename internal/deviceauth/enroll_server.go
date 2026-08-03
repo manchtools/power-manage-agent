@@ -16,7 +16,11 @@ import (
 
 const (
 	// EnrollSocketPath is the unix socket for enrollment requests.
-	// Mode 0666 so any local user can connect (token is the authorization).
+	// Mode 0600 plus an SO_PEERCRED check restrict it to a local process
+	// running as the agent's own uid (root under the shipped unit) — any
+	// other local uid is refused. This authorizes by OS identity, not human
+	// intent: a root-owned service could also connect, so enrollment stays a
+	// privileged local operation rather than something any local user can do.
 	EnrollSocketPath = "/run/pm-agent/enroll.sock"
 )
 
@@ -58,12 +62,23 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 		return fmt.Errorf("listen on %s: %w", s.socketPath, err)
 	}
 
-	// Set socket permissions: world-readable/writable so any local user can enroll.
-	// The registration token is the authorization mechanism.
-	if err := os.Chmod(s.socketPath, 0666); err != nil {
+	// Restrict the socket to its owner (the agent's uid, root under the
+	// shipped unit). Enrollment authorizes a control plane to command this
+	// host, so the caller must be a local process running as the agent's uid,
+	// not any local user; a world-writable socket would let any unprivileged
+	// local user enroll the root agent into an attacker-controlled control
+	// plane.
+	if err := os.Chmod(s.socketPath, 0600); err != nil {
 		listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+
+	// Authenticate the connecting process by its OS identity: only the
+	// agent's own uid may enroll. This is the load-bearing check — file mode
+	// alone can be widened by a privileged actor — and it fails closed when
+	// peer credentials cannot be read. The token/URL/pin validation in the
+	// handler remains as defense in depth.
+	listener = newPeerCredListener(listener, s.logger)
 
 	// Create HTTP mux with Connect-RPC handler
 	mux := http.NewServeMux()

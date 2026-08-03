@@ -54,28 +54,28 @@ validate the agent's client certificate itself.
 
 The agent has one explicit enrollment method:
 
-#### Socket-based enrollment (recommended, no sudo required)
+#### Socket-based enrollment (recommended; run as the agent's uid / root)
 
 1. The install script starts the agent as a systemd service
-2. The unenrolled agent opens an **enrollment socket** at `/run/pm-agent/enroll.sock` (mode 0666, any local user can connect)
-3. A regular user runs `power-manage-agent enroll -server=URL -token-file=PATH -pin=CA_SHA256`
+2. The unenrolled agent opens an **enrollment socket** at `/run/pm-agent/enroll.sock` (mode 0600, restricted to the agent's own uid — root under the shipped unit)
+3. The local operator (running as the agent's uid, i.e. root) runs `power-manage-agent enroll -server=URL -token-file=PATH -pin=CA_SHA256`
    (or `PM_REGISTRATION_TOKEN=… power-manage-agent enroll -server=URL -pin=CA_SHA256`)
 4. The CLI sends an `Enroll` RPC to the agent over the unix socket
 5. The agent calls the **Control Server** `Register` RPC with the token and a locally-generated CSR
 6. The Control Server validates the token, signs the certificate, and returns credentials
 7. The agent saves credentials, closes the enrollment socket, starts the auth socket, and opens its stream to control
 
-<!-- docref: begin src=internal/deviceauth/enroll_server.go#EnrollSocketPath:9838543e -->
-> **Trust boundary (deliberate self-service design).** The enrollment
-> socket is intentionally world-accessible (mode `0666`) so a **non-root
-> user can enroll their own corporate/BYOD device without sudo** — that
-> is the whole point of the socket. The security boundary is the
-> registration **token** and the CA fingerprint delivered with it; an admin who
-> does *not* want self-service can pre-enroll devices with a bulk
-> registration token instead. The agent applies a **global** rate limit
-> of 5 enrollment attempts per minute, so a local user can briefly
-> disrupt a legitimate enrollment by flooding bad tokens — acceptable for
-> a self-hosted MDM, not for adversarial multi-tenant hosts.
+<!-- docref: begin src=internal/deviceauth/enroll_server.go#EnrollSocketPath:7b7f3315 -->
+> **Trust boundary.** The enrollment socket is owner-only (mode `0600`) and
+> the agent authenticates the connecting process by its OS identity
+> (`SO_PEERCRED`): only the agent's own uid — root under the shipped unit — may
+> enroll. Enrollment hands a control plane the power to command this host, so it
+> is a privileged local operation; the registration **token** authorizes the
+> agent *to* control, and the CA pin defends an honest caller against a network
+> MITM, but neither authorizes an arbitrary local process to drive the agent's
+> trust anchors. An unprivileged local caller is refused before any request is
+> served. The agent also applies a **global** rate limit of 5 enrollment
+> attempts per minute.
 <!-- docref: end -->
 >
 > **Enrollment hardening.** `server_url` must be **https** (cleartext/opaque
@@ -90,9 +90,9 @@ The agent has one explicit enrollment method:
 
 ```
                                   ┌─────────────────────────┐
-  User (no sudo)                  │   Agent (systemd svc)   │
+  Operator (root)                 │   Agent (systemd svc)   │
   power-manage-agent enroll ───►  │   /run/pm-agent/        │
-    -server=URL -token-file=PATH  │     enroll.sock (0666)  │
+    -server=URL -token-file=PATH  │     enroll.sock (0600)  │
     -pin=CA_SHA256                │         │               │
                                   │         │               │
                                   │    Register RPC ──────► Control Server
@@ -149,8 +149,9 @@ go build -o power-manage-agent ./agent/cmd/agent
 # Start the agent as root (it will wait for enrollment)
 sudo ./power-manage-agent
 
-# In another terminal (as any user), enroll via the local socket:
-power-manage-agent enroll -server=https://control.example.com:8081 -token-file=TOKEN_PATH -pin=YOUR_CA_SHA256
+# In another terminal, enroll via the local socket as root (the shipped
+# service runs as root; the socket only admits the agent's own uid):
+sudo power-manage-agent enroll -server=https://control.example.com:8081 -token-file=TOKEN_PATH -pin=YOUR_CA_SHA256
 ```
 
 For a production-style manual install (without the install script):
