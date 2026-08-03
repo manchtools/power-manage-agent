@@ -39,4 +39,4 @@ jobs:
 
       # Purpose-built docref CI image (docref + git on Alpine); nothing to build.
       - name: docref check (docs match the code they describe)
-        run: docker run --rm -v "${{ github.workspace }}:/repo" ghcr.io/manchtools/open-docref:v0.1.0 check
+        run: docker run --rm -v "${{ github.workspace }}:/repo" ghcr.io/manchtools/open-docref:v0.1.1 check
