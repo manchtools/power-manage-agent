@@ -10,6 +10,7 @@ require (
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
 	golang.org/x/crypto v0.52.0
+	golang.org/x/sys v0.45.0
 	golang.org/x/term v0.43.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.44.3
@@ -69,7 +70,6 @@ require (
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
 	golang.org/x/net v0.55.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
-	golang.org/x/sys v0.45.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect
 	gopkg.in/yaml.v3 v3.0.1 // indirect

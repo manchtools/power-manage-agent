@@ -31,4 +31,4 @@ The build context is the **parent** directory: CI checks the repo out into `agen
 
 ## Docs
 
-`README.md` and `docs/` are docref-anchored: run `docker run --rm -v "$PWD:/repo" ghcr.io/manchtools/open-docref:v0.1.0 check` before pushing doc or code changes that touch anchored symbols; CI fails on drift. Update the prose *and* re-approve the claim — never delete an anchor to silence the check.
+`README.md` and `docs/` are docref-anchored: run `docker run --rm -v "$PWD:/repo" ghcr.io/manchtools/open-docref:v0.1.1 check` before pushing doc or code changes that touch anchored symbols; CI fails on drift. Update the prose *and* re-approve the claim — never delete an anchor to silence the check.
