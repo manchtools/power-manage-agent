@@ -48,13 +48,13 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 		peerUID, err := peerUIDOf(conn)
 		if err != nil {
 			l.logger.Warn("enrollment: refusing connection; peer credentials unreadable", "error", err)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		if !peerAuthorized(peerUID, l.selfUID) {
 			l.logger.Warn("enrollment: refusing unprivileged local caller",
 				"peer_uid", peerUID, "required_uid", l.selfUID)
-			conn.Close()
+			_ = conn.Close()
 			continue
 		}
 		return conn, nil

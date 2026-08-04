@@ -21,7 +21,7 @@ func TestPeerCredListener_AcceptsSameUIDPeer(t *testing.T) {
 	base, err := net.Listen("unix", socket)
 	require.NoError(t, err)
 	l := newPeerCredListener(base, slog.Default())
-	defer l.Close()
+	defer func() { _ = l.Close() }()
 
 	accepted := make(chan net.Conn, 1)
 	acceptErr := make(chan error, 1)
@@ -36,11 +36,11 @@ func TestPeerCredListener_AcceptsSameUIDPeer(t *testing.T) {
 
 	client, err := net.Dial("unix", socket)
 	require.NoError(t, err)
-	defer client.Close()
+	defer func() { _ = client.Close() }()
 
 	select {
 	case conn := <-accepted:
-		conn.Close()
+		_ = conn.Close()
 	case err := <-acceptErr:
 		t.Fatalf("Accept refused an authorized same-uid peer: %v", err)
 	case <-time.After(2 * time.Second):

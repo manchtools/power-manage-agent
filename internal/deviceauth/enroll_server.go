@@ -69,7 +69,7 @@ func (s *EnrollServer) Start(ctx context.Context) error {
 	// local user enroll the root agent into an attacker-controlled control
 	// plane.
 	if err := os.Chmod(s.socketPath, 0600); err != nil {
-		listener.Close()
+		_ = listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
