@@ -398,12 +398,11 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.Action, cal
 		}
 	case pb.ActionType_ACTION_TYPE_ENCRYPTION:
 		var changed bool
-		var metadata map[string]string
-		output, changed, metadata, execErr = e.executeLuks(ctx, env.GetEncryption(), env.DesiredState, envActionID(env))
+		// The encryption path reports no metadata: control refuses any
+		// ActionResult carrying it, and device_path already reaches control
+		// through StoreLuksKey.
+		output, changed, _, execErr = e.executeLuks(ctx, env.GetEncryption(), env.DesiredState, envActionID(env))
 		result.Changed = changed
-		if len(metadata) > 0 {
-			result.Metadata = metadata
-		}
 	case pb.ActionType_ACTION_TYPE_WIFI:
 		var changed bool
 		output, changed, execErr = e.executeWifi(ctx, env.GetWifi(), env.DesiredState, envActionID(env))

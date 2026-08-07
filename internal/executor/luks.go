@@ -283,18 +283,15 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 		}
 	}
 
-	// Build metadata
-	metadata := map[string]string{
-		"luks.device_path": devicePath,
-	}
-	if localState != nil {
-		metadata["luks.device_key_type"] = localState.DeviceKeyType
-	}
-
+	// No result metadata. Control refuses any ActionResult with a non-empty
+	// metadata map, and the outbox marks a frame synced as soon as the local
+	// send returns — so a result that carried metadata was either dropped
+	// outright or replayed on every reconnect. device_path reaches control
+	// through StoreLuksKey, which is where it belongs.
 	return &pb.CommandOutput{
 		ExitCode: 0,
 		Stdout:   output.String(),
-	}, changed, metadata, nil
+	}, changed, nil, nil
 }
 
 // takeOwnership takes ownership of the LUKS volume by replacing the PSK with a managed passphrase.
