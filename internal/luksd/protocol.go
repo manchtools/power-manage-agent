@@ -10,13 +10,21 @@
 // and the only thing crossing the socket is `{token, passphrase}` — no
 // data dir, no store path. Authorization is the existing server-issued
 // LUKS token (device-bound, single-use, short-TTL), validated by the
-// daemon over the agent's OWN authenticated control connection — NEVER the
-// socket peer's OS identity. So the socket can be world-connectable (0666,
-// mirroring enroll.sock): the token is the authority, not the local user.
+// daemon over the agent's OWN authenticated control connection — never
+// anything the socket peer asserts about itself.
+//
+// F2 corrects the claim that used to stand here, that a 0666 socket
+// "mirrors enroll.sock". It does the opposite: enroll.sock is 0600 WITH an
+// SO_PEERCRED same-uid check. A bearer token is not a substitute for
+// knowing who is on the other end — it leaks (it reached the device on
+// argv until F2) and this daemon writes LUKS keyslots as root. So the
+// socket now authenticates its peer by OS identity before any handler runs
+// (peercred.go); the token still authorizes the operation.
 package luksd
 
 // DefaultSocketPath is the unix socket the root agent listens on for
-// LUKS passphrase requests. Mode 0666 (token is the authorization).
+// LUKS passphrase requests. Mode 0622: connect(2) requires only write
+// permission, and the peer-uid check — not the file mode — is the gate.
 const DefaultSocketPath = "/run/pm-agent/luks.sock"
 
 // userPassphraseSlot is the LUKS keyslot the user passphrase occupies.
@@ -53,5 +61,6 @@ const (
 	CodePassphraseReuse  = "passphrase_reuse"
 	CodeKeyUnavailable   = "key_unavailable"
 	CodeInternal         = "internal"
+	CodeBusy             = "busy"
 	CodeOK               = "ok"
 )

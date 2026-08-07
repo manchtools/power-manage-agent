@@ -62,6 +62,10 @@ type Daemon struct {
 	listener   net.Listener
 	wg         sync.WaitGroup
 
+	// inFlight bounds concurrent handlers (F21). A token slot is taken before
+	// the goroutine starts and released when it ends.
+	inFlight chan struct{}
+
 	now func() time.Time // clock seam; defaults to time.Now
 }
 
@@ -74,7 +78,14 @@ func NewDaemon(socketPath string, st StateStore, enroller Enroller, logger *slog
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Daemon{socketPath: socketPath, logger: logger, store: st, enroller: enroller, now: time.Now}
+	return &Daemon{
+		socketPath: socketPath,
+		logger:     logger,
+		store:      st,
+		enroller:   enroller,
+		inFlight:   make(chan struct{}, maxConcurrentRequests),
+		now:        time.Now,
+	}
 }
 
 // SetSession installs the current connected control session. Called on
@@ -99,8 +110,28 @@ func (d *Daemon) currentSession() Session {
 	return d.session
 }
 
-// Start creates the socket and serves until ctx is cancelled. The socket
-// is created world-connectable (0666); the token is the authorization.
+const (
+	// maxConcurrentRequests bounds in-flight handlers (F21). Setting a LUKS
+	// passphrase is one person at a keyboard; without a bound, a local caller
+	// could hold open as many pre-authorization handlers as the root agent has
+	// descriptors. Excess connections are refused immediately rather than
+	// queued, so the refusal is visible instead of looking like a hang.
+	maxConcurrentRequests = 4
+
+	// requestTimeout bounds one request end to end (F21). The handler used to
+	// inherit the process-root context, so a stalled control call or a wedged
+	// cryptsetup pinned a root goroutine for the life of the agent. It is
+	// generous: argon2 key derivation in luksAddKey is deliberately slow.
+	requestTimeout = 90 * time.Second
+
+	// busyWriteTimeout bounds the refusal write to a connection that never
+	// entered a handler, so refusing cannot itself block the accept loop.
+	busyWriteTimeout = 2 * time.Second
+)
+
+// Start creates the socket and serves until ctx is cancelled. The socket is
+// write-only for group and other (0622 — connect(2) needs no read bit) and
+// every accepted connection has passed the peer-uid check in peercred.go.
 func (d *Daemon) Start(ctx context.Context) error {
 	dir := filepath.Dir(d.socketPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -113,10 +144,21 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if err != nil {
 		return fmt.Errorf("listen on %s: %w", d.socketPath, err)
 	}
-	if err := os.Chmod(d.socketPath, 0o666); err != nil {
+	// The unprivileged endpoint client must be able to connect, and connect(2)
+	// requires only write permission — the read bit 0666 handed out was never
+	// used by anything and made the mode look like the security boundary. It
+	// is not: the peer-uid check below is.
+	if err := os.Chmod(d.socketPath, 0o622); err != nil {
 		_ = listener.Close()
 		return fmt.Errorf("chmod socket: %w", err)
 	}
+
+	// Authenticate the connecting process by its OS identity before it reaches
+	// any handler. This is what makes a token scraped out of /proc useless to a
+	// service account, and it fails closed when peer credentials are
+	// unreadable. Server-side token validation remains the authorization for
+	// the operation itself.
+	guarded := newPeerCredListener(listener, d.logger)
 
 	d.listenerMu.Lock()
 	d.listener = listener
@@ -130,7 +172,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}()
 
 	for {
-		conn, err := listener.Accept()
+		conn, err := guarded.Accept()
 		if err != nil {
 			d.wg.Wait()
 			// Only a closed listener is the graceful-shutdown path; any
@@ -143,9 +185,23 @@ func (d *Daemon) Start(ctx context.Context) error {
 			d.logger.Error("LUKS daemon accept failed; daemon stopping", "error", err)
 			return fmt.Errorf("luksd accept: %w", err)
 		}
+		select {
+		case d.inFlight <- struct{}{}:
+		default:
+			// Refuse rather than queue: the caller learns to retry instead of
+			// holding a descriptor on the root daemon indefinitely.
+			d.logger.Warn("LUKS daemon: refusing request; too many in flight", "limit", maxConcurrentRequests)
+			_ = conn.SetWriteDeadline(d.now().Add(busyWriteTimeout))
+			d.writeResponse(conn, errResponse(CodeBusy, "too many concurrent LUKS requests; retry shortly"))
+			_ = conn.Close()
+			continue
+		}
 		d.wg.Add(1)
 		go func() {
-			defer d.wg.Done()
+			defer func() {
+				<-d.inFlight
+				d.wg.Done()
+			}()
 			d.handleConn(ctx, conn)
 		}()
 	}
@@ -178,7 +234,12 @@ func (d *Daemon) handleConn(ctx context.Context, conn net.Conn) {
 		d.writeResponse(conn, Response{OK: false, Code: CodeInternal, Error: "malformed request"})
 		return
 	}
-	resp := d.handleRequest(ctx, req)
+	// Bound the request itself (F21). Without this the handler runs under the
+	// process-root context, so a control call that never returns or a wedged
+	// cryptsetup holds one of the daemon's few request slots forever.
+	reqCtx, cancel := context.WithTimeout(ctx, requestTimeout)
+	defer cancel()
+	resp := d.handleRequest(reqCtx, req)
 	// Fresh write window (#173): enrollment (cryptsetup key-slot work)
 	// runs before the response, so a single shared deadline could expire
 	// exactly when the passphrase was already set and the client most
