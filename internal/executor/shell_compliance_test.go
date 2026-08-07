@@ -2,6 +2,7 @@ package executor
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,7 +10,22 @@ import (
 	"github.com/stretchr/testify/require"
 
 	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
+	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
 )
+
+// failingBaseRunner cannot run anything: the interpreter is missing, the
+// privilege backend refuses, the binary is not executable.
+type failingBaseRunner struct{}
+
+func (failingBaseRunner) Run(_ context.Context, _ sysexec.Command) (sysexec.Result, error) {
+	return sysexec.Result{}, errors.New("no such file or directory")
+}
+
+func (failingBaseRunner) Stream(_ context.Context, _ sysexec.Command, _ sysexec.OutputCallback) (sysexec.Result, error) {
+	return sysexec.Result{}, errors.New("no such file or directory")
+}
+
+func (failingBaseRunner) Backend() sysexec.PrivilegeBackend { return sysexec.Direct }
 
 // A compliance-classified action is detection-only. With no detection script
 // there is nothing to detect, so the agent must fail closed: the pre-fix
@@ -68,4 +84,28 @@ func TestComplianceShellRunsDetectionOnly(t *testing.T) {
 	assert.NotNil(t, detectionOut, "compliance reports its detection findings")
 	assert.Nil(t, execOut)
 	assert.False(t, changed)
+}
+
+// A detection script that could not run at all is not evidence of compliance.
+// The reported result is what control stores as the device's compliance state,
+// so the compliant flag must stay false however the run failed.
+func TestComplianceShellReportsNotCompliantWhenDetectionCannotRun(t *testing.T) {
+	prev := executorRunner
+	t.Cleanup(func() { executorRunner = prev })
+	executorRunner = failingBaseRunner{}
+
+	e := NewExecutor(nil)
+	result := e.ExecuteAction(context.Background(), &pb.Action{
+		Id:   &pb.ActionId{Value: "01J0000000000000000000000A"},
+		Type: pb.ActionType_ACTION_TYPE_SHELL,
+		Params: &pb.Action_Shell{Shell: &pb.ShellParams{
+			IsCompliance:    true,
+			DetectionScript: "test -f /etc/pm-compliance-probe",
+			RunAsRoot:       true,
+		}},
+	})
+
+	assert.False(t, result.Compliant, "a detection script that never ran proves nothing")
+	assert.Equal(t, pb.ExecutionStatus_EXECUTION_STATUS_FAILED, result.Status)
+	assert.NotEmpty(t, result.Error)
 }
