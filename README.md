@@ -629,8 +629,8 @@ run in-process without a separate escalation account or sudoers policy.
 
 - **Registration**: Agent registers with the Control Server over HTTPS, authenticating with a registration token
 - **mTLS**: After registration, the agent connects to control's agent listener using mutual TLS with certificates signed by the Control Server CA
-<!-- docref: begin src=cmd/power-manage-agent/cert_rotation.go#renewAt:211ccaeb -->
-- **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate, which the agent stores locally — this enables seamless CA rotation without re-registration. On failure, the agent retries hourly.
+<!-- docref: begin src=cmd/power-manage-agent/cert_rotation.go#renewAt:211ccaeb,cmd/power-manage-agent/cert_rotation.go#applyRenewal:49ccae95 -->
+- **Certificate Rotation**: The agent automatically renews its mTLS certificate at 80% of its lifetime (~292 days for a 1-year cert). Renewal uses the existing private key to generate a new CSR and calls the Control Server's `RenewCertificate` RPC, presenting the current certificate for identity verification. The response includes the active CA certificate. The agent stores it only when it is identical to or cross-signed by the enrolled CA; an unrelated root is refused. Operators load the old+new bundle and restart control before the overlap begins. On failure, the agent retries hourly.
 - **Trust root**: the direct agent stream validates control against the pinned
   enrollment CA. Renewal occurs through authenticated control and preserves CA
   continuity.
