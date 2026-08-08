@@ -507,8 +507,8 @@ The client sends **only** `{token, passphrase}`. The root agent then, with its
 3. fetches the managed key and runs `cryptsetup` directly — no `--data-dir`, no
    sudo.
 
-The device-bound, single-use token—not the local socket user—is the sole
-authority for this operation.
+The device-bound, single-use token authorizes the operation. Matching the peer
+UID to the audit login UID is an additional local admission control.
 <!-- docref: end -->
 
 ### Repository (`REPOSITORY`)

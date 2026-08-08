@@ -193,7 +193,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 	// reaches a LUKS operation and therefore has no reason to materialize its
 	// credential.
 	if as != nil {
-		winnerID, err := e.resolveLuksConflict(actionID)
+		winnerID, err := resolveLuksConflict(as, actionID)
 		if err != nil {
 			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
 		}
@@ -647,11 +647,9 @@ func (e *Executor) RevokeLuksDeviceKey(ctx context.Context, actionID string) (bo
 
 // resolveLuksConflict determines which LUKS action should manage the volume.
 // Returns the winning action ID. If this action is not the winner, it should fail.
-func (e *Executor) resolveLuksConflict(actionID string) (string, error) {
-	as := e.getActionStore()
+func resolveLuksConflict(as ActionStore, actionID string) (string, error) {
 	if as == nil {
-		// No action store wired — caller should have gated on this,
-		// but be defensive: assume this action wins.
+		// No action store wired: assume this action wins.
 		return actionID, nil
 	}
 	stored, err := as.GetStoredActions()
