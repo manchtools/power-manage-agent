@@ -131,7 +131,7 @@ const (
 
 // Start creates the socket and serves until ctx is cancelled. The socket is
 // write-only for group and other (0622 — connect(2) needs no read bit) and
-// every accepted connection has passed the peer-uid check in peercred.go.
+// every accepted connection has passed the login-session check in peercred.go.
 func (d *Daemon) Start(ctx context.Context) error {
 	dir := filepath.Dir(d.socketPath)
 	if err := os.MkdirAll(dir, 0o755); err != nil {
@@ -153,11 +153,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 		return fmt.Errorf("chmod socket: %w", err)
 	}
 
-	// Authenticate the connecting process by its OS identity before it reaches
-	// any handler. This is what makes a token scraped out of /proc useless to a
-	// service account, and it fails closed when peer credentials are
-	// unreadable. Server-side token validation remains the authorization for
-	// the operation itself.
+	// Authenticate the connecting process by its kernel audit login identity
+	// before it reaches any handler. Service processes without a verified login
+	// session fail closed. Server-side token validation remains the
+	// authorization for the operation itself.
 	guarded := newPeerCredListener(listener, d.logger)
 
 	d.listenerMu.Lock()

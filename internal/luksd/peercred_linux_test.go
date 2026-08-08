@@ -3,6 +3,7 @@
 package luksd
 
 import (
+	"context"
 	"log/slog"
 	"net"
 	"os"
@@ -15,7 +16,7 @@ import (
 
 // TestPeerCredListener_AcceptsSameUIDPeer is the positive control: a connection
 // from THIS process must still be admitted by the guarded listener. It relies
-// on the Linux SO_PEERCRED implementation of peerUIDOf, so it is Linux-only.
+// on the Linux SO_PEERCRED implementation of peerCredentialsOf, so it is Linux-only.
 func TestPeerCredListener_AcceptsSameUIDPeer(t *testing.T) {
 	socket := filepath.Join(t.TempDir(), "peer.sock")
 	base, err := net.Listen("unix", socket)
@@ -34,7 +35,9 @@ func TestPeerCredListener_AcceptsSameUIDPeer(t *testing.T) {
 		accepted <- conn
 	}()
 
-	client, err := net.Dial("unix", socket)
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client, err := (&net.Dialer{}).DialContext(ctx, "unix", socket)
 	require.NoError(t, err)
 	defer func() { _ = client.Close() }()
 
@@ -67,7 +70,9 @@ func TestPeerCredListener_RefusesPeerWithUnreadableCredentials(t *testing.T) {
 		}
 	}()
 
-	client, err := net.Dial("tcp", base.Addr().String())
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	client, err := (&net.Dialer{}).DialContext(ctx, "tcp", base.Addr().String())
 	require.NoError(t, err)
 	defer func() { _ = client.Close() }()
 
@@ -92,7 +97,7 @@ func TestLuksDaemon_SocketRemainsConnectableAtTightenedMode(t *testing.T) {
 	require.NoError(t, err)
 	require.Equal(t, os.FileMode(0o622), info.Mode().Perm())
 
-	resp, err := submit(t, sock, Request{Token: "tok", Passphrase: goodPassphrase})
+	resp, err := submit(sock, Request{Token: "tok", Passphrase: goodPassphrase})
 	require.NoError(t, err, "the tightened socket mode must not break the unprivileged client")
 	require.True(t, resp.OK, "%+v", resp)
 }

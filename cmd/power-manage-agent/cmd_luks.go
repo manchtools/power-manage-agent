@@ -21,6 +21,8 @@ import (
 // /proc/<pid>/cmdline, which every local user can read.
 const luksTokenEnv = "PM_LUKS_TOKEN"
 
+const maxLuksTokenBytes = 4096
+
 const luksUsage = "usage: power-manage-agent luks set-passphrase [--token-file <path>|-]\n" +
 	"       the token may also come from $" + luksTokenEnv + ", or be typed at the prompt"
 
@@ -76,7 +78,9 @@ func resolveLuksToken(tokenFile, envToken string, stdin io.Reader, prompt func()
 		}
 		return token, nil
 	}
-	if token := strings.TrimSpace(envToken); token != "" {
+	if token, err := normalizeLuksToken([]byte(envToken), luksTokenEnv); err != nil {
+		return "", err
+	} else if token != "" {
 		return token, nil
 	}
 	if prompt != nil {
@@ -84,7 +88,9 @@ func resolveLuksToken(tokenFile, envToken string, stdin io.Reader, prompt func()
 		if err != nil {
 			return "", err
 		}
-		if token = strings.TrimSpace(token); token != "" {
+		if token, err = normalizeLuksToken([]byte(token), "prompt"); err != nil {
+			return "", err
+		} else if token != "" {
 			return token, nil
 		}
 	}
@@ -99,25 +105,37 @@ func readLuksTokenFile(path string, stdin io.Reader) (string, error) {
 		if stdin == nil {
 			return "", errors.New("--token-file - was given but stdin is unavailable")
 		}
-		line, err := bufio.NewReader(stdin).ReadString('\n')
+		line, err := bufio.NewReader(io.LimitReader(stdin, maxLuksTokenBytes+1)).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return "", fmt.Errorf("read token from stdin: %w", err)
 		}
-		return strings.TrimSpace(line), nil
+		return normalizeLuksToken([]byte(line), "stdin")
 	}
 
-	info, err := os.Stat(path)
+	file, err := os.Open(path)
+	if err != nil {
+		return "", fmt.Errorf("read token file %s: %w", path, err)
+	}
+	defer func() { _ = file.Close() }()
+	info, err := file.Stat()
 	if err != nil {
 		return "", fmt.Errorf("read token file %s: %w", path, err)
 	}
 	if perm := info.Mode().Perm(); perm&0o077 != 0 {
 		return "", fmt.Errorf("token file %s is mode %04o; it must not be readable beyond its owner (chmod 600 %s)", path, perm, path)
 	}
-	b, err := os.ReadFile(path)
+	b, err := io.ReadAll(io.LimitReader(file, maxLuksTokenBytes+1))
 	if err != nil {
 		return "", fmt.Errorf("read token file %s: %w", path, err)
 	}
-	return strings.TrimSpace(string(b)), nil
+	return normalizeLuksToken(b, path)
+}
+
+func normalizeLuksToken(raw []byte, source string) (string, error) {
+	if len(raw) > maxLuksTokenBytes {
+		return "", fmt.Errorf("LUKS token from %s exceeds %d bytes", source, maxLuksTokenBytes)
+	}
+	return strings.TrimSpace(string(raw)), nil
 }
 
 // promptToken reads the token from the terminal without echoing it. Typed

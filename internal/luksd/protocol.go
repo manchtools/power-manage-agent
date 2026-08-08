@@ -18,13 +18,14 @@
 // SO_PEERCRED same-uid check. A bearer token is not a substitute for
 // knowing who is on the other end — it leaks (it reached the device on
 // argv until F2) and this daemon writes LUKS keyslots as root. So the
-// socket now authenticates its peer by OS identity before any handler runs
-// (peercred.go); the token still authorizes the operation.
+// socket now authenticates its peer by the kernel's audit login identity
+// before any handler runs (peercred.go); the token still authorizes the
+// operation.
 package luksd
 
 // DefaultSocketPath is the unix socket the root agent listens on for
 // LUKS passphrase requests. Mode 0622: connect(2) requires only write
-// permission, and the peer-uid check — not the file mode — is the gate.
+// permission, and the login-session check — not the file mode — is the gate.
 const DefaultSocketPath = "/run/pm-agent/luks.sock"
 
 // userPassphraseSlot is the LUKS keyslot the user passphrase occupies.

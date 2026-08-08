@@ -113,3 +113,17 @@ func TestResolveLuksToken_RefusesReadableTokenFile(t *testing.T) {
 		t.Fatalf("resolveLuksToken(0600 file) = (%q, %v), want the token", got, err)
 	}
 }
+
+func TestResolveLuksToken_BoundsStreamAndFileInputs(t *testing.T) {
+	oversized := strings.Repeat("x", maxLuksTokenBytes+1)
+	if _, err := resolveLuksToken("-", "", strings.NewReader(oversized), nil); err == nil {
+		t.Fatal("oversized stdin token was accepted")
+	}
+	file := filepath.Join(t.TempDir(), "oversized-token")
+	if err := os.WriteFile(file, []byte(oversized), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolveLuksToken(file, "", nil, nil); err == nil {
+		t.Fatal("oversized token file was accepted")
+	}
+}

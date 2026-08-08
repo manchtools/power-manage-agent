@@ -3,6 +3,7 @@ package luksd
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net"
 	"os"
 	"path/filepath"
@@ -44,9 +45,10 @@ func startDaemon(t *testing.T, sess Session) string {
 }
 
 // submit sends one request over the socket and returns the decoded response.
-func submit(t *testing.T, sock string, req Request) (Response, error) {
-	t.Helper()
-	conn, err := net.DialTimeout("unix", sock, 5*time.Second)
+func submit(sock string, req Request) (Response, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	conn, err := (&net.Dialer{}).DialContext(ctx, "unix", sock)
 	if err != nil {
 		return Response{}, err
 	}
@@ -68,6 +70,7 @@ type ctxRecordingSession struct {
 	inFlnow int
 	peak    int
 	gate    chan struct{}
+	err     error
 }
 
 func (s *ctxRecordingSession) ValidateLuksToken(ctx context.Context, _ string) (*sdk.ValidateLuksTokenResult, error) {
@@ -87,6 +90,9 @@ func (s *ctxRecordingSession) ValidateLuksToken(ctx context.Context, _ string) (
 	s.mu.Lock()
 	s.inFlnow--
 	s.mu.Unlock()
+	if s.err != nil {
+		return nil, s.err
+	}
 	return validResult(), nil
 }
 
@@ -114,7 +120,7 @@ func TestLuksDaemon_RequestContextHasADeadline(t *testing.T) {
 	sess := &ctxRecordingSession{}
 	sock := startDaemon(t, sess)
 
-	resp, err := submit(t, sock, Request{Token: "tok", Passphrase: goodPassphrase})
+	resp, err := submit(sock, Request{Token: "tok", Passphrase: goodPassphrase})
 	require.NoError(t, err)
 	require.True(t, resp.OK, "%+v", resp)
 
@@ -134,28 +140,47 @@ func TestLuksDaemon_RequestContextHasADeadline(t *testing.T) {
 func TestLuksDaemon_BoundsConcurrentHandlers(t *testing.T) {
 	const attempts = 16
 	gate := make(chan struct{})
-	sess := &ctxRecordingSession{gate: gate}
+	sess := &ctxRecordingSession{gate: gate, err: errors.New("stop after concurrency measurement")}
 	sock := startDaemon(t, sess)
 
-	var wg sync.WaitGroup
+	type outcome struct {
+		response Response
+		err      error
+	}
+	results := make(chan outcome, attempts)
 	for i := 0; i < attempts; i++ {
-		wg.Add(1)
 		go func() {
-			defer wg.Done()
-			_, _ = submit(t, sock, Request{Token: "tok", Passphrase: goodPassphrase})
+			response, err := submit(sock, Request{Token: "tok", Passphrase: goodPassphrase})
+			results <- outcome{response: response, err: err}
 		}()
 	}
 
-	// Give every attempt a chance to reach the request path; stop early once
-	// they all have, so an unbounded daemon fails fast rather than at timeout.
-	deadline := time.Now().Add(3 * time.Second)
-	for time.Now().Before(deadline) && sess.peakInFlight() < attempts {
-		time.Sleep(5 * time.Millisecond)
-	}
-	peak := sess.peakInFlight()
-	close(gate)
-	wg.Wait()
+	released := false
+	defer func() {
+		if !released {
+			close(gate)
+		}
+	}()
+	require.Eventually(t, func() bool {
+		return sess.peakInFlight() == maxConcurrentRequests
+	}, 3*time.Second, 5*time.Millisecond)
+	assert.Equal(t, maxConcurrentRequests, sess.peakInFlight())
 
-	assert.Less(t, peak, attempts,
-		"the daemon ran %d handlers at once; a world-connectable root socket must bound in-flight requests", peak)
+	for i := 0; i < attempts-maxConcurrentRequests; i++ {
+		select {
+		case result := <-results:
+			require.NoError(t, result.err)
+			assert.Equal(t, CodeBusy, result.response.Code)
+		case <-time.After(3 * time.Second):
+			t.Fatal("timed out waiting for an excess request to be refused")
+		}
+	}
+	close(gate)
+	released = true
+
+	for i := 0; i < maxConcurrentRequests; i++ {
+		result := <-results
+		require.NoError(t, result.err)
+		assert.Equal(t, CodeInvalidToken, result.response.Code)
+	}
 }

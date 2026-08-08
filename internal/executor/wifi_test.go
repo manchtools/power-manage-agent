@@ -114,3 +114,13 @@ func TestExecuteSealedWifi_RejectsWrongFieldContext(t *testing.T) {
 		})
 	}
 }
+
+func TestExecuteSealedWifi_RejectsUnsafeActionIDBeforeOpeningCredential(t *testing.T) {
+	e := NewExecutor(nil)
+	_, _, err := e.executeSealedWifi(context.Background(), &pb.WifiParams{
+		AuthType: pb.WifiAuthType_WIFI_AUTH_TYPE_PSK,
+	}, pb.DesiredState_DESIRED_STATE_PRESENT, "../../etc")
+	if err == nil || !strings.Contains(err.Error(), "action ID") {
+		t.Fatalf("executeSealedWifi() error = %v, want action-ID rejection before sealed-field access", err)
+	}
+}

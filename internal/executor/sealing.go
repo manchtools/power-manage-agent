@@ -101,6 +101,9 @@ func (e *Executor) executeSealedLuks(ctx context.Context, params *pb.EncryptionP
 }
 
 func (e *Executor) executeSealedWifi(ctx context.Context, params *pb.WifiParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
+	if err := validateActionIDForFilesystem(actionID); err != nil {
+		return nil, false, err
+	}
 	if state == pb.DesiredState_DESIRED_STATE_ABSENT {
 		return e.executeWifi(ctx, params, state, actionID, "", "")
 	}

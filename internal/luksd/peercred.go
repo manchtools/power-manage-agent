@@ -6,43 +6,31 @@ import (
 	"os"
 )
 
-// firstRegularUID is the conventional floor for interactive login accounts on
-// Linux (UID_MIN in /etc/login.defs). Below it sit root and the service
-// accounts a remote compromise lands in.
-const firstRegularUID = 1000
-
-// nobodyUID is the unprivileged account kernel and userspace map anonymous or
-// squashed identities onto. It is above firstRegularUID on most distributions
-// but is never a person setting a disk passphrase, so it is excluded by name.
-const nobodyUID = 65534
+type peerCredentials struct {
+	uid int
+	pid int
+}
 
 // peerAuthorized reports whether a local peer running as peerUID may submit a
 // LUKS passphrase request to the daemon running as selfUID.
 //
 // This socket is deliberately unlike enroll.sock, whose only legitimate client
 // is the agent itself, so same-uid is its rule. Here the client is the endpoint
-// user's UNPRIVILEGED CLI and its uid is not knowable in advance — an AD/SSSD
-// login gets an arbitrary one — so the rule is the strongest one that does not
-// need to know the human:
+// user's UNPRIVILEGED CLI. Linux's audit login UID identifies the authenticated
+// login session without guessing from numeric UID ranges, so low-UID and
+// directory-backed users work while service processes with no login session do
+// not.
 //
-//   - the agent's own uid (root under the shipped unit) is allowed, and
-//   - any regular interactive login uid is allowed.
-//
-// That refuses the case that matters in practice: a service account
-// (www-data, nobody, a compromised daemon) that scraped the one-time token out
-// of somebody's /proc/<pid>/cmdline and connected as itself. It deliberately
-// does NOT claim to tell one logged-in human from another — the token is a
-// bearer credential and nothing the kernel reports about the peer can decide
-// which human it was issued to. That residual is why the token no longer
-// travels on argv at all (see cmd_luks.go and the control's CliCommand).
-func peerAuthorized(peerUID, selfUID int) bool {
+// The agent's own uid remains allowed for local maintenance. Every other peer
+// must run as the uid that authenticated the kernel audit session.
+func peerAuthorized(peerUID, selfUID, loginUID int) bool {
 	if peerUID < 0 {
 		return false
 	}
 	if peerUID == selfUID {
 		return true
 	}
-	return peerUID >= firstRegularUID && peerUID != nobodyUID
+	return loginUID >= 0 && peerUID == loginUID
 }
 
 // peerCredListener wraps a unix net.Listener and only yields connections whose
@@ -66,7 +54,7 @@ func newPeerCredListener(l net.Listener, logger *slog.Logger) *peerCredListener 
 }
 
 // Accept returns the next connection from an authorized peer uid, closing and
-// skipping every other one. peerUIDOf is platform-specific; on platforms
+// skipping every other one. peerCredentialsOf is platform-specific; on platforms
 // without peer-credential retrieval it fails closed, so this listener refuses
 // every connection there.
 func (l *peerCredListener) Accept() (net.Conn, error) {
@@ -75,17 +63,26 @@ func (l *peerCredListener) Accept() (net.Conn, error) {
 		if err != nil {
 			return nil, err
 		}
-		peerUID, err := peerUIDOf(conn)
+		credentials, err := peerCredentialsOf(conn)
 		if err != nil {
 			l.logger.Warn("luksd: refusing connection; peer credentials unreadable", "error", err)
 			_ = conn.Close()
 			continue
 		}
-		if !peerAuthorized(peerUID, l.selfUID) {
+		loginUID := -1
+		if credentials.uid != l.selfUID {
+			loginUID, err = loginUIDOfPID(credentials.pid)
+			if err != nil {
+				l.logger.Warn("luksd: refusing connection; login identity unreadable", "error", err)
+				_ = conn.Close()
+				continue
+			}
+		}
+		if !peerAuthorized(credentials.uid, l.selfUID, loginUID) {
 			// Attribution: a stolen token used from a service account leaves
 			// the uid in the root-owned journal.
 			l.logger.Warn("luksd: refusing LUKS passphrase request from a non-login uid",
-				"peer_uid", peerUID, "agent_uid", l.selfUID)
+				"peer_uid", credentials.uid, "login_uid", loginUID, "agent_uid", l.selfUID)
 			_ = conn.Close()
 			continue
 		}

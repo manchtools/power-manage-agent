@@ -486,19 +486,22 @@ The agent communicates with the server via bidirectional stream messages (`GetLu
 
 #### LUKS passphrase daemon
 
+<!-- docref: begin src=cmd/power-manage-agent/cmd_luks.go#resolveLuksToken:0972a499,internal/luksd/peercred.go#peerAuthorized:8ce20012,internal/luksd/server.go#Daemon.Start:80dfc23a -->
 When `device_bound_key_type` is `USER_PASSPHRASE`, the user sets their slot-7
-passphrase with `power-manage-agent luks set-passphrase --token <token>`. This
-command is **unprivileged** and requires **no sudo / sudoers rule**: it is a
-thin client to a root daemon the agent runs in-process on a Unix socket at
-`/run/pm-agent/luks.sock` (mode 0666, created under the unit's
+passphrase with `power-manage-agent luks set-passphrase` and supplies the token
+by private file, environment variable, or hidden prompt. This command is
+**unprivileged** and requires **no sudo / sudoers rule**: it is a thin client
+to a root daemon the agent runs in-process on a Unix socket at
+`/run/pm-agent/luks.sock` (mode 0622, created under the unit's
 `RuntimeDirectory=pm-agent`).
 
 The client sends **only** `{token, passphrase}`. The root agent then, with its
 **own** credentials over its **own** authenticated connection to control:
 
 1. validates (and consumes) the server-issued token — it is **device-bound,
-   single-use, and short-TTL**; authorization is the token, **never** the local
-   OS user of the socket peer (so AD/SSSD logins are unaffected);
+   single-use, and short-TTL**; the socket additionally requires the peer UID
+   to match Linux's kernel-maintained audit login UID, without assuming a
+   numeric UID range (so AD/SSSD and locally configured login UIDs work);
 2. enforces the passphrase **policy and reuse** rules server-side (the
    unprivileged client cannot read the root-owned reuse history);
 3. fetches the managed key and runs `cryptsetup` directly — no `--data-dir`, no
@@ -506,6 +509,7 @@ The client sends **only** `{token, passphrase}`. The root agent then, with its
 
 The device-bound, single-use token—not the local socket user—is the sole
 authority for this operation.
+<!-- docref: end -->
 
 ### Repository (`REPOSITORY`)
 
