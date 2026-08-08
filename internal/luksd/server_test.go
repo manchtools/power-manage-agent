@@ -253,8 +253,14 @@ func TestLuksDaemon_RevokesExistingKeyBeforeEnroll(t *testing.T) {
 	assert.Less(t, indexOf(order, "wipetpm"), indexOf(order, "addkey"), "revoke must precede enroll")
 }
 
-// WS6: the socket is created world-connectable (0666), stale sockets are
-// cleared on start, and the socket is removed on shutdown.
+// F2: the socket is NOT world-readable. connect(2) needs only write
+// permission, so 0666 handed out a read bit the protocol never used while
+// advertising the socket as an open channel — and, with no SO_PEERCRED check,
+// the mode was the only thing standing between any local uid and a root
+// daemon that writes LUKS keyslots. The peer-credential gate is now the
+// load-bearing control (see peercred.go); the mode stops overstating what the
+// file permissions decide. Stale sockets are still cleared on start and the
+// socket is still removed on shutdown.
 func TestLuksDaemon_SocketModeAndCleanup(t *testing.T) {
 	dir := t.TempDir()
 	sock := filepath.Join(dir, "luks.sock")
@@ -273,7 +279,8 @@ func TestLuksDaemon_SocketModeAndCleanup(t *testing.T) {
 	})
 	info, err := os.Stat(sock)
 	require.NoError(t, err)
-	assert.Equal(t, os.FileMode(0o666), info.Mode().Perm(), "socket must be 0666 (token is the authz)")
+	assert.Equal(t, os.FileMode(0o622), info.Mode().Perm(),
+		"socket must be write-only for group/other: connect(2) needs no read bit, and the peer-uid check — not the mode — is the authorization")
 
 	cancel()
 	<-done
