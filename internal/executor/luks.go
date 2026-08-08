@@ -19,6 +19,8 @@ import (
 // reads it via --key-file). NewMultilineSecret accepts arbitrary key material.
 func luksSecret(s string) sysexec.Secret { return sysexec.NewMultilineSecret(s) }
 
+func luksSecretBytes(b []byte) sysexec.Secret { return sysexec.NewMultilineSecret(string(b)) }
+
 // LuksKeyStore is the executor's narrow in-process key boundary. The runtime
 // adapter seals outbound passphrases and opens inbound passphrases immediately
 // before this interface is crossed; protobuf never carries plaintext.
@@ -103,7 +105,7 @@ func (e *Executor) clearLuksTimestampFailures(actionID string) {
 // function operates on a consistent view of the wired-in dependencies
 // instead of racing SetLuksKeyStore() / SetStore() / SetActionStore()
 // in runtime.go's reconnect loop.
-func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams, state pb.DesiredState, actionID, presharedKey string) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams, state pb.DesiredState, actionID string, openPresharedKey func() ([]byte, error)) (*pb.CommandOutput, bool, map[string]string, error) {
 	if params == nil {
 		return nil, false, nil, fmt.Errorf("luks params required")
 	}
@@ -121,7 +123,7 @@ func (e *Executor) executeLuks(ctx context.Context, params *pb.EncryptionParams,
 	case pb.DesiredState_DESIRED_STATE_ABSENT:
 		return e.removeLuksManagement(actionID)
 	default:
-		return e.setupLuks(ctx, params, actionID, presharedKey)
+		return e.setupLuks(ctx, params, actionID, openPresharedKey)
 	}
 }
 
@@ -165,7 +167,7 @@ func (e *Executor) removeLuksManagement(actionID string) (*pb.CommandOutput, boo
 }
 
 // setupLuks handles PRESENT state — detect volume, check conflicts, take ownership, rotate, reconcile device key.
-func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, actionID, presharedKey string) (*pb.CommandOutput, bool, map[string]string, error) {
+func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, actionID string, openPresharedKey func() ([]byte, error)) (*pb.CommandOutput, bool, map[string]string, error) {
 	st := e.getStore()
 	if st == nil {
 		return nil, false, nil, fmt.Errorf("agent store not configured")
@@ -187,8 +189,25 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 		return nil, false, nil, fmt.Errorf("get luks state: %w", err)
 	}
 
+	// Resolve policy conflicts before opening the PSK. A losing action never
+	// reaches a LUKS operation and therefore has no reason to materialize its
+	// credential.
+	if as != nil {
+		winnerID, err := e.resolveLuksConflict(actionID)
+		if err != nil {
+			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
+		}
+		if winnerID != actionID {
+			return &pb.CommandOutput{
+				ExitCode: 0,
+				Stdout:   fmt.Sprintf("LUKS: skipped — another action %s takes precedence\n", winnerID),
+			}, false, nil, nil
+		}
+	}
+
 	// Determine device path
 	var devicePath string
+	var presharedKey []byte
 	if localState != nil && localState.OwnershipTaken && localState.DevicePath != "" {
 		// Subsequent run — use stored device path
 		devicePath = localState.DevicePath
@@ -201,8 +220,17 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 		}
 		output.WriteString(fmt.Sprintf("LUKS: managing volume %s\n", devicePath))
 	} else {
+		if openPresharedKey == nil {
+			return nil, false, nil, fmt.Errorf("encryption pre-shared key is not configured")
+		}
+		presharedKey, err = openPresharedKey()
+		if err != nil {
+			return nil, false, nil, err
+		}
+		defer clear(presharedKey)
+
 		// First run — detect volume by PSK
-		vol, err := encMgr.DetectVolumeByKey(ctx, luksSecret(presharedKey))
+		vol, err := encMgr.DetectVolumeByKey(ctx, luksSecretBytes(presharedKey))
 		if err != nil {
 			// Fall back to heuristic detection (PSK may have been removed by a partial prior run)
 			vol, err = encMgr.DetectVolume(ctx)
@@ -214,21 +242,6 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 			output.WriteString(fmt.Sprintf("LUKS: matched volume %s by pre-shared key\n", vol.DevicePath))
 		}
 		devicePath = vol.DevicePath
-	}
-
-	// Conflict resolution — check if another LUKS action should win
-	if as != nil {
-		winnerID, err := e.resolveLuksConflict(actionID)
-		if err != nil {
-			return nil, false, nil, fmt.Errorf("conflict resolution failed: %w", err)
-		}
-		if winnerID != actionID {
-			output.WriteString(fmt.Sprintf("LUKS: skipped — another action %s takes precedence\n", winnerID))
-			return &pb.CommandOutput{
-				ExitCode: 0,
-				Stdout:   output.String(),
-			}, false, nil, nil
-		}
 	}
 
 	changed := false
@@ -298,7 +311,7 @@ func (e *Executor) setupLuks(ctx context.Context, params *pb.EncryptionParams, a
 // Server-confirmed: the old key is only removed after the server confirms receipt of the new key.
 // If the server already has a working key (e.g. from a previous run with lost local state),
 // ownership is recovered without re-using the PSK.
-func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParams, actionID, devicePath, presharedKey string) error {
+func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParams, actionID, devicePath string, presharedKey []byte) error {
 	ks := e.getLuksKeyStore()
 	if ks == nil {
 		return fmt.Errorf("LUKS key store not configured (no stream connection)")
@@ -357,7 +370,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	e.logger.Info("LUKS: adding managed key using PSK",
 		"psk_len", len(presharedKey),
 		"new_key_len", len(passphrase))
-	if err := encMgr.AddKey(ctx, devicePath, luksSecret(presharedKey), luksSecret(passphrase), sysenc.AddKeyOptions{}); err != nil {
+	if err := encMgr.AddKey(ctx, devicePath, luksSecretBytes(presharedKey), luksSecret(passphrase), sysenc.AddKeyOptions{}); err != nil {
 		return fmt.Errorf("add managed key: %w", err)
 	}
 
@@ -378,7 +391,7 @@ func (e *Executor) takeOwnership(ctx context.Context, params *pb.EncryptionParam
 	}
 
 	// Verified — now safe to remove PSK
-	if err := encMgr.RemoveKey(ctx, devicePath, luksSecret(presharedKey)); err != nil {
+	if err := encMgr.RemoveKey(ctx, devicePath, luksSecretBytes(presharedKey)); err != nil {
 		e.logger.Warn("failed to remove PSK after ownership (both keys work)", "error", err)
 	}
 

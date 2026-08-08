@@ -89,15 +89,17 @@ func (e *Executor) OpenLuksPassphrase(actionID string, value *pb.SealedValue) (s
 
 func (e *Executor) executeSealedLuks(ctx context.Context, params *pb.EncryptionParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, map[string]string, error) {
 	if state == pb.DesiredState_DESIRED_STATE_ABSENT {
-		return e.executeLuks(ctx, params, state, actionID, "")
+		return e.executeLuks(ctx, params, state, actionID, nil)
 	}
-	plaintext, err := e.openFromControl(params.GetPresharedKey(),
-		"powermanage.v1.EncryptionParams", "preshared_key", e.getDeviceID(), actionID)
-	if err != nil {
-		return nil, false, nil, fmt.Errorf("open encryption pre-shared key: %w", err)
+	openPresharedKey := func() ([]byte, error) {
+		plaintext, err := e.openFromControl(params.GetPresharedKey(),
+			"powermanage.v1.EncryptionParams", "preshared_key", e.getDeviceID(), actionID)
+		if err != nil {
+			return nil, fmt.Errorf("open encryption pre-shared key: %w", err)
+		}
+		return plaintext, nil
 	}
-	defer clear(plaintext)
-	return e.executeLuks(ctx, params, state, actionID, string(plaintext))
+	return e.executeLuks(ctx, params, state, actionID, openPresharedKey)
 }
 
 func (e *Executor) executeSealedWifi(ctx context.Context, params *pb.WifiParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {

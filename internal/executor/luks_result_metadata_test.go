@@ -68,7 +68,7 @@ func TestSetupLuksReportsNoMetadata(t *testing.T) {
 
 	_, _, metadata, err := e.setupLuks(context.Background(),
 		&pb.EncryptionParams{MinWords: 3},
-		"01HXLUKSMETA00000000000000", "psk-value")
+		"01HXLUKSMETA00000000000000", func() ([]byte, error) { return []byte("psk-value"), nil })
 	require.NoError(t, err)
 	assert.Empty(t, metadata, "control rejects every result that carries metadata")
 }

@@ -58,10 +58,61 @@ func TestSetupLuks_GetLuksStateError_FailsClosed(t *testing.T) {
 	e.SetLuksKeyStore(&fakeLuksKeyStore{})
 
 	params := &pb.EncryptionParams{MinWords: 5}
-	_, _, _, err = e.setupLuks(context.Background(), params, "01HXFAILCLOSED000000000000", "psk")
+	opened := false
+	_, _, _, err = e.setupLuks(context.Background(), params, "01HXFAILCLOSED000000000000", func() ([]byte, error) {
+		opened = true
+		return []byte("psk"), nil
+	})
 	require.Error(t, err, "setupLuks must fail closed on a state-read error")
 	assert.Contains(t, err.Error(), "luks state",
 		"the error must be the state read failing closed, not a downstream volume-detection error")
+	assert.False(t, opened, "the PSK must remain sealed when the state store rejects execution")
+}
+
+func TestExecuteSealedLuks_RejectsClosedStoreBeforeOpeningPSK(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	require.NoError(t, err)
+	require.NoError(t, st.Close())
+
+	e := &Executor{logger: slog.Default(), now: time.Now}
+	e.SetStore(st)
+	e.SetLuksKeyStore(&fakeLuksKeyStore{})
+	params := &pb.EncryptionParams{
+		PresharedKey: &pb.SealedValue{Version: sealedFieldVersion, Ciphertext: []byte("not-valid-ciphertext")},
+	}
+
+	_, _, _, err = e.executeSealedLuks(context.Background(), params,
+		pb.DesiredState_DESIRED_STATE_PRESENT, "01HXSEALEDFAIL0000000000000")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "get luks state",
+		"the store gate must fail before malformed ciphertext can reach the opening boundary")
+}
+
+func TestExecuteSealedLuks_SkipsConflictBeforeOpeningPSK(t *testing.T) {
+	st, err := store.New(t.TempDir())
+	require.NoError(t, err)
+	defer st.Close()
+
+	now := time.Now()
+	e := &Executor{logger: slog.Default(), now: time.Now}
+	e.SetStore(st)
+	e.SetLuksKeyStore(&fakeLuksKeyStore{})
+	e.SetActionStore(&fakeActionStore{actions: []*store.StoredAction{
+		encAction("weak", 3, pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_UNSPECIFIED,
+			pb.DesiredState_DESIRED_STATE_PRESENT, now),
+		encAction("strong", 8, pb.LpsPasswordComplexity_LPS_PASSWORD_COMPLEXITY_COMPLEX,
+			pb.DesiredState_DESIRED_STATE_PRESENT, now),
+	}})
+	params := &pb.EncryptionParams{
+		PresharedKey: &pb.SealedValue{Version: sealedFieldVersion, Ciphertext: []byte("not-valid-ciphertext")},
+	}
+
+	output, changed, _, err := e.executeSealedLuks(context.Background(), params,
+		pb.DesiredState_DESIRED_STATE_PRESENT, "weak")
+	require.NoError(t, err)
+	assert.False(t, changed)
+	assert.Contains(t, output.GetStdout(), "strong",
+		"the losing policy must be skipped without opening its sealed PSK")
 }
 
 // WS6 #3 (lockout safety): when the server is unreachable, takeOwnership
@@ -84,7 +135,7 @@ func TestTakeOwnership_FailsClosedWhenServerUnreachable(t *testing.T) {
 	e.SetLuksKeyStore(ks)
 
 	params := &pb.EncryptionParams{MinWords: 5}
-	err = e.takeOwnership(context.Background(), params, "01HXUNREACH0000000000000000", "/dev/mapper/test", "psk")
+	err = e.takeOwnership(context.Background(), params, "01HXUNREACH0000000000000000", "/dev/mapper/test", []byte("psk"))
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not reachable")
 	assert.Equal(t, 1, ks.getKeyCalls, "GetKey is attempted once")
