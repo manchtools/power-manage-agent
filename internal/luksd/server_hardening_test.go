@@ -54,12 +54,18 @@ func submit(sock string, req Request) (Response, error) {
 	}
 	defer func() { _ = conn.Close() }()
 	_ = conn.SetDeadline(time.Now().Add(10 * time.Second))
-	if err := json.NewEncoder(conn).Encode(req); err != nil {
+	// A saturated daemon may send CodeBusy and close before this client finishes
+	// writing. Preserve that valid response instead of turning the race into a
+	// broken-pipe test failure.
+	writeErr := json.NewEncoder(conn).Encode(req)
+	var resp Response
+	if err := json.NewDecoder(conn).Decode(&resp); err != nil {
+		if writeErr != nil {
+			return Response{}, writeErr
+		}
 		return Response{}, err
 	}
-	var resp Response
-	err = json.NewDecoder(conn).Decode(&resp)
-	return resp, err
+	return resp, nil
 }
 
 // ctxRecordingSession captures the context the daemon hands to the request
