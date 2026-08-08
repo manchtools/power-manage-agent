@@ -25,7 +25,7 @@ func wifiCertPath(actionID string) string {
 // executeWifi manages WiFi connection profiles via NetworkManager.
 // PRESENT: creates or updates the connection profile (delegated to the SDK).
 // ABSENT: deletes the connection profile and any certificate files.
-func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state pb.DesiredState, actionID string) (*pb.CommandOutput, bool, error) {
+func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state pb.DesiredState, actionID, psk, clientKey string) (*pb.CommandOutput, bool, error) {
 	if params == nil {
 		return nil, false, fmt.Errorf("wifi params required")
 	}
@@ -74,10 +74,10 @@ func (e *Executor) executeWifi(ctx context.Context, params *pb.WifiParams, state
 		Name:        conName,
 		SSID:        params.Ssid,
 		AuthType:    wifiAuthFromProto(params.AuthType),
-		PSK:         sysexec.NewMultilineSecret(params.Psk),
+		PSK:         sysexec.NewMultilineSecret(psk),
 		CACert:      params.CaCert,
 		ClientCert:  params.ClientCert,
-		ClientKey:   sysexec.NewMultilineSecret(params.ClientKey),
+		ClientKey:   sysexec.NewMultilineSecret(clientKey),
 		Identity:    params.Identity,
 		AutoConnect: params.AutoConnect,
 		Hidden:      params.Hidden,

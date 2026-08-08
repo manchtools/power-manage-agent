@@ -401,11 +401,11 @@ func (e *Executor) ExecuteWithStreaming(ctx context.Context, env *pb.Action, cal
 		// The encryption path reports no metadata: control refuses any
 		// ActionResult carrying it, and device_path already reaches control
 		// through StoreLuksKey.
-		output, changed, _, execErr = e.executeLuks(ctx, env.GetEncryption(), env.DesiredState, envActionID(env))
+		output, changed, _, execErr = e.executeSealedLuks(ctx, env.GetEncryption(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_WIFI:
 		var changed bool
-		output, changed, execErr = e.executeWifi(ctx, env.GetWifi(), env.DesiredState, envActionID(env))
+		output, changed, execErr = e.executeSealedWifi(ctx, env.GetWifi(), env.DesiredState, envActionID(env))
 		result.Changed = changed
 	case pb.ActionType_ACTION_TYPE_REBOOT:
 		output, execErr = e.executeReboot(ctx)

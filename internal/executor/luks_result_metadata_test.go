@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
+	sdkcrypto "github.com/manchtools/power-manage-sdk/crypto"
 	pb "github.com/manchtools/power-manage-sdk/gen/go/powermanage/v1"
 	sysenc "github.com/manchtools/power-manage-sdk/sys/encryption"
 	sysexec "github.com/manchtools/power-manage-sdk/sys/exec"
@@ -66,21 +67,32 @@ func TestSetupLuksReportsNoMetadata(t *testing.T) {
 	e := newLuksExecutor(t, "/dev/mapper/root")
 
 	_, _, metadata, err := e.setupLuks(context.Background(),
-		&pb.EncryptionParams{PresharedKey: "psk-value", MinWords: 3},
-		"01HXLUKSMETA00000000000000")
+		&pb.EncryptionParams{MinWords: 3},
+		"01HXLUKSMETA00000000000000", "psk-value")
 	require.NoError(t, err)
 	assert.Empty(t, metadata, "control rejects every result that carries metadata")
 }
 
 func TestExecuteEncryptionActionReportsNoResultMetadata(t *testing.T) {
 	e := newLuksExecutor(t, "/dev/mapper/root")
+	agentKey, err := sdkcrypto.GenerateX25519()
+	require.NoError(t, err)
+	controlKey, err := sdkcrypto.GenerateX25519()
+	require.NoError(t, err)
+	require.NoError(t, e.ConfigureSealing(agentKey.Bytes(), controlKey.PublicKey().Bytes()))
+	const actionID = "01HXLUKSEXEC00000000000000"
+	aad, info, err := sdkcrypto.FieldSealContext(sdkcrypto.DirectionControlToAgent,
+		"powermanage.v1.EncryptionParams", "preshared_key", e.getDeviceID(), actionID)
+	require.NoError(t, err)
+	sealed, err := sdkcrypto.SealToPublicKey(agentKey.PublicKey(), []byte("psk-value"), aad, info)
+	require.NoError(t, err)
 
 	result := e.ExecuteAction(context.Background(), &pb.Action{
-		Id:           &pb.ActionId{Value: "01HXLUKSEXEC00000000000000"},
+		Id:           &pb.ActionId{Value: actionID},
 		Type:         pb.ActionType_ACTION_TYPE_ENCRYPTION,
 		DesiredState: pb.DesiredState_DESIRED_STATE_PRESENT,
 		Params: &pb.Action_Encryption{Encryption: &pb.EncryptionParams{
-			PresharedKey: "psk-value", MinWords: 3,
+			PresharedKey: &pb.SealedValue{Version: 1, Ciphertext: sealed}, MinWords: 3,
 		}},
 	})
 	require.NotNil(t, result)

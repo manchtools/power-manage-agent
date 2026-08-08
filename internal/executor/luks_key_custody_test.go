@@ -104,8 +104,8 @@ func TestTakeOwnership_StoresTheSamePassphraseItAddsToTheVolume(t *testing.T) {
 	e.SetDeviceID(deviceID)
 	e.SetLuksKeyStore(ks)
 
-	params := &pb.EncryptionParams{PresharedKey: "psk-value", MinWords: 3}
-	require.NoError(t, e.takeOwnership(context.Background(), params, actionID, "/dev/mapper/test"))
+	params := &pb.EncryptionParams{MinWords: 3}
+	require.NoError(t, e.takeOwnership(context.Background(), params, actionID, "/dev/mapper/test", "psk-value"))
 
 	require.NotEmpty(t, stored, "StoreKey must have been called with the managed passphrase")
 	require.NotEmpty(t, addedPassphrase, "AddKey must have been called")
@@ -152,8 +152,8 @@ func TestTakeOwnership_NoDeviceID_FailsClosedBeforeMutation(t *testing.T) {
 	e.SetLuksKeyStore(ks)
 	// No device ID set.
 
-	params := &pb.EncryptionParams{PresharedKey: "psk-value", MinWords: 3}
-	err = e.takeOwnership(context.Background(), params, "01HXNOKEY00000000000000000", "/dev/mapper/test")
+	params := &pb.EncryptionParams{MinWords: 3}
+	err = e.takeOwnership(context.Background(), params, "01HXNOKEY00000000000000000", "/dev/mapper/test", "psk-value")
 	require.Error(t, err, "no device identity → fail closed")
 	assert.Zero(t, ks.storeKeyCalls, "nothing may be sent that cannot be attributed to a device")
 	assert.Zero(t, fakeEnc.addKeyCalls, "no LUKS mutation may happen when the store is doomed")
@@ -174,8 +174,8 @@ func TestTakeOwnership_NotConnected_FailsClosedBeforeMutation(t *testing.T) {
 	e.SetDeviceID("01HXDEVICE0000000000000000")
 	// No key store wired: the agent is not connected.
 
-	params := &pb.EncryptionParams{PresharedKey: "psk-value", MinWords: 3}
-	err = e.takeOwnership(context.Background(), params, "01HXNOCONN0000000000000000", "/dev/mapper/test")
+	params := &pb.EncryptionParams{MinWords: 3}
+	err = e.takeOwnership(context.Background(), params, "01HXNOCONN0000000000000000", "/dev/mapper/test", "psk-value")
 	require.Error(t, err, "not connected → fail closed")
 	assert.Zero(t, fakeEnc.addKeyCalls,
 		"a volume must not be taken over while the passphrase cannot be reported")

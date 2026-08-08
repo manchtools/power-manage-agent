@@ -57,8 +57,8 @@ func TestSetupLuks_GetLuksStateError_FailsClosed(t *testing.T) {
 	e.SetStore(st)
 	e.SetLuksKeyStore(&fakeLuksKeyStore{})
 
-	params := &pb.EncryptionParams{PresharedKey: "psk", MinWords: 5}
-	_, _, _, err = e.setupLuks(context.Background(), params, "01HXFAILCLOSED000000000000")
+	params := &pb.EncryptionParams{MinWords: 5}
+	_, _, _, err = e.setupLuks(context.Background(), params, "01HXFAILCLOSED000000000000", "psk")
 	require.Error(t, err, "setupLuks must fail closed on a state-read error")
 	assert.Contains(t, err.Error(), "luks state",
 		"the error must be the state read failing closed, not a downstream volume-detection error")
@@ -83,8 +83,8 @@ func TestTakeOwnership_FailsClosedWhenServerUnreachable(t *testing.T) {
 	e.SetStore(st)
 	e.SetLuksKeyStore(ks)
 
-	params := &pb.EncryptionParams{PresharedKey: "psk", MinWords: 5}
-	err = e.takeOwnership(context.Background(), params, "01HXUNREACH0000000000000000", "/dev/mapper/test")
+	params := &pb.EncryptionParams{MinWords: 5}
+	err = e.takeOwnership(context.Background(), params, "01HXUNREACH0000000000000000", "/dev/mapper/test", "psk")
 	require.Error(t, err)
 	assert.Contains(t, err.Error(), "not reachable")
 	assert.Equal(t, 1, ks.getKeyCalls, "GetKey is attempted once")
