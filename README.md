@@ -940,6 +940,32 @@ private secret and refuses to publish if it does not match the configured
 public value.
 <!-- docref: end -->
 
+#### Forks and downstream releases: bring your own keys
+
+Cloning or forking this repository does not provide MANCHTOOLS release-signing
+settings or private key material. Downstream maintainers must configure their
+own Ed25519 pair under the same Actions variable and environment-secret names.
+
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:aeab103d,internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3 -->
+There are two deliberately different build modes:
+
+- A normal `go build ./cmd/power-manage-agent` development build succeeds
+  without a release key, but contains no trusted publisher identity.
+  Automatic `checksum_url` updates do not work: the agent rejects the release
+  manifest before trusting its hashes. An exact `expected_sha256` delivered by
+  control still works, but that is an explicitly pinned update rather than
+  automatic release tracking.
+- The tag-triggered release workflow requires
+  `RELEASE_SIGNING_PUBLIC_KEY` before building release binaries and requires
+  the matching `RELEASE_SIGNING_PRIVATE_KEY` before publishing them. It fails
+  closed when either setting is absent, invalid, or mismatched.
+
+Therefore, producing a signed, automatically updateable downstream release is
+BYOK: generate and protect a fork-owned key pair, then configure both settings
+before creating a release tag. No MANCHTOOLS private signing key is present in
+the source tree or required by a fork.
+<!-- docref: end -->
+
 ## Integration Test Suite
 
 The test suite (`internal/executor/integration_test.go`, ~3,500 lines) exercises the executor against real system state inside containerized environments. Each test container mirrors production: tests run as `root` directly, the same way the agent runs in production (systemd `User=root`).
