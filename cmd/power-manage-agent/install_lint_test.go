@@ -91,11 +91,15 @@ func TestInstall_VerifiesPublisherSignatureBeforeChecksum(t *testing.T) {
 
 func TestReleaseWorkflowSignsChecksumsInProtectedEnvironment(t *testing.T) {
 	workflow := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+	_, releaseJob, ok := strings.Cut(workflow, "\n  release:\n")
+	if !ok {
+		t.Fatal("release workflow is missing the release job")
+	}
 	for _, required := range []string{
 		"environment: releases", "RELEASE_SIGNING_PRIVATE_KEY", "RELEASE_SIGNING_PUBLIC_KEY",
 		"SHA256SUMS.sig", "openssl pkeyutl -sign -rawin", "ED25519 Private-Key:",
 	} {
-		if !strings.Contains(workflow, required) {
+		if !strings.Contains(releaseJob, required) {
 			t.Errorf("release workflow is missing %q", required)
 		}
 	}

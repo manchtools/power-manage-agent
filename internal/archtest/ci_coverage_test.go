@@ -75,6 +75,19 @@ func TestCIRunsEveryIntegrationTest(t *testing.T) {
 	}
 }
 
+func TestIntegrationCIUsesPinnedSDK(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(moduleRoot(t), ".github", "workflows", "integration-test.yml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	workflow := string(raw)
+	for _, override := range []string{"SDK_MODE", "Resolve SDK branch override", "power-manage-sdk.git"} {
+		if strings.Contains(workflow, override) {
+			t.Errorf("integration CI must use the reviewed SDK pin, found override path %q", override)
+		}
+	}
+}
+
 // discoverIntegrationTaggedFiles maps module-relative _test.go files that
 // carry the `integration` build tag to their declared Test function names.
 // vendor/, testdata/, and hidden directories are skipped.

@@ -46,37 +46,10 @@ jobs:
         with:
           path: agent
 
-      # Cross-cutting dev override: if the SDK repo has a branch with
-      # the same name as this PR/push, use that SDK branch in place of
-      # the pinned version in agent/go.mod. This keeps pair-branch
-      # development working without having to bump go.mod on every
-      # in-flight SDK change. Everyone else falls through to the pinned
-      # version fetched from the SDK's GitHub repo at build
-      # time, so SDK main can change without breaking agent CI.
-      - name: Resolve SDK branch override
-        id: sdk_ref
-        run: |
-          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-          if git ls-remote --heads https://github.com/MANCHTOOLS/power-manage-sdk.git "refs/heads/${BRANCH}" | grep -q .; then
-            echo "mode=branch" >> "$GITHUB_OUTPUT"
-            echo "ref=${BRANCH}" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=pinned" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout SDK branch (override)
-        if: steps.sdk_ref.outputs.mode == 'branch'
-        uses: actions/checkout@v5
-        with:
-          repository: MANCHTOOLS/power-manage-sdk
-          ref: ${{ steps.sdk_ref.outputs.ref }}
-          path: sdk
-
       - name: Build test image
         run: |
           docker build \
             -f agent/${{ matrix.dockerfile }} \
-            --build-arg SDK_MODE=${{ steps.sdk_ref.outputs.mode }} \
             -t pm-agent-test-${{ matrix.distro }} \
             .
 
@@ -97,30 +70,10 @@ jobs:
         with:
           path: agent
 
-      - name: Resolve SDK branch override
-        id: sdk_ref
-        run: |
-          BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
-          if git ls-remote --heads https://github.com/MANCHTOOLS/power-manage-sdk.git "refs/heads/${BRANCH}" | grep -q .; then
-            echo "mode=branch" >> "$GITHUB_OUTPUT"
-            echo "ref=${BRANCH}" >> "$GITHUB_OUTPUT"
-          else
-            echo "mode=pinned" >> "$GITHUB_OUTPUT"
-          fi
-
-      - name: Checkout SDK branch (override)
-        if: steps.sdk_ref.outputs.mode == 'branch'
-        uses: actions/checkout@v5
-        with:
-          repository: MANCHTOOLS/power-manage-sdk
-          ref: ${{ steps.sdk_ref.outputs.ref }}
-          path: sdk
-
       - name: Build test image
         run: |
           docker build \
             -f agent/test/Dockerfile.integration \
-            --build-arg SDK_MODE=${{ steps.sdk_ref.outputs.mode }} \
             -t pm-agent-test-debian \
             .
 
