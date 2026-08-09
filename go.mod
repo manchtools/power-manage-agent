@@ -4,31 +4,31 @@ go 1.25.12
 
 require (
 	connectrpc.com/connect v1.18.1
-	github.com/manchtools/power-manage-sdk v0.5.4-0.20260809083716-5f23bc6d3400
+	github.com/manchtools/power-manage-sdk v0.5.4
 	github.com/oklog/ulid/v2 v2.1.0
 	github.com/pressly/goose/v3 v3.26.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/stretchr/testify v1.11.1
-	golang.org/x/crypto v0.52.0
-	golang.org/x/sys v0.45.0
-	golang.org/x/term v0.43.0
+	golang.org/x/crypto v0.53.0
+	golang.org/x/sys v0.46.0
+	golang.org/x/term v0.44.0
 	google.golang.org/protobuf v1.36.11
 	modernc.org/sqlite v1.44.3
 )
 
 // The SDK import path differs from the actual GitHub repo URL
 // (monorepo-style import path, polyrepo actual layout). Map it here
-// so every `go build` uses a specific, pinned SDK commit rather than
+// so every `go build` uses a specific, pinned SDK version rather than
 // whatever happens to be in a local ../sdk checkout. Developers who
 // want to iterate against a local SDK override this with a per-dev
 // go.work at their workspace root — see agent/README.md for setup.
 //
-// Pin lifecycle (audit F034): this hash is bumped manually after the
-// SDK PR that introduces a new server-visible behaviour merges. The
+// Pin lifecycle (audit F034): this version is bumped manually after the
+// SDK change receives a release tag. The
 // agent maintainer runs `go get
-// github.com/manchtools/power-manage-sdk@<commit>` and commits the
+// github.com/manchtools/power-manage-sdk@<version>` and commits the
 // resulting go.mod/go.sum together with the agent change that consumes
-// it. There is no automatic floating tag — that's intentional, because
+// it. There is no automatic floating version — that's intentional, because
 // SDK proto/Go API drifts between commits should be reviewable in the
 // same PR as the agent change that consumes them.
 
@@ -46,7 +46,7 @@ require (
 	github.com/go-cmd/cmd v1.4.3 // indirect
 	github.com/go-git/gcfg v1.5.1-0.20230307220236-3a3c6141e376 // indirect
 	github.com/go-git/go-billy/v5 v5.9.0 // indirect
-	github.com/go-git/go-git/v5 v5.19.1 // indirect
+	github.com/go-git/go-git/v5 v5.19.2 // indirect
 	github.com/go-playground/locales v0.14.1 // indirect
 	github.com/go-playground/universal-translator v0.18.1 // indirect
 	github.com/go-playground/validator/v10 v10.30.1 // indirect
@@ -68,7 +68,7 @@ require (
 	github.com/xanzy/ssh-agent v0.3.3 // indirect
 	go.uber.org/multierr v1.11.0 // indirect
 	golang.org/x/exp v0.0.0-20260410095643-746e56fc9e2f // indirect
-	golang.org/x/net v0.55.0 // indirect
+	golang.org/x/net v0.56.0 // indirect
 	golang.org/x/sync v0.21.0 // indirect
 	golang.org/x/text v0.39.0 // indirect
 	gopkg.in/warnings.v0 v0.1.2 // indirect

@@ -51,7 +51,7 @@ jobs:
       # the pinned version in agent/go.mod. This keeps pair-branch
       # development working without having to bump go.mod on every
       # in-flight SDK change. Everyone else falls through to the pinned
-      # pseudo-version fetched from the SDK's GitHub repo at build
+      # version fetched from the SDK's GitHub repo at build
       # time, so SDK main can change without breaking agent CI.
       - name: Resolve SDK branch override
         id: sdk_ref
