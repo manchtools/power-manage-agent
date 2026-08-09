@@ -75,7 +75,7 @@ func TestExecuteAgentUpdate_RefusesOlderVersion(t *testing.T) {
 	staged := agentScript("v2026.05.01", 0)
 	h := newUpdateHarness(t, "v2026.06.02", staged, nil) // running newer than staged
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err == nil {
 		t.Fatal("a downgrade must be refused by default")
 	}
@@ -93,7 +93,7 @@ func TestExecuteAgentUpdate_RefusesMalformedVersion(t *testing.T) {
 	staged := agentScript("garbage", 0)
 	h := newUpdateHarness(t, "v2026.06.02", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err == nil {
 		t.Fatal("an unparseable staged version must be refused fail-closed")
 	}
@@ -109,7 +109,7 @@ func TestExecuteAgentUpdate_RefusesMalformedRunningVersion(t *testing.T) {
 	staged := agentScript("v2026.06.02", 0)
 	h := newUpdateHarness(t, "garbage", staged, nil) // running version unparseable
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err == nil {
 		t.Fatal("an unparseable running version must be refused fail-closed")
 	}
@@ -126,7 +126,7 @@ func TestExecuteAgentUpdate_RefusesMalformedRunningVersion(t *testing.T) {
 func TestExecuteAgentUpdate_AllowDowngradeBypass(t *testing.T) {
 	staged := agentScript("v2026.05.01", 0)
 	h := newUpdateHarness(t, "v2026.06.02", staged, nil)
-	p := h.params(sha256hex(staged))
+	p := h.params()
 	p.AllowDowngrade = true
 
 	_, changed, err := h.e.executeAgentUpdate(context.Background(), p)

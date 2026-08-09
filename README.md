@@ -750,31 +750,27 @@ journalctl -u power-manage-agent -f
 
 The agent self-updates via the `ACTION_TYPE_AGENT_UPDATE` action. Admins
 schedule it on managed devices; the authenticated direct delivery carries an
-HTTPS `binary_url` and an integrity source.
+HTTPS `binary_url` and the publisher's HTTPS `checksum_url`.
 
-### Integrity: signed `checksum_url` or a pinned `expected_sha256`
+### Integrity: publisher-signed checksum manifest
 
-Each arch must provide **at least one** of:
+Each configured architecture must provide both `binary_url` and `checksum_url`.
+The checksum URL names a `SHA256SUMS` file with an adjacent `SHA256SUMS.sig`.
+The agent verifies the exact manifest bytes with its embedded Ed25519 release
+key before trusting the candidate binary's hash. Pointing both URLs at
+`releases/latest/...` lets the fleet track publisher-signed releases hands-off.
 
-- **`checksum_url`** (default) — a `SHA256SUMS` file with an adjacent
-  `SHA256SUMS.sig`. The agent verifies the exact manifest bytes with its pinned
-  Ed25519 release key before trusting a hash. This is the hands-off option:
-  point both URLs at `releases/latest/...` and the fleet tracks signed releases.
-- **`expected_sha256`** (opt-in) — an exact, lowercase-hex hash. When set it
-  **overrides** `checksum_url` and arrives in the authenticated delivery. Use
-  it to pin an exact binary for staged rollouts. A new version requires
-  updating the action.
-
-`binary_url` (and `checksum_url`, when used) must be HTTPS. An action with neither integrity source is rejected at create time and by the agent.
+Both URLs must be HTTPS. The server and agent reject an action without a signed
+checksum-manifest source; an update action cannot supply or replace the trusted
+public key.
 
 <!-- docref: begin src=internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3,internal/executor/agent_update.go#downloadAndExtractChecksum:ca7f8bef -->
 Once a trusted installer or agent containing the embedded key is present, a
 compromised artifact host can replace the binary, manifest, and signature but
 cannot produce a signature that it accepts. The initial `curl | bash` bootstrap
 still trusts the source serving that installer; retrieve or inspect it through
-a trusted repository or control-server channel. A control-pinned
-`expected_sha256` remains available for an exact staged rollout and bypasses
-manifest fetching entirely.
+a trusted repository or control-server channel. There is no action-supplied
+hash or public-key bypass for automatic updates.
 <!-- docref: end -->
 
 ### Anti-rollback
@@ -785,9 +781,9 @@ requires `allow_downgrade` in the authenticated delivery.
 
 ### Update Process
 
-1. Download the binary to `/var/lib/power-manage/update/agent-update-*.tmp` and
-   verify its SHA256 against pinned `expected_sha256`, or against a hash from
-   the publisher-signed manifest
+1. Download and authenticate the publisher-signed checksum manifest, then
+   download the binary to `/var/lib/power-manage/update/agent-update-*.tmp` and
+   verify its SHA-256 against the trusted manifest entry
 2. Run `<tmpPath> version`, compare with running — skip if same; refuse a downgrade unless `allow_downgrade`
 3. Run `<tmpPath> self-test` as a subprocess (60s timeout). The self-test:
    - Loads stored credentials
@@ -951,10 +947,8 @@ There are two deliberately different build modes:
 
 - A normal `go build ./cmd/power-manage-agent` development build succeeds
   without a release key, but contains no trusted publisher identity.
-  Automatic `checksum_url` updates do not work: the agent rejects the release
-  manifest before trusting its hashes. An exact `expected_sha256` delivered by
-  control still works, but that is an explicitly pinned update rather than
-  automatic release tracking.
+  Self-update does not work: the agent rejects the release manifest before
+  trusting its hashes, and no action field can bypass that check.
 - The tag-triggered release workflow requires
   `RELEASE_SIGNING_PUBLIC_KEY` before building release binaries and requires
   the matching `RELEASE_SIGNING_PRIVATE_KEY` before publishing them. It fails
