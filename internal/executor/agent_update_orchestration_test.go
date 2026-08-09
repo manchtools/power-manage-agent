@@ -63,6 +63,9 @@ type updateHarness struct {
 // newUpdateHarness serves `serveBody` at /agent and `sumsBody` at /sums.
 func newUpdateHarness(t *testing.T, runningVersion string, serveBody, sumsBody []byte) *updateHarness {
 	t.Helper()
+	if sumsBody == nil {
+		sumsBody = []byte(sha256hex(serveBody) + "  agent\n")
+	}
 	dir := t.TempDir()
 	binaryPath := filepath.Join(dir, "power-manage-agent")
 	oldBytes := []byte("#!/bin/sh\necho OLD\n")
@@ -122,17 +125,15 @@ func newUpdateHarness(t *testing.T, runningVersion string, serveBody, sumsBody [
 	return h
 }
 
-func (h *updateHarness) params(expectedSha string) *pb.AgentUpdateParams {
+func (h *updateHarness) params() *pb.AgentUpdateParams {
 	return &pb.AgentUpdateParams{
 		Amd64: &pb.AgentUpdateArch{
-			BinaryUrl:      h.srv.URL + "/agent",
-			ChecksumUrl:    h.srv.URL + "/sums",
-			ExpectedSha256: expectedSha,
+			BinaryUrl:   h.srv.URL + "/agent",
+			ChecksumUrl: h.srv.URL + "/sums",
 		},
 		Arm64: &pb.AgentUpdateArch{
-			BinaryUrl:      h.srv.URL + "/agent",
-			ChecksumUrl:    h.srv.URL + "/sums",
-			ExpectedSha256: expectedSha,
+			BinaryUrl:   h.srv.URL + "/agent",
+			ChecksumUrl: h.srv.URL + "/sums",
 		},
 	}
 }
@@ -157,18 +158,19 @@ func (h *updateHarness) currentBinary(t *testing.T) []byte {
 	return b
 }
 
-// WS7 #6: a binary whose bytes do not hash to the action's
-// expected_sha256 is rejected; the swap is aborted, the live binary is
+// WS7 #6: a binary whose bytes do not hash to the signed manifest is
+// rejected; the swap is aborted, the live binary is
 // byte-identical, no .bak is created, Shutdown is not called.
 func TestExecuteAgentUpdate_ChecksumMismatchAbortsSwap(t *testing.T) {
 	genuine := agentScript("v2026.06.05", 0)
 	tampered := append([]byte{}, genuine...)
 	tampered[len(tampered)-2] ^= 0xff // flip a non-terminal byte
 
-	// expected_sha256 is the hash of the GENUINE bytes; the server serves
-	// TAMPERED bytes → mismatch (intent: hash binds content).
-	h := newUpdateHarness(t, "v2026.06.01", tampered, nil)
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(genuine)))
+	// The signed manifest contains the GENUINE hash; the server serves
+	// TAMPERED bytes → mismatch (intent: signed hash binds content).
+	sums := []byte(sha256hex(genuine) + "  agent\n")
+	h := newUpdateHarness(t, "v2026.06.01", tampered, sums)
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 
 	if err == nil {
 		t.Fatal("checksum mismatch must abort the update")
@@ -184,37 +186,12 @@ func TestExecuteAgentUpdate_ChecksumMismatchAbortsSwap(t *testing.T) {
 	}
 }
 
-// WS7 #1 (core): when expected_sha256 is present, the swap is gated on it
-// and a malicious same-origin checksum document is NOT trusted. Serve a
-// SHA256SUMS that advertises a MATCHING hash for the tampered bytes while
-// expected_sha256 holds the genuine hash → tampered binary rejected.
-func TestExecuteAgentUpdate_HashBoundToControlAction_NotChecksumFile(t *testing.T) {
-	genuine := agentScript("v2026.06.05", 0)
-	tampered := append([]byte{}, genuine...)
-	tampered[len(tampered)-2] ^= 0xff
-
-	// The lying checksum file vouches for the tampered bytes.
-	sums := []byte(sha256hex(tampered) + "  agent\n")
-	h := newUpdateHarness(t, "v2026.06.01", tampered, sums)
-
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(genuine)))
-	if err == nil {
-		t.Fatal("tampered binary must be rejected even when a same-origin checksum file vouches for it")
-	}
-	if changed {
-		t.Error("changed must be false")
-	}
-	if got := h.currentBinary(t); string(got) != string(h.oldBytes) {
-		t.Error("live binary must be unchanged")
-	}
-}
-
 // WS7 #6: a staged binary whose self-test fails keeps the current binary.
 func TestExecuteAgentUpdate_SelfTestFailKeepsBinary(t *testing.T) {
 	staged := agentScript("v2026.06.05", 1) // self-test exits non-zero
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err == nil {
 		t.Fatal("self-test failure must abort the update")
 	}
@@ -232,7 +209,7 @@ func TestExecuteAgentUpdate_HappyPathSwapsAndShutsDown(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err != nil {
 		t.Fatalf("happy-path update failed: %v", err)
 	}
@@ -263,7 +240,7 @@ func TestExecuteAgentUpdate_RefreshesUnitFromNewBinary(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err != nil {
 		t.Fatalf("update failed: %v", err)
 	}
@@ -290,7 +267,7 @@ func TestExecuteAgentUpdate_UnitInstallFailureIsFailOpen(t *testing.T) {
 	staged := agentScriptUnitExit("v2026.06.05", 0, 1)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params(sha256hex(staged)))
+	_, changed, err := h.e.executeAgentUpdate(context.Background(), h.params())
 	if err != nil {
 		t.Fatalf("update must succeed despite install-unit failure: %v", err)
 	}
@@ -302,15 +279,15 @@ func TestExecuteAgentUpdate_UnitInstallFailureIsFailOpen(t *testing.T) {
 	}
 }
 
-// WS7 (revised): an action with NEITHER expected_sha256 NOR checksum_url
-// has no integrity source and is refused fail-closed (also enforced
+// An action without checksum_url has no signed integrity source and is
+// refused fail-closed (also enforced
 // server-side). The agent-update path uses downloadToFile, which has no
 // checksum chokepoint of its own.
 func TestExecuteAgentUpdate_RefusesNoIntegritySource(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
 
-	// No expected_sha256 AND no checksum_url.
+	// No checksum_url.
 	noIntegrity := &pb.AgentUpdateParams{
 		Amd64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent"},
 		Arm64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent"},
@@ -327,24 +304,23 @@ func TestExecuteAgentUpdate_RefusesNoIntegritySource(t *testing.T) {
 	}
 }
 
-// WS7 (revised): the DEFAULT path — no pinned expected_sha256, integrity
-// verified against the operator's checksum_url (SHA256SUMS). This is what
+// The only update path verifies the publisher's signed checksum manifest.
+// This is what
 // lets binary_url/checksum_url track "latest" hands-off. A correct
 // checksum file + newer version → swap + shutdown.
-func TestExecuteAgentUpdate_ChecksumURLFallback(t *testing.T) {
+func TestExecuteAgentUpdate_SignedManifest(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	// SHA256SUMS line for the binary served at /agent (filename "agent").
 	sums := []byte(sha256hex(staged) + "  agent\n")
 	h := newUpdateHarness(t, "v2026.06.01", staged, sums)
 
-	// No expected_sha256 → agent fetches + verifies via checksum_url.
 	p := &pb.AgentUpdateParams{
 		Amd64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
 		Arm64: &pb.AgentUpdateArch{BinaryUrl: h.srv.URL + "/agent", ChecksumUrl: h.srv.URL + "/sums"},
 	}
 	_, changed, err := h.e.executeAgentUpdate(context.Background(), p)
 	if err != nil {
-		t.Fatalf("checksum_url fallback update failed: %v", err)
+		t.Fatalf("signed-manifest update failed: %v", err)
 	}
 	if !changed {
 		t.Error("changed must be true on a successful checksum_url-verified update")
@@ -420,7 +396,7 @@ func TestExecuteAgentUpdate_ChecksumURLSignatureRejected(t *testing.T) {
 func TestExecuteAgentUpdate_HTTPSourceRejected(t *testing.T) {
 	staged := agentScript("v2026.06.05", 0)
 	h := newUpdateHarness(t, "v2026.06.01", staged, nil)
-	p := h.params(sha256hex(staged))
+	p := h.params()
 	p.Amd64.BinaryUrl = "http://example.com/agent"
 	p.Arm64.BinaryUrl = "http://example.com/agent"
 

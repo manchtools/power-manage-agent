@@ -13,10 +13,12 @@ reviews:
         until their narrow sink; application frames are not signed.
     - path: "internal/executor/agent_update.go"
       instructions: >
-        Agent updates must verify either a control-pinned SHA-256 or the
-        Ed25519-signed release manifest before staging a binary, enforce
-        anti-rollback, self-test before the atomic swap, and retain one
-        recoverable previous binary.
+        Agent updates must authenticate the Ed25519-signed release manifest
+        before trusting its SHA-256 and staging a binary, enforce anti-rollback,
+        self-test before the atomic swap, and retain one recoverable previous
+        binary. Preserve operator-selected HTTPS release endpoints, including
+        private/internal hosts used by self-hosted deployments; do not require a
+        MANCHTOOLS or public-network host allowlist.
   tools:
     golangci-lint:
       enabled: true

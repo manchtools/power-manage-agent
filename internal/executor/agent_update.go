@@ -65,8 +65,8 @@ func (e *Executor) markAgentUpdateExecuted() bool {
 //  2. Look up AgentUpdateArch for own architecture
 //  3. If no entry → skip (success, no changes)
 //  4. Validate the binary URL is HTTPS
-//  5. Download binary to temp file, verify SHA256 against the CA-signed
-//     expected_sha256 (WS7 #1 — NOT a same-origin checksum file)
+//  5. Authenticate the publisher-signed checksum manifest, then download the
+//     binary and verify its SHA-256 against the trusted manifest entry
 //  6. Run ./agent-new version → extract version string
 //  7. Compare with running version → skip if same; refuse a downgrade
 //     unless allow_downgrade is set on the control-authored action (anti-rollback)
@@ -109,29 +109,18 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 		return nil, false, fmt.Errorf("binary URL validation: %w", err)
 	}
 
-	// Step 4: determine the expected binary hash. The operator can pin it
-	// directly; otherwise the publisher-signed release manifest is authoritative.
-	//   - expected_sha256 set → AUTHORITATIVE, control-authored pin. It rides
-	//     inside the control-authored action, so even a compromised download origin
-	//     cannot vouch for a tampered binary. Overrides checksum_url.
-	//   - otherwise → fetch checksum_url and checksum_url.sig, authenticate
-	//     the exact manifest bytes with the release Ed25519 key, then extract
-	//     the binary hash. The download origin cannot sign substituted bytes.
-	// At least one must be present (also enforced server-side) so an update
-	// never runs with no integrity check.
-	expectedChecksum := strings.ToLower(arch.ExpectedSha256)
-	if expectedChecksum == "" {
-		if arch.ChecksumUrl == "" {
-			return nil, false, fmt.Errorf("agent update rejected: action sets neither expected_sha256 nor checksum_url")
-		}
-		if err := sdk.ValidateHTTPSURL(arch.ChecksumUrl); err != nil {
-			return nil, false, fmt.Errorf("checksum URL validation: %w", err)
-		}
-		fileChecksum, err := downloadAndExtractChecksum(ctx, arch.ChecksumUrl, extractFilename(arch.BinaryUrl), updateRedirectPolicy(params))
-		if err != nil {
-			return nil, false, fmt.Errorf("download checksum: %w", err)
-		}
-		expectedChecksum = fileChecksum
+	// Step 4: authenticate the release manifest before trusting its binary hash.
+	// checksum_url is required by the public contract and server authoring, and
+	// this executor validates it again before any network access.
+	if arch.ChecksumUrl == "" {
+		return nil, false, fmt.Errorf("agent update rejected: checksum_url is required")
+	}
+	if err := sdk.ValidateHTTPSURL(arch.ChecksumUrl); err != nil {
+		return nil, false, fmt.Errorf("checksum URL validation: %w", err)
+	}
+	expectedChecksum, err := downloadAndExtractChecksum(ctx, arch.ChecksumUrl, extractFilename(arch.BinaryUrl), updateRedirectPolicy(params))
+	if err != nil {
+		return nil, false, fmt.Errorf("download checksum: %w", err)
 	}
 
 	// Step 5: Download binary to temp file in DataDir (agent-owned).
@@ -149,13 +138,13 @@ func (e *Executor) executeAgentUpdate(ctx context.Context, params *pb.AgentUpdat
 	_ = tmpFile.Close() // remote.Fetch writes via its own temp + atomic rename onto tmpPath
 	defer os.Remove(tmpPath)
 
-	// Download the binary, verify it against the (operator-or-CA-pinned)
-	// expected sha256, and place it at mode 0755 (executable for the version
+	// Download the binary, verify it against the hash from the signed release
+	// manifest, and place it at mode 0755 (executable for the version
 	// self-test below) — all in one atomic step via the SDK remote source. An
 	// integrity failure is the binary-doesn't-match-the-pin case.
 	if err := fetchArtifact(ctx, arch.BinaryUrl, tmpPath, expectedChecksum, "0755", updateRedirectPolicy(params)); err != nil {
 		if errors.Is(err, remote.ErrIntegrity) {
-			return nil, false, fmt.Errorf("binary does not match the expected_sha256 pin: %w", err)
+			return nil, false, fmt.Errorf("binary does not match the signed release manifest: %w", err)
 		}
 		return nil, false, fmt.Errorf("download binary: %w", err)
 	}
@@ -431,9 +420,9 @@ func extractFilename(rawURL string) string {
 // updateRedirectPolicy resolves the redirect policy for a self-update download
 // from the operator's explicit AllowRedirect choice on the action. Default false
 // keeps the strict same-origin guard; true follows cross-origin redirects (e.g.
-// a CDN such as GitHub releases). The binary is always verified against a SHA-256
-// (expected_sha256, or the hash resolved from checksum_url) and an https->http
-// downgrade is refused by the SDK regardless, so the flag opts into a
+// a CDN such as GitHub releases). The binary is always verified against the
+// hash resolved from the publisher-signed manifest and an https->http downgrade
+// is refused by the SDK regardless, so the flag opts into a
 // host-changing hop, not into unchecked bytes — mirroring allow_downgrade as a
 // security-sensitive operator decision that rides inside the control-authored action.
 func updateRedirectPolicy(params *pb.AgentUpdateParams) remote.RedirectPolicy {
