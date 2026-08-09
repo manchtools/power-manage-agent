@@ -67,7 +67,7 @@ jobs:
     name: GitHub Release
     runs-on: ubuntu-latest
     needs: [build]
-    environment: release
+    environment: releases
     steps:
       - uses: actions/checkout@v5
         with:
@@ -170,24 +170,12 @@ jobs:
           ## Installation
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
-          \`\`\`
-
-          Or install this specific version:
-
-          \`\`\`bash
           curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
           \`\`\`
 
           ## Update
 
-          To update an already registered agent to the latest prerelease:
-
-          \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- --pre
-          \`\`\`
-
-          Or update to this specific version:
+          To update an already registered agent to this prerelease:
 
           \`\`\`bash
           curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}

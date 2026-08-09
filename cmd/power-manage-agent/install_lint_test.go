@@ -91,13 +91,35 @@ func TestInstall_VerifiesPublisherSignatureBeforeChecksum(t *testing.T) {
 
 func TestReleaseWorkflowSignsChecksumsInProtectedEnvironment(t *testing.T) {
 	workflow := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+	_, releaseJob, ok := strings.Cut(workflow, "\n  release:\n")
+	if !ok {
+		t.Fatal("release workflow is missing the release job")
+	}
 	for _, required := range []string{
-		"environment: release", "RELEASE_SIGNING_PRIVATE_KEY", "RELEASE_SIGNING_PUBLIC_KEY",
+		"environment: releases", "RELEASE_SIGNING_PRIVATE_KEY", "RELEASE_SIGNING_PUBLIC_KEY",
 		"SHA256SUMS.sig", "openssl pkeyutl -sign -rawin", "ED25519 Private-Key:",
 	} {
-		if !strings.Contains(workflow, required) {
+		if !strings.Contains(releaseJob, required) {
 			t.Errorf("release workflow is missing %q", required)
 		}
+	}
+}
+
+func TestReleaseWorkflowPrereleaseInstructionsUseExactTag(t *testing.T) {
+	workflow := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+	_, prerelease, ok := strings.Cut(workflow, `if [[ "${{ needs.build.outputs.is_prerelease }}" == "true" ]]; then`)
+	if !ok {
+		t.Fatal("release workflow is missing the prerelease release-body branch")
+	}
+	prerelease, _, ok = strings.Cut(prerelease, "          else")
+	if !ok {
+		t.Fatal("release workflow is missing the stable release-body branch")
+	}
+	if strings.Contains(prerelease, "releases/latest/download/install.sh") {
+		t.Error("prerelease instructions must not bootstrap the latest stable installer")
+	}
+	if !strings.Contains(prerelease, `releases/download/${TAG}/install.sh`) {
+		t.Error("prerelease instructions must use the installer from the exact release tag")
 	}
 }
 

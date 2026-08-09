@@ -75,6 +75,42 @@ func TestCIRunsEveryIntegrationTest(t *testing.T) {
 	}
 }
 
+func TestIntegrationCIUsesPinnedSDK(t *testing.T) {
+	root := moduleRoot(t)
+	goMod, err := os.ReadFile(filepath.Join(root, "go.mod"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !regexp.MustCompile(`(?m)^\s*github\.com/manchtools/power-manage-sdk\s+v0\.5\.4\s*$`).Match(goMod) {
+		t.Error("go.mod must require github.com/manchtools/power-manage-sdk at exactly v0.5.4")
+	}
+
+	files := []string{
+		filepath.Join(root, "go.mod"),
+		filepath.Join(root, ".github", "workflows", "integration-test.yml"),
+	}
+	dockerfiles, err := filepath.Glob(filepath.Join(root, "test", "Dockerfile.integration*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(dockerfiles) == 0 {
+		t.Fatal("matches-zero guard: discovered no test/Dockerfile.integration* files")
+	}
+	files = append(files, dockerfiles...)
+
+	for _, file := range files {
+		raw, err := os.ReadFile(file)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, override := range []string{"SDK_MODE", "Resolve SDK branch override", "power-manage-sdk.git", "replace github.com/manchtools/power-manage-sdk"} {
+			if strings.Contains(string(raw), override) {
+				t.Errorf("integration CI must use the reviewed SDK pin, found override path %q in %s", override, file)
+			}
+		}
+	}
+}
+
 // discoverIntegrationTaggedFiles maps module-relative _test.go files that
 // carry the `integration` build tag to their declared Test function names.
 // vendor/, testdata/, and hidden directories are skipped.

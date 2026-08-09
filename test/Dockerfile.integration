@@ -27,7 +27,7 @@ RUN mkdir -p /run/sshd
 WORKDIR /workspace
 
 # Copy only the agent module; go.mod's replace directive points at a
-# pinned SDK pseudo-version fetched from GitHub at build time. Cross-
+# pinned SDK version fetched from GitHub at build time. Cross-
 # cutting SDK/agent development happens locally via a per-dev go.work
 # at the workspace root — see agent/README.md.
 COPY agent/ ./agent/
