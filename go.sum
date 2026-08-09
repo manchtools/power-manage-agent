@@ -88,6 +88,8 @@ github.com/manchtools/power-manage-sdk v0.5.4-0.20260809075732-1f98c6d6df19 h1:x
 github.com/manchtools/power-manage-sdk v0.5.4-0.20260809075732-1f98c6d6df19/go.mod h1:kW40GYv7KS/CQRUCW8hyX06AOb/FtG6PF6cGXUu3/IQ=
 github.com/manchtools/power-manage-sdk v0.5.4-0.20260809081706-6e8b0d70cb7c h1:5YyazeQUsxwKUcv6DTNG7IWlOU2FfyMo5W0lWEV7KvQ=
 github.com/manchtools/power-manage-sdk v0.5.4-0.20260809081706-6e8b0d70cb7c/go.mod h1:kW40GYv7KS/CQRUCW8hyX06AOb/FtG6PF6cGXUu3/IQ=
+github.com/manchtools/power-manage-sdk v0.5.4-0.20260809083716-5f23bc6d3400 h1:vufBOQU5xW0WHq4m+eJyY6J/lENWZ7nf3UkjEYrfagk=
+github.com/manchtools/power-manage-sdk v0.5.4-0.20260809083716-5f23bc6d3400/go.mod h1:kW40GYv7KS/CQRUCW8hyX06AOb/FtG6PF6cGXUu3/IQ=
 github.com/mattn/go-isatty v0.0.20 h1:xfD0iDuEKnDkl03q4limB+vH+GxLEtL/jb4xVJSWWEY=
 github.com/mattn/go-isatty v0.0.20/go.mod h1:W+V8PltTTMOvKvAeJH7IuucS94S2C6jfK/D7dTCTo3Y=
 github.com/mfridman/interpolate v0.0.2 h1:pnuTK7MQIxxFz1Gr+rjSIx9u7qVjf5VOoM/u6BbAxPY=
