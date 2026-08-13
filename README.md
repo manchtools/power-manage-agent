@@ -127,13 +127,16 @@ curl -fsSL https://your-server/install.sh | sudo bash -s -- \
   --pin YOUR_CA_SHA256
 ```
 
-<!-- docref: begin src=install.sh#download_binary:3f9090ea -->
+<!-- docref: begin src=install.sh#download_binary:2f3e9ce7 -->
 The install script:
-1. Downloads `SHA256SUMS` and `SHA256SUMS.sig`, verifies the manifest with the
+1. Installs its own release by default: the release build stamps the tag into
+   the installer, so a release asset run without `-v` fetches that release's
+   binaries rather than resolving GitHub's prerelease-skipping `latest` alias
+2. Downloads `SHA256SUMS` and `SHA256SUMS.sig`, verifies the manifest with the
    pinned Ed25519 release key, then verifies and installs the agent binary
-2. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
-3. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
-4. Enrolls via the enrollment socket only when `--server`, `--token`, and `--pin` are provided
+3. Creates `/var/lib/power-manage` as a root-owned, mode 0700 data directory
+4. Installs the systemd unit with `User=root` and the documented capability bounding set, then enables and starts the service
+5. Enrolls via the enrollment socket only when `--server`, `--token`, and `--pin` are provided
 <!-- docref: end -->
 
 The `power-manage://` desktop URI handler is **opt-in** (`--enable-uri-handler` or `POWER_MANAGE_ENABLE_URI_HANDLER=true`) and **off by default** — an unconditional handler exposes the root-capable binary to drive-by browser links. When enabled, the `.desktop` entry sets `Terminal=false` so a link cannot auto-spawn a terminal.
@@ -921,7 +924,7 @@ Integration tests run automatically on push to `main` and on pull requests via G
 The release workflow (`.github/workflows/release.yml`) gates binary builds on
 passing integration tests, then signs the checksum manifest before publishing.
 
-<!-- docref: begin src=.github/workflows/release.yml#@release-signing:ad1354ab -->
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:25ceebff -->
 Release signing uses two GitHub settings:
 
 - `RELEASE_SIGNING_PRIVATE_KEY`: the PKCS#8 PEM private key, stored only as a
@@ -942,7 +945,7 @@ Cloning or forking this repository does not provide MANCHTOOLS release-signing
 settings or private key material. Downstream maintainers must configure their
 own Ed25519 pair under the same Actions variable and environment-secret names.
 
-<!-- docref: begin src=.github/workflows/release.yml#@release-signing:ad1354ab,internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3 -->
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:25ceebff,internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3 -->
 There are two deliberately different build modes:
 
 - A normal `go build ./cmd/power-manage-agent` development build succeeds

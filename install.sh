@@ -35,6 +35,10 @@ GITHUB_REPO="MANCHTOOLS/power-manage-agent"
 # release artifact carries the pinned value.
 RELEASE_SIGNING_PUBLIC_KEY="__RELEASE_SIGNING_PUBLIC_KEY__"
 
+# Stamped by the release workflow exactly like the key above; the source tree
+# keeps the raw placeholder and the run-time default stays "latest".
+INSTALLER_RELEASE_VERSION="__INSTALLER_RELEASE_VERSION__"
+
 # Default values
 DATA_DIR="/var/lib/power-manage"
 BINARY_PATH="/usr/local/bin/power-manage-agent"
@@ -237,6 +241,21 @@ download_binary() {
         log_info "Using existing binary at $BINARY_PATH"
         chmod +x "$BINARY_PATH"
         return
+    fi
+
+    # A release installer installs its own release when no version was named:
+    # GitHub's "latest" alias resolves only non-prereleases, so a project that
+    # currently ships prereleases resolves it to an ancient stable whose
+    # assets do not match this installer. -v and --pre keep their meaning.
+    # The sentinel is assembled at run time for the same reason as the key
+    # guard below: the release sed must never rewrite this comparison.
+    local version_sentinel="__INSTALLER_RELEASE_VERSION"
+    version_sentinel="${version_sentinel}__"
+    if [[ "$VERSION" == "latest" ]] && [[ -z "$PRE_RELEASE" ]] \
+        && [[ -n "$INSTALLER_RELEASE_VERSION" ]] \
+        && [[ "$INSTALLER_RELEASE_VERSION" != "$version_sentinel" ]]; then
+        VERSION="$INSTALLER_RELEASE_VERSION"
+        log_info "No version named; installing this installer's release: ${VERSION}"
     fi
 
     # Resolve version for --pre flag

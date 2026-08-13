@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -261,5 +262,43 @@ func TestInstall_PlaceholderAppearsOnlyInTheAssignment(t *testing.T) {
 	substituted := strings.ReplaceAll(sh, placeholder, "TESTKEYBASE64")
 	if strings.Contains(substituted, `== "TESTKEYBASE64"`) {
 		t.Error("after key substitution the configured-key guard compares the key against itself; assemble the sentinel at run time")
+	}
+}
+
+// Self-discovering generalization of the placeholder rule: every release
+// placeholder declared in install.sh must (a) appear exactly once, on the
+// assignment its sed targets, (b) actually be substituted by the release
+// workflow, and (c) survive a simulated global substitution without any
+// guard comparing a variable against the freshly injected value. A new
+// placeholder added without workflow wiring, or referenced literally in a
+// second place, fails here instead of in the next broken release.
+func TestInstall_EveryPlaceholderStampedExactlyOnce(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	wf := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+
+	pattern := regexp.MustCompile(`__[A-Z][A-Z0-9_]*__`)
+	counts := map[string]int{}
+	for _, token := range pattern.FindAllString(sh, -1) {
+		counts[token]++
+	}
+	if len(counts) == 0 {
+		t.Fatal("install.sh declares no release placeholders; the release build would stamp nothing")
+	}
+
+	substituted := sh
+	for token, count := range counts {
+		if count != 1 {
+			t.Errorf("placeholder %s appears %d times; the global release sed replaces every occurrence, so only its assignment may carry it", token, count)
+		}
+		if !strings.Contains(sh, `="`+token+`"`) {
+			t.Errorf("placeholder %s must appear as a quoted assignment for the release sed to stamp", token)
+		}
+		if !strings.Contains(wf, token) {
+			t.Errorf("release.yml never substitutes %s; a release would ship the raw placeholder and fail closed", token)
+		}
+		substituted = strings.ReplaceAll(substituted, token, "STAMPED_VALUE")
+	}
+	if strings.Contains(substituted, `== "STAMPED_VALUE"`) {
+		t.Error("after substitution a guard compares a variable against the injected value; assemble sentinels at run time")
 	}
 }

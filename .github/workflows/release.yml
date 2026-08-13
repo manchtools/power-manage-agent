@@ -99,6 +99,14 @@ jobs:
             echo "release installer still contains the public-key placeholder" >&2
             exit 1
           fi
+          # Stamp the installer's own release so running it without -v
+          # installs THIS release: the GitHub "latest" alias resolves only
+          # non-prereleases and hands a prerelease user mismatched assets.
+          sed -i "s|__INSTALLER_RELEASE_VERSION__|${GITHUB_REF_NAME}|g" release/install.sh
+          if grep -q '__INSTALLER_RELEASE_VERSION__' release/install.sh; then
+            echo "release installer still contains the version placeholder" >&2
+            exit 1
+          fi
           cd release
           sha256sum power-manage-agent-linux-amd64 power-manage-agent-linux-arm64 install.sh > SHA256SUMS
 
