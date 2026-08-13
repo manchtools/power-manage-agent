@@ -320,7 +320,14 @@ download_binary() {
         exit 1
     fi
 
-    if [[ "$RELEASE_SIGNING_PUBLIC_KEY" == "__RELEASE_SIGNING_PUBLIC_KEY__" ]] || \
+    # The sentinel is assembled at run time so the release build's GLOBAL
+    # placeholder substitution can never rewrite this comparison. rc1 shipped
+    # with the literal placeholder here: the sed replaced it with the real
+    # key, the guard compared the key against itself, and every SIGNED
+    # release refused to install precisely because the key WAS configured.
+    local placeholder_sentinel="__RELEASE_SIGNING_PUBLIC_KEY"
+    placeholder_sentinel="${placeholder_sentinel}__"
+    if [[ "$RELEASE_SIGNING_PUBLIC_KEY" == "$placeholder_sentinel" ]] || \
         [[ -z "$RELEASE_SIGNING_PUBLIC_KEY" ]]; then
         log_error "Release signing public key is not configured. Refusing to install."
         exit 1

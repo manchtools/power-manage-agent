@@ -232,3 +232,34 @@ func TestContainerfile_DataDirPerms(t *testing.T) {
 		t.Error("Containerfile must `chmod 700 /var/lib/power-manage` after creating it")
 	}
 }
+
+// The release build substitutes the public key into install.sh with a GLOBAL
+// sed over the placeholder. rc1 shipped an installer whose "not configured"
+// guard was itself the placeholder literal, so the sed rewrote the guard into
+// comparing the configured key against itself and every SIGNED release
+// refused to install. The full placeholder may therefore appear exactly once
+// — the assignment the sed is meant to hit — and the guard must assemble its
+// sentinel at run time where no substitution can reach it.
+func TestInstall_PlaceholderAppearsOnlyInTheAssignment(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	const placeholder = "__RELEASE_SIGNING_PUBLIC_KEY__"
+
+	count := strings.Count(sh, placeholder)
+	if count == 0 {
+		t.Fatal("install.sh must carry the release-key placeholder assignment; a build with none has nothing to substitute")
+	}
+	if count != 1 {
+		t.Errorf("the release-key placeholder appears %d times; the release sed replaces every occurrence, so only the assignment may carry it", count)
+	}
+	if !strings.Contains(sh, `RELEASE_SIGNING_PUBLIC_KEY="`+placeholder+`"`) {
+		t.Error("the single placeholder occurrence must be the assignment the release sed substitutes")
+	}
+
+	// Simulate the release substitution and prove the guard survives it: the
+	// substituted script must never compare the variable against the value
+	// that was just injected.
+	substituted := strings.ReplaceAll(sh, placeholder, "TESTKEYBASE64")
+	if strings.Contains(substituted, `== "TESTKEYBASE64"`) {
+		t.Error("after key substitution the configured-key guard compares the key against itself; assemble the sentinel at run time")
+	}
+}
