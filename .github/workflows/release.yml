@@ -186,7 +186,7 @@ jobs:
           ## Installation
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
           \`\`\`
 
           ## Update
@@ -194,7 +194,7 @@ jobs:
           To update an already registered agent to this prerelease:
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}
           \`\`\`
 
           The update stops the running service, downloads the new binary, updates the sudoers configuration, and restarts the service. Existing registration and credentials are preserved.
@@ -204,13 +204,13 @@ jobs:
           ## Installation
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash -s -- -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
           \`\`\`
 
           Or install a specific version:
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG} -s https://your-server.example.com -t YOUR_TOKEN -p CA_SHA256
           \`\`\`
 
           ## Update
@@ -218,13 +218,13 @@ jobs:
           To update an already registered agent to the latest version:
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/latest/download/install.sh | sudo bash
+          curl -fsSL https://github.com/${{ github.repository }}/releases/latest/download/install.sh | sudo bash
           \`\`\`
 
           Or update to this specific version:
 
           \`\`\`bash
-          curl -fsSL https://github.com/MANCHTOOLS/power-manage-agent/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}
+          curl -fsSL https://github.com/${{ github.repository }}/releases/download/${TAG}/install.sh | sudo bash -s -- -v ${TAG}
           \`\`\`
 
           The update stops the running service, downloads the new binary, updates the sudoers configuration, and restarts the service. Existing registration and credentials are preserved.

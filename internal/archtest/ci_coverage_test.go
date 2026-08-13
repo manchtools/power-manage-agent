@@ -75,14 +75,25 @@ func TestCIRunsEveryIntegrationTest(t *testing.T) {
 	}
 }
 
+// sdkModulePath is the SDK module whose version pin integration CI must
+// build against. A replace directive naming it silently defeats that pin.
+const sdkModulePath = "github.com/manchtools/power-manage-sdk"
+
 func TestIntegrationCIUsesPinnedSDK(t *testing.T) {
 	root := moduleRoot(t)
 	goMod, err := os.ReadFile(filepath.Join(root, "go.mod"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !regexp.MustCompile(`(?m)^\s*github\.com/manchtools/power-manage-sdk\s+v0\.5\.4\s*$`).Match(goMod) {
-		t.Error("go.mod must require github.com/manchtools/power-manage-sdk at exactly v0.5.4")
+	if !regexp.MustCompile(`(?m)^\s*` + regexp.QuoteMeta(sdkModulePath) + `\s+v0\.5\.4\s*$`).Match(goMod) {
+		t.Error("go.mod must require " + sdkModulePath + " at exactly v0.5.4")
+	}
+	// go.mod's replace directives are PARSED rather than substring-scanned by
+	// the marker loop below: Go's parenthesised block form puts the `replace`
+	// keyword and the module path on different lines, so a same-line marker
+	// never sees it while the override is fully in effect (issue #204).
+	if overrides := sdkReplaceDirectives(string(goMod)); len(overrides) > 0 {
+		t.Errorf("go.mod replaces %s with %q; integration CI must build against the reviewed pin", sdkModulePath, overrides)
 	}
 
 	files := []string{
@@ -108,6 +119,192 @@ func TestIntegrationCIUsesPinnedSDK(t *testing.T) {
 				t.Errorf("integration CI must use the reviewed SDK pin, found override path %q in %s", override, file)
 			}
 		}
+	}
+}
+
+// sdkReplaceDirectives returns the replacement target of every `replace`
+// directive in goMod whose left-hand module path is exactly sdkModulePath.
+//
+// It parses the directive structure rather than scanning for the substring
+// "replace <path>", because the go command accepts BOTH
+//
+//	replace github.com/manchtools/power-manage-sdk v0.5.4 => ../sdk
+//
+// and the parenthesised block form
+//
+//	replace (
+//	    github.com/manchtools/power-manage-sdk v0.5.4 => ../sdk
+//	)
+//
+// which override the pin identically while a same-line substring scan sees
+// only the first (issue #204). Comments are stripped first, so a
+// commented-out directive — which the build ignores — is not reported.
+func sdkReplaceDirectives(goMod string) []string {
+	var out []string
+	inBlock := false
+	for _, raw := range strings.Split(goMod, "\n") {
+		line := strings.TrimSpace(stripGoModComment(raw))
+		if line == "" {
+			continue
+		}
+		if inBlock {
+			if strings.HasPrefix(line, ")") {
+				inBlock = false
+				continue
+			}
+		} else {
+			rest, ok := afterGoModKeyword(line, "replace")
+			if !ok {
+				continue
+			}
+			if strings.HasPrefix(rest, "(") {
+				inBlock = true
+				line = strings.TrimSpace(strings.TrimPrefix(rest, "("))
+				if line == "" || strings.HasPrefix(line, ")") {
+					continue
+				}
+			} else {
+				line = rest
+			}
+		}
+		if target, ok := sdkReplaceTarget(line); ok {
+			out = append(out, target)
+		}
+	}
+	return out
+}
+
+// stripGoModComment removes a `//` line comment. go.mod has no block
+// comments, so a line comment is the only form to handle.
+func stripGoModComment(line string) string {
+	if i := strings.Index(line, "//"); i >= 0 {
+		return line[:i]
+	}
+	return line
+}
+
+// afterGoModKeyword reports whether line opens with keyword as a whole token
+// and returns the remainder. It rejects a merely-prefixed identifier such as
+// `replacements`, and accepts `replace(` because go.mod's lexer treats the
+// parenthesis as its own token.
+func afterGoModKeyword(line, keyword string) (string, bool) {
+	rest, ok := strings.CutPrefix(line, keyword)
+	if !ok || rest == "" {
+		return "", false
+	}
+	if c := rest[0]; c != ' ' && c != '\t' && c != '(' {
+		return "", false
+	}
+	return strings.TrimSpace(rest), true
+}
+
+// sdkReplaceTarget parses one `<old> [version] => <new> [version]` entry and
+// returns the replacement target when the old side names sdkModulePath. The
+// old-side version is optional, and the path may be quoted.
+func sdkReplaceTarget(entry string) (string, bool) {
+	oldSide, newSide, ok := strings.Cut(entry, "=>")
+	if !ok {
+		return "", false
+	}
+	fields := strings.Fields(oldSide)
+	if len(fields) == 0 {
+		return "", false
+	}
+	if strings.Trim(fields[0], "\"`") != sdkModulePath {
+		return "", false
+	}
+	return strings.TrimSpace(newSide), true
+}
+
+// TestSDKReplaceDirectivesSeesEveryReplaceForm pins the detector against the
+// forms the go command actually accepts. The block-form rows are the
+// regression: a same-line substring scan reports a clean go.mod while the pin
+// is fully overridden (issue #204).
+//
+// The `replace (` / module-path / version split across three lines is
+// deliberately absent — the go command rejects it as a parse error, so it is
+// not a bypass this guard has to cover.
+func TestSDKReplaceDirectivesSeesEveryReplaceForm(t *testing.T) {
+	const header = "module github.com/manchtools/power-manage/agent\n\ngo 1.25.12\n\nrequire " + sdkModulePath + " v0.5.4\n\n"
+
+	for _, tc := range []struct {
+		name   string
+		goMod  string
+		want   []string
+		reason string
+	}{
+		{
+			name:   "clean go.mod with no replace at all",
+			goMod:  header,
+			want:   nil,
+			reason: "the pinned baseline must not be reported as overridden",
+		},
+		{
+			name:   "single-line replace with a version",
+			goMod:  header + "replace " + sdkModulePath + " v0.5.4 => ../sdk\n",
+			want:   []string{"../sdk"},
+			reason: "the form the original marker scan already caught",
+		},
+		{
+			name:   "single-line replace without a version",
+			goMod:  header + "replace " + sdkModulePath + " => ../sdk\n",
+			want:   []string{"../sdk"},
+			reason: "the version on the left is optional",
+		},
+		{
+			name:   "block-form replace with a version",
+			goMod:  header + "replace (\n\t" + sdkModulePath + " v0.5.4 => ../sdk\n)\n",
+			want:   []string{"../sdk"},
+			reason: "issue #204: the keyword and the module path sit on different lines",
+		},
+		{
+			name:   "block-form replace with the module path alone on its line",
+			goMod:  header + "replace (\n\t" + sdkModulePath + " => ../sdk\n)\n",
+			want:   []string{"../sdk"},
+			reason: "issue #204: versionless block entry, still a full override",
+		},
+		{
+			name:   "block-form replace hidden among unrelated entries",
+			goMod:  header + "replace (\n\tgithub.com/other/thing v1.2.3 => ../thing\n\t" + sdkModulePath + " v0.5.4 => github.com/attacker/sdk v0.0.1\n\tgithub.com/third/thing => ../third\n)\n",
+			want:   []string{"github.com/attacker/sdk v0.0.1"},
+			reason: "the SDK entry must be found regardless of its position in the block",
+		},
+		{
+			name:   "block-form replacing only other modules",
+			goMod:  header + "replace (\n\tgithub.com/other/thing v1.2.3 => ../thing\n)\n",
+			want:   nil,
+			reason: "replacing an unrelated module is not an SDK pin override",
+		},
+		{
+			name:   "module whose path merely starts with the SDK path",
+			goMod:  header + "replace " + sdkModulePath + "-extras v1.0.0 => ../extras\n",
+			want:   nil,
+			reason: "the left-hand path must match exactly, not by prefix",
+		},
+		{
+			name:   "commented-out replace directives",
+			goMod:  header + "// replace " + sdkModulePath + " => ../sdk\nreplace (\n\t// " + sdkModulePath + " v0.5.4 => ../sdk\n)\n",
+			want:   nil,
+			reason: "a commented directive has no effect on the build",
+		},
+		{
+			name:   "block-form replace closed and followed by a require block",
+			goMod:  header + "replace (\n\t" + sdkModulePath + " => ../sdk\n)\n\nrequire (\n\tgithub.com/other/thing v1.2.3 // indirect\n)\n",
+			want:   []string{"../sdk"},
+			reason: "the scanner must leave the block at `)` and not swallow later directives",
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got := sdkReplaceDirectives(tc.goMod)
+			if len(got) != len(tc.want) {
+				t.Fatalf("sdkReplaceDirectives() = %q, want %q (%s)", got, tc.want, tc.reason)
+			}
+			for i := range got {
+				if got[i] != tc.want[i] {
+					t.Errorf("sdkReplaceDirectives()[%d] = %q, want %q (%s)", i, got[i], tc.want[i], tc.reason)
+				}
+			}
+		})
 	}
 }
 

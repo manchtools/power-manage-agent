@@ -122,6 +122,73 @@ func TestReleaseWorkflowPrereleaseInstructionsUseExactTag(t *testing.T) {
 	if !strings.Contains(prerelease, `releases/download/${TAG}/install.sh`) {
 		t.Error("prerelease instructions must use the installer from the exact release tag")
 	}
+
+	// Issue #204: both prerelease installer URLs must be built from
+	// ${{ github.repository }}. Hardcoding the upstream slug makes a fork's
+	// generated release body send its users to upstream's assets — which are
+	// signed with upstream's key and contain none of the fork's builds,
+	// contradicting the BYOK downstream signing contract in README.md.
+	installers := releaseDownloadRepositories(prerelease)
+	if len(installers) < 2 {
+		t.Fatalf("matches-zero guard: the prerelease body documents an install and an update installer, so it must carry at least 2 release-download URLs; found %d", len(installers))
+	}
+	for _, repo := range installers {
+		if repo != githubRepositoryExpression {
+			t.Errorf("prerelease installer URL hardcodes repository %q; use %s so a fork's release body points at the fork's own signed assets", repo, githubRepositoryExpression)
+		}
+	}
+}
+
+// githubRepositoryExpression is the Actions expression that renders to the
+// owner/repo slug of whatever repository is running the workflow.
+const githubRepositoryExpression = "${{ github.repository }}"
+
+// releaseDownloadRepositoryPattern captures the owner/repo slug of every
+// github.com release URL — both `releases/download/<tag>/` and
+// `releases/latest/download/`. The capture is non-greedy so it stops at the
+// first `/releases/`, and `.` (not `\S`) because the correct value,
+// ${{ github.repository }}, contains spaces.
+var releaseDownloadRepositoryPattern = regexp.MustCompile(`https://github\.com/(.+?)/releases/(?:latest/)?download/`)
+
+// releaseDownloadRepositories returns the repository slug used by every
+// github.com release-download URL in the given workflow fragment.
+func releaseDownloadRepositories(fragment string) []string {
+	var out []string
+	for _, m := range releaseDownloadRepositoryPattern.FindAllStringSubmatch(fragment, -1) {
+		out = append(out, m[1])
+	}
+	return out
+}
+
+// TestReleaseWorkflowBodyURLsAreForkSafe generalises the rule the prerelease
+// test applies to its own branch: NO release URL anywhere in the generated
+// release body may name a repository literally. The stable branch documents
+// four more installer commands than the prerelease branch, and a hardcoded
+// slug is the same defect there — a fork tagging a stable release would
+// publish instructions that install upstream's signed binaries.
+//
+// Self-discovering: it reads whatever URLs the step emits, so a newly added
+// installer snippet is covered without editing a list here.
+func TestReleaseWorkflowBodyURLsAreForkSafe(t *testing.T) {
+	workflow := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+	_, body, ok := strings.Cut(workflow, "\n      - name: Generate release body\n")
+	if !ok {
+		t.Fatal("release workflow is missing the release-body step")
+	}
+	body, _, ok = strings.Cut(body, "\n      - name: ")
+	if !ok {
+		t.Fatal("release workflow's release-body step is not followed by another step")
+	}
+
+	repos := releaseDownloadRepositories(body)
+	if len(repos) == 0 {
+		t.Fatal("matches-zero guard: extracted no github.com release-download URLs from the release-body step; the pattern is broken")
+	}
+	for _, repo := range repos {
+		if repo != githubRepositoryExpression {
+			t.Errorf("release body URL hardcodes repository %q; use %s so forks publish instructions for their own release assets", repo, githubRepositoryExpression)
+		}
+	}
 }
 
 func TestInstall_ReleaseVerifierAcceptsOnlyConfiguredSigner(t *testing.T) {
