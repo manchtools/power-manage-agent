@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 )
@@ -230,5 +231,74 @@ func TestContainerfile_DataDirPerms(t *testing.T) {
 	cf := readRepoFile(t, "Containerfile")
 	if !strings.Contains(cf, "chmod 700 /var/lib/power-manage") {
 		t.Error("Containerfile must `chmod 700 /var/lib/power-manage` after creating it")
+	}
+}
+
+// The release build substitutes the public key into install.sh with a GLOBAL
+// sed over the placeholder. rc1 shipped an installer whose "not configured"
+// guard was itself the placeholder literal, so the sed rewrote the guard into
+// comparing the configured key against itself and every SIGNED release
+// refused to install. The full placeholder may therefore appear exactly once
+// — the assignment the sed is meant to hit — and the guard must assemble its
+// sentinel at run time where no substitution can reach it.
+func TestInstall_PlaceholderAppearsOnlyInTheAssignment(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	const placeholder = "__RELEASE_SIGNING_PUBLIC_KEY__"
+
+	count := strings.Count(sh, placeholder)
+	if count == 0 {
+		t.Fatal("install.sh must carry the release-key placeholder assignment; a build with none has nothing to substitute")
+	}
+	if count != 1 {
+		t.Errorf("the release-key placeholder appears %d times; the release sed replaces every occurrence, so only the assignment may carry it", count)
+	}
+	if !strings.Contains(sh, `RELEASE_SIGNING_PUBLIC_KEY="`+placeholder+`"`) {
+		t.Error("the single placeholder occurrence must be the assignment the release sed substitutes")
+	}
+
+	// Simulate the release substitution and prove the guard survives it: the
+	// substituted script must never compare the variable against the value
+	// that was just injected.
+	substituted := strings.ReplaceAll(sh, placeholder, "TESTKEYBASE64")
+	if strings.Contains(substituted, `== "TESTKEYBASE64"`) {
+		t.Error("after key substitution the configured-key guard compares the key against itself; assemble the sentinel at run time")
+	}
+}
+
+// Self-discovering generalization of the placeholder rule: every release
+// placeholder declared in install.sh must (a) appear exactly once, on the
+// assignment its sed targets, (b) actually be substituted by the release
+// workflow, and (c) survive a simulated global substitution without any
+// guard comparing a variable against the freshly injected value. A new
+// placeholder added without workflow wiring, or referenced literally in a
+// second place, fails here instead of in the next broken release.
+func TestInstall_EveryPlaceholderStampedExactlyOnce(t *testing.T) {
+	sh := readRepoFile(t, "install.sh")
+	wf := readRepoFile(t, filepath.Join(".github", "workflows", "release.yml"))
+
+	pattern := regexp.MustCompile(`__[A-Z][A-Z0-9_]*__`)
+	counts := map[string]int{}
+	for _, token := range pattern.FindAllString(sh, -1) {
+		counts[token]++
+	}
+	if len(counts) == 0 {
+		t.Fatal("install.sh declares no release placeholders; the release build would stamp nothing")
+	}
+
+	substituted := sh
+	for token, count := range counts {
+		if count != 1 {
+			t.Errorf("placeholder %s appears %d times; the global release sed replaces every occurrence, so only its assignment may carry it", token, count)
+		}
+		if !strings.Contains(sh, `="`+token+`"`) {
+			t.Errorf("placeholder %s must appear as a quoted assignment for the release sed to stamp", token)
+		}
+		if !strings.Contains(wf, token) {
+			t.Errorf("release.yml never substitutes %s; a release would ship the raw placeholder and fail closed", token)
+		}
+		substituted = strings.ReplaceAll(substituted, token, "STAMPED_VALUE")
+	}
+	if strings.Contains(substituted, `== "STAMPED_VALUE"`) {
+		t.Error("after substitution a guard compares a variable against the injected value; assemble sentinels at run time")
 	}
 }
