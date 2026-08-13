@@ -924,7 +924,7 @@ Integration tests run automatically on push to `main` and on pull requests via G
 The release workflow (`.github/workflows/release.yml`) gates binary builds on
 passing integration tests, then signs the checksum manifest before publishing.
 
-<!-- docref: begin src=.github/workflows/release.yml#@release-signing:25ceebff -->
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:0f884921 -->
 Release signing uses two GitHub settings:
 
 - `RELEASE_SIGNING_PRIVATE_KEY`: the PKCS#8 PEM private key, stored only as a
@@ -945,7 +945,7 @@ Cloning or forking this repository does not provide MANCHTOOLS release-signing
 settings or private key material. Downstream maintainers must configure their
 own Ed25519 pair under the same Actions variable and environment-secret names.
 
-<!-- docref: begin src=.github/workflows/release.yml#@release-signing:25ceebff,internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3 -->
+<!-- docref: begin src=.github/workflows/release.yml#@release-signing:0f884921,internal/executor/release_signature.go#verifyReleaseManifest:ef74f2a3 -->
 There are two deliberately different build modes:
 
 - A normal `go build ./cmd/power-manage-agent` development build succeeds
